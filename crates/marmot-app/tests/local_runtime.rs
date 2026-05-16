@@ -1,7 +1,9 @@
 use cgka_traits::TransportEndpoint;
-use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_LABEL;
 use marmot_account::AccountHome;
-use marmot_app::{AccountRelayListBootstrap, MarmotApp, UserDirectorySearch, UserProfileMetadata};
+use marmot_app::{
+    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, MarmotApp, UserDirectorySearch,
+    UserProfileMetadata,
+};
 
 #[tokio::test]
 async fn local_app_runtime_exchanges_messages_without_lab() {
@@ -77,24 +79,21 @@ async fn local_app_runtime_creates_default_agent_text_stream_group() {
     assert_eq!(prompt.messages[0].sender, "alice");
     assert_eq!(prompt.messages[0].plaintext, "write a summary");
 
-    let context = b"v1-test-stream-context";
     let alice_secret = alice
-        .export_secret(&group_id, AGENT_TEXT_STREAM_EXPORTER_LABEL, context, 32)
+        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
         .unwrap();
     let bob_secret = bob
-        .export_secret(&group_id, AGENT_TEXT_STREAM_EXPORTER_LABEL, context, 32)
+        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
         .unwrap();
-    let other_secret = alice
-        .export_secret(
-            &group_id,
-            AGENT_TEXT_STREAM_EXPORTER_LABEL,
-            b"other-stream-context",
-            32,
-        )
-        .unwrap();
+    let repeated_alice_secret = alice
+        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
+        .unwrap_err();
 
     assert_eq!(alice_secret, bob_secret);
-    assert_ne!(alice_secret, other_secret);
+    assert!(
+        repeated_alice_secret.to_string().contains("PuncturedInput"),
+        "{repeated_alice_secret}"
+    );
 }
 
 #[tokio::test]

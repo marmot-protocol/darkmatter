@@ -219,36 +219,47 @@ impl<S: StorageProvider> Engine<S> {
         Ok(admins)
     }
 
-    pub(crate) fn export_secret_with_epoch(
-        &self,
+    pub(crate) fn safe_export_secret_with_epoch(
+        &mut self,
         group_id: &GroupId,
-        label: &str,
-        context: &[u8],
-        length: usize,
+        component_id: AppComponentId,
     ) -> Result<(EpochId, Vec<u8>), EngineError> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
         );
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
+        let mut mls_group = openmls::group::MlsGroup::load(
             <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
             &mls_gid,
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
+        let required_components =
+            crate::app_components::required_app_components_of_group(&mls_group)?;
+        if !required_components.contains(component_id) {
+            return Err(EngineError::Other(format!(
+                "group does not require app component {component_id:#06x}"
+            )));
+        }
+
         let crypto =
             <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(&provider);
-        if let Some(staged) = mls_group.pending_commit() {
-            let secret = staged
-                .export_secret(crypto, label, context, length)
-                .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?;
-            Ok((EpochId(staged.group_context().epoch().as_u64()), secret))
+        let storage =
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider);
+        if let Some(epoch) = mls_group
+            .pending_commit()
+            .map(|staged| EpochId(staged.group_context().epoch().as_u64()))
+        {
+            let secret = mls_group
+                .safe_export_secret_from_pending(crypto, storage, component_id)
+                .map_err(|e| EngineError::Backend(format!("staged safe_export_secret: {e:?}")))?;
+            Ok((epoch, secret))
         } else {
             let secret = mls_group
-                .export_secret(crypto, label, context, length)
-                .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
+                .safe_export_secret(crypto, storage, component_id)
+                .map_err(|e| EngineError::Backend(format!("safe_export_secret: {e:?}")))?;
             Ok((EpochId(mls_group.epoch().as_u64()), secret))
         }
     }
@@ -378,14 +389,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         )))
     }
 
-    fn export_secret(
-        &self,
+    fn safe_export_secret(
+        &mut self,
         group_id: &GroupId,
-        label: &str,
-        context: &[u8],
-        length: usize,
+        component_id: AppComponentId,
     ) -> Result<Vec<u8>, EngineError> {
-        self.export_secret_with_epoch(group_id, label, context, length)
+        self.safe_export_secret_with_epoch(group_id, component_id)
             .map(|(_, secret)| secret)
     }
 

@@ -2,7 +2,7 @@
 //!
 //! This module intentionally stops below the QUIC transport binding. It gives
 //! upper layers stable names for the Marmot component/capabilities and small
-//! helpers for the component state, exporter context, and final transcript
+//! helpers for the component state, key context, and final transcript
 //! hash.
 
 use crate::app_components::AppComponentData;
@@ -21,8 +21,7 @@ pub const AGENT_TEXT_STREAM_QUIC_SEND_FEATURE: Feature =
 pub const AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE: Feature =
     Feature("marmot.feature.agent_text_stream_quic.fanout.v1");
 
-pub const AGENT_TEXT_STREAM_EXPORTER_LABEL: &str = "marmot.agent-text-stream.v1";
-pub const AGENT_TEXT_STREAM_EXPORTER_CONTEXT_VERSION: &[u8] = b"v1";
+pub const AGENT_TEXT_STREAM_KEY_CONTEXT_VERSION: &[u8] = b"v1";
 pub const AGENT_TEXT_STREAM_TRANSCRIPT_HASH_CONTEXT: &[u8] =
     b"marmot agent text stream transcript v1";
 
@@ -172,7 +171,7 @@ pub enum AgentTextStreamPolicyError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentTextStreamExporterContextV1 {
+pub struct AgentTextStreamKeyContextV1 {
     pub group_id: GroupId,
     pub stream_id: Vec<u8>,
     pub mls_epoch: EpochId,
@@ -180,7 +179,7 @@ pub struct AgentTextStreamExporterContextV1 {
     pub start_event_id: MessageId,
 }
 
-impl AgentTextStreamExporterContextV1 {
+impl AgentTextStreamKeyContextV1 {
     pub fn new(
         group_id: GroupId,
         stream_id: impl Into<Vec<u8>>,
@@ -199,7 +198,7 @@ impl AgentTextStreamExporterContextV1 {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        push_len_prefixed(&mut out, AGENT_TEXT_STREAM_EXPORTER_CONTEXT_VERSION);
+        push_len_prefixed(&mut out, AGENT_TEXT_STREAM_KEY_CONTEXT_VERSION);
         push_len_prefixed(&mut out, self.group_id.as_slice());
         push_len_prefixed(&mut out, &self.stream_id);
         out.extend_from_slice(&self.mls_epoch.0.to_be_bytes());
@@ -341,8 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn exporter_context_is_versioned_and_length_delimited() {
-        let context = AgentTextStreamExporterContextV1::new(
+    fn key_context_is_versioned_and_length_delimited() {
+        let context = AgentTextStreamKeyContextV1::new(
             GroupId::new(vec![0x01, 0x02]),
             vec![0x03, 0x04],
             EpochId(9),

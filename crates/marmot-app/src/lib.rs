@@ -1960,17 +1960,13 @@ impl AppClient {
             .collect())
     }
 
-    pub fn export_secret(
-        &self,
+    pub fn safe_export_secret(
+        &mut self,
         group_id: &GroupId,
-        label: &str,
-        context: &[u8],
-        length: usize,
+        component_id: cgka_traits::AppComponentId,
     ) -> Result<Vec<u8>, AppError> {
         self.ensure_group(group_id)?;
-        Ok(self
-            .runtime
-            .export_secret(group_id, label, context, length)?)
+        Ok(self.runtime.safe_export_secret(group_id, component_id)?)
     }
 
     pub async fn invite_members(

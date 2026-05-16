@@ -820,16 +820,12 @@ where
         Ok(self.session.app_component(group_id, component_id)?)
     }
 
-    pub fn export_secret(
-        &self,
+    pub fn safe_export_secret(
+        &mut self,
         group_id: &GroupId,
-        label: &str,
-        context: &[u8],
-        length: usize,
+        component_id: AppComponentId,
     ) -> AccountResult<Vec<u8>> {
-        Ok(self
-            .session
-            .export_secret(group_id, label, context, length)?)
+        Ok(self.session.safe_export_secret(group_id, component_id)?)
     }
 
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {

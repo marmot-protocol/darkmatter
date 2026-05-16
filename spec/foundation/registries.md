@@ -56,4 +56,3 @@ Existing Marmot exporter uses should be treated as registered until their owning
 | `"marmot" / "group-event"`     | Nostr group transport | kind `445` outer encryption key |
 | `"marmot" / "encrypted-media"` | encrypted media       | media key material              |
 | `"marmot-mip06-join-psk-v1"`   | multi-device join     | external PSK material           |
-| `"marmot.agent-text-stream.v1"` | agent text streams    | live stream secret              |
