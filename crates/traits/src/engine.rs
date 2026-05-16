@@ -397,6 +397,19 @@ pub trait CgkaEngine: Send + Sync {
     /// underlying type varies with the storage parameter.
     fn group_context(&self, group_id: &GroupId) -> Result<Box<dyn GroupContext + '_>, EngineError>;
 
+    /// Derive an MLS exporter secret for a group.
+    ///
+    /// Feature and transport code should use feature-specific labels and
+    /// context bytes. Exported bytes are key material and must not be logged,
+    /// persisted in plaintext, or surfaced in diagnostics.
+    fn export_secret(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>, EngineError>;
+
     /// Signed app-component bytes from the group's current
     /// `app_data_dictionary`.
     fn app_component(

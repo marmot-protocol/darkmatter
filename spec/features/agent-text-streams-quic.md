@@ -325,12 +325,12 @@ Candidate derivation:
 ```text
 stream_secret = MLS-Exporter(
   "marmot.agent-text-stream.v1",
-  context = "v1" ||
-            group_id ||
-            stream_id ||
+  context = len("v1") || "v1" ||
+            len(group_id) || group_id ||
+            len(stream_id) || stream_id ||
             mls_epoch ||
-            sender_id ||
-            start_event_id,
+            len(sender_id) || sender_id ||
+            len(start_event_id) || start_event_id,
   32
 )
 
@@ -350,8 +350,9 @@ ct    = AEAD_Encrypt(record_key, nonce, aad, plaintext_frame)
 ChaCha20-Poly1305 is a good first candidate because Marmot already uses it for MIP-era encrypted media. AES-GCM is also
 reasonable when a platform stack makes it easier or faster.
 
-The exact exporter label and context need to be registered if this feature becomes real. A future version should prefer
-the MLS Extensions Safe framework when the backend support exists.
+The exporter label is registered in the foundation registry. The context is versioned and length-delimited so adjacent
+variable fields cannot collide. A future version should prefer the MLS Extensions Safe framework when the backend support
+exists.
 
 ## Sender authentication
 
@@ -405,7 +406,9 @@ Each stream has a monotonically increasing `seq`. Receivers reject duplicate seq
 The transcript hash should commit to plaintext frame order:
 
 ```text
-H_0 = hash("marmot agent text stream transcript v1" || stream_id || start_event_id)
+H_0 = hash("marmot agent text stream transcript v1" ||
+           len(stream_id) || stream_id ||
+           len(start_event_id) || start_event_id)
 H_n = hash(H_{n-1} || seq || record_type || plaintext_frame)
 ```
 

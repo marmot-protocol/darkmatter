@@ -207,6 +207,16 @@ impl AccountDeviceSession {
         Ok(self.engine.app_component(group_id, component_id)?)
     }
 
+    pub fn export_secret(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>, EngineError> {
+        self.engine.export_secret(group_id, label, context, length)
+    }
+
     pub async fn create_group(
         &mut self,
         req: CreateGroupRequest,

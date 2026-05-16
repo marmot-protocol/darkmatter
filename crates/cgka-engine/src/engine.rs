@@ -218,6 +218,40 @@ impl<S: StorageProvider> Engine<S> {
         admins.dedup();
         Ok(admins)
     }
+
+    pub(crate) fn export_secret_with_epoch(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> Result<(EpochId, Vec<u8>), EngineError> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+
+        let crypto =
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(&provider);
+        if let Some(staged) = mls_group.pending_commit() {
+            let secret = staged
+                .export_secret(crypto, label, context, length)
+                .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?;
+            Ok((EpochId(staged.group_context().epoch().as_u64()), secret))
+        } else {
+            let secret = mls_group
+                .export_secret(crypto, label, context, length)
+                .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
+            Ok((EpochId(mls_group.epoch().as_u64()), secret))
+        }
+    }
 }
 
 // ── CgkaEngine impl ─────────────────────────────────────────────────────────
@@ -342,6 +376,17 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                 &mls_group,
             )?),
         )))
+    }
+
+    fn export_secret(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>, EngineError> {
+        self.export_secret_with_epoch(group_id, label, context, length)
+            .map(|(_, secret)| secret)
     }
 
     fn app_component(
