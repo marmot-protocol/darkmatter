@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         run: |
@@ -36,7 +36,7 @@ jobs:
           cargo --version
 
       - name: Cache Cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -51,19 +51,19 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check workspace
-        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
+        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --locked
 
       - name: Check all features
-        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --all-features
+        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --all-features --locked
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run clippy with all features
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   conformance:
     name: Simulator and vectors
@@ -72,7 +72,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         run: |
@@ -84,7 +84,7 @@ jobs:
           cargo --version
 
       - name: Cache Cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -96,19 +96,19 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run simulator tests
-        run: cargo test -p cgka-conformance-simulator
+        run: cargo test -p cgka-conformance-simulator --locked
 
       - name: Run slow simulator tests
-        run: cargo test -p cgka-conformance-simulator --features conformance-slow
+        run: cargo test -p cgka-conformance-simulator --features conformance-slow --locked
 
       - name: Run vector report
         run: |
-          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
             --vectors crates/cgka-conformance-simulator/vectors \
             --out target/cgka-conformance-simulator-reports
 
       - name: Upload vector report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cgka-conformance-simulator-reports
           path: target/cgka-conformance-simulator-reports
@@ -121,7 +121,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Tamarin dependencies
         run: |
