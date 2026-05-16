@@ -619,11 +619,6 @@ impl AppAgentTextStreamComponent {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AppCreateGroupOptions {
-    pub agent_text_streams: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AppGroupImageInput {
     image_hash_hex: String,
     image_key_hex: String,
@@ -1910,16 +1905,6 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
     ) -> Result<GroupId, AppError> {
-        self.create_group_with_options(name, member_refs, AppCreateGroupOptions::default())
-            .await
-    }
-
-    pub async fn create_group_with_options(
-        &mut self,
-        name: &str,
-        member_refs: &[&str],
-        options: AppCreateGroupOptions,
-    ) -> Result<GroupId, AppError> {
         validate_group_profile(name, "")?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
@@ -1932,13 +1917,11 @@ impl AppClient {
             component_id: NOSTR_ROUTING_COMPONENT_ID,
             data: nostr_routing_bytes,
         }];
-        if options.agent_text_streams {
-            app_components.push(
-                AgentTextStreamQuicPolicyV1::user_to_agent_default()
-                    .to_app_component_data()
-                    .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
-            );
-        }
+        app_components.push(
+            AgentTextStreamQuicPolicyV1::user_to_agent_default()
+                .to_app_component_data()
+                .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
+        );
 
         let (group_id, effects) = self
             .runtime

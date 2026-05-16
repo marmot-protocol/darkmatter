@@ -7,9 +7,9 @@ use cgka_traits::error::EngineError;
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
-    AccountRelayListBootstrap, AccountRelayListStatus, AppCreateGroupOptions, AppError,
-    AppGroupMemberRecord, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus,
-    FetchedKeyPackage, MarmotApp, SyncSummary,
+    AccountRelayListBootstrap, AccountRelayListStatus, AppError, AppGroupMemberRecord,
+    AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp,
+    SyncSummary,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -148,8 +148,6 @@ enum ChatsCommand {
 enum GroupCommand {
     Create {
         name: String,
-        #[arg(long)]
-        agent_text_streams: bool,
         #[arg(value_name = "MEMBER")]
         members: Vec<String>,
     },
@@ -764,23 +762,13 @@ async fn group_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
-        GroupCommand::Create {
-            name,
-            agent_text_streams,
-            members,
-        } => {
+        GroupCommand::Create { name, members } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
             let mut client = app.client(&account.label).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-            let group_id = client
-                .create_group_with_options(
-                    &name,
-                    &member_refs,
-                    AppCreateGroupOptions { agent_text_streams },
-                )
-                .await?;
+            let group_id = client.create_group(&name, &member_refs).await?;
             let group_id_hex = hex::encode(group_id.as_slice());
             let group = app
                 .group(&account.label, &group_id_hex)?

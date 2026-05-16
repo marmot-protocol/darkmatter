@@ -1,10 +1,7 @@
 use cgka_traits::TransportEndpoint;
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_LABEL;
 use marmot_account::AccountHome;
-use marmot_app::{
-    AccountRelayListBootstrap, AppCreateGroupOptions, MarmotApp, UserDirectorySearch,
-    UserProfileMetadata,
-};
+use marmot_app::{AccountRelayListBootstrap, MarmotApp, UserDirectorySearch, UserProfileMetadata};
 
 #[tokio::test]
 async fn local_app_runtime_exchanges_messages_without_lab() {
@@ -36,7 +33,7 @@ async fn local_app_runtime_exchanges_messages_without_lab() {
 }
 
 #[tokio::test]
-async fn local_app_runtime_creates_agent_text_stream_group() {
+async fn local_app_runtime_creates_default_agent_text_stream_group() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -47,16 +44,7 @@ async fn local_app_runtime_creates_agent_text_stream_group() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice
-        .create_group_with_options(
-            "agent",
-            &["bob"],
-            AppCreateGroupOptions {
-                agent_text_streams: true,
-            },
-        )
-        .await
-        .unwrap();
+    let group_id = alice.create_group("agent", &["bob"]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let alice_group = app.group("alice", &group_id_hex).unwrap().unwrap();

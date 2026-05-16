@@ -544,7 +544,7 @@ fn positional_group_and_message_commands_use_global_or_env_account() {
 }
 
 #[test]
-fn group_create_can_require_agent_text_streams() {
+fn group_create_includes_agent_text_streams_by_default() {
     let home = tempfile::tempdir().expect("tempdir");
 
     let alice = create_account(home.path());
@@ -553,15 +553,7 @@ fn group_create_can_require_agent_text_streams() {
 
     let created_group = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "agent",
-            "--agent-text-streams",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "agent", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
     assert_eq!(created_group["agent_text_stream"]["required"], true);
