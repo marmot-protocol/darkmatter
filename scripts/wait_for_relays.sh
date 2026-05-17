@@ -12,7 +12,12 @@ IFS=',' read -r -a RELAY_URLS <<< "$RELAY_URLS_CSV"
 check_relay() {
     local relay_url=$1
     local attempts=0
-    local http_url=${relay_url/ws:/http:}
+    local http_url
+    case "$relay_url" in
+        wss://*) http_url="https://${relay_url#wss://}" ;;
+        ws://*) http_url="http://${relay_url#ws://}" ;;
+        *) http_url="$relay_url" ;;
+    esac
     local websocket_key="dGhlIHNhbXBsZSBub25jZQ=="
 
     echo "Testing relay: $relay_url"

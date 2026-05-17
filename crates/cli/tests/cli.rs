@@ -188,7 +188,10 @@ fn require_real_relays() -> bool {
 }
 
 fn local_relay_available(relay: &str) -> bool {
-    let Some(address) = relay.strip_prefix("ws://") else {
+    let Some(address) = relay
+        .strip_prefix("wss://")
+        .or_else(|| relay.strip_prefix("ws://"))
+    else {
         return false;
     };
     let address = address.split('/').next().expect("relay authority");
