@@ -140,7 +140,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 
    - `url "https://github.com/marmot-protocol/darkmatter/archive/refs/tags/v0.1.0.tar.gz"`
    - `sha256 "<archive-sha256>"`
-   - `revision 0` should be omitted for the first formula update.
+   - Omit `revision 0` for the first formula update.
 
 ## Test The Tap Formula
 
