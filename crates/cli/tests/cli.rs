@@ -1,6 +1,6 @@
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -18,6 +18,19 @@ fn dm_with_relay(home: &std::path::Path, relay: &str) -> Command {
     command
 }
 
+fn command_output_summary(output: &Output) -> String {
+    format!(
+        "status={}\nstdout_len={}\nstderr_len={}",
+        output.status,
+        output.stdout.len(),
+        output.stderr.len()
+    )
+}
+
+fn json_value_summary(label: &str, value: &Value) -> String {
+    format!("{label}_json_len={}", value.to_string().len())
+}
+
 fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
     let output = dm(home)
         .args(args)
@@ -25,9 +38,8 @@ fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
         .expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "dm failed\n{}",
+        command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["ok"], true);
@@ -41,9 +53,8 @@ fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Va
         .expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\nrelay: {relay}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "dm failed\nrelay=<REDACTED_RELAY>\n{}",
+        command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["ok"], true);
@@ -57,9 +68,8 @@ fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
         .expect("dm command should start");
     assert!(
         !output.status.success(),
-        "dm unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "dm unexpectedly succeeded\n{}",
+        command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["ok"], false);
@@ -75,9 +85,8 @@ fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)
     let output = command.output().expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "dm failed\n{}",
+        command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["ok"], true);
@@ -235,7 +244,10 @@ fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_i
         last = sync;
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("account {account} did not join {group_id} via {relay}; last sync: {last}");
+    panic!(
+        "account <REDACTED_ACCOUNT> did not join <REDACTED_GROUP> via <REDACTED_RELAY>; {}",
+        json_value_summary("last_sync", &last)
+    );
 }
 
 fn sync_until_message(
@@ -257,7 +269,10 @@ fn sync_until_message(
         last = sync;
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("account {account} did not receive {plaintext:?} via {relay}; last sync: {last}");
+    panic!(
+        "account <REDACTED_ACCOUNT> did not receive <REDACTED_MESSAGE> via <REDACTED_RELAY>; {}",
+        json_value_summary("last_sync", &last)
+    );
 }
 
 fn wait_for_daemon(socket: &std::path::Path) {
@@ -338,9 +353,8 @@ fn account_create_accepts_nsec_without_echoing_it() {
         .expect("dm command should start");
     assert!(
         output.status.success(),
-        "dm failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "dm failed\n{}",
+        command_output_summary(&output)
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains(nsec));
 
@@ -804,9 +818,8 @@ fn daemon_executes_cli_commands_over_socket() {
         .expect("dm should start");
     assert!(
         output.status.success(),
-        "dm failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "dm failed\n{}",
+        command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["result"]["local_signing"], true);
@@ -838,9 +851,8 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .expect("dm daemon start should run");
     assert!(
         start.status.success(),
-        "daemon start failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr)
+        "daemon start failed\n{}",
+        command_output_summary(&start)
     );
 
     let status = Command::new(env!("CARGO_BIN_EXE_dm"))
@@ -852,9 +864,8 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .expect("dm daemon status should run");
     assert!(
         status.status.success(),
-        "daemon status failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&status.stdout),
-        String::from_utf8_lossy(&status.stderr)
+        "daemon status failed\n{}",
+        command_output_summary(&status)
     );
     let status_json: Value =
         serde_json::from_slice(&status.stdout).expect("status stdout should be JSON");
@@ -872,9 +883,8 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .expect("dm account create should run through daemon");
     assert!(
         created.status.success(),
-        "daemon execute failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&created.stdout),
-        String::from_utf8_lossy(&created.stderr)
+        "daemon execute failed\n{}",
+        command_output_summary(&created)
     );
     let created_json: Value =
         serde_json::from_slice(&created.stdout).expect("created stdout should be JSON");
@@ -889,9 +899,8 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .expect("dm daemon stop should run");
     assert!(
         stop.status.success(),
-        "daemon stop failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&stop.stdout),
-        String::from_utf8_lossy(&stop.stderr)
+        "daemon stop failed\n{}",
+        command_output_summary(&stop)
     );
 }
 
@@ -921,9 +930,8 @@ fn daemon_background_sync_updates_local_accounts() {
         .expect("dm daemon start should run");
     assert!(
         start.status.success(),
-        "daemon start failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr)
+        "daemon start failed\n{}",
+        command_output_summary(&start)
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
