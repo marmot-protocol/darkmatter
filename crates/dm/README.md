@@ -1,51 +1,199 @@
 # dm
 
-`dm` is the first real app surface for the Darkmatter/Marmot stack.
+`dm` is the command-line app for the Darkmatter/Marmot stack. It manages Nostr-keyed accounts, relay
+lists, KeyPackages, chats, groups, messages, local projections, background sync, and the terminal UI.
 
-It is intentionally small, but it is not a smoke harness: commands are named around accounts, keys, chats, groups,
-messages, and sync. Pass `--json` for a stable response envelope; `dm tui` uses that same surface.
+The crate builds two binaries:
 
-The CLI uses `marmot-account` for account home/key storage and `marmot-app` for the runtime bridge plus Nostr
-account-relay setup. `dm` can run commands directly or send them to the background `dmd` daemon over a Unix socket.
+- `dm`: the user-facing CLI and TUI entrypoint.
+- `dmd`: the background daemon used by `dm daemon start`.
 
-## Examples
+`dm` uses `marmot-account` for account homes and secret storage, and `marmot-app` for the runtime bridge,
+transport setup, group projection, message projection, and Nostr directory refresh.
 
-Nostr is the identity layer. Local signing accounts are generated with `account create` or imported with
-`account create <nsec>`. Public accounts can be added with `account create <npub-or-pubkey-hex>`, but they cannot sign,
-publish KeyPackages, sync, or send messages.
+## Install From This Checkout
+
+Install both binaries into your local Cargo bin directory:
 
 ```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file account create
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file account create <bob-nsec>
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> keys publish
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <alice-npub-or-hex> group create general <bob-npub-or-hex>
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> sync
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <alice-npub-or-hex> message send <group-hex> "hello bob"
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> sync
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> chats list
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> message list --group <group-hex> --limit 20
+cargo install --path crates/dm --locked --bins
+```
+
+Make sure `~/.cargo/bin` is on `PATH`, then check the installed commands:
+
+```sh
+dm --help
+dmd --help
+```
+
+For source-checkout work without installing:
+
+```sh
+cargo run -p darkmatter-cli --bin dm -- --help
+cargo run -p darkmatter-cli --bin dmd -- --help
+```
+
+For isolated development runs, keep the home and secret store explicit:
+
+```sh
+export DM_HOME="$(mktemp -d)"
+export DM_SECRET_STORE=file
+```
+
+The default secret store is the platform keychain. Use `DM_SECRET_STORE=file` only for local development,
+tests, and disposable homes.
+
+## Configuration
+
+Common options can be passed as flags or environment variables:
+
+- `--home <path>` or `DM_HOME`: account home, local relay files, projections, daemon socket, pid, and log.
+- `--account <npub-or-hex>` or `DM_ACCOUNT`: selected local signing account for account-scoped commands.
+- `--socket <path>` or `DM_SOCKET`: daemon socket. The default is `$DM_HOME/dev/dmd.sock`.
+- `--secret-store keychain|file` or `DM_SECRET_STORE`: signing-key backend.
+- `--keychain-service <name>` or `DM_KEYCHAIN_SERVICE`: keychain service name.
+- `--relay <wss-url>`: use a Nostr relay through the SDK transport. Without this flag, `dm` uses the local
+  file relay under the home directory.
+- `--json`: return a stable JSON envelope for scripts, the TUI, and daemon forwarding.
+
+The default home is `DM_HOME` when set. Without `DM_HOME`, `dm` uses the platform user data directory:
+
+- macOS: `~/Library/Application Support/darkmatter`
+- Linux and other non-macOS Unix: `$XDG_DATA_HOME/darkmatter`, or `~/.local/share/darkmatter`
+- Windows: `%APPDATA%\darkmatter`
+
+## Quick Start
+
+Create two local signing accounts, publish Bob's KeyPackage, create a chat as Alice, and let Bob sync it:
+
+```sh
+export DM_HOME="$(mktemp -d)"
+export DM_SECRET_STORE=file
+
+dm account create
+dm account create <bob-nsec>
+dm account list
+
+dm --account <bob-npub-or-hex> keys publish
+dm --account <alice-npub-or-hex> group create general <bob-npub-or-hex>
+dm --account <alice-npub-or-hex> message send <group-hex> "hello bob"
+
+dm --account <bob-npub-or-hex> sync
+dm --account <bob-npub-or-hex> chats list
+dm --account <bob-npub-or-hex> message list --group <group-hex> --limit 20
+```
+
+Most account-scoped commands resolve the account in this order:
+
+1. `--account <npub-or-hex>`
+2. `DM_ACCOUNT`
+3. the only local signing account, when exactly one exists
+
+Public-only accounts can be added with `dm account create <npub-or-hex>`. They are useful for relay-list
+and KeyPackage lookup, but cannot sign, publish KeyPackages, sync groups, or send messages.
+
+## Command Map
+
+Account commands:
+
+```sh
+dm account create [nsec-or-npub]
+dm account list
+dm account status [npub-or-hex]
+dm account relay-lists [npub-or-hex] --bootstrap-relays <relay-url>
+```
+
+KeyPackage commands:
+
+```sh
+dm --account <npub-or-hex> keys publish
+dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>
+```
+
+Chat projection commands:
+
+```sh
+dm --account <npub-or-hex> chats list
+dm --account <npub-or-hex> chats list --include-archived
+dm --account <npub-or-hex> chats show <group-hex>
+dm --account <npub-or-hex> chats archive <group-hex>
+dm --account <npub-or-hex> chats unarchive <group-hex>
+```
+
+Group commands:
+
+```sh
+dm --account <npub-or-hex> group create <name> [member-npub-or-hex ...]
+dm --account <npub-or-hex> group members <group-hex>
+dm --account <npub-or-hex> group invite <group-hex> <member-npub-or-hex> [...]
+dm --account <npub-or-hex> group remove <group-hex> <member-npub-or-hex> [...]
+dm --account <npub-or-hex> group update <group-hex> --name <name>
+dm --account <npub-or-hex> group update <group-hex> --description <description>
+```
+
+Message commands:
+
+```sh
+dm --account <npub-or-hex> message send <group-hex> "hello"
+dm --account <npub-or-hex> message send --group <group-hex> "--text that starts with a dash"
+dm --account <npub-or-hex> message list
+dm --account <npub-or-hex> message list --group <group-hex> --limit 20
+```
+
+Sync command:
+
+```sh
+dm --account <npub-or-hex> sync
+```
+
+## Daemon
+
+`dm daemon start` launches `dmd` in the background for the selected home. The daemon owns the Unix socket,
+writes `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and periodically syncs every local signing
+account. It also refreshes the app-level Nostr user directory for local signing accounts, which warms cached
+follow lists and profile metadata for likely contacts.
+
+```sh
+dm daemon start --sync-interval-ms 2000
+dm daemon status
+dm --account <npub-or-hex> chats list
+dm daemon stop
+```
+
+When a daemon socket exists for a home, normal `dm --home <path> ...` commands are forwarded to that
+daemon. `dm daemon status`, `dm daemon stop`, and `dm tui` handle daemon access directly.
+
+Use `--socket` or `DM_SOCKET` to target a specific daemon. Use `dmd` directly when a process supervisor
+should own the daemon lifecycle:
+
+```sh
+dmd --home "$DM_HOME" --sync-interval-ms 2000
 ```
 
 ## TUI
 
-`dm tui` is a Ratatui shell over the real CLI. It lists local accounts, shows visible chats for the selected local
-signing account, renders recent messages, and sends messages from a composer. When a daemon socket exists for the same
-home, the TUI's child `dm --json` commands use the daemon just like normal CLI commands. The header shows daemon state,
-and while the daemon is running the TUI periodically refreshes the visible account/chat/message projection when the
-composer is idle.
+`dm tui` is a Ratatui interface over the real `dm --json` command surface. It lists local accounts, shows
+visible chats for the selected local signing account, renders recent messages, and sends messages from a
+composer.
 
 ```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file tui
+dm tui
 ```
 
-Controls stay deliberately small:
+When a daemon is running for the same home, TUI child commands use the daemon socket. The header shows daemon
+state. While the daemon is running, the TUI refreshes account, chat, and message projection data when the
+composer is idle.
 
-- `Tab` cycles accounts, chats, and composer.
-- Arrow keys move the selected account or chat.
-- `Enter` selects the highlighted account/chat or submits the composer.
-- `?` opens help, `Esc` clears help/input, and `Ctrl-C` quits.
+Controls:
 
-The composer accepts either a plain chat message or a slash command:
+- `Tab`: cycle accounts, chats, and composer.
+- Arrow keys or `j`/`k`: move the selected account or chat.
+- `Enter`: select the highlighted account/chat or submit the composer.
+- `?`: open help.
+- `Esc`: clear help or input.
+- `Ctrl-C`: quit.
+
+Composer slash commands:
 
 ```text
 /sync
@@ -71,99 +219,38 @@ The composer accepts either a plain chat message or a slash command:
 /quit
 ```
 
-`/account create` generates a local signing account, `/account import <nsec>` imports a local signing account, and
-`/account add <npub-or-hex>` adds a public-only account for relay-list and KeyPackage lookup. Imported `nsec` input is
-redacted in the composer.
+`/account import <nsec>` redacts the secret in the composer. `/chat archived` shows archived chats so they
+can be selected and unarchived; `/chat archived off` returns to the visible-chat list. Member commands operate
+on the selected chat and call the same group membership commands exposed by the CLI.
 
-`/chat new` creates a chat with any members typed directly on the command. `/chat rename`, `/chat describe`,
-`/chat archive`, and `/chat unarchive` operate on the selected chat. `/chat archived` shows archived chats so they can
-be selected and unarchived; `/chat archived off` returns to the normal visible-chat list. `/members add`,
-`/members remove`, and `/members list` operate on the selected chat and use the real group membership commands.
+## JSON Output
 
-Most account-scoped commands resolve the local account in this order:
+Pass `--json` for machine-readable output. Success responses wrap command data in a stable result envelope.
+Errors use snake_case `error.code` values and include repair fields when the CLI can name the next command.
 
-1. top-level `--account <npub-or-hex>`, before the command
-2. `DM_ACCOUNT`
-3. the only local account, when exactly one exists
+The TUI and daemon both depend on the JSON shape, so treat response changes as API changes.
 
-Use `keys` for normal KeyPackage work:
+## Packaging Direction
+
+Local development should keep using:
 
 ```sh
-dm --account <npub-or-hex> keys publish
-dm --account <npub-or-hex> keys fetch
-dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>
+cargo install --path crates/dm --locked --bins
 ```
 
-There are no legacy aliases for this namespace; `keys` is the command.
-
-Daemon commands:
+For public releases, Homebrew is the right first-class installer. Use the namespaced tap:
 
 ```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file daemon start --sync-interval-ms 2000
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm daemon status
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm daemon stop
+brew install marmot-protocol/tap/darkmatter
 ```
 
-Once a daemon socket exists for a home, `dm --home <path> ...` will send normal commands to `dmd`. The daemon writes
-`dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and periodically syncs every local signing account. Use
-`--socket` or `DM_SOCKET` to target a specific daemon.
+The tap formula lives in `github.com/marmot-protocol/homebrew-tap` and installs both `dm` and `dmd` from `crates/dm`.
+Once release CI exists, the tap can publish bottles for macOS and Linux so users do not pay the full Rust build cost.
+The project-side release checklist lives at `docs/release/dm-homebrew.md`.
 
-During account setup and background sync, `dm`/`dmd` also lets `marmot-app` refresh the Nostr user directory for local
-signing accounts. That warms cached follow lists and profile metadata for likely contacts without adding a CLI address
-book. Product commands still take `npub` or hex pubkeys directly at the point of use.
+`cargo install --git https://github.com/marmot-protocol/darkmatter.git darkmatter-cli --locked --bins` is a useful
+source install path for engineers and automation.
 
-Two-terminal local loop:
-
-Terminal 1:
-
-```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file daemon start --sync-interval-ms 1000
-```
-
-Terminal 2:
-
-```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm account create
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm account create <bob-nsec>
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --account <bob-npub-or-hex> keys publish
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --account <alice-npub-or-hex> group create general <bob-npub-or-hex>
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --account <bob-npub-or-hex> chats list
-```
-
-Chat commands are the preferred user-facing spelling for local chat projection work:
-
-```sh
-dm --account <npub-or-hex> chats list
-dm --account <npub-or-hex> chats show <group-hex>
-dm --account <npub-or-hex> chats archive <group-hex>
-dm --account <npub-or-hex> chats unarchive <group-hex>
-```
-
-Group membership changes use positional Nostr identities:
-
-```sh
-dm --account <npub-or-hex> group invite <group-hex> <member-npub-or-hex> [...]
-dm --account <npub-or-hex> group remove <group-hex> <member-npub-or-hex> [...]
-```
-
-When an account is removed from a group, `dm` keeps that account's local group and message projection as history.
-Archiving or hiding that group is a separate user decision, not an automatic side effect of membership removal.
-
-`--json` errors use stable snake_case `error.code` values and include repair fields when the CLI can name a concrete
-next command.
-
-`account status` is the quickest operator view. It reports relay-list completeness, group/message/event counts, the
-selected secret-store backend, and whether the per-account projection database exists and is encrypted.
-
-`dm` uses the platform keychain/credential store for account signing keys by default. Pass `--secret-store file`, or set
-`DM_SECRET_STORE=file`, for isolated deterministic development runs. The keychain service defaults to
-`com.marmot.darkmatter`; use `--keychain-service` or `DM_KEYCHAIN_SERVICE` to override it for host apps and test
-installations.
-
-The default home is `DM_HOME` when set. Without `DM_HOME`, `dm` uses the platform user data directory:
-
-- macOS: `~/Library/Application Support/darkmatter`
-- Linux and other non-macOS Unix: `$XDG_DATA_HOME/darkmatter`, or `~/.local/share/darkmatter`
-- Windows: `%APPDATA%\darkmatter`
-
-Use `--home` for isolated development runs and tests.
+`cargo install darkmatter-cli` from crates.io is a later option. The workspace currently has
+`publish = false`, and the CLI depends on local workspace crates. Publishing there needs a separate crate
+publication plan or a split packaging crate.
