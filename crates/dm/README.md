@@ -230,6 +230,11 @@ Errors use snake_case `error.code` values and include repair fields when the CLI
 
 The TUI and daemon both depend on the JSON shape, so treat response changes as API changes.
 
+## Changelog
+
+Release notes for the CLI crate live in [`CHANGELOG.md`](CHANGELOG.md). Update it for user-facing CLI,
+daemon, TUI, JSON, install, or packaging changes.
+
 ## Packaging Direction
 
 Local development should keep using:

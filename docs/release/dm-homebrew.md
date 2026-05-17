@@ -102,6 +102,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 
 6. Update user-facing docs if commands, defaults, or daemon behavior changed:
 
+   - `crates/dm/CHANGELOG.md`
    - `crates/dm/README.md`
    - `crates/dm/AGENTS.md`
    - this checklist
