@@ -7,6 +7,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains
+  `darkmatter-cli`, and the installed binaries remain `dm` and `dmd`.
+
 ## [0.1.0] - 2026-05-17
 
 Initial release of the `dm` command-line app, the `dmd` background daemon, and the Ratatui TUI.
@@ -24,7 +29,7 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
   sync, and app-level Nostr user-directory warming.
 - `dm tui`, a terminal interface over the real CLI/daemon command surface with account selection, chat
   navigation, message sending, slash commands, daemon controls, account onboarding, and member management.
-- Local installation docs for `cargo install --path crates/dm --locked --bins`.
+- Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
 [Unreleased]: https://github.com/marmot-protocol/darkmatter/compare/v0.1.0...HEAD

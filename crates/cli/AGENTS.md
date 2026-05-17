@@ -1,4 +1,4 @@
-# AGENTS.md - dm
+# AGENTS.md - cli
 
 Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot stack.
 
@@ -20,7 +20,7 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
   only when documenting source-checkout work.
 - Keep `CHANGELOG.md` current for user-facing CLI, daemon, TUI, JSON, install, or packaging changes. Use the
   `Unreleased` section until a version is tagged.
-- Keep local development installable with `cargo install --path crates/dm --locked --bins`.
+- Keep local development installable with `cargo install --path crates/cli --locked --bins`.
 - Treat the namespaced Homebrew tap `marmot-protocol/tap` as the preferred public packaging path unless product
   direction changes. The formula should install both `dm` and `dmd`; crates.io install needs a separate publish plan
   because the workspace currently has `publish = false`.

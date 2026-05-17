@@ -94,7 +94,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 
    ```sh
    install_root="$(mktemp -d)"
-   cargo install --path crates/dm --locked --bins --root "$install_root" --force
+   cargo install --path crates/cli --locked --bins --root "$install_root" --force
    "$install_root/bin/dm" --help
    "$install_root/bin/dmd" --help
    DM_HOME="$(mktemp -d)" DM_SECRET_STORE=file "$install_root/bin/dm" account create
@@ -102,9 +102,9 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 
 6. Update user-facing docs if commands, defaults, or daemon behavior changed:
 
-   - `crates/dm/CHANGELOG.md`
-   - `crates/dm/README.md`
-   - `crates/dm/AGENTS.md`
+   - `crates/cli/CHANGELOG.md`
+   - `crates/cli/README.md`
+   - `crates/cli/AGENTS.md`
    - this checklist
 
 ## Tag And Formula Source
@@ -199,7 +199,7 @@ brew uninstall darkmatter
 - The formula builds from source until bottles are published.
 - While `marmot-protocol/darkmatter` is private, the formula should use the Git tag and exact revision. Public tarball
   URLs return 404 without authentication.
-- The formula uses `cargo install --locked --bins --path crates/dm`, so source archives must include the workspace
+- The formula uses `cargo install --locked --bins --path crates/cli`, so source archives must include the workspace
   `Cargo.lock`.
 - crates.io install is a separate release track. The workspace currently has `publish = false`, and the CLI depends on
   local workspace crates.

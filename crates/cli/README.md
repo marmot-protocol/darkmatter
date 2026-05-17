@@ -11,12 +11,15 @@ The crate builds two binaries:
 `dm` uses `marmot-account` for account homes and secret storage, and `marmot-app` for the runtime bridge,
 transport setup, group projection, message projection, and Nostr directory refresh.
 
+The source directory is `crates/cli`. The Cargo package name remains `darkmatter-cli`, and the installed
+commands remain `dm` and `dmd`.
+
 ## Install From This Checkout
 
 Install both binaries into your local Cargo bin directory:
 
 ```sh
-cargo install --path crates/dm --locked --bins
+cargo install --path crates/cli --locked --bins
 ```
 
 Make sure `~/.cargo/bin` is on `PATH`, then check the installed commands:
@@ -240,7 +243,7 @@ daemon, TUI, JSON, install, or packaging changes.
 Local development should keep using:
 
 ```sh
-cargo install --path crates/dm --locked --bins
+cargo install --path crates/cli --locked --bins
 ```
 
 For public releases, Homebrew is the right first-class installer. Use the namespaced tap:
@@ -249,7 +252,7 @@ For public releases, Homebrew is the right first-class installer. Use the namesp
 brew install marmot-protocol/tap/darkmatter
 ```
 
-The tap formula lives in `github.com/marmot-protocol/homebrew-tap` and installs both `dm` and `dmd` from `crates/dm`.
+The tap formula lives in `github.com/marmot-protocol/homebrew-tap` and installs both `dm` and `dmd` from `crates/cli`.
 Once release CI exists, the tap can publish bottles for macOS and Linux so users do not pay the full Rust build cost.
 The project-side release checklist lives at `docs/release/dm-homebrew.md`.
 
