@@ -1,7 +1,7 @@
 ---
 title: "App Core Boundary"
 created: 2026-05-15
-updated: 2026-05-15
+updated: 2026-05-17
 tags: [marmot, app-core, cli, tui, swift]
 status: overview
 ---

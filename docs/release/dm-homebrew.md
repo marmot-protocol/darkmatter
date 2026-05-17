@@ -88,6 +88,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
    just check
    just clippy
    just test
+   just tamarin
    ```
 
 5. Run the installed-binary smoke test from a clean checkout:
