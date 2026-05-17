@@ -248,7 +248,11 @@ The tap formula lives in `github.com/marmot-protocol/homebrew-tap` and installs 
 Once release CI exists, the tap can publish bottles for macOS and Linux so users do not pay the full Rust build cost.
 The project-side release checklist lives at `docs/release/dm-homebrew.md`.
 
-`cargo install --git https://github.com/marmot-protocol/darkmatter.git darkmatter-cli --locked --bins` is a useful
+While `marmot-protocol/darkmatter` is private, Homebrew source builds require GitHub access to the source repo. Public
+tarball installs can replace that once the source repo is public or release assets are published somewhere installers can
+download.
+
+`cargo install --git ssh://git@github.com/marmot-protocol/darkmatter.git darkmatter-cli --locked --bins` is a useful
 source install path for engineers and automation.
 
 `cargo install darkmatter-cli` from crates.io is a later option. The workspace currently has

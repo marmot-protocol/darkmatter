@@ -106,7 +106,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
    - `crates/dm/AGENTS.md`
    - this checklist
 
-## Tag And Archive
+## Tag And Formula Source
 
 1. Create an annotated tag from the commit whose `Cargo.toml` version matches the tag:
 
@@ -115,20 +115,26 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
    git push origin v0.1.0
    ```
 
-2. Download the GitHub source archive:
+2. For the current private source repo, update `Formula/darkmatter.rb` in `marmot-protocol/homebrew-tap` to use the
+   private Git tag plus the exact commit revision:
+
+   ```ruby
+   url "ssh://git@github.com/marmot-protocol/darkmatter.git",
+       tag:      "v0.1.0",
+       revision: "<tagged-commit-sha>"
+   ```
+
+   Users and CI runners need GitHub access to `marmot-protocol/darkmatter` for this source build path.
+
+3. If the source repo is public, prefer the GitHub source archive plus `sha256`:
 
    ```sh
    curl -L -o darkmatter-v0.1.0.tar.gz \
      https://github.com/marmot-protocol/darkmatter/archive/refs/tags/v0.1.0.tar.gz
-   ```
-
-3. Compute the archive checksum:
-
-   ```sh
    shasum -a 256 darkmatter-v0.1.0.tar.gz
    ```
 
-4. Update `Formula/darkmatter.rb` in `marmot-protocol/homebrew-tap`:
+   Then set:
 
    - `url "https://github.com/marmot-protocol/darkmatter/archive/refs/tags/v0.1.0.tar.gz"`
    - `sha256 "<archive-sha256>"`
@@ -160,6 +166,9 @@ brew test marmot-protocol/tap/darkmatter
 
 Source builds are enough for the first tap release. Add bottles after release CI exists.
 
+While `marmot-protocol/darkmatter` is private, bottle CI needs either access to the source repo or a prebuilt source
+archive/release asset it can download. Public source archives avoid that extra CI setup.
+
 Manual bottle flow:
 
 ```sh
@@ -187,7 +196,9 @@ brew uninstall darkmatter
 ## Current Limits
 
 - The formula builds from source until bottles are published.
-- The formula uses `cargo install --locked --bins --path crates/dm`, so release archives must include the workspace
+- While `marmot-protocol/darkmatter` is private, the formula should use the Git tag and exact revision. Public tarball
+  URLs return 404 without authentication.
+- The formula uses `cargo install --locked --bins --path crates/dm`, so source archives must include the workspace
   `Cargo.lock`.
 - crates.io install is a separate release track. The workspace currently has `publish = false`, and the CLI depends on
   local workspace crates.
