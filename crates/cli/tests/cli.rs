@@ -1,3 +1,5 @@
+use std::env;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,12 @@ fn dm(home: &std::path::Path) -> Command {
     command
 }
 
+fn dm_with_relay(home: &std::path::Path, relay: &str) -> Command {
+    let mut command = dm(home);
+    command.arg("--relay").arg(relay);
+    command
+}
+
 fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
     let output = dm(home)
         .args(args)
@@ -18,6 +26,22 @@ fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
     assert!(
         output.status.success(),
         "dm failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    value["result"].clone()
+}
+
+fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
+    let output = dm_with_relay(home, relay)
+        .args(args)
+        .output()
+        .expect("dm command should start");
+    assert!(
+        output.status.success(),
+        "dm failed\nrelay: {relay}\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -103,6 +127,134 @@ fn sorted_accounts<const N: usize>(accounts: [&str; N]) -> Vec<String> {
         .collect::<Vec<_>>();
     accounts.sort();
     accounts
+}
+
+fn message_plaintexts(value: &Value) -> Vec<String> {
+    value["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|message| {
+            message["plaintext"]
+                .as_str()
+                .expect("message plaintext")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn assert_message_plaintexts(value: &Value, expected: &[&str]) {
+    let actual = message_plaintexts(value);
+    for expected in expected {
+        assert!(
+            actual.iter().any(|plaintext| plaintext == expected),
+            "expected message {expected:?} in {actual:?}"
+        );
+    }
+}
+
+fn assert_no_message_plaintext(value: &Value, unexpected: &str) {
+    let actual = message_plaintexts(value);
+    assert!(
+        actual.iter().all(|plaintext| plaintext != unexpected),
+        "did not expect message {unexpected:?} in {actual:?}"
+    );
+}
+
+fn real_relay_urls() -> Vec<String> {
+    env::var("DARKMATTER_E2E_RELAYS")
+        .ok()
+        .map(|relays| {
+            relays
+                .split(',')
+                .map(str::trim)
+                .filter(|relay| !relay.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|relays| !relays.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                "ws://127.0.0.1:28080".to_owned(),
+                "ws://127.0.0.1:27777".to_owned(),
+            ]
+        })
+}
+
+fn require_real_relays() -> bool {
+    env::var("DARKMATTER_E2E_REQUIRE_RELAYS")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn local_relay_available(relay: &str) -> bool {
+    let Some(address) = relay.strip_prefix("ws://") else {
+        return false;
+    };
+    let address = address.split('/').next().expect("relay authority");
+    let Ok(addresses) = address.to_socket_addrs() else {
+        return false;
+    };
+    addresses.into_iter().any(|socket_address| {
+        TcpStream::connect_timeout(&socket_address, Duration::from_millis(200)).is_ok()
+    })
+}
+
+fn create_account_with_real_relay(home: &std::path::Path, relay: &str) -> String {
+    run_json_with_relay(
+        home,
+        relay,
+        &[
+            "account",
+            "create",
+            "--default-relays",
+            relay,
+            "--bootstrap-relays",
+            relay,
+        ],
+    )["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned()
+}
+
+fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        if sync["joined_groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|group| group == group_id))
+        {
+            return sync;
+        }
+        last = sync;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("account {account} did not join {group_id} via {relay}; last sync: {last}");
+}
+
+fn sync_until_message(
+    home: &std::path::Path,
+    relay: &str,
+    account: &str,
+    plaintext: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        if message_plaintexts(&sync)
+            .iter()
+            .any(|message| message == plaintext)
+        {
+            return sync;
+        }
+        last = sync;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("account {account} did not receive {plaintext:?} via {relay}; last sync: {last}");
 }
 
 fn wait_for_daemon(socket: &std::path::Path) {
@@ -1311,4 +1463,177 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
         &["--account", &bob, "message", "list", "--group", group_id],
     );
     assert_eq!(bob_history["messages"][0]["plaintext"], "history stays");
+}
+
+#[test]
+fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    let carol = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    run_json(home.path(), &["--account", &carol, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "three-way", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "before",
+            "carol",
+        ],
+    );
+    let bob_sync = run_json(home.path(), &["--account", &bob, "sync"]);
+    assert_message_plaintexts(&bob_sync, &["before carol"]);
+
+    let invite = run_json(
+        home.path(),
+        &["--account", &alice, "group", "invite", group_id, &carol],
+    );
+    assert_eq!(invite["published"], 2);
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let carol_join = run_json(home.path(), &["--account", &carol, "sync"]);
+    assert_eq!(carol_join["joined_groups"][0], group_id);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &carol,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "carol",
+            "joined",
+        ],
+    );
+    let alice_after_carol = run_json(home.path(), &["--account", &alice, "sync"]);
+    assert_message_plaintexts(&alice_after_carol, &["carol joined"]);
+    let bob_after_carol = run_json(home.path(), &["--account", &bob, "sync"]);
+    assert_message_plaintexts(&bob_after_carol, &["carol joined"]);
+
+    let remove = run_json(
+        home.path(),
+        &["--account", &alice, "group", "remove", group_id, &bob],
+    );
+    assert_eq!(remove["published"], 1);
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    run_json(home.path(), &["--account", &carol, "sync"]);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &carol,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "after",
+            "bob",
+            "removed",
+        ],
+    );
+    let alice_after_remove = run_json(home.path(), &["--account", &alice, "sync"]);
+    assert_message_plaintexts(&alice_after_remove, &["after bob removed"]);
+    let bob_after_remove = run_json(home.path(), &["--account", &bob, "sync"]);
+    assert_no_message_plaintext(&bob_after_remove, "after bob removed");
+
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "message", "list", "--group", group_id],
+    );
+    assert_message_plaintexts(&bob_messages, &["before carol", "carol joined"]);
+    assert_no_message_plaintext(&bob_messages, "after bob removed");
+
+    let bob_send_error = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "removed",
+            "sender",
+        ],
+    );
+    assert_eq!(bob_send_error["code"], "engine_error");
+}
+
+#[test]
+fn real_local_relays_deliver_cli_messages_over_sdk_path() {
+    let relays = real_relay_urls();
+    let available_relays = relays
+        .iter()
+        .filter(|relay| local_relay_available(relay))
+        .collect::<Vec<_>>();
+    if available_relays.is_empty() {
+        assert!(
+            !require_real_relays(),
+            "real relay CLI E2E requires one of these relays to be reachable: {relays:?}"
+        );
+        eprintln!("skipping real relay CLI E2E: no local relay ports are reachable");
+        return;
+    }
+
+    for relay in available_relays {
+        let relay = relay.as_str();
+        let home = tempfile::tempdir().expect("tempdir");
+        let alice = create_account_with_real_relay(home.path(), relay);
+        let bob = create_account_with_real_relay(home.path(), relay);
+        run_json_with_relay(home.path(), relay, &["--account", &bob, "keys", "publish"]);
+
+        let group_name = format!(
+            "real-relay-{}",
+            relay.rsplit(':').next().unwrap_or("unknown")
+        );
+        let created_group = run_json_with_relay(
+            home.path(),
+            relay,
+            &["--account", &alice, "group", "create", &group_name, &bob],
+        );
+        let group_id = created_group["group_id"].as_str().expect("group id");
+
+        let bob_join = sync_until_joined(home.path(), relay, &bob, group_id);
+        assert_eq!(bob_join["joined_groups"][0], group_id);
+
+        let body = format!("hello over {relay}");
+        run_json_with_relay(
+            home.path(),
+            relay,
+            &[
+                "--account",
+                &alice,
+                "message",
+                "send",
+                "--group",
+                group_id,
+                &body,
+            ],
+        );
+        let bob_sync = sync_until_message(home.path(), relay, &bob, &body);
+        assert_message_plaintexts(&bob_sync, &[&body]);
+
+        let bob_messages = run_json_with_relay(
+            home.path(),
+            relay,
+            &["--account", &bob, "message", "list", "--group", group_id],
+        );
+        assert_message_plaintexts(&bob_messages, &[&body]);
+    }
 }
