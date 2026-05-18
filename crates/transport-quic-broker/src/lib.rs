@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
@@ -26,7 +26,8 @@ pub const QUIC_BROKER_PROTOCOL_V1: &str = "marmot.quic_broker.v1";
 pub const DEFAULT_SUBSCRIBER_QUEUE_DEPTH: usize = 32;
 
 const FRAME_LEN_BYTES: usize = 4;
-const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+#[cfg(test)]
+const LOCAL_SERVER_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_millis(500);
 const SUBSCRIBER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -688,9 +689,16 @@ fn client_endpoint(
             ))
         }
     };
-    let mut endpoint = Endpoint::client(LOCAL_BIND)?;
+    let mut endpoint = Endpoint::client(client_bind_addr_for_broker(broker_addr))?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+fn client_bind_addr_for_broker(broker_addr: SocketAddr) -> SocketAddr {
+    match broker_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
 }
 
 fn insecure_client_crypto() -> Result<rustls::ClientConfig, QuicBrokerError> {
@@ -840,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn broker_forwards_live_records_to_subscriber_with_same_transcript() {
         let server = QuicBrokerServer::bind(QuicBrokerConfig {
-            bind_addr: LOCAL_BIND,
+            bind_addr: LOCAL_SERVER_BIND,
             per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
             ..QuicBrokerConfig::default()
         })
@@ -913,6 +921,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn client_bind_addr_matches_broker_address_family() {
+        assert_eq!(
+            client_bind_addr_for_broker(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        );
+        assert_eq!(
+            client_bind_addr_for_broker(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 4450)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        );
+    }
+
     #[tokio::test]
     async fn insecure_local_rejects_remote_broker_addr() {
         let err = publish_text_to_broker(PublishTextToBroker {
@@ -945,7 +965,7 @@ mod tests {
         std::fs::write(&key_path, certified_key.signing_key.serialize_pem()).unwrap();
 
         let server = QuicBrokerServer::bind(QuicBrokerConfig {
-            bind_addr: LOCAL_BIND,
+            bind_addr: LOCAL_SERVER_BIND,
             per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
             tls: QuicBrokerTlsConfig::PemFiles {
                 cert_path,

@@ -253,15 +253,20 @@ fn run_json_until_child_exits(
 ) -> (Value, Output) {
     let deadline = Instant::now() + timeout;
     let mut last_error = None;
+    let mut command_value = None;
     while Instant::now() < deadline {
-        match run_command(home) {
-            Ok(value) => {
-                if child.try_wait().expect("child status").is_some() {
-                    let output = child.wait_with_output().expect("child output");
-                    return (value, output);
-                }
+        if command_value.is_none() {
+            match run_command(home) {
+                Ok(value) => command_value = Some(value),
+                Err(error) => last_error = Some(error),
             }
-            Err(error) => last_error = Some(error),
+        }
+        if let Some(value) = command_value.take() {
+            if child.try_wait().expect("child status").is_some() {
+                let output = child.wait_with_output().expect("child output");
+                return (value, output);
+            }
+            command_value = Some(value);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -272,6 +277,30 @@ fn run_json_until_child_exits(
         command_output_summary(&output),
         last_error.as_deref().unwrap_or("<none>")
     );
+}
+
+#[test]
+fn run_json_until_child_exits_does_not_repeat_successful_command() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let child = Command::new("sh")
+        .args(["-c", "sleep 0.2"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("child should start");
+    let calls = std::cell::Cell::new(0);
+
+    let (value, output) =
+        run_json_until_child_exits(home.path(), child, Duration::from_secs(2), |_| {
+            let next = calls.get() + 1;
+            calls.set(next);
+            assert_eq!(next, 1, "successful command must not be repeated");
+            Ok(serde_json::json!({ "sent": true }))
+        });
+
+    assert_eq!(calls.get(), 1);
+    assert!(output.status.success());
+    assert_eq!(value["sent"], true);
 }
 
 fn run_json_until_success(home: &std::path::Path, args: &[&str], timeout: Duration) -> Value {
