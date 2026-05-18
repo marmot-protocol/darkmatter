@@ -68,7 +68,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Start local relay stack
-        run: docker compose up -d
+        run: docker compose up -d setup nostr-rs-relay strfry-nostr-relay
 
       - name: Wait for local relays
         run: |
@@ -82,7 +82,7 @@ jobs:
 
       - name: Dump local relay logs
         if: failure()
-        run: docker compose logs nostr-rs-relay strfry-nostr-relay quic-broker || true
+        run: docker compose logs nostr-rs-relay strfry-nostr-relay || true
 
       - name: Stop local relay stack
         if: always()
