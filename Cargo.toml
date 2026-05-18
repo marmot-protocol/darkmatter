@@ -12,7 +12,6 @@ members = [
     "crates/transport-quic-stream",
     "crates/transport-quic-broker",
     "crates/marmot-account",
-    "crates/marmot-lab",
     "crates/marmot-app",
     "crates/cli",
 ]
@@ -49,6 +48,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 rand = "0.8"
 sha2 = "0.10"
+url = "2"
 chacha20poly1305 = "0.10"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
@@ -78,6 +78,5 @@ transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
 marmot-account = { path = "crates/marmot-account" }
-marmot-lab = { path = "crates/marmot-lab" }
 marmot-app = { path = "crates/marmot-app" }
 darkmatter-cli = { path = "crates/cli" }

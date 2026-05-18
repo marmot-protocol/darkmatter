@@ -37,7 +37,6 @@ This repo owns the candidate CGKA engine workspace:
 | QUIC agent text stream previews | `crates/transport-quic-stream/AGENTS.md` |
 | QUIC preview broker | `crates/transport-quic-broker/AGENTS.md` |
 | First app CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
-| Local two-client lab | `crates/marmot-lab/README.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Marmot v2 protocol draft | `spec/AGENTS.md` |
