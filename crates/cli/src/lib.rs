@@ -100,6 +100,8 @@ enum AccountCommand {
         default_relays: Vec<String>,
         #[arg(long, value_name = "URLS", value_delimiter = ',')]
         bootstrap_relays: Vec<String>,
+        #[arg(long)]
+        publish_missing_relay_lists: bool,
     },
     List,
     Status {
@@ -226,6 +228,10 @@ enum DmError {
     MissingGroupId,
     #[error("relay URL cannot be empty")]
     EmptyRelayUrl,
+    #[error(
+        "relay URL is required; pass --relay, set DM_RELAY, or provide setup relays for account creation"
+    )]
+    MissingRelay,
     #[error("no account selected")]
     MissingAccount,
     #[error("multiple accounts exist; pass --account or set DM_ACCOUNT")]
@@ -348,11 +354,20 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
         keychain_service: keychain_service.clone(),
     };
     let account_home = open_account_home(&home, secret_store, &keychain_service)?;
-    let app = app_for(home, cli.relay, account_home.clone());
+    let relay = resolve_relay(cli.relay.clone())?;
+    let app = app_for(home, relay.clone(), account_home.clone());
     let account_flag = cli.account.clone();
     match cli.command {
         Command::Account { command } => {
-            account_command(&account_home, &app, command, runtime_info, account_flag).await
+            account_command(
+                &account_home,
+                &app,
+                command,
+                runtime_info,
+                account_flag,
+                relay,
+            )
+            .await
         }
         Command::Keys { command } => {
             key_package_command(&account_home, &app, command, account_flag).await
@@ -427,31 +442,58 @@ async fn account_command(
     command: AccountCommand,
     runtime_info: CliRuntimeInfo,
     account_flag: Option<String>,
+    relay: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
         AccountCommand::Create {
             identity,
-            default_relays,
-            bootstrap_relays,
+            mut default_relays,
+            mut bootstrap_relays,
+            publish_missing_relay_lists,
         } => {
+            let used_global_relay_defaults =
+                apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
             let directory_bootstrap_relays = bootstrap_relays.clone();
             let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
+            let creates_new_private_key = identity.is_none();
             let account = create_nostr_account(account_home, identity)?;
             let relay_lists = match account.local_signing {
                 true => {
-                    if imports_private_key && !bootstrap_relays.is_empty() {
-                        let bootstrap_endpoints = match relay_endpoints(bootstrap_relays.clone()) {
-                            Ok(endpoints) => endpoints,
-                            Err(err) => rollback_account_after_setup_failure(
-                                account_home,
-                                &account.label,
-                                err,
-                            )?,
-                        };
+                    if creates_new_private_key && default_relays.is_empty() {
+                        rollback_account_after_setup_failure(
+                            account_home,
+                            &account.label,
+                            DmError::MissingRelay,
+                        )?;
+                    }
+                    if imports_private_key
+                        && default_relays.is_empty()
+                        && bootstrap_relays.is_empty()
+                    {
+                        rollback_account_after_setup_failure(
+                            account_home,
+                            &account.label,
+                            DmError::MissingRelay,
+                        )?;
+                    }
+                    if imports_private_key
+                        && (!default_relays.is_empty() || !bootstrap_relays.is_empty())
+                    {
+                        let bootstrap =
+                            match relay_bootstrap(default_relays.clone(), bootstrap_relays.clone())
+                            {
+                                Ok(Some(bootstrap)) => bootstrap,
+                                Ok(None) => unreachable!("import relay setup checked above"),
+                                Err(err) => rollback_account_after_setup_failure(
+                                    account_home,
+                                    &account.label,
+                                    err,
+                                )?,
+                            };
                         let current_status = match relay_list_status_for_account_id(
                             app,
                             &account.account_id_hex,
-                            bootstrap_endpoints.clone(),
+                            bootstrap.bootstrap_relays.clone(),
                         )
                         .await
                         {
@@ -464,7 +506,7 @@ async fn account_command(
                         };
                         if current_status.complete {
                             current_status
-                        } else if default_relays.is_empty() {
+                        } else if !publish_missing_relay_lists || default_relays.is_empty() {
                             rollback_account_after_setup_failure(
                                 account_home,
                                 &account.label,
@@ -476,7 +518,7 @@ async fn account_command(
                         } else {
                             let bootstrap = match relay_bootstrap_from_endpoints(
                                 default_relays,
-                                bootstrap_endpoints,
+                                bootstrap.bootstrap_relays,
                             )
                             .and_then(|bootstrap| {
                                 bootstrap.ok_or_else(|| AppError::MissingDefaultRelays.into())
@@ -524,7 +566,14 @@ async fn account_command(
                     }
                 }
                 false => {
-                    if !default_relays.is_empty() {
+                    if bootstrap_relays.is_empty() {
+                        rollback_account_after_setup_failure(
+                            account_home,
+                            &account.label,
+                            DmError::MissingRelay,
+                        )?;
+                    }
+                    if !default_relays.is_empty() && !used_global_relay_defaults {
                         return Err(DmError::PublicAccountCannotSign);
                     }
                     relay_list_status_for_account_id(
@@ -1235,6 +1284,39 @@ fn rollback_account_after_setup_failure<T>(
     }
 }
 
+fn apply_global_relay_defaults(
+    default_relays: &mut Vec<String>,
+    bootstrap_relays: &mut Vec<String>,
+    relay: Option<String>,
+) -> bool {
+    if !default_relays.is_empty() || !bootstrap_relays.is_empty() {
+        return false;
+    }
+    let Some(relay) = relay.map(|relay| relay.trim().to_owned()) else {
+        return false;
+    };
+    if relay.is_empty() {
+        return false;
+    }
+    default_relays.push(relay.clone());
+    bootstrap_relays.push(relay);
+    true
+}
+
+fn resolve_relay(relay: Option<String>) -> Result<Option<String>, DmError> {
+    match relay.or_else(|| std::env::var("DM_RELAY").ok()) {
+        Some(relay) => {
+            let relay = relay.trim().to_owned();
+            if relay.is_empty() {
+                Err(DmError::EmptyRelayUrl)
+            } else {
+                Ok(Some(relay))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
 fn relay_bootstrap(
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
@@ -1375,10 +1457,7 @@ fn relay_lists_json(status: AccountRelayListStatus) -> Value {
 }
 
 fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
-    if let Some(url) = relay {
-        return MarmotApp::with_relays_and_account_home(home, vec![url], account_home);
-    }
-    MarmotApp::local_with_account_home(home, account_home)
+    MarmotApp::with_relays_and_account_home(home, relay.into_iter().collect(), account_home)
 }
 
 fn open_account_home(
@@ -1505,6 +1584,7 @@ fn dm_error_json(err: &DmError) -> Value {
             "relay_lists": relay_lists_json(status.as_ref().clone()),
             "repair": {
                 "requires": "--default-relays",
+                "publish_missing": "--publish-missing-relay-lists",
             },
         }),
         DmError::AccountHome(err) => account_home_error_json(err),
@@ -1524,6 +1604,15 @@ fn dm_error_json(err: &DmError) -> Value {
         DmError::EmptyRelayUrl => json!({
             "code": "empty_relay_url",
             "message": err.to_string(),
+        }),
+        DmError::MissingRelay => json!({
+            "code": "missing_relay_url",
+            "message": err.to_string(),
+            "repair": {
+                "flag": "--relay <ws-or-wss-url>",
+                "env": "DM_RELAY",
+                "account_setup": "--default-relays <url> --bootstrap-relays <url>",
+            },
         }),
         DmError::MissingAccount => json!({
             "code": "missing_account",

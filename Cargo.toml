@@ -10,7 +10,6 @@ members = [
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
     "crates/marmot-account",
-    "crates/marmot-lab",
     "crates/marmot-app",
     "crates/cli",
 ]
@@ -70,6 +69,5 @@ cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 marmot-account = { path = "crates/marmot-account" }
-marmot-lab = { path = "crates/marmot-lab" }
 marmot-app = { path = "crates/marmot-app" }
 darkmatter-cli = { path = "crates/cli" }

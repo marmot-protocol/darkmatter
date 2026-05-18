@@ -50,13 +50,14 @@ tests, and disposable homes.
 
 Common options can be passed as flags or environment variables:
 
-- `--home <path>` or `DM_HOME`: account home, local relay files, projections, daemon socket, pid, and log.
+- `--home <path>` or `DM_HOME`: account home, projections, daemon socket, pid, and log.
 - `--account <npub-or-hex>` or `DM_ACCOUNT`: selected local signing account for account-scoped commands.
 - `--socket <path>` or `DM_SOCKET`: daemon socket. The default is `$DM_HOME/dev/dmd.sock`.
 - `--secret-store keychain|file` or `DM_SECRET_STORE`: signing-key backend.
 - `--keychain-service <name>` or `DM_KEYCHAIN_SERVICE`: keychain service name.
-- `--relay <wss-url>`: use a Nostr relay through the SDK transport. Without this flag, `dm` uses the local
-  file relay under the home directory.
+- `--relay <ws-or-wss-url>` or `DM_RELAY`: use a Nostr relay through the SDK transport. For
+  `dm account create`, this also becomes the default, inbox, and KeyPackage relay when command-specific
+  relay-list flags are omitted.
 - `--json`: return a stable JSON envelope for scripts, the TUI, and daemon forwarding.
 
 The default home is `DM_HOME` when set. Without `DM_HOME`, `dm` uses the platform user data directory:
@@ -101,10 +102,16 @@ Account commands:
 
 ```sh
 dm account create [nsec-or-npub]
+dm account create --default-relays <relay-url>[,<relay-url>...] --bootstrap-relays <relay-url>[,<relay-url>...]
+dm account create <nsec> --bootstrap-relays <relay-url> --publish-missing-relay-lists --default-relays <relay-url>
 dm account list
 dm account status [npub-or-hex]
 dm account relay-lists [npub-or-hex] --bootstrap-relays <relay-url>
 ```
+
+Brand-new local signing accounts publish NIP-65, inbox, and KeyPackage relay lists when `--relay` or
+`--default-relays` is provided. Importing an existing `nsec` checks those lists from the bootstrap relays; if any
+required list is missing, add `--publish-missing-relay-lists` with `--default-relays` to publish the missing lists.
 
 KeyPackage commands:
 
@@ -152,9 +159,10 @@ dm --account <npub-or-hex> sync
 ## Daemon
 
 `dm daemon start` launches `dmd` in the background for the selected home. The daemon owns the Unix socket,
-writes `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and periodically syncs every local signing
-account. It also refreshes the app-level Nostr user directory for local signing accounts, which warms cached
-follow lists and profile metadata for likely contacts.
+writes `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and keeps long-lived relay subscriptions for
+local signing accounts when `--relay` points at a real WebSocket relay. The sync interval is still used for
+local file-relay scans and for noticing newly added accounts; real relay subscriptions stay open between
+intervals.
 
 ```sh
 dm daemon start --sync-interval-ms 2000
