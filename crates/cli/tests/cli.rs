@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
 
+const POLL_TIMEOUT: Duration = Duration::from_secs(8);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
     _relay: MockRelay,
@@ -18,9 +21,10 @@ impl TestRelay {
         let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
         let mut last_error = None;
         let relay = (0..8)
-            .find_map(|_| match runtime.block_on(MockRelay::run()) {
+            .find_map(|attempt| match runtime.block_on(MockRelay::run()) {
                 Ok(relay) => Some(relay),
                 Err(err) => {
+                    eprintln!("mock relay startup attempt {} failed: {err}", attempt + 1);
                     last_error = Some(err);
                     std::thread::sleep(Duration::from_millis(25));
                     None
@@ -274,7 +278,7 @@ fn create_account_with_real_relay(home: &std::path::Path, relay: &str) -> String
 }
 
 fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_id: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
@@ -285,7 +289,7 @@ fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_i
             return sync;
         }
         last = sync;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not join <REDACTED_GROUP> via <REDACTED_RELAY>; {}",
@@ -299,7 +303,7 @@ fn sync_until_message(
     account: &str,
     plaintext: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
@@ -310,7 +314,7 @@ fn sync_until_message(
             return sync;
         }
         last = sync;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not receive <REDACTED_MESSAGE> via <REDACTED_RELAY>; {}",
@@ -319,7 +323,7 @@ fn sync_until_message(
 }
 
 fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, member: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let _ = run_json(home, &["--account", account, "sync"]);
@@ -331,7 +335,7 @@ fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, memb
             return members;
         }
         last = members;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not see expected member in <REDACTED_GROUP>; {}",
@@ -345,7 +349,7 @@ fn wait_until_chat_visible(
     account: &str,
     group_id: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let chats = run_json_with_relay(home, relay, &["--account", account, "chats", "list"]);
@@ -356,7 +360,7 @@ fn wait_until_chat_visible(
             return chats;
         }
         last = chats;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not project <REDACTED_GROUP> via daemon; {}",
@@ -371,7 +375,7 @@ fn wait_until_projected_message(
     group_id: &str,
     plaintext: &str,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let messages = run_json_with_relay(
@@ -386,7 +390,7 @@ fn wait_until_projected_message(
             return messages;
         }
         last = messages;
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
         "account <REDACTED_ACCOUNT> did not project <REDACTED_MESSAGE> via daemon; {}",

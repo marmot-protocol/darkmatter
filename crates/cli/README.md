@@ -73,6 +73,7 @@ Create two local signing accounts, publish Bob's KeyPackage, create a chat as Al
 ```sh
 export DM_HOME="$(mktemp -d)"
 export DM_SECRET_STORE=file
+export DM_RELAY="ws://127.0.0.1:28080"
 
 dm account create
 dm account create <bob-nsec>
@@ -160,11 +161,12 @@ dm --account <npub-or-hex> sync
 
 `dm daemon start` launches `dmd` in the background for the selected home. The daemon owns the Unix socket,
 writes `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and keeps long-lived relay subscriptions for
-local signing accounts when `--relay` points at a real WebSocket relay. The sync interval is still used for
-local file-relay scans and for noticing newly added accounts; real relay subscriptions stay open between
-intervals.
+local signing accounts when `--relay` points at a real WebSocket relay. The sync interval is used for account
+reconciliation and maintenance tasks, such as detecting newly added accounts and periodic upkeep; real relay
+subscriptions stay open between intervals.
 
 ```sh
+export DM_RELAY="ws://127.0.0.1:28080"
 dm daemon start --sync-interval-ms 2000
 dm daemon status
 dm --account <npub-or-hex> chats list
@@ -178,6 +180,7 @@ Use `--socket` or `DM_SOCKET` to target a specific daemon. Use `dmd` directly wh
 should own the daemon lifecycle:
 
 ```sh
+export DM_RELAY="ws://127.0.0.1:28080"
 dmd --home "$DM_HOME" --sync-interval-ms 2000
 ```
 

@@ -228,6 +228,8 @@ enum DmError {
     MissingGroupId,
     #[error("relay URL cannot be empty")]
     EmptyRelayUrl,
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(String),
     #[error(
         "relay URL is required; pass --relay, set DM_RELAY, or provide setup relays for account creation"
     )]
@@ -451,7 +453,7 @@ async fn account_command(
             mut bootstrap_relays,
             publish_missing_relay_lists,
         } => {
-            let used_global_relay_defaults =
+            let global_relay_defaults =
                 apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
             let directory_bootstrap_relays = bootstrap_relays.clone();
             let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
@@ -573,7 +575,7 @@ async fn account_command(
                             DmError::MissingRelay,
                         )?;
                     }
-                    if !default_relays.is_empty() && !used_global_relay_defaults {
+                    if !default_relays.is_empty() && !global_relay_defaults.default_relays {
                         return Err(DmError::PublicAccountCannotSign);
                     }
                     relay_list_status_for_account_id(
@@ -1284,37 +1286,52 @@ fn rollback_account_after_setup_failure<T>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GlobalRelayDefaults {
+    default_relays: bool,
+    bootstrap_relays: bool,
+}
+
 fn apply_global_relay_defaults(
     default_relays: &mut Vec<String>,
     bootstrap_relays: &mut Vec<String>,
     relay: Option<String>,
-) -> bool {
-    if !default_relays.is_empty() || !bootstrap_relays.is_empty() {
-        return false;
-    }
+) -> GlobalRelayDefaults {
+    let mut applied = GlobalRelayDefaults::default();
     let Some(relay) = relay.map(|relay| relay.trim().to_owned()) else {
-        return false;
+        return applied;
     };
     if relay.is_empty() {
-        return false;
+        return applied;
     }
-    default_relays.push(relay.clone());
-    bootstrap_relays.push(relay);
-    true
+    if default_relays.is_empty() {
+        default_relays.push(relay.clone());
+        applied.default_relays = true;
+    }
+    if bootstrap_relays.is_empty() {
+        bootstrap_relays.push(relay);
+        applied.bootstrap_relays = true;
+    }
+    applied
 }
 
 fn resolve_relay(relay: Option<String>) -> Result<Option<String>, DmError> {
     match relay.or_else(|| std::env::var("DM_RELAY").ok()) {
-        Some(relay) => {
-            let relay = relay.trim().to_owned();
-            if relay.is_empty() {
-                Err(DmError::EmptyRelayUrl)
-            } else {
-                Ok(Some(relay))
-            }
-        }
+        Some(relay) => validate_relay_url(relay).map(Some),
         None => Ok(None),
     }
+}
+
+fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, DmError> {
+    let relay = relay.as_ref().trim();
+    if relay.is_empty() {
+        return Err(DmError::EmptyRelayUrl);
+    }
+    let parsed = url::Url::parse(relay).map_err(|_| DmError::InvalidRelayUrl(relay.to_owned()))?;
+    if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host().is_none() {
+        return Err(DmError::InvalidRelayUrl(relay.to_owned()));
+    }
+    Ok(relay.to_owned())
 }
 
 fn relay_bootstrap(
@@ -1341,11 +1358,7 @@ fn relay_bootstrap_from_endpoints(
 fn relay_endpoints(values: Vec<String>) -> Result<Vec<TransportEndpoint>, DmError> {
     let mut endpoints = Vec::new();
     for value in values {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return Err(DmError::EmptyRelayUrl);
-        }
-        let endpoint = TransportEndpoint(trimmed.to_owned());
+        let endpoint = TransportEndpoint(validate_relay_url(value)?);
         if !endpoints.contains(&endpoint) {
             endpoints.push(endpoint);
         }
@@ -1605,6 +1618,15 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "empty_relay_url",
             "message": err.to_string(),
         }),
+        DmError::InvalidRelayUrl(_) => json!({
+            "code": "invalid_relay_url",
+            "message": err.to_string(),
+            "repair": {
+                "flag": "--relay <ws-or-wss-url>",
+                "env": "DM_RELAY",
+                "account_setup": "--default-relays <ws-or-wss-url> --bootstrap-relays <ws-or-wss-url>",
+            },
+        }),
         DmError::MissingRelay => json!({
             "code": "missing_relay_url",
             "message": err.to_string(),
@@ -1825,7 +1847,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::default_home_from_env;
+    use super::{
+        DmError, GlobalRelayDefaults, apply_global_relay_defaults, default_home_from_env,
+        relay_endpoints, resolve_relay,
+    };
 
     #[test]
     fn default_home_uses_user_data_location_instead_of_current_directory() {
@@ -1859,6 +1884,67 @@ mod tests {
         assert_eq!(
             home,
             PathBuf::from("/home/alice/Library/Application Support/darkmatter")
+        );
+    }
+
+    #[test]
+    fn global_relay_defaults_backfill_default_and_bootstrap_independently() {
+        let mut default_relays = vec!["wss://explicit-default.example".to_owned()];
+        let mut bootstrap_relays = Vec::new();
+
+        let applied = apply_global_relay_defaults(
+            &mut default_relays,
+            &mut bootstrap_relays,
+            Some(" wss://global.example ".to_owned()),
+        );
+
+        assert_eq!(
+            applied,
+            GlobalRelayDefaults {
+                default_relays: false,
+                bootstrap_relays: true,
+            }
+        );
+        assert_eq!(default_relays, vec!["wss://explicit-default.example"]);
+        assert_eq!(bootstrap_relays, vec!["wss://global.example"]);
+
+        let mut default_relays = Vec::new();
+        let mut bootstrap_relays = vec!["wss://explicit-bootstrap.example".to_owned()];
+
+        let applied = apply_global_relay_defaults(
+            &mut default_relays,
+            &mut bootstrap_relays,
+            Some("wss://global.example".to_owned()),
+        );
+
+        assert_eq!(
+            applied,
+            GlobalRelayDefaults {
+                default_relays: true,
+                bootstrap_relays: false,
+            }
+        );
+        assert_eq!(default_relays, vec!["wss://global.example"]);
+        assert_eq!(bootstrap_relays, vec!["wss://explicit-bootstrap.example"]);
+    }
+
+    #[test]
+    fn relay_url_helpers_reject_malformed_or_non_websocket_urls() {
+        assert!(matches!(
+            resolve_relay(Some("not-a-relay-url".to_owned())),
+            Err(DmError::InvalidRelayUrl(value)) if value == "not-a-relay-url"
+        ));
+        assert!(matches!(
+            resolve_relay(Some("https://relay.example".to_owned())),
+            Err(DmError::InvalidRelayUrl(value)) if value == "https://relay.example"
+        ));
+        assert!(matches!(
+            relay_endpoints(vec!["mailto:relay@example.com".to_owned()]),
+            Err(DmError::InvalidRelayUrl(value)) if value == "mailto:relay@example.com"
+        ));
+        assert_eq!(
+            resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),
+            Some("wss://relay.example/path".to_owned())
         );
     }
 }

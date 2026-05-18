@@ -2021,14 +2021,14 @@ impl AppClient {
                 Err(_) => break,
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+                continue;
+            }
             if seen.contains(&event_id) {
                 continue;
             }
             seen.insert(event_id.clone());
             self.state.seen_events.push(event_id);
-            if self.is_own_relay_echo(&delivery, &local_account_id_hex) {
-                continue;
-            }
             self.ingest_delivery(delivery, &profiles, &mut summary)
                 .await?;
         }
@@ -2173,16 +2173,6 @@ impl AppClient {
         }
     }
 
-    fn is_own_relay_echo(
-        &self,
-        delivery: &cgka_traits::TransportDelivery,
-        local_account_id_hex: &str,
-    ) -> bool {
-        NostrTransportEvent::from_transport_message(&delivery.message)
-            .ok()
-            .is_some_and(|event| event.pubkey == local_account_id_hex)
-    }
-
     fn nostr_routing_for_group(
         &self,
         group_id: &GroupId,
@@ -2197,6 +2187,20 @@ impl AppClient {
             })?;
         AppGroupNostrRoutingComponent::from_bytes(&bytes)
     }
+}
+
+fn is_own_relay_echo(
+    delivery: &cgka_traits::TransportDelivery,
+    local_account_id_hex: &str,
+    known_event_ids: &HashSet<String>,
+) -> bool {
+    let event_id = hex::encode(delivery.message.id.as_slice());
+    if !known_event_ids.contains(&event_id) {
+        return false;
+    }
+    NostrTransportEvent::from_transport_message(&delivery.message)
+        .ok()
+        .is_some_and(|event| event.pubkey == local_account_id_hex)
 }
 
 impl Drop for AppClient {
@@ -3005,6 +3009,30 @@ fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), App
 mod tests {
     use super::*;
 
+    fn relay_delivery(event_id: String, pubkey: String) -> cgka_traits::TransportDelivery {
+        let event = NostrTransportEvent {
+            id: event_id,
+            pubkey,
+            created_at: 1,
+            kind: transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".to_owned(), "aa".to_owned()]],
+            content: "ciphertext".to_owned(),
+            sig: None,
+        };
+        cgka_traits::TransportDelivery {
+            account_id: MemberId::new(vec![0; 32]),
+            group_id_hint: None,
+            message: event.to_transport_message().unwrap(),
+            received_at: cgka_traits::transport::Timestamp(1),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+                plane: cgka_traits::TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+            },
+        }
+    }
+
     #[test]
     fn relay_list_discovery_builds_one_limited_filter_per_required_kind() {
         let public_key =
@@ -3031,5 +3059,34 @@ mod tests {
                 KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
             ]
         );
+    }
+
+    #[test]
+    fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
+        let local_pubkey = "11".repeat(32);
+        let known_event_id = "22".repeat(32);
+        let new_cross_device_event_id = "33".repeat(32);
+        let known_event_ids = HashSet::from([known_event_id.clone()]);
+
+        let known_local_delivery = relay_delivery(known_event_id.clone(), local_pubkey.clone());
+        assert!(is_own_relay_echo(
+            &known_local_delivery,
+            &local_pubkey,
+            &known_event_ids
+        ));
+
+        let same_pubkey_new_event = relay_delivery(new_cross_device_event_id, local_pubkey.clone());
+        assert!(!is_own_relay_echo(
+            &same_pubkey_new_event,
+            &local_pubkey,
+            &known_event_ids
+        ));
+
+        let known_other_pubkey_delivery = relay_delivery(known_event_id, "44".repeat(32));
+        assert!(!is_own_relay_echo(
+            &known_other_pubkey_delivery,
+            &local_pubkey,
+            &known_event_ids
+        ));
     }
 }

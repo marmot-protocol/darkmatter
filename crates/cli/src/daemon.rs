@@ -579,9 +579,7 @@ fn apply_defaults(cli: &mut Cli, defaults: &DaemonDefaults) {
     if cli.home.is_none() {
         cli.home = Some(defaults.home.clone());
     }
-    if cli.relay.is_none() {
-        cli.relay = defaults.relay.clone();
-    }
+    cli.relay = defaults.relay.clone();
     if cli.secret_store.is_none() {
         cli.secret_store = defaults.secret_store;
     }
@@ -614,7 +612,7 @@ async fn start_daemon(
                 crate::DmError::MissingRelay.to_string(),
             );
         }
-        Err(err) => return daemon_error(cli.json, "empty_relay_url", err.to_string()),
+        Err(err) => return daemon_error(cli.json, relay_error_code(&err), err.to_string()),
     };
 
     let executable = match daemon_executable() {
@@ -1003,6 +1001,14 @@ async fn remove_stale_socket(
     }
 }
 
+fn relay_error_code(err: &crate::DmError) -> &'static str {
+    match err {
+        crate::DmError::EmptyRelayUrl => "empty_relay_url",
+        crate::DmError::InvalidRelayUrl(_) => "invalid_relay_url",
+        _ => "relay_url_error",
+    }
+}
+
 fn daemon_executable() -> Result<PathBuf, String> {
     if let Ok(current) = std::env::current_exe()
         && let Some(parent) = current.parent()
@@ -1021,4 +1027,38 @@ fn daemon_executable() -> Result<PathBuf, String> {
             })
         })
         .ok_or_else(|| "dmd not found; ensure it is built and on PATH".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
+        let defaults = DaemonDefaults {
+            home: PathBuf::from("/tmp/dm-daemon-home"),
+            socket: PathBuf::from("/tmp/dm-daemon.sock"),
+            pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
+            log_path: PathBuf::from("/tmp/dm-daemon.log"),
+            relay: Some("wss://daemon.example".to_owned()),
+            secret_store: Some(crate::SecretStoreKind::File),
+            keychain_service: Some("daemon-keychain".to_owned()),
+            sync_interval: Duration::from_millis(1000),
+        };
+        let mut cli = Cli {
+            home: None,
+            socket: Some(PathBuf::from("/tmp/forwarded.sock")),
+            relay: Some("wss://client.example".to_owned()),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command: crate::Command::Sync,
+        };
+
+        apply_defaults(&mut cli, &defaults);
+
+        assert_eq!(cli.relay.as_deref(), Some("wss://daemon.example"));
+        assert_eq!(cli.socket, None);
+    }
 }
