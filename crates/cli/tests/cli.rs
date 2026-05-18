@@ -36,18 +36,22 @@ fn json_value_summary(label: &str, value: &Value) -> String {
 }
 
 fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
+    try_run_json(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
+}
+
+fn try_run_json(home: &std::path::Path, args: &[&str]) -> Result<Value, String> {
     let output = dm(home)
         .args(args)
         .output()
         .expect("dm command should start");
-    assert!(
-        output.status.success(),
-        "dm failed\n{}",
-        command_output_summary(&output)
-    );
+    if !output.status.success() {
+        return Err(command_output_summary(&output));
+    }
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(value["ok"], true);
-    value["result"].clone()
+    if value["ok"] != true {
+        return Err(format!("unexpected json response: {value}"));
+    }
+    Ok(value["result"].clone())
 }
 
 fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
@@ -177,6 +181,74 @@ fn assert_no_message_plaintext(value: &Value, unexpected: &str) {
 fn free_udp_addr() -> String {
     let socket = UdpSocket::bind("127.0.0.1:0").expect("bind free udp socket");
     socket.local_addr().expect("local udp addr").to_string()
+}
+
+fn wait_for_udp_listener(addr: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match UdpSocket::bind(addr) {
+            Ok(socket) => drop(socket),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => return,
+            Err(err) => panic!("failed to probe udp listener {addr}: {err}"),
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("udp listener {addr} did not become ready");
+}
+
+fn run_json_until_child_exits(
+    home: &std::path::Path,
+    mut child: Child,
+    timeout: Duration,
+    mut run_command: impl FnMut(&std::path::Path) -> Result<Value, String>,
+) -> (Value, Output) {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match run_command(home) {
+            Ok(value) => {
+                if child.try_wait().expect("child status").is_some() {
+                    let output = child.wait_with_output().expect("child output");
+                    return (value, output);
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("killed child output");
+    panic!(
+        "child did not finish after retried command\n{}\nlast_command_error={}",
+        command_output_summary(&output),
+        last_error.as_deref().unwrap_or("<none>")
+    );
+}
+
+fn run_json_until_success(home: &std::path::Path, args: &[&str], timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match try_run_json(home, args) {
+            Ok(value) => return value,
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "dm did not succeed after retries\nlast_command_error={}",
+        last_error.as_deref().unwrap_or("<none>")
+    );
+}
+
+fn wait_child_output_or_panic(child: Child, timeout: Duration, context: &str) -> Output {
+    let output = wait_child_output(child, timeout);
+    assert!(
+        output.status.success(),
+        "{context}\n{}",
+        command_output_summary(&output)
+    );
+    output
 }
 
 struct BrokerHandle {
@@ -826,9 +898,9 @@ fn stream_send_and_receive_show_quic_text_content() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let receiver = receiver.spawn().expect("stream receiver should start");
-    std::thread::sleep(Duration::from_millis(250));
+    wait_for_udp_listener(&bind, Duration::from_secs(5));
 
-    let sent = run_json(
+    let sent = run_json_until_success(
         home.path(),
         &[
             "stream",
@@ -841,21 +913,52 @@ fn stream_send_and_receive_show_quic_text_content() {
             "hello",
             "streaming",
         ],
+        Duration::from_secs(5),
     );
     assert_eq!(sent["chunk_count"], 3);
 
-    let output = wait_child_output(receiver, Duration::from_secs(5));
-    assert!(
-        output.status.success(),
-        "stream receiver failed\n{}",
-        command_output_summary(&output)
-    );
+    let output =
+        wait_child_output_or_panic(receiver, Duration::from_secs(5), "stream receiver failed");
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
     assert_eq!(value["ok"], true);
     let result = &value["result"];
     assert_eq!(result["text"], "hello streaming");
     assert_eq!(result["chunk_count"], 3);
     assert_eq!(result["chunks"][0]["text"], "hello");
+}
+
+#[test]
+fn stream_send_insecure_local_rejects_remote_endpoints() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let error = run_json_error(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--connect",
+            "203.0.113.10:4450",
+            "--insecure-local",
+            "hello",
+        ],
+    );
+
+    assert_eq!(error["code"], "insecure_local_requires_loopback");
+
+    let broker_error = run_json_error(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            "203.0.113.10:4450",
+            "--insecure-local",
+            "hello",
+        ],
+    );
+
+    assert_eq!(broker_error["code"], "insecure_local_requires_loopback");
 }
 
 #[test]
@@ -926,35 +1029,35 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let watcher = watcher.spawn().expect("stream watcher should start");
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let sent = run_json(
-        home.path(),
-        &[
-            "stream",
-            "send",
-            "--broker",
-            "--connect",
-            &broker.addr.to_string(),
-            "--server-name",
-            "localhost",
-            "--insecure-local",
-            "--stream-id",
-            stream_id,
-            "--start-event-id",
-            start_message_id,
-            "--chunk-bytes",
-            "5",
-            "--chunk-delay-ms",
-            "25",
-            "hello",
-            "anchored",
-            "stream",
-        ],
-    );
+    let broker_addr = broker.addr.to_string();
+    let (sent, output) =
+        run_json_until_child_exits(home.path(), watcher, Duration::from_secs(5), |home| {
+            try_run_json(
+                home,
+                &[
+                    "stream",
+                    "send",
+                    "--broker",
+                    "--connect",
+                    &broker_addr,
+                    "--server-name",
+                    "localhost",
+                    "--insecure-local",
+                    "--stream-id",
+                    stream_id,
+                    "--start-event-id",
+                    start_message_id,
+                    "--chunk-bytes",
+                    "5",
+                    "--chunk-delay-ms",
+                    "25",
+                    "hello",
+                    "anchored",
+                    "stream",
+                ],
+            )
+        });
     assert_eq!(sent["brokered"], true);
-
-    let output = wait_child_output(watcher, Duration::from_secs(5));
     assert!(
         output.status.success(),
         "stream watcher failed\n{}",

@@ -16,6 +16,7 @@ use tokio::time::sleep;
 
 const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 
 pub struct QuicTextStreamReceiver {
     endpoint: Endpoint,
@@ -169,7 +170,7 @@ pub async fn send_text_stream(
         ));
     }
 
-    let endpoint = client_endpoint(config.trust)?;
+    let endpoint = client_endpoint(config.trust, config.server_addr)?;
     let connection = endpoint
         .connect(config.server_addr, &config.server_name)?
         .await?;
@@ -219,6 +220,10 @@ pub fn split_text_deltas(text: &str, max_chunk_bytes: usize) -> Vec<Vec<u8>> {
         if !current.is_empty() && current.len() + ch_len > max_chunk_bytes {
             chunks.push(std::mem::take(&mut current).into_bytes());
         }
+        if current.is_empty() && ch_len > max_chunk_bytes {
+            chunks.push(ch.to_string().into_bytes());
+            continue;
+        }
         current.push(ch);
     }
     if !current.is_empty() {
@@ -237,7 +242,10 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStreamError> {
     Ok((server_config, cert_der.as_ref().to_vec()))
 }
 
-fn client_endpoint(trust: ServerTrust) -> Result<Endpoint, QuicTextStreamError> {
+fn client_endpoint(
+    trust: ServerTrust,
+    server_addr: SocketAddr,
+) -> Result<Endpoint, QuicTextStreamError> {
     let client_config = match trust {
         ServerTrust::Platform => ClientConfig::try_with_platform_verifier()?,
         ServerTrust::CertificateDer(cert_der) => {
@@ -246,10 +254,17 @@ fn client_endpoint(trust: ServerTrust) -> Result<Endpoint, QuicTextStreamError> 
             ClientConfig::with_root_certificates(Arc::new(roots))
                 .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?
         }
-        ServerTrust::InsecureLocal => ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(insecure_client_crypto()?)
-                .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?,
-        )),
+        ServerTrust::InsecureLocal => {
+            if !server_addr.ip().is_loopback() {
+                return Err(QuicTextStreamError::InsecureLocalRequiresLoopback(
+                    server_addr,
+                ));
+            }
+            ClientConfig::new(Arc::new(
+                QuicClientConfig::try_from(insecure_client_crypto()?)
+                    .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?,
+            ))
+        }
     };
     let mut endpoint = Endpoint::client(LOCAL_BIND)?;
     endpoint.set_default_client_config(client_config);
@@ -294,12 +309,20 @@ async fn read_record(
     }
 
     let len = u32::from_be_bytes(len_bytes) as usize;
-    if len == 0 {
-        return Err(QuicTextStreamError::EmptyFrame);
-    }
+    validate_frame_len(len)?;
     let mut bytes = vec![0_u8; len];
     recv.read_exact(&mut bytes).await?;
     Ok(Some(AgentTextStreamRecordV1::decode(&bytes)?))
+}
+
+fn validate_frame_len(len: usize) -> Result<(), QuicTextStreamError> {
+    if len == 0 {
+        return Err(QuicTextStreamError::EmptyFrame);
+    }
+    if len > MAX_FRAME_SIZE {
+        return Err(QuicTextStreamError::FrameTooLarge(len));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -386,6 +409,8 @@ pub enum QuicTextStreamError {
     Certificate(String),
     #[error("QUIC client config failed: {0}")]
     ClientConfig(String),
+    #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
+    InsecureLocalRequiresLoopback(SocketAddr),
     #[error("QUIC endpoint closed before accepting a stream")]
     EndpointClosed,
     #[error("agent text stream did not contain any records")]
@@ -420,6 +445,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["h", "é", "ll", "o"]
         );
+    }
+
+    #[test]
+    fn text_delta_splitter_keeps_oversized_multibyte_characters_whole() {
+        let chunks = split_text_deltas("éa", 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| str::from_utf8(chunk).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["é", "a"]
+        );
+    }
+
+    #[test]
+    fn oversized_frames_are_rejected_before_allocation() {
+        assert!(matches!(
+            validate_frame_len(MAX_FRAME_SIZE + 1),
+            Err(QuicTextStreamError::FrameTooLarge(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn insecure_local_rejects_remote_server_addr() {
+        let err = send_text_stream(SendTextStream {
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 4450),
+            server_name: "example.com".to_owned(),
+            trust: ServerTrust::InsecureLocal,
+            stream_id: vec![0x42; 32],
+            start_event_id: MessageId::new(vec![0x24; 32]),
+            text: "hello".to_owned(),
+            max_chunk_bytes: 5,
+            chunk_delay: Duration::ZERO,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            QuicTextStreamError::InsecureLocalRequiresLoopback(_)
+        ));
     }
 
     #[tokio::test]

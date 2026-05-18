@@ -354,6 +354,8 @@ enum DmError {
     InvalidTranscriptHashLength(usize),
     #[error("choose either --server-cert-der-hex or --insecure-local")]
     ConflictingStreamTrust,
+    #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
+    InsecureLocalRequiresLoopback(SocketAddr),
     #[error("missing account relay lists: {0:?}")]
     MissingRelayLists(Vec<String>, Box<AccountRelayListStatus>),
     #[error(
@@ -1182,7 +1184,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
                 .unwrap_or_else(transport_quic_stream::random_stream_id);
             let (start_event_id, anchored) = stream_start_event_id(start_event_id)?;
             if broker {
-                let trust = broker_trust(server_cert_der_hex, insecure_local)?;
+                let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
                 let sent = publish_text_to_broker(PublishTextToBroker {
                     broker_addr: connect,
                     server_name: server_name.clone(),
@@ -1213,7 +1215,7 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
                     }),
                 });
             }
-            let trust = stream_trust(server_cert_der_hex, insecure_local)?;
+            let trust = stream_trust(connect, server_cert_der_hex, insecure_local)?;
             let sent = send_text_stream(SendTextStream {
                 server_addr: connect,
                 server_name: server_name.clone(),
@@ -1331,7 +1333,7 @@ async fn stream_command_app(
                 .find(|candidate| candidate.trim().starts_with("quic://"))
                 .ok_or(DmError::MissingQuicCandidate)?;
             let candidate = parse_quic_candidate(candidate)?;
-            let trust = broker_trust(server_cert_der_hex, insecure_local)?;
+            let trust = broker_trust(candidate.addr, server_cert_der_hex, insecure_local)?;
             let stream_id = hex::decode(&start_payload.stream_id)?;
             let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
             let received = subscribe_text_from_broker(SubscribeTextFromBroker {
@@ -1623,6 +1625,7 @@ fn route_name(route: &AgentTextStreamRouteV1) -> &'static str {
 }
 
 fn broker_trust(
+    server_addr: SocketAddr,
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
 ) -> Result<BrokerServerTrust, DmError> {
@@ -1630,6 +1633,7 @@ fn broker_trust(
         return Err(DmError::ConflictingStreamTrust);
     }
     if insecure_local {
+        ensure_insecure_local_endpoint(server_addr)?;
         return Ok(BrokerServerTrust::InsecureLocal);
     }
     server_cert_der_hex
@@ -1648,6 +1652,7 @@ fn broker_trust_name(trust: &BrokerServerTrust) -> &'static str {
 }
 
 fn stream_trust(
+    server_addr: SocketAddr,
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
 ) -> Result<ServerTrust, DmError> {
@@ -1655,6 +1660,7 @@ fn stream_trust(
         return Err(DmError::ConflictingStreamTrust);
     }
     if insecure_local {
+        ensure_insecure_local_endpoint(server_addr)?;
         return Ok(ServerTrust::InsecureLocal);
     }
     server_cert_der_hex
@@ -1662,6 +1668,13 @@ fn stream_trust(
         .transpose()
         .map(|trust| trust.unwrap_or(ServerTrust::Platform))
         .map_err(Into::into)
+}
+
+fn ensure_insecure_local_endpoint(server_addr: SocketAddr) -> Result<(), DmError> {
+    if server_addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(DmError::InsecureLocalRequiresLoopback(server_addr))
 }
 
 fn stream_trust_name(trust: &ServerTrust) -> &'static str {
@@ -2252,6 +2265,11 @@ fn dm_error_json(err: &DmError) -> Value {
         DmError::ConflictingStreamTrust => json!({
             "code": "conflicting_stream_trust",
             "message": err.to_string(),
+        }),
+        DmError::InsecureLocalRequiresLoopback(addr) => json!({
+            "code": "insecure_local_requires_loopback",
+            "message": err.to_string(),
+            "addr": addr.to_string(),
         }),
         DmError::MissingGroupId => json!({
             "code": "missing_group_id",

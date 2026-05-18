@@ -27,6 +27,7 @@ pub const DEFAULT_SUBSCRIBER_QUEUE_DEPTH: usize = 32;
 
 const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 
 #[derive(Clone, Debug)]
 pub struct QuicBrokerConfig {
@@ -234,7 +235,7 @@ pub async fn publish_text_to_broker(
         return Err(QuicBrokerError::ChunkSizeTooLarge(config.max_chunk_bytes));
     }
 
-    let endpoint = client_endpoint(config.trust)?;
+    let endpoint = client_endpoint(config.trust, config.broker_addr)?;
     let connection = endpoint
         .connect(config.broker_addr, &config.server_name)?
         .await?;
@@ -275,7 +276,7 @@ pub async fn publish_text_to_broker(
 pub async fn subscribe_text_from_broker(
     config: SubscribeTextFromBroker,
 ) -> Result<ReceivedTextStream, QuicBrokerError> {
-    let endpoint = client_endpoint(config.trust)?;
+    let endpoint = client_endpoint(config.trust, config.broker_addr)?;
     let connection = endpoint
         .connect(config.broker_addr, &config.server_name)?
         .await?;
@@ -553,12 +554,20 @@ async fn read_bytes_frame(
     }
 
     let len = u32::from_be_bytes(len_bytes) as usize;
-    if len == 0 {
-        return Err(QuicBrokerError::EmptyFrame);
-    }
+    validate_frame_len(len)?;
     let mut bytes = vec![0_u8; len];
     recv.read_exact(&mut bytes).await?;
     Ok(Some(bytes))
+}
+
+fn validate_frame_len(len: usize) -> Result<(), QuicBrokerError> {
+    if len == 0 {
+        return Err(QuicBrokerError::EmptyFrame);
+    }
+    if len > MAX_FRAME_SIZE {
+        return Err(QuicBrokerError::FrameTooLarge(len));
+    }
+    Ok(())
 }
 
 fn decode_stream_id(value: &str) -> Result<Vec<u8>, QuicBrokerError> {
@@ -633,7 +642,10 @@ fn load_private_key(path: &PathBuf) -> Result<PrivateKeyDer<'static>, QuicBroker
         .ok_or(QuicBrokerError::MissingPrivateKey)
 }
 
-fn client_endpoint(trust: BrokerServerTrust) -> Result<Endpoint, QuicBrokerError> {
+fn client_endpoint(
+    trust: BrokerServerTrust,
+    broker_addr: SocketAddr,
+) -> Result<Endpoint, QuicBrokerError> {
     let client_config = match trust {
         BrokerServerTrust::Platform => ClientConfig::try_with_platform_verifier()?,
         BrokerServerTrust::CertificateDer(cert_der) => {
@@ -642,10 +654,15 @@ fn client_endpoint(trust: BrokerServerTrust) -> Result<Endpoint, QuicBrokerError
             ClientConfig::with_root_certificates(Arc::new(roots))
                 .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?
         }
-        BrokerServerTrust::InsecureLocal => ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(insecure_client_crypto()?)
-                .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?,
-        )),
+        BrokerServerTrust::InsecureLocal => {
+            if !broker_addr.ip().is_loopback() {
+                return Err(QuicBrokerError::InsecureLocalRequiresLoopback(broker_addr));
+            }
+            ClientConfig::new(Arc::new(
+                QuicClientConfig::try_from(insecure_client_crypto()?)
+                    .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?,
+            ))
+        }
     };
     let mut endpoint = Endpoint::client(LOCAL_BIND)?;
     endpoint.set_default_client_config(client_config);
@@ -755,6 +772,8 @@ pub enum QuicBrokerError {
     MissingPrivateKey,
     #[error("QUIC client config failed: {0}")]
     ClientConfig(String),
+    #[error("--insecure-local is only allowed for loopback QUIC broker endpoints, got {0}")]
+    InsecureLocalRequiresLoopback(SocketAddr),
     #[error("broker subscriber queue depth cannot be zero")]
     EmptySubscriberQueue,
     #[error("broker control frame is missing")]
@@ -860,6 +879,35 @@ mod tests {
 
         assert_eq!(state.live_room_count().await, 0);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn oversized_frames_are_rejected_before_allocation() {
+        assert!(matches!(
+            validate_frame_len(MAX_FRAME_SIZE + 1),
+            Err(QuicBrokerError::FrameTooLarge(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn insecure_local_rejects_remote_broker_addr() {
+        let err = publish_text_to_broker(PublishTextToBroker {
+            broker_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 4450),
+            server_name: "example.com".to_owned(),
+            trust: BrokerServerTrust::InsecureLocal,
+            stream_id: vec![0xaa; 32],
+            start_event_id: MessageId::new(vec![0x11; 32]),
+            text: "hello".to_owned(),
+            max_chunk_bytes: 5,
+            chunk_delay: Duration::ZERO,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            QuicBrokerError::InsecureLocalRequiresLoopback(_)
+        ));
     }
 
     #[tokio::test]
