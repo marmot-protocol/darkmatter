@@ -29,7 +29,7 @@ const FRAME_LEN_BYTES: usize = 4;
 #[cfg(test)]
 const LOCAL_SERVER_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
-const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_millis(500);
+const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
 const SUBSCRIBER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug)]
