@@ -1,33 +1,26 @@
 [package]
-name = "darkmatter-cli"
+name = "transport-quic-broker"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "dm"
-path = "src/main.rs"
-
-[[bin]]
-name = "dmd"
-path = "src/bin/dmd.rs"
+name = "marmot-quic-broker"
+path = "src/bin/marmot-quic-broker.rs"
 
 [dependencies]
 cgka-traits.workspace = true
-cgka-session.workspace = true
 clap.workspace = true
-crossterm.workspace = true
 hex.workspace = true
-marmot-account.workspace = true
-marmot-app.workspace = true
-nostr.workspace = true
-ratatui.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net"] }
-transport-quic-broker.workspace = true
+tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 transport-quic-stream.workspace = true
 
 [dev-dependencies]

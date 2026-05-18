@@ -7,6 +7,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Added `dm stream start`, `dm stream finish`, and `dm stream verify` for anchoring agent text
+  stream starts/finals through normal encrypted Marmot messages and checking QUIC transcript hashes.
+- Added `dm stream watch` and `dm stream send --broker` for brokered QUIC preview streams anchored by the
+  durable start message.
+- Added `dm stream receive` and `dm stream send` for provisional raw QUIC agent text stream previews.
+
 ### Changed
 
 - Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains

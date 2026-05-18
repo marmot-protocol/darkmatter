@@ -82,7 +82,7 @@ jobs:
 
       - name: Dump local relay logs
         if: failure()
-        run: docker compose logs nostr-rs-relay strfry-nostr-relay || true
+        run: docker compose logs nostr-rs-relay strfry-nostr-relay quic-broker || true
 
       - name: Stop local relay stack
         if: always()
