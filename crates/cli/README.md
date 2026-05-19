@@ -1,7 +1,7 @@
 # dm
 
 `dm` is the command-line app for the Darkmatter/Marmot stack. It manages Nostr-keyed accounts, relay
-lists, KeyPackages, chats, groups, messages, local projections, background sync, and the terminal UI.
+lists, KeyPackages, chats, groups, messages, local projections, live runtime subscriptions, and the terminal UI.
 
 The crate builds two binaries:
 
@@ -204,7 +204,7 @@ stream anchors and final markers in conversation order instead of relay catch-up
 newline-delimited stream responses as they arrive. Each response has a typed `result.type`; normal app messages use
 `message`, reactions use `reaction`, deletions use `message_delete`, media references use `media`, durable agent stream
 anchors/finals use `agent_stream_start` and `agent_stream_final`, live brokered QUIC chunks use `agent_stream_delta`,
-daemon-owned QUIC preview summaries use `stream_preview`, chat rows use `chat`, and group state rows use `group_state`.
+runtime-owned QUIC preview summaries use `stream_preview`, chat rows use `chat`, and group state rows use `group_state`.
 
 Media commands:
 
@@ -266,11 +266,11 @@ directly to a peer receiver, which is useful with `dm stream receive --bind 127.
 same stream id. QUIC chunks are transient preview data; normal Marmot messages remain the durable group history. Use
 `--insecure-local` only for loopback development with generated self-signed certificates.
 
-When `dmd` is running, `stream watch --background` starts the broker subscription inside the daemon and returns
-immediately. `dm daemon status --json` then includes `stream_watches` with running/completed/failed preview state,
-including the received preview text and transcript hash after the brokered stream arrives. The same preview state is
-also emitted as typed `stream_preview` updates from `dm messages subscribe <group-hex>`, while individual broker chunks
-arrive as `agent_stream_delta` updates.
+When `dmd` is running, `stream watch --background` starts the broker subscription through the daemon and returns
+immediately. The runtime stream manager owns the running/completed/failed preview state. `dm daemon status --json`
+includes that state under `stream_watches`, including received preview text and transcript hash after the brokered stream
+arrives. The same preview state is emitted as typed `stream_preview` updates from `dm messages subscribe <group-hex>`,
+while individual broker chunks arrive as `agent_stream_delta` updates.
 
 Sync command:
 
@@ -281,9 +281,10 @@ dm --account <npub-or-hex> sync
 ## Daemon
 
 `dm daemon start` launches `dmd` in the background for the selected home. The daemon owns the Unix socket,
-writes `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and keeps long-lived relay subscriptions for
-local signing accounts using its discovery and account-relay defaults. Commands forwarded through the daemon refresh
-subscription state automatically after identity, group, message, and stream mutations.
+writes `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and hosts one `MarmotAppRuntime`. The runtime keeps
+long-lived relay subscriptions for local signing accounts using the daemon's discovery and account-relay defaults.
+Commands forwarded through the daemon update runtime subscription state automatically after identity, group, message,
+and stream mutations.
 
 ```sh
 export DM_HOME="$PWD/dev/data/daemon-demo"
@@ -296,10 +297,13 @@ dm --account <npub-or-hex> chats list
 dm daemon stop
 ```
 
+`dm daemon status --json` includes a redacted `relay_health` object with aggregate relay counts and connection status
+buckets. It does not include relay URLs, account ids, group ids, subscription ids, or message ids.
+
 When a daemon socket exists for a home, normal `dm --home <path> ...` commands are forwarded to that
 daemon. `dm daemon status`, `dm daemon stop`, and `dm tui` handle daemon access directly.
-Background stream watches started with `dm stream watch --background` are owned by the daemon and reported through
-daemon status. Long-lived subscriptions use the daemon socket directly:
+Background stream watches started with `dm stream watch --background` are launched by the daemon and tracked by the
+runtime stream manager. Long-lived subscriptions use the daemon socket directly:
 
 ```sh
 dm --account <npub-or-hex> messages subscribe <group-hex> --limit 50

@@ -29,9 +29,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added `dm media list <group>`, which lists typed media references already projected from group message history.
 - Added `dm messages subscribe <group>`, a daemon-backed newline-delimited stream that emits typed `message`,
   `agent_stream_start`, `agent_stream_final`, `agent_stream_delta`, and `stream_preview` updates, including live
-  brokered QUIC text chunks from daemon-owned stream watches.
-- Added `dm stream watch --background`, which starts a brokered QUIC stream watch inside `dmd` and reports
-  running/completed/failed preview state through `dm daemon status --json`.
+  brokered QUIC text chunks from runtime-owned stream watch state.
+- Added `dm stream watch --background`, which starts a brokered QUIC stream watch through `dmd` and reports
+  runtime-managed running/completed/failed preview state through `dm daemon status --json`.
+- Added redacted relay-plane health to `dm daemon status --json`.
 - Added `dmd --default-account-relays`, matching `wnd` setup flags and applying daemon account-relay defaults to
   daemon-forwarded account creation.
 - Added TUI `/stream` slash commands for starting, watching, finishing, verifying, and inspecting brokered agent text
@@ -44,8 +45,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-owned
-  subscription model. The older singular `dm message` spelling still works during the transition.
+- Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-hosted
+  runtime subscription model. The older singular `dm message` spelling still works during the transition.
 - `dm create-identity` and `dm login <nsec>` now publish the initial local KeyPackage automatically after relay-list
   setup, so the normal invite path does not require a separate `keys publish` repair step.
 - Message projections now order history by recorded transport time before local receipt/insertion order, so synced

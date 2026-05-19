@@ -3,7 +3,7 @@ title: "Marmot App Runtime Shape"
 created: 2026-05-19
 updated: 2026-05-19
 tags: [marmot, overview, app-runtime, daemon, tui]
-status: design
+status: implemented-first-slice
 ---
 
 # Marmot App Runtime Shape
@@ -103,19 +103,35 @@ engine/session boundaries and per-account persistence. The runtime work should b
 
 ## First Vertical Slice
 
-The first slice should prove the architecture without filling in every product surface:
+The first slice now proves the architecture without filling in every product surface:
 
-1. Add `MarmotAppRuntime::open`, `start`, and `shutdown`.
-2. Restore local accounts into an `AccountManager`.
-3. Move identity creation into runtime setup so relay lists and a fresh KeyPackage publish during `create_identity`.
-4. Add a runtime event enum for group joins, messages, and agent stream updates.
-5. Move live Nostr receive/ingest into `marmot-app`.
-6. Change `dmd` to hold one runtime and forward requests into it.
-7. Make `messages subscribe` use runtime snapshot plus broadcast receiver.
-8. Keep the TUI as a daemon client.
+1. `MarmotAppRuntime::open`, `start`, and `shutdown` exist.
+2. Local signing accounts are restored into an `AccountManager`.
+3. Identity creation publishes relay lists, a profile, and a fresh KeyPackage through runtime-backed setup.
+4. Runtime events cover group joins, group-state changes, messages, and typed agent stream start/final messages.
+5. Live Nostr receive and ingest run inside `marmot-app` account workers.
+6. `dmd` hosts one runtime and forwards command intents into it.
+7. `messages subscribe`, `chats subscribe`, and `groups subscribe-state` use runtime snapshots plus live receivers.
+8. Agent stream preview state and deltas are owned by a runtime shared stream manager and surfaced through message
+   subscriptions.
+9. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, and redacted relay-health
+   reporting.
+10. The TUI remains a daemon client.
 
 The acceptance test should create Alice and Bob, create a group, receive Bob's group join, send a normal message, start
 an agent stream, receive stream deltas, and finish the stream without calling `dm sync` or publishing keys manually.
+
+## Remaining Hardening
+
+The remaining work is narrower than the original refactor, but still real:
+
+- directory, profile, follow-list, and KeyPackage discovery are not yet fully coalesced through a shared relay-plane
+  subscription service;
+- relay auth, relay scoring, and explicit reconnect/backoff policy are still delegated mostly to `nostr-sdk`;
+- stream watch execution still lives in the CLI/daemon adapter, while runtime owns stream state and typed updates;
+- `sync` remains as a diagnostic/repair command and some internal function names still say `sync` for catch-up/replay
+  work;
+- production apps still need lifecycle hooks for mobile/desktop foregrounding, backgrounding, and shutdown.
 
 ## Crate Responsibility After The Refactor
 

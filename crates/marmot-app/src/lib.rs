@@ -67,11 +67,16 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
+mod agent_streams;
 mod directory_cache;
 mod projection;
 mod relay_plane;
 
-pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter};
+pub use agent_streams::{
+    AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
+    AgentStreamWatchReport, AgentStreamWatchStart,
+};
+pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
 
 use directory_cache::DirectoryCache;
 use projection::AccountProjectionDb;
@@ -120,12 +125,14 @@ pub struct AccountManager {
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     relay_plane: MarmotRelayPlane,
+    agent_streams: AgentStreamWatchManager,
 }
 
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
+            agent_streams: AgentStreamWatchManager::default(),
         }
     }
 }
@@ -133,6 +140,10 @@ impl Default for RuntimeSharedServices {
 impl RuntimeSharedServices {
     pub fn relay_plane(&self) -> &MarmotRelayPlane {
         &self.relay_plane
+    }
+
+    pub fn agent_streams(&self) -> AgentStreamWatchManager {
+        self.agent_streams.clone()
     }
 }
 

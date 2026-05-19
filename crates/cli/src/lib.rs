@@ -664,16 +664,7 @@ pub struct CliOutput {
     pub stderr: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct AgentStreamDelta {
-    pub account: Option<String>,
-    pub group_id: String,
-    pub stream_id: String,
-    pub seq: u64,
-    pub record_type: u8,
-    pub flags: u8,
-    pub text: String,
-}
+pub(crate) type AgentStreamDelta = marmot_app::AgentStreamDelta;
 
 #[derive(Debug)]
 pub(crate) struct CommandOutput {

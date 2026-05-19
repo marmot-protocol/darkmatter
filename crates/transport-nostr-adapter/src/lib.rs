@@ -40,7 +40,7 @@ pub use relay_list::{
     NostrAccountRelayListPublication,
 };
 #[cfg(feature = "sdk")]
-pub use sdk_client::{NostrSdkRelayClient, NostrSdkSubscriptionPlan};
+pub use sdk_client::{NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan};
 
 const DELIVERY_BUFFER: usize = 1024;
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].

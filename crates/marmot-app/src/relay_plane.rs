@@ -6,17 +6,21 @@ use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
     MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    TransportDelivery, TransportEndpoint, TransportGroupSync, TransportPublishReport,
+    TransportPublishRequest, TransportPublishTarget,
 };
-use nostr_sdk::prelude::Client as NostrSdkClient;
+use nostr_sdk::prelude::{Client as NostrSdkClient, RelayUrl};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrTransportAdapter,
+    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
+    NostrTransportAdapter,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
 const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
+const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -25,7 +29,21 @@ pub struct MarmotRelayPlane {
 
 struct MarmotRelayPlaneInner {
     subscription_rebuild_lookback: Option<Duration>,
+    relay_safety: RelaySafetyPolicy,
     transport: Arc<RelayPlaneTransport>,
+}
+
+#[derive(Clone, Debug)]
+struct RelaySafetyPolicy {
+    max_endpoints_per_route: usize,
+}
+
+impl Default for RelaySafetyPolicy {
+    fn default() -> Self {
+        Self {
+            max_endpoints_per_route: MAX_RELAY_ENDPOINTS_PER_ROUTE,
+        }
+    }
 }
 
 struct RelayPlaneTransport {
@@ -42,6 +60,22 @@ pub struct MarmotRelayPlaneAccountAdapter {
     relay_plane: MarmotRelayPlane,
     publish_client: Arc<dyn NostrRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<TransportDelivery>>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPlaneHealth {
+    pub sdk_backed: bool,
+    pub total_relays: usize,
+    pub initialized: usize,
+    pub pending: usize,
+    pub connecting: usize,
+    pub connected: usize,
+    pub disconnected: usize,
+    pub terminated: usize,
+    pub banned: usize,
+    pub sleeping: usize,
+    pub connection_attempts: usize,
+    pub connection_successes: usize,
 }
 
 impl MarmotRelayPlane {
@@ -92,6 +126,7 @@ impl MarmotRelayPlane {
         let this = Self {
             inner: Arc::new(MarmotRelayPlaneInner {
                 subscription_rebuild_lookback,
+                relay_safety: RelaySafetyPolicy::default(),
                 transport,
             }),
         };
@@ -129,6 +164,13 @@ impl MarmotRelayPlane {
         Some(Timestamp(
             last_transport_timestamp.saturating_sub(lookback.as_secs()),
         ))
+    }
+
+    pub async fn relay_health(&self) -> RelayPlaneHealth {
+        if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
+            return RelayPlaneHealth::from_sdk(sdk_relay_client.relay_health().await);
+        }
+        RelayPlaneHealth::default()
     }
 
     pub async fn shutdown(&self) {
@@ -199,6 +241,92 @@ impl MarmotRelayPlane {
     }
 }
 
+impl RelayPlaneHealth {
+    fn from_sdk(health: NostrSdkRelayHealth) -> Self {
+        Self {
+            sdk_backed: true,
+            total_relays: health.total_relays,
+            initialized: health.initialized,
+            pending: health.pending,
+            connecting: health.connecting,
+            connected: health.connected,
+            disconnected: health.disconnected,
+            terminated: health.terminated,
+            banned: health.banned,
+            sleeping: health.sleeping,
+            connection_attempts: health.connection_attempts,
+            connection_successes: health.connection_successes,
+        }
+    }
+}
+
+impl RelaySafetyPolicy {
+    fn sanitize_activation(
+        &self,
+        mut activation: TransportAccountActivation,
+    ) -> Result<TransportAccountActivation, String> {
+        activation.inbox_endpoints =
+            self.sanitize_endpoints(activation.inbox_endpoints, "account inbox")?;
+        for group in &mut activation.group_subscriptions {
+            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
+        }
+        Ok(activation)
+    }
+
+    fn sanitize_group_sync(
+        &self,
+        mut sync: TransportGroupSync,
+    ) -> Result<TransportGroupSync, String> {
+        for group in &mut sync.group_subscriptions {
+            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
+        }
+        Ok(sync)
+    }
+
+    fn sanitize_publish_request(
+        &self,
+        mut request: TransportPublishRequest,
+    ) -> Result<TransportPublishRequest, String> {
+        match &mut request.target {
+            TransportPublishTarget::Group { endpoints, .. } => {
+                *endpoints = self.sanitize_endpoints(endpoints.clone(), "group publish")?;
+            }
+            TransportPublishTarget::Inbox { endpoints, .. } => {
+                *endpoints = self.sanitize_endpoints(endpoints.clone(), "inbox publish")?;
+            }
+        }
+        Ok(request)
+    }
+
+    fn sanitize_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Result<Vec<TransportEndpoint>, String> {
+        let mut sanitized = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let raw = endpoint.as_str().trim();
+            if raw.is_empty() {
+                return Err(format!("{context}: invalid relay endpoint"));
+            }
+            let relay_url = RelayUrl::parse(raw)
+                .map_err(|err| format!("{context}: invalid relay endpoint: {err}"))?;
+            let endpoint = TransportEndpoint(relay_url.to_string());
+            if !sanitized.contains(&endpoint) {
+                sanitized.push(endpoint);
+            }
+        }
+        if sanitized.len() > self.max_endpoints_per_route {
+            return Err(format!(
+                "{context}: relay endpoint count {} exceeds limit {}",
+                sanitized.len(),
+                self.max_endpoints_per_route
+            ));
+        }
+        Ok(sanitized)
+    }
+}
+
 #[async_trait]
 impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     async fn activate_account(
@@ -210,6 +338,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
                 activation.account_id,
             ));
         }
+        let activation = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_activation(activation)
+            .map_err(TransportAdapterError::Subscription)?;
         self.relay_plane
             .inner
             .transport
@@ -225,6 +359,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if sync.account_id != self.account_id {
             return Err(TransportAdapterError::AccountNotActive(sync.account_id));
         }
+        let sync = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_group_sync(sync)
+            .map_err(TransportAdapterError::Subscription)?;
         self.relay_plane
             .inner
             .transport
@@ -256,6 +396,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if request.account_id != self.account_id {
             return Err(TransportAdapterError::AccountNotActive(request.account_id));
         }
+        let request = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_publish_request(request)
+            .map_err(TransportAdapterError::Publish)?;
         request.validate_envelope_matches_target()?;
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
@@ -345,6 +491,62 @@ mod tests {
                 failed: Vec::<TransportEndpointFailure>::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn relay_plane_rejects_invalid_relay_endpoints_before_subscribing() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+
+        let err = alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice,
+                inbox_endpoints: vec![TransportEndpoint("https://relay.example".into())],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .expect_err("invalid relay endpoint should be rejected");
+
+        assert!(err.to_string().contains("invalid relay endpoint"));
+        assert!(relay.subscriptions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_plane_deduplicates_canonical_relay_endpoints() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let group_id = GroupId::new(vec![0xC3; 32]);
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+
+        alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice,
+                inbox_endpoints: vec![
+                    TransportEndpoint(" wss://relay.example ".into()),
+                    TransportEndpoint("wss://relay.example".into()),
+                ],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id,
+                    transport_group_id: vec![0xD4; 32],
+                    endpoints: vec![
+                        TransportEndpoint("wss://relay.example/".into()),
+                        TransportEndpoint("wss://relay.example/".into()),
+                    ],
+                }],
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let subscriptions = relay.subscriptions.lock().unwrap().clone();
+        assert!(subscriptions.iter().all(|subscription| match subscription {
+            NostrSubscription::AccountInbox { endpoints, .. }
+            | NostrSubscription::Group { endpoints, .. } => endpoints.len() == 1,
+        }));
     }
 
     #[tokio::test]

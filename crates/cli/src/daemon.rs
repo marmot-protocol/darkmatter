@@ -97,24 +97,11 @@ pub struct DaemonStatus {
     pub home: Option<PathBuf>,
     pub log: Option<PathBuf>,
     pub last_sync: Option<DaemonSyncReport>,
+    pub relay_health: Option<marmot_app::RelayPlaneHealth>,
     pub stream_watches: Vec<DaemonStreamWatchReport>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DaemonStreamWatchReport {
-    pub watch_id: String,
-    pub account: Option<String>,
-    pub group_id: String,
-    pub stream_id: Option<String>,
-    pub started_at: u64,
-    pub finished_at: Option<u64>,
-    pub status: String,
-    pub text: Option<String>,
-    pub transcript_hash: Option<String>,
-    pub chunk_count: Option<u64>,
-    pub error: Option<String>,
-    pub result: Option<serde_json::Value>,
-}
+pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonOutgoingStreamReport {
@@ -135,7 +122,6 @@ struct DaemonState {
     pid: u32,
     started_at: u64,
     last_sync: Option<DaemonSyncReport>,
-    stream_watches: HashMap<String, DaemonStreamWatchReport>,
 }
 
 #[derive(Default)]
@@ -580,7 +566,6 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         pid: std::process::id(),
         started_at: unix_now(),
         last_sync: None,
-        stream_watches: HashMap::new(),
     }));
     let events = DaemonEventHub::new();
     let mut workers = DaemonWorkers::default();
@@ -694,7 +679,7 @@ async fn handle_connection(
             },
         ),
         DaemonRequest::Status => {
-            let status = server_status(defaults, &state);
+            let status = server_status(defaults, &state, workers.runtime.runtime.as_ref()).await;
             (
                 false,
                 CliOutput {
@@ -714,10 +699,16 @@ async fn handle_connection(
         ),
         DaemonRequest::StreamWatch { mut cli } => {
             apply_defaults(&mut cli, defaults);
-            let output = start_stream_watch(
-                *cli,
+            reconcile_app_runtime(
+                defaults,
                 state.clone(),
                 events.clone(),
+                &mut workers.runtime,
+            )
+            .await;
+            let output = start_stream_watch(
+                *cli,
+                workers.runtime.runtime.as_ref(),
                 &mut workers.stream_watch,
             );
             (false, output)
@@ -843,7 +834,7 @@ async fn read_daemon_request(
 async fn handle_messages_subscription(
     stream: &mut UnixStream,
     defaults: &DaemonDefaults,
-    state: Arc<Mutex<DaemonState>>,
+    _state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     runtime: Option<marmot_app::MarmotAppRuntime>,
     cli: Cli,
@@ -873,6 +864,7 @@ async fn handle_messages_subscription(
         let _ = write_stream_end(stream).await;
         return Ok(());
     };
+    let stream_manager = runtime.shared_services().agent_streams();
     let mut runtime_subscription = match runtime.subscribe_messages(
         &account_ref,
         marmot_app::AppMessageQuery {
@@ -891,6 +883,7 @@ async fn handle_messages_subscription(
     let mut seen_messages = HashSet::new();
     let mut seen_stream_previews = HashSet::new();
     let mut event_rx = events.subscribe_messages();
+    let mut stream_rx = stream_manager.subscribe();
     if !write_stream_response(
         stream,
         &DaemonStreamResponse::ok(serde_json::json!({
@@ -928,7 +921,24 @@ async fn handle_messages_subscription(
         }
     }
 
-    for preview in stream_previews_for_group(&state, Some(&account_ref), &group_id) {
+    for update in stream_manager.recent_updates() {
+        let response = agent_stream_update_response(update, false);
+        if !write_message_subscription_event(
+            stream,
+            response,
+            &group_id,
+            &mut seen_messages,
+            &mut seen_stream_previews,
+        )
+        .await
+        {
+            return Ok(());
+        }
+    }
+
+    for preview in stream_manager.previews_for_group(Some(&account_ref), &group_id) {
+        let preview =
+            serde_json::to_value(preview).expect("stream preview serialization cannot fail");
         let fingerprint = stream_preview_fingerprint(&preview);
         if !seen_stream_previews.insert(fingerprint) {
             continue;
@@ -976,6 +986,33 @@ async fn handle_messages_subscription(
                     Err(broadcast::error::RecvError::Lagged(count)) => {
                         let response = DaemonStreamResponse::err(format!(
                             "message stream lagged: {count} updates dropped"
+                        ));
+                        if !write_stream_response(stream, &response).await {
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            stream_update = stream_rx.recv() => {
+                match stream_update {
+                    Ok(update) => {
+                        let response = agent_stream_update_response(update, false);
+                        if !write_message_subscription_event(
+                            stream,
+                            response,
+                            &group_id,
+                            &mut seen_messages,
+                            &mut seen_stream_previews,
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        let response = DaemonStreamResponse::err(format!(
+                            "agent stream update stream lagged: {count} updates dropped"
                         ));
                         if !write_stream_response(stream, &response).await {
                             return Ok(());
@@ -1242,38 +1279,6 @@ fn cli_output_result(output: CliOutput) -> Result<serde_json::Value, String> {
         .unwrap_or(serde_json::Value::Null))
 }
 
-fn stream_previews_for_group(
-    state: &Arc<Mutex<DaemonState>>,
-    account: Option<&str>,
-    group_id: &str,
-) -> Vec<serde_json::Value> {
-    let Ok(state) = state.lock() else {
-        return Vec::new();
-    };
-    let mut previews = state
-        .stream_watches
-        .values()
-        .filter(|watch| watch.group_id == group_id)
-        .filter(|watch| {
-            account.is_none()
-                || watch.account.as_deref().is_none()
-                || watch.account.as_deref() == account
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    previews.sort_by(|left, right| {
-        left.started_at
-            .cmp(&right.started_at)
-            .then_with(|| left.watch_id.cmp(&right.watch_id))
-    });
-    previews
-        .into_iter()
-        .map(|preview| {
-            serde_json::to_value(preview).expect("stream preview serialization cannot fail")
-        })
-        .collect()
-}
-
 fn stream_preview_fingerprint(preview: &serde_json::Value) -> String {
     let watch_id = preview
         .get("watch_id")
@@ -1325,6 +1330,20 @@ fn agent_stream_delta_response(delta: crate::AgentStreamDelta) -> DaemonStreamRe
         "type": "agent_stream_delta",
         "agent_stream_delta": delta,
     }))
+}
+
+fn agent_stream_update_response(
+    update: marmot_app::AgentStreamUpdate,
+    initial: bool,
+) -> DaemonStreamResponse {
+    match update {
+        marmot_app::AgentStreamUpdate::WatchUpdated(report) => {
+            let preview =
+                serde_json::to_value(report).expect("stream preview serialization cannot fail");
+            stream_preview_response(preview, initial)
+        }
+        marmot_app::AgentStreamUpdate::Delta(delta) => agent_stream_delta_response(delta),
+    }
 }
 
 fn message_stream_response(message: serde_json::Value, trigger: &str) -> DaemonStreamResponse {
@@ -1444,36 +1463,34 @@ async fn write_stream_end(stream: &mut UnixStream) -> bool {
 
 fn start_stream_watch(
     cli: Cli,
-    state: Arc<Mutex<DaemonState>>,
-    events: DaemonEventHub,
+    runtime: Option<&marmot_app::MarmotAppRuntime>,
     workers: &mut StreamWatchWorkers,
 ) -> CliOutput {
     let json = cli.json;
-    let (report, handle) = match spawn_stream_watch(cli, state, events.clone()) {
+    let Some(runtime) = runtime else {
+        return daemon_error(
+            json,
+            "stream_watch_failed",
+            "app runtime is not running".to_owned(),
+        );
+    };
+    let stream_manager = runtime.shared_services().agent_streams();
+    let (report, handle) = match spawn_stream_watch(cli, stream_manager) {
         Ok(spawned) => spawned,
         Err(message) => return daemon_error(json, "stream_watch_failed", message),
     };
     let watch_id = report.watch_id.clone();
     workers.replace(watch_id, handle);
-    let preview =
-        serde_json::to_value(report.clone()).expect("stream preview serialization cannot fail");
-    events.publish_message(stream_preview_response(preview, false));
 
     stream_watch_output(json, &report)
 }
 
 fn spawn_stream_watch(
     mut cli: Cli,
-    state: Arc<Mutex<DaemonState>>,
-    events: DaemonEventHub,
+    stream_manager: marmot_app::AgentStreamWatchManager,
 ) -> Result<(DaemonStreamWatchReport, JoinHandle<()>), String> {
-    let report = new_stream_watch_report(&cli)?;
+    let report = stream_manager.start_watch(new_stream_watch_start(&cli)?);
     let watch_id = report.watch_id.clone();
-    if let Ok(mut state) = state.lock() {
-        state
-            .stream_watches
-            .insert(watch_id.clone(), report.clone());
-    }
 
     cli.json = true;
     if let crate::Command::Stream {
@@ -1483,21 +1500,20 @@ fn spawn_stream_watch(
         *background = false;
     }
 
-    let worker_state = state.clone();
     let worker_watch_id = watch_id;
-    let delta_events = events.clone();
+    let worker_stream_manager = stream_manager.clone();
     let handle = tokio::spawn(async move {
         let output = crate::run_stream_watch_local_with_observer(cli, move |delta| {
-            delta_events.publish_message(agent_stream_delta_response(delta));
+            worker_stream_manager.record_delta(delta.clone());
         })
         .await;
-        finish_stream_watch(worker_state, events, worker_watch_id, output);
+        finish_stream_watch(stream_manager, worker_watch_id, output);
     });
 
     Ok((report, handle))
 }
 
-fn new_stream_watch_report(cli: &Cli) -> Result<DaemonStreamWatchReport, String> {
+fn new_stream_watch_start(cli: &Cli) -> Result<marmot_app::AgentStreamWatchStart, String> {
     let crate::Command::Stream {
         command: crate::StreamCommand::Watch {
             group, stream_id, ..
@@ -1513,39 +1529,17 @@ fn new_stream_watch_report(cli: &Cli) -> Result<DaemonStreamWatchReport, String>
         .transpose()
         .map_err(|err| err.to_string())?;
     let started_at = unix_now();
-    let watch_id = stream_watch_id(&group_id, stream_id.as_deref(), unix_now_millis());
-    Ok(DaemonStreamWatchReport {
-        watch_id,
+    Ok(marmot_app::AgentStreamWatchStart {
         account: cli.account.clone(),
         group_id,
         stream_id,
         started_at,
-        finished_at: None,
-        status: "running".to_owned(),
-        text: None,
-        transcript_hash: None,
-        chunk_count: None,
-        error: None,
-        result: None,
+        started_at_millis: unix_now_millis(),
     })
 }
 
-fn stream_watch_id(group_id: &str, stream_id: Option<&str>, started_at_ms: u128) -> String {
-    let stream = stream_id.unwrap_or("latest");
-    format!(
-        "sw-{started_at_ms}-{}-{}",
-        short_id(group_id),
-        short_id(stream)
-    )
-}
-
-fn short_id(value: &str) -> String {
-    value.chars().take(12).collect()
-}
-
 fn finish_stream_watch(
-    state: Arc<Mutex<DaemonState>>,
-    events: DaemonEventHub,
+    stream_manager: marmot_app::AgentStreamWatchManager,
     watch_id: String,
     output: CliOutput,
 ) {
@@ -1602,27 +1596,19 @@ fn finish_stream_watch(
         error = Some("stream watch failed".to_owned());
     }
 
-    let mut finished = None;
-    if let Ok(mut state) = state.lock()
-        && let Some(report) = state.stream_watches.get_mut(&watch_id)
-    {
-        report.finished_at = Some(unix_now());
-        report.status = status;
-        if stream_id.is_some() {
-            report.stream_id = stream_id;
-        }
-        report.text = text;
-        report.transcript_hash = transcript_hash;
-        report.chunk_count = chunk_count;
-        report.error = error;
-        report.result = result;
-        finished = Some(report.clone());
-    }
-    if let Some(report) = finished {
-        let preview =
-            serde_json::to_value(report).expect("stream preview serialization cannot fail");
-        events.publish_message(stream_preview_response(preview, false));
-    }
+    let _ = stream_manager.finish_watch(
+        &watch_id,
+        marmot_app::AgentStreamWatchCompletion {
+            finished_at: unix_now(),
+            status,
+            stream_id,
+            text,
+            transcript_hash,
+            chunk_count,
+            error,
+            result,
+        },
+    );
 }
 
 fn stream_watch_output(json: bool, report: &DaemonStreamWatchReport) -> CliOutput {
@@ -2011,6 +1997,10 @@ async fn run_stream_compose_session(
     }
 }
 
+fn short_id(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
 fn stream_compose_key(account: Option<&str>, stream_id: &str) -> String {
     format!("{}:{stream_id}", account.unwrap_or(""))
 }
@@ -2378,6 +2368,7 @@ async fn reconcile_app_runtime(
             defaults.clone(),
             state.clone(),
             events.clone(),
+            runtime.shared_services().agent_streams(),
             receiver,
         ));
         host.runtime = Some(runtime);
@@ -2397,6 +2388,7 @@ async fn reconcile_app_runtime(
                 defaults.clone(),
                 state,
                 events,
+                runtime.shared_services().agent_streams(),
                 runtime.subscribe(),
             ));
         }
@@ -2417,13 +2409,21 @@ fn spawn_app_runtime_bridge(
     defaults: DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
+    stream_manager: marmot_app::AgentStreamWatchManager,
     mut receiver: broadcast::Receiver<marmot_app::MarmotAppEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    handle_app_runtime_event(&defaults, state.clone(), events.clone(), event).await;
+                    handle_app_runtime_event(
+                        &defaults,
+                        state.clone(),
+                        events.clone(),
+                        stream_manager.clone(),
+                        event,
+                    )
+                    .await;
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     record_sync_error(
@@ -2441,6 +2441,7 @@ async fn handle_app_runtime_event(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
+    stream_manager: marmot_app::AgentStreamWatchManager,
     event: marmot_app::MarmotAppEvent,
 ) {
     let started_at = unix_now();
@@ -2481,8 +2482,7 @@ async fn handle_app_runtime_event(
                 defaults,
                 &message.account_id_hex,
                 &summary,
-                state.clone(),
-                events,
+                stream_manager,
             )
             .await;
             record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
@@ -2541,8 +2541,7 @@ async fn auto_watch_agent_stream_starts(
     defaults: &DaemonDefaults,
     account_id: &str,
     summary: &marmot_app::SyncSummary,
-    state: Arc<Mutex<DaemonState>>,
-    events: DaemonEventHub,
+    stream_manager: marmot_app::AgentStreamWatchManager,
 ) {
     for message in &summary.messages {
         let Some(payload) = crate::agent_text_stream_payload(&message.plaintext) else {
@@ -2558,12 +2557,7 @@ async fn auto_watch_agent_stream_starts(
         }
         let group_id = hex::encode(message.group_id.as_slice());
         let stream_id = start.stream_id;
-        if stream_watch_exists(
-            &state,
-            Some(account_id),
-            &group_id,
-            Some(stream_id.as_str()),
-        ) {
+        if stream_manager.watch_exists(Some(account_id), &group_id, Some(stream_id.as_str())) {
             continue;
         }
 
@@ -2587,29 +2581,8 @@ async fn auto_watch_agent_stream_starts(
                 },
             },
         };
-        if let Ok((report, _handle)) = spawn_stream_watch(cli, state.clone(), events.clone()) {
-            let preview =
-                serde_json::to_value(report).expect("stream preview serialization cannot fail");
-            events.publish_message(stream_preview_response(preview, false));
-        }
+        let _ = spawn_stream_watch(cli, stream_manager.clone());
     }
-}
-
-fn stream_watch_exists(
-    state: &Arc<Mutex<DaemonState>>,
-    account: Option<&str>,
-    group_id: &str,
-    stream_id: Option<&str>,
-) -> bool {
-    let Ok(state) = state.lock() else {
-        return true;
-    };
-    state.stream_watches.values().any(|watch| {
-        watch.account.as_deref() == account
-            && watch.group_id == group_id
-            && watch.stream_id.as_deref() == stream_id
-            && matches!(watch.status.as_str(), "running" | "completed")
-    })
 }
 
 fn empty_sync_report(started_at: u64) -> DaemonSyncReport {
@@ -2851,6 +2824,7 @@ async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
                 log: home.as_deref().map(default_log_path),
                 home,
                 last_sync: None,
+                relay_health: None,
                 stream_watches: Vec::new(),
             }
         });
@@ -2895,21 +2869,26 @@ fn daemon_status_json(status: DaemonStatus) -> serde_json::Value {
         "home": status.home,
         "log": status.log,
         "last_sync": status.last_sync,
+        "relay_health": status.relay_health,
         "stream_watches": status.stream_watches,
     })
 }
 
-fn server_status(defaults: &DaemonDefaults, state: &Arc<Mutex<DaemonState>>) -> DaemonStatus {
+async fn server_status(
+    defaults: &DaemonDefaults,
+    state: &Arc<Mutex<DaemonState>>,
+    runtime: Option<&marmot_app::MarmotAppRuntime>,
+) -> DaemonStatus {
     let state = state.lock().ok();
-    let mut stream_watches = state
-        .as_ref()
-        .map(|state| state.stream_watches.values().cloned().collect::<Vec<_>>())
+    let relay_health = if let Some(runtime) = runtime {
+        let shared = runtime.shared_services();
+        Some(shared.relay_plane().relay_health().await)
+    } else {
+        None
+    };
+    let stream_watches = runtime
+        .map(|runtime| runtime.shared_services().agent_streams().reports())
         .unwrap_or_default();
-    stream_watches.sort_by(|left, right| {
-        left.started_at
-            .cmp(&right.started_at)
-            .then_with(|| left.watch_id.cmp(&right.watch_id))
-    });
     DaemonStatus {
         running: true,
         socket: defaults.socket.clone(),
@@ -2920,6 +2899,7 @@ fn server_status(defaults: &DaemonDefaults, state: &Arc<Mutex<DaemonState>>) -> 
         home: Some(defaults.home.clone()),
         log: Some(defaults.log_path.clone()),
         last_sync: state.as_ref().and_then(|state| state.last_sync.clone()),
+        relay_health,
         stream_watches,
     }
 }
