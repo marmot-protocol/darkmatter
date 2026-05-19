@@ -150,12 +150,12 @@ struct MessageRow {
 struct DaemonView {
     running: bool,
     pid: Option<u64>,
-    last_sync: Option<DaemonSyncView>,
+    last_runtime_activity: Option<DaemonRuntimeActivityView>,
     stream_watches: Vec<DaemonStreamWatchView>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DaemonSyncView {
+struct DaemonRuntimeActivityView {
     accounts: u64,
     events: u64,
     joined_groups: u64,
@@ -1727,7 +1727,9 @@ fn parse_daemon_view(value: &Value) -> DaemonView {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pid: value.get("pid").and_then(Value::as_u64),
-        last_sync: value.get("last_sync").and_then(parse_daemon_sync_view),
+        last_runtime_activity: value
+            .get("last_runtime_activity")
+            .and_then(parse_daemon_runtime_activity_view),
         stream_watches: value
             .get("stream_watches")
             .and_then(Value::as_array)
@@ -1741,8 +1743,8 @@ fn parse_daemon_view(value: &Value) -> DaemonView {
     }
 }
 
-fn parse_daemon_sync_view(value: &Value) -> Option<DaemonSyncView> {
-    Some(DaemonSyncView {
+fn parse_daemon_runtime_activity_view(value: &Value) -> Option<DaemonRuntimeActivityView> {
+    Some(DaemonRuntimeActivityView {
         accounts: value.get("accounts").and_then(Value::as_u64)?,
         events: value.get("events").and_then(Value::as_u64).unwrap_or(0),
         joined_groups: value
@@ -1778,13 +1780,13 @@ fn daemon_header_label(daemon: &DaemonView) -> String {
         .pid
         .map(|pid| format!("on pid={pid}"))
         .unwrap_or_else(|| "on".to_owned());
-    if let Some(sync) = &daemon.last_sync {
+    if let Some(activity) = &daemon.last_runtime_activity {
         label.push_str(&format!(
-            " sync={}/{}/{}",
-            sync.events, sync.joined_groups, sync.messages
+            " activity={}/{}/{}",
+            activity.events, activity.joined_groups, activity.messages
         ));
-        if sync.errors > 0 {
-            label.push_str(&format!(" errors={}", sync.errors));
+        if activity.errors > 0 {
+            label.push_str(&format!(" errors={}", activity.errors));
         }
     }
     let active_streams = daemon
@@ -1802,13 +1804,17 @@ fn daemon_status_sentence(daemon: &DaemonView) -> String {
     if !daemon.running {
         return "daemon not running".to_owned();
     }
-    let sync = daemon
-        .last_sync
+    let activity = daemon
+        .last_runtime_activity
         .as_ref()
-        .map(|sync| {
+        .map(|activity| {
             format!(
-                " last-sync accounts={} events={} joined={} messages={} errors={}",
-                sync.accounts, sync.events, sync.joined_groups, sync.messages, sync.errors
+                " last-activity accounts={} events={} joined={} messages={} errors={}",
+                activity.accounts,
+                activity.events,
+                activity.joined_groups,
+                activity.messages,
+                activity.errors
             )
         })
         .unwrap_or_default();
@@ -1818,7 +1824,7 @@ fn daemon_status_sentence(daemon: &DaemonView) -> String {
     } else {
         format!(" {streams}")
     };
-    format!("daemon running{sync}{streams}")
+    format!("daemon running{activity}{streams}")
 }
 
 fn stream_watch_status(daemon: &DaemonView) -> String {
@@ -2312,7 +2318,7 @@ mod tests {
         let daemon = parse_daemon_view(&serde_json::json!({
             "running": true,
             "pid": 1234,
-            "last_sync": {
+            "last_runtime_activity": {
                 "accounts": 2,
                 "events": 3,
                 "joined_groups": 1,
@@ -2323,11 +2329,11 @@ mod tests {
 
         assert_eq!(
             daemon_header_label(&daemon),
-            "on pid=1234 sync=3/1/4 errors=1"
+            "on pid=1234 activity=3/1/4 errors=1"
         );
         assert_eq!(
             daemon_status_sentence(&daemon),
-            "daemon running last-sync accounts=2 events=3 joined=1 messages=4 errors=1"
+            "daemon running last-activity accounts=2 events=3 joined=1 messages=4 errors=1"
         );
         assert_eq!(
             daemon_status_sentence(&parse_daemon_view(&serde_json::json!({"running": false}))),

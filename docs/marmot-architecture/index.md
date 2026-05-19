@@ -54,8 +54,8 @@ Written to be readable in 5 minutes each, shareable as a package.
     bindings.
 
 - **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
-  - **What it covers:** The planned multi-account `marmot-app` runtime, its shared Nostr relay plane, and the daemon,
-    CLI, TUI boundary.
+  - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
+    plane, and the daemon, CLI, TUI boundary.
 
 - **Doc:** [`overview/cgka-engine-quality-and-vectors.md`](./overview/cgka-engine-quality-and-vectors.md)
   - **What it covers:** Near-term engine quality target: whitenoise-rs integration, chaos coverage, scenario vectors,

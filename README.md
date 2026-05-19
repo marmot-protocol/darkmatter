@@ -90,10 +90,10 @@ Integration prototypes:
 
 - `crates/cgka-session` - account-device session wrapper over `Engine<SqliteStorage>`.
 - `crates/marmot-account` - app-core home, account records, key storage, and transport adapter orchestration.
-- `crates/marmot-app` - first non-lab app runtime bridge used by the CLI, daemon, and TUI.
+- `crates/marmot-app` - first non-lab multi-account app runtime bridge used by the CLI, daemon, and TUI.
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
 - `crates/cli` - first real CLI app surface plus `dmd` daemon and `dm tui` for Nostr-keyed accounts, keys, chats,
-  groups, messages, and background sync.
+  groups, messages, live runtime subscriptions, and diagnostic catch-up.
 
 Reference and model support:
 

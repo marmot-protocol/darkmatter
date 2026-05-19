@@ -116,7 +116,8 @@ The first slice now proves the architecture without filling in every product sur
    subscriptions.
 9. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, and redacted relay-health
    reporting.
-10. The TUI remains a daemon client.
+10. Daemon status reports `last_runtime_activity` instead of modeling the daemon as a background sync loop.
+11. The TUI remains a daemon client.
 
 The acceptance test should create Alice and Bob, create a group, receive Bob's group join, send a normal message, start
 an agent stream, receive stream deltas, and finish the stream without calling `dm sync` or publishing keys manually.
@@ -128,7 +129,8 @@ The remaining work is narrower than the original refactor, but still real:
 - directory, profile, follow-list, and KeyPackage discovery are not yet fully coalesced through a shared relay-plane
   subscription service;
 - relay auth, relay scoring, and explicit reconnect/backoff policy are still delegated mostly to `nostr-sdk`;
-- stream watch execution still lives in the CLI/daemon adapter, while runtime owns stream state and typed updates;
+- stream watch execution still lives in the CLI/daemon adapter, while runtime owns stream state and typed updates and
+  the daemon tracks watch worker lifecycle;
 - `sync` remains as a diagnostic/repair command and some internal function names still say `sync` for catch-up/replay
   work;
 - production apps still need lifecycle hooks for mobile/desktop foregrounding, backgrounding, and shutdown.

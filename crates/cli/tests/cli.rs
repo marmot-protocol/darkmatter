@@ -3108,6 +3108,8 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     assert!(status_json["result"]["pid"].as_u64().is_some());
     assert!(status_json["result"]["pid_file"].as_str().is_some());
     assert!(status_json["result"].get("sync_interval_ms").is_none());
+    assert!(status_json["result"].get("last_sync").is_none());
+    assert!(status_json["result"].get("last_runtime_activity").is_some());
 
     let created = Command::new(env!("CARGO_BIN_EXE_dm"))
         .arg("--socket")
@@ -3162,7 +3164,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
 }
 
 #[test]
-fn daemon_background_sync_updates_local_accounts() {
+fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("dmd.sock");
     let alice = create_account(home.path());
@@ -3233,7 +3235,7 @@ fn daemon_background_sync_updates_local_accounts() {
 
     assert!(
         saw_group,
-        "daemon background sync did not join Bob to the group"
+        "daemon runtime subscriptions did not join Bob to the group"
     );
 }
 

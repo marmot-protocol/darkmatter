@@ -38,29 +38,29 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
 - `keys`: list/publish/check the selected local account's KeyPackage and fetch another account's latest KeyPackage.
 - `chats`: list, show, subscribe, archive, and unarchive local chat projections.
 - `group` and `groups`: create groups, list/show groups, list members/admins/relays, invite/add/remove members, update
-  profile fields, and subscribe to daemon-owned group-state updates.
+  profile fields, and subscribe to runtime-owned group-state updates through the daemon.
 - `messages`: send text messages, list/search projected messages with Whitenoise-shaped cursor flags, and subscribe to
-  daemon-owned typed message updates.
+  runtime-owned typed message updates through the daemon.
 - `follows`, `profile`, `relays`, `settings`, and `users`: expose the current Nostr directory/settings behavior.
 - `media`, `notifications`, reaction/delete/retry message commands, and user-driven invite/admin commands: keep the
   Whitenoise-shaped command names but return `unsupported_command` until real behavior exists.
 - `stream`: anchor, watch, send, finish, and verify provisional QUIC agent text stream previews.
-- `sync`: process relay events for the selected local signing account.
+- `sync`: diagnostic catch-up for processing relay events for the selected local signing account.
 - `daemon`: start, stop, and inspect `dmd`.
 - `tui`: open the Ratatui interface over the real `dm --json` command surface.
 
 ## Daemon Guidance
 
-- Keep `dm daemon start|stop|status`, the `dmd` binary, socket-backed execution, pid/log files, and background sync
-  covered when touched.
-- `dm daemon start` should spawn `dmd` with the selected home, socket, secret store, keychain service, and daemon-owned
-  relay defaults. Keep `dm daemon start` and direct `dmd` setup flags aligned with `wnd`, including `--data-dir`,
-  `--logs-dir`, `--discovery-relays`, and `--default-account-relays`.
+- Keep `dm daemon start|stop|status`, the `dmd` binary, socket-backed execution, pid/log files, runtime subscription
+  workers, and diagnostic catch-up covered when touched.
+- `dm daemon start` should spawn `dmd` with the selected home, socket, secret store, keychain service, and
+  daemon-configured relay defaults. Keep `dm daemon start` and direct `dmd` setup flags aligned with `wnd`, including
+  `--data-dir`, `--logs-dir`, `--discovery-relays`, and `--default-account-relays`.
 - Normal commands may forward to `dmd` when a socket exists for the selected home. Daemon control commands and TUI
   startup handle daemon access directly.
-- Background sync should refresh local signing accounts and the app-level Nostr user directory.
-- Keep daemon status JSON useful for the TUI: running state, pid, socket, log path, last sync summary, and
-  background stream watch summaries.
+- Runtime subscriptions should keep local signing accounts current; explicit catch-up remains a diagnostic/repair path.
+- Keep daemon status JSON useful for the TUI: running state, pid, socket, log path, last runtime activity summary,
+  relay health, and background stream watch summaries.
 - Keep QUIC preview subscription output under `messages subscribe` as typed `stream_preview` updates. Do not introduce
   user-facing `streams subscribe` or `stream subscribe` commands for the same app-level feed.
 - Keep daemon streaming output newline-delimited and typed. Current user-facing subscription feeds are
@@ -73,7 +73,7 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
 - Keep account onboarding on top of `dm create-identity` and `dm login`; redact `nsec` import input before rendering it in the composer.
 - Keep daemon controls on top of `dm daemon start|stop|status`; live refresh should observe daemon state and avoid
   interrupting active composer input.
-- Keep TUI stream controls on top of the real `dm stream` commands. Broker watches should use daemon-owned background
+- Keep TUI stream controls on top of the real `dm stream` commands. Broker watches should use runtime-tracked daemon
   watches instead of blocking the TUI event loop.
 - Keep chat and group management on top of real CLI commands. `/chat new` is the TUI spelling for chat creation; do not
   reintroduce `/new` as a hidden compatibility alias.

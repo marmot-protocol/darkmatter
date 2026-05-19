@@ -278,6 +278,9 @@ Sync command:
 dm --account <npub-or-hex> sync
 ```
 
+`sync` is a diagnostic and repair command. Normal daemon-backed chat, group, and stream flows use runtime
+subscriptions and should not need a manual sync step.
+
 ## Daemon
 
 `dm daemon start` launches `dmd` in the background for the selected home. The daemon owns the Unix socket,
@@ -297,8 +300,9 @@ dm --account <npub-or-hex> chats list
 dm daemon stop
 ```
 
-`dm daemon status --json` includes a redacted `relay_health` object with aggregate relay counts and connection status
-buckets. It does not include relay URLs, account ids, group ids, subscription ids, or message ids.
+`dm daemon status --json` includes `last_runtime_activity` for the TUI plus a redacted `relay_health` object with
+aggregate relay counts and connection status buckets. It does not include relay URLs, account ids, group ids,
+subscription ids, or message ids.
 
 When a daemon socket exists for a home, normal `dm --home <path> ...` commands are forwarded to that
 daemon. `dm daemon status`, `dm daemon stop`, and `dm tui` handle daemon access directly.
@@ -375,8 +379,8 @@ dm tui
 ```
 
 When a daemon is running for the same home, TUI child commands use the daemon socket. The header shows daemon
-state. While the daemon is running, the TUI refreshes account, chat, and message projection data when the
-composer is idle.
+state. While the daemon is running, the TUI attaches to daemon-backed runtime subscriptions for live message, chat, and
+group-state changes, and refreshes snapshots when the composer is idle.
 
 Controls:
 
@@ -421,6 +425,7 @@ can be selected and unarchived; `/chat archived off` returns to the visible-chat
 on the selected chat and call the same group membership commands exposed by the CLI.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews
 appear as provisional preview rows in the message panel.
+`/sync` is a diagnostic escape hatch for explicit catch-up; it is not part of the normal live runtime path.
 
 ## JSON Output
 

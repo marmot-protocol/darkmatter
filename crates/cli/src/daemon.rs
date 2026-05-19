@@ -73,7 +73,7 @@ struct DaemonDefaults {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct DaemonSyncReport {
+pub struct DaemonRuntimeActivityReport {
     pub started_at: u64,
     pub finished_at: u64,
     pub accounts: usize,
@@ -96,7 +96,7 @@ pub struct DaemonStatus {
     pub started_at: Option<u64>,
     pub home: Option<PathBuf>,
     pub log: Option<PathBuf>,
-    pub last_sync: Option<DaemonSyncReport>,
+    pub last_runtime_activity: Option<DaemonRuntimeActivityReport>,
     pub relay_health: Option<marmot_app::RelayPlaneHealth>,
     pub stream_watches: Vec<DaemonStreamWatchReport>,
 }
@@ -121,13 +121,14 @@ pub struct DaemonOutgoingStreamReport {
 struct DaemonState {
     pid: u32,
     started_at: u64,
-    last_sync: Option<DaemonSyncReport>,
+    last_runtime_activity: Option<DaemonRuntimeActivityReport>,
 }
 
 #[derive(Default)]
 struct AppRuntimeHost {
     runtime: Option<marmot_app::MarmotAppRuntime>,
     bridge: Option<JoinHandle<()>>,
+    stream_watch: StreamWatchWorkers,
 }
 
 impl AppRuntimeHost {
@@ -138,25 +139,33 @@ impl AppRuntimeHost {
         if let Some(handle) = self.bridge.take() {
             handle.abort();
         }
+        self.stream_watch.abort_all();
         self.runtime = None;
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StreamWatchWorkers {
-    handles: HashMap<String, JoinHandle<()>>,
+    handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
 
 impl StreamWatchWorkers {
-    fn replace(&mut self, watch_id: String, handle: JoinHandle<()>) {
-        if let Some(previous) = self.handles.insert(watch_id, handle) {
-            previous.abort();
+    fn replace(&self, watch_id: String, handle: JoinHandle<()>) {
+        match self.handles.lock() {
+            Ok(mut handles) => {
+                if let Some(previous) = handles.insert(watch_id, handle) {
+                    previous.abort();
+                }
+            }
+            Err(_) => handle.abort(),
         }
     }
 
-    fn abort_all(&mut self) {
-        for (_, handle) in self.handles.drain() {
-            handle.abort();
+    fn abort_all(&self) {
+        if let Ok(mut handles) = self.handles.lock() {
+            for (_, handle) in handles.drain() {
+                handle.abort();
+            }
         }
     }
 }
@@ -193,14 +202,12 @@ impl StreamComposeWorkers {
 #[derive(Default)]
 struct DaemonWorkers {
     runtime: AppRuntimeHost,
-    stream_watch: StreamWatchWorkers,
     stream_compose: StreamComposeWorkers,
 }
 
 impl DaemonWorkers {
     async fn abort_all(&mut self) {
         self.runtime.abort_all().await;
-        self.stream_watch.abort_all();
         self.stream_compose.abort_all();
     }
 }
@@ -565,7 +572,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     let state = Arc::new(Mutex::new(DaemonState {
         pid: std::process::id(),
         started_at: unix_now(),
-        last_sync: None,
+        last_runtime_activity: None,
     }));
     let events = DaemonEventHub::new();
     let mut workers = DaemonWorkers::default();
@@ -709,7 +716,7 @@ async fn handle_connection(
             let output = start_stream_watch(
                 *cli,
                 workers.runtime.runtime.as_ref(),
-                &mut workers.stream_watch,
+                &workers.runtime.stream_watch,
             );
             (false, output)
         }
@@ -1464,7 +1471,7 @@ async fn write_stream_end(stream: &mut UnixStream) -> bool {
 fn start_stream_watch(
     cli: Cli,
     runtime: Option<&marmot_app::MarmotAppRuntime>,
-    workers: &mut StreamWatchWorkers,
+    workers: &StreamWatchWorkers,
 ) -> CliOutput {
     let json = cli.json;
     let Some(runtime) = runtime else {
@@ -2311,7 +2318,7 @@ async fn refresh_app_runtime(
                 if let Some(runtime) = &host.runtime
                     && let Err(err) = runtime.restart_account(&account_id).await
                 {
-                    record_sync_error(&state, err.to_string());
+                    record_runtime_activity_error(&state, err.to_string());
                 }
             } else {
                 reconcile_app_runtime(defaults, state, events, host).await;
@@ -2322,7 +2329,7 @@ async fn refresh_app_runtime(
             if let Some(runtime) = &host.runtime
                 && let Err(err) = runtime.catch_up_accounts().await
             {
-                record_sync_error(&state, err.to_string());
+                record_runtime_activity_error(&state, err.to_string());
             }
         }
     }
@@ -2355,19 +2362,20 @@ async fn reconcile_app_runtime(
         let runtime = match open_app_runtime(defaults) {
             Ok(runtime) => runtime,
             Err(err) => {
-                record_sync_error(&state, err.to_string());
+                record_runtime_activity_error(&state, err.to_string());
                 return;
             }
         };
         let receiver = runtime.subscribe();
         if let Err(err) = runtime.start().await {
-            record_sync_error(&state, err.to_string());
+            record_runtime_activity_error(&state, err.to_string());
             return;
         }
         host.bridge = Some(spawn_app_runtime_bridge(
             defaults.clone(),
             state.clone(),
             events.clone(),
+            host.stream_watch.clone(),
             runtime.shared_services().agent_streams(),
             receiver,
         ));
@@ -2377,7 +2385,7 @@ async fn reconcile_app_runtime(
 
     if let Some(runtime) = &host.runtime {
         if let Err(err) = runtime.reconcile_accounts().await {
-            record_sync_error(&state, err.to_string());
+            record_runtime_activity_error(&state, err.to_string());
         }
         if host
             .bridge
@@ -2388,6 +2396,7 @@ async fn reconcile_app_runtime(
                 defaults.clone(),
                 state,
                 events,
+                host.stream_watch.clone(),
                 runtime.shared_services().agent_streams(),
                 runtime.subscribe(),
             ));
@@ -2409,6 +2418,7 @@ fn spawn_app_runtime_bridge(
     defaults: DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
+    stream_workers: StreamWatchWorkers,
     stream_manager: marmot_app::AgentStreamWatchManager,
     mut receiver: broadcast::Receiver<marmot_app::MarmotAppEvent>,
 ) -> JoinHandle<()> {
@@ -2420,13 +2430,14 @@ fn spawn_app_runtime_bridge(
                         &defaults,
                         state.clone(),
                         events.clone(),
+                        stream_workers.clone(),
                         stream_manager.clone(),
                         event,
                     )
                     .await;
                 }
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    record_sync_error(
+                    record_runtime_activity_error(
                         &state,
                         format!("app runtime event stream lagged: {count} updates dropped"),
                     );
@@ -2441,6 +2452,7 @@ async fn handle_app_runtime_event(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
+    stream_workers: StreamWatchWorkers,
     stream_manager: marmot_app::AgentStreamWatchManager,
     event: marmot_app::MarmotAppEvent,
 ) {
@@ -2451,7 +2463,10 @@ async fn handle_app_runtime_event(
                 joined_groups: vec![group_id],
                 ..marmot_app::SyncSummary::default()
             };
-            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+            record_runtime_activity_report(
+                &state,
+                runtime_activity_report_from_summary(started_at, 1, &summary),
+            );
         }
         marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
         marmot_app::MarmotAppEvent::MessageReceived(message) => {
@@ -2466,7 +2481,10 @@ async fn handle_app_runtime_event(
                     messages: vec![message.message],
                     ..marmot_app::SyncSummary::default()
                 };
-                record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+                record_runtime_activity_report(
+                    &state,
+                    runtime_activity_report_from_summary(started_at, 1, &summary),
+                );
             }
         }
         marmot_app::MarmotAppEvent::AgentStreamStarted(message) => {
@@ -2482,10 +2500,14 @@ async fn handle_app_runtime_event(
                 defaults,
                 &message.account_id_hex,
                 &summary,
+                stream_workers,
                 stream_manager,
             )
             .await;
-            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+            record_runtime_activity_report(
+                &state,
+                runtime_activity_report_from_summary(started_at, 1, &summary),
+            );
         }
         marmot_app::MarmotAppEvent::AgentStreamFinalized(message) => {
             events.publish_message(message_stream_response(
@@ -2496,17 +2518,23 @@ async fn handle_app_runtime_event(
                 messages: vec![message.message],
                 ..marmot_app::SyncSummary::default()
             };
-            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+            record_runtime_activity_report(
+                &state,
+                runtime_activity_report_from_summary(started_at, 1, &summary),
+            );
         }
         marmot_app::MarmotAppEvent::GroupEvent(group_event) => {
             let summary = marmot_app::SyncSummary {
                 events: vec![group_event.event],
                 ..marmot_app::SyncSummary::default()
             };
-            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+            record_runtime_activity_report(
+                &state,
+                runtime_activity_report_from_summary(started_at, 1, &summary),
+            );
         }
         marmot_app::MarmotAppEvent::AccountError(error) => {
-            record_sync_error(
+            record_runtime_activity_error(
                 &state,
                 format!(
                     "app runtime account {} failed: {}",
@@ -2541,6 +2569,7 @@ async fn auto_watch_agent_stream_starts(
     defaults: &DaemonDefaults,
     account_id: &str,
     summary: &marmot_app::SyncSummary,
+    stream_workers: StreamWatchWorkers,
     stream_manager: marmot_app::AgentStreamWatchManager,
 ) {
     for message in &summary.messages {
@@ -2581,12 +2610,14 @@ async fn auto_watch_agent_stream_starts(
                 },
             },
         };
-        let _ = spawn_stream_watch(cli, stream_manager.clone());
+        if let Ok((report, handle)) = spawn_stream_watch(cli, stream_manager.clone()) {
+            stream_workers.replace(report.watch_id, handle);
+        }
     }
 }
 
-fn empty_sync_report(started_at: u64) -> DaemonSyncReport {
-    DaemonSyncReport {
+fn empty_runtime_activity_report(started_at: u64) -> DaemonRuntimeActivityReport {
+    DaemonRuntimeActivityReport {
         started_at,
         finished_at: started_at,
         accounts: 0,
@@ -2600,12 +2631,12 @@ fn empty_sync_report(started_at: u64) -> DaemonSyncReport {
     }
 }
 
-fn sync_report_from_summary(
+fn runtime_activity_report_from_summary(
     started_at: u64,
     accounts: usize,
     summary: &marmot_app::SyncSummary,
-) -> DaemonSyncReport {
-    let mut report = empty_sync_report(started_at);
+) -> DaemonRuntimeActivityReport {
+    let mut report = empty_runtime_activity_report(started_at);
     report.finished_at = unix_now();
     report.accounts = accounts;
     report.events = summary.events.len();
@@ -2614,17 +2645,20 @@ fn sync_report_from_summary(
     report
 }
 
-fn record_sync_error(state: &Arc<Mutex<DaemonState>>, error: String) {
+fn record_runtime_activity_error(state: &Arc<Mutex<DaemonState>>, error: String) {
     let started_at = unix_now();
-    let mut report = empty_sync_report(started_at);
+    let mut report = empty_runtime_activity_report(started_at);
     report.finished_at = unix_now();
     report.errors.push(error);
-    record_sync_report(state, report);
+    record_runtime_activity_report(state, report);
 }
 
-fn record_sync_report(state: &Arc<Mutex<DaemonState>>, report: DaemonSyncReport) {
+fn record_runtime_activity_report(
+    state: &Arc<Mutex<DaemonState>>,
+    report: DaemonRuntimeActivityReport,
+) {
     if let Ok(mut state) = state.lock() {
-        state.last_sync = Some(report);
+        state.last_runtime_activity = Some(report);
     }
 }
 
@@ -2823,7 +2857,7 @@ async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
                 started_at: None,
                 log: home.as_deref().map(default_log_path),
                 home,
-                last_sync: None,
+                last_runtime_activity: None,
                 relay_health: None,
                 stream_watches: Vec::new(),
             }
@@ -2868,7 +2902,7 @@ fn daemon_status_json(status: DaemonStatus) -> serde_json::Value {
         "started_at": status.started_at,
         "home": status.home,
         "log": status.log,
-        "last_sync": status.last_sync,
+        "last_runtime_activity": status.last_runtime_activity,
         "relay_health": status.relay_health,
         "stream_watches": status.stream_watches,
     })
@@ -2898,7 +2932,9 @@ async fn server_status(
         started_at: state.as_ref().map(|state| state.started_at),
         home: Some(defaults.home.clone()),
         log: Some(defaults.log_path.clone()),
-        last_sync: state.as_ref().and_then(|state| state.last_sync.clone()),
+        last_runtime_activity: state
+            .as_ref()
+            .and_then(|state| state.last_runtime_activity.clone()),
         relay_health,
         stream_watches,
     }
