@@ -22,6 +22,7 @@ use cgka_traits::{
     TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use transport_nostr_peeler::{NOSTR_SOURCE, NostrTransportEvent};
 
@@ -42,7 +43,6 @@ pub use relay_list::{
 pub use sdk_client::{NostrSdkRelayClient, NostrSdkSubscriptionPlan};
 
 const DELIVERY_BUFFER: usize = 1024;
-
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrSubscription {
@@ -61,6 +61,40 @@ pub enum NostrSubscription {
 }
 
 impl NostrSubscription {
+    pub fn subscription_id(&self) -> String {
+        match self {
+            Self::AccountInbox {
+                account_id,
+                endpoints,
+                ..
+            } => compact_subscription_id(
+                "inbox",
+                &[
+                    account_id.as_slice(),
+                    endpoint_set_digest(endpoints).as_bytes(),
+                ],
+            ),
+            Self::Group {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+                ..
+            } => {
+                let h_tag = hex::encode(transport_group_id);
+                compact_subscription_id(
+                    "group",
+                    &[
+                        account_id.as_slice(),
+                        group_id.as_slice(),
+                        h_tag.as_bytes(),
+                        endpoint_set_digest(endpoints).as_bytes(),
+                    ],
+                )
+            }
+        }
+    }
+
     fn route_key(&self) -> NostrSubscriptionRouteKey {
         match self {
             Self::AccountInbox {
@@ -377,8 +411,7 @@ impl TransportAdapter for NostrTransportAdapter {
         );
         self.relay_client.unsubscribe_account(account_id).await?;
         let mut state = self.state.write().await;
-        state.accounts.remove(account_id);
-        state.metrics.subscriptions_removed += removed_count;
+        state.deactivate(account_id, removed_count);
         Ok(())
     }
 
@@ -484,6 +517,11 @@ impl AdapterState {
             self.metrics.subscriptions_created += created;
             self.metrics.subscriptions_removed += removed;
         }
+    }
+
+    fn deactivate(&mut self, account_id: &MemberId, removed_count: usize) {
+        self.accounts.remove(account_id);
+        self.metrics.subscriptions_removed += removed_count;
     }
 
     fn record_inbound_event(&mut self, delivered: usize) {
@@ -607,4 +645,35 @@ fn normalized_endpoints(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoin
     endpoints.sort();
     endpoints.dedup();
     endpoints
+}
+
+fn endpoint_set_digest(endpoints: &[TransportEndpoint]) -> String {
+    let mut values = endpoints
+        .iter()
+        .map(TransportEndpoint::as_str)
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn compact_subscription_id(kind: &str, components: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, kind.as_bytes());
+    for component in components {
+        hash_component(&mut hasher, component);
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("marmot:{kind}:{}", &digest[..32])
+}
+
+fn hash_component(hasher: &mut Sha256, component: &[u8]) {
+    hasher.update((component.len() as u64).to_be_bytes());
+    hasher.update(component);
 }

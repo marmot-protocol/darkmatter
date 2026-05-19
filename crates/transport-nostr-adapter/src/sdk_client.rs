@@ -12,7 +12,6 @@ use nostr_sdk::prelude::{
     RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, Tag, TagKind,
     Timestamp as NostrTimestamp,
 };
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -147,20 +146,17 @@ impl NostrSdkRelayClient {
                 if let Some(since) = since {
                     filter = filter.since(NostrTimestamp::from_secs(since.0));
                 }
-                let endpoint_digest = endpoint_set_digest(endpoints);
+                let subscription_id = SubscriptionId::new(subscription.subscription_id());
                 Ok(NostrSdkSubscriptionPlan {
                     account_id: account_id.clone(),
-                    subscription_id: compact_subscription_id(
-                        "inbox",
-                        &[account_id.as_slice(), endpoint_digest.as_bytes()],
-                    ),
+                    subscription_id,
                     endpoints: parse_endpoints(endpoints, "account inbox subscription")?,
                     filter,
                 })
             }
             NostrSubscription::Group {
                 account_id,
-                group_id,
+                group_id: _,
                 transport_group_id,
                 endpoints,
                 since,
@@ -172,18 +168,10 @@ impl NostrSdkRelayClient {
                 if let Some(since) = since {
                     filter = filter.since(NostrTimestamp::from_secs(since.0));
                 }
-                let endpoint_digest = endpoint_set_digest(endpoints);
+                let subscription_id = SubscriptionId::new(subscription.subscription_id());
                 Ok(NostrSdkSubscriptionPlan {
                     account_id: account_id.clone(),
-                    subscription_id: compact_subscription_id(
-                        "group",
-                        &[
-                            account_id.as_slice(),
-                            group_id.as_slice(),
-                            h_tag.as_bytes(),
-                            endpoint_digest.as_bytes(),
-                        ],
-                    ),
+                    subscription_id,
                     endpoints: parse_endpoints(endpoints, "group subscription")?,
                     filter,
                 })
@@ -419,37 +407,6 @@ fn nostr_tag_from_vec(values: &[String]) -> Result<Tag, TransportAdapterError> {
     ))
 }
 
-fn endpoint_set_digest(endpoints: &[TransportEndpoint]) -> String {
-    let mut values = endpoints
-        .iter()
-        .map(TransportEndpoint::as_str)
-        .collect::<Vec<_>>();
-    values.sort_unstable();
-    values.dedup();
-
-    let mut hasher = Sha256::new();
-    for value in values {
-        hasher.update(value.len().to_be_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hex::encode(hasher.finalize())
-}
-
-fn compact_subscription_id(kind: &str, components: &[&[u8]]) -> SubscriptionId {
-    let mut hasher = Sha256::new();
-    hash_component(&mut hasher, kind.as_bytes());
-    for component in components {
-        hash_component(&mut hasher, component);
-    }
-    let digest = hex::encode(hasher.finalize());
-    SubscriptionId::new(format!("marmot:{kind}:{}", &digest[..32]))
-}
-
-fn hash_component(hasher: &mut Sha256, component: &[u8]) {
-    hasher.update((component.len() as u64).to_be_bytes());
-    hasher.update(component);
-}
-
 trait PushUnique<T> {
     fn push_unique(&mut self, value: T);
 }
@@ -478,26 +435,16 @@ mod tests {
         let transport_group_id = vec![0xC3; 32];
         let endpoint = TransportEndpoint("wss://group.example".into());
 
-        let plan = NostrSdkRelayClient::plan_subscription(&NostrSubscription::Group {
+        let subscription = NostrSubscription::Group {
             account_id: account_id.clone(),
             group_id: group_id.clone(),
             transport_group_id: transport_group_id.clone(),
             endpoints: vec![endpoint.clone()],
             since: Some(Timestamp(1_700_000_000)),
-        })
-        .expect("plan");
+        };
+        let expected_subscription_id = SubscriptionId::new(subscription.subscription_id());
+        let plan = NostrSdkRelayClient::plan_subscription(&subscription).expect("plan");
 
-        let h_tag = hex::encode(&transport_group_id);
-        let endpoint_digest = endpoint_set_digest(std::slice::from_ref(&endpoint));
-        let expected_subscription_id = compact_subscription_id(
-            "group",
-            &[
-                account_id.as_slice(),
-                group_id.as_slice(),
-                h_tag.as_bytes(),
-                endpoint_digest.as_bytes(),
-            ],
-        );
         assert_eq!(plan.account_id, account_id);
         assert_eq!(plan.endpoints[0].to_string(), endpoint.0);
         assert_eq!(plan.subscription_id, expected_subscription_id);
@@ -522,18 +469,14 @@ mod tests {
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
         let endpoint = TransportEndpoint("wss://inbox.example".into());
 
-        let plan = NostrSdkRelayClient::plan_subscription(&NostrSubscription::AccountInbox {
+        let subscription = NostrSubscription::AccountInbox {
             account_id: account_id.clone(),
             endpoints: vec![endpoint.clone()],
             since: None,
-        })
-        .expect("plan");
+        };
+        let expected_subscription_id = SubscriptionId::new(subscription.subscription_id());
+        let plan = NostrSdkRelayClient::plan_subscription(&subscription).expect("plan");
 
-        let endpoint_digest = endpoint_set_digest(std::slice::from_ref(&endpoint));
-        let expected_subscription_id = compact_subscription_id(
-            "inbox",
-            &[account_id.as_slice(), endpoint_digest.as_bytes()],
-        );
         assert_eq!(plan.account_id, account_id);
         assert_eq!(plan.endpoints[0].to_string(), endpoint.0);
         assert_eq!(plan.subscription_id, expected_subscription_id);

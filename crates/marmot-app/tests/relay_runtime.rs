@@ -2,10 +2,12 @@ use cgka_traits::TransportEndpoint;
 use cgka_traits::{MarmotAppMessagePayloadV1, MarmotMediaReferenceV1, MarmotReactionActionV1};
 use marmot_account::AccountHome;
 use marmot_app::{
-    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, MarmotApp, UserDirectorySearch,
-    UserProfileMetadata,
+    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, AccountSetupRequest,
+    AppMessageQuery, MarmotApp, MarmotAppEvent, MarmotAppRuntime, RuntimeMessageUpdate,
+    UserDirectorySearch, UserProfileMetadata,
 };
 use nostr_relay_builder::MockRelay;
+use tokio::time::{Duration, timeout};
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -21,6 +23,401 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
 
 fn endpoint(url: &str) -> TransportEndpoint {
     TransportEndpoint(url.to_owned())
+}
+
+#[tokio::test]
+async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(created.account.local_signing);
+    assert!(created.relay_lists.complete);
+    assert!(created.key_package_bytes.is_some_and(|bytes| bytes > 0));
+    let directory_entry = app
+        .directory_entry_for_account_id(&created.account.account_id_hex)
+        .unwrap()
+        .expect("directory entry");
+    let profile = directory_entry.profile.expect("created identity profile");
+    assert_eq!(
+        profile.name,
+        Some(format!("marmot_{}", &created.account.account_id_hex[..8]))
+    );
+    assert!(profile.display_name.is_some());
+    assert_eq!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .into_iter()
+            .filter(|account| account.account_id_hex == created.account.account_id_hex)
+            .count(),
+        1
+    );
+
+    let fetched = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.key_package.0.len(),
+        created.key_package_bytes.unwrap()
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "runtime intents",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"hello through runtime intents".to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "hello through runtime intents"
+        )
+    })
+    .await;
+
+    let stream_id = [0x44; 32];
+    runtime
+        .start_agent_text_stream(
+            &alice.account.account_id_hex,
+            &group_id,
+            &stream_id,
+            123,
+            vec!["quic://127.0.0.1:4450".to_owned()],
+        )
+        .await
+        .unwrap();
+    let stream_event = wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::AgentStreamStarted(stream)
+                if stream.account_id_hex == bob_id
+                    && stream.message.group_id == group_id
+                    && stream.payload.kind() == "start"
+                    && stream.payload.stream_id() == hex::encode(stream_id)
+        )
+    })
+    .await;
+    assert!(matches!(
+        stream_event,
+        MarmotAppEvent::AgentStreamStarted(_)
+    ));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob_setup = app.client("bob").await.unwrap();
+    bob_setup.publish_key_package().await.unwrap();
+    drop(bob_setup);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    runtime.start().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("live", &["bob"]).await.unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    alice
+        .send(&group_id, b"hello through the app runtime")
+        .await
+        .unwrap();
+    let received = wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "hello through the app runtime"
+        )
+    })
+    .await;
+
+    assert!(matches!(received, MarmotAppEvent::MessageReceived(_)));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "message subscriptions",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"already projected".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut subscription = runtime
+        .subscribe_messages(
+            &bob.account.account_id_hex,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+    assert_eq!(subscription.snapshot.len(), 1);
+    assert_eq!(subscription.snapshot[0].plaintext, "already projected");
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"live through runtime subscription".to_vec(),
+        )
+        .await
+        .unwrap();
+    let update = wait_for_message_update(&mut subscription, |update| {
+        matches!(
+            update,
+            RuntimeMessageUpdate::Message(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "live through runtime subscription"
+        )
+    })
+    .await;
+    assert!(matches!(update, RuntimeMessageUpdate::Message(_)));
+
+    runtime.shutdown().await;
+}
+
+async fn wait_for_event<F>(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    mut matches_event: F,
+) -> MarmotAppEvent
+where
+    F: FnMut(&MarmotAppEvent) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches_event(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("runtime event")
+}
+
+async fn wait_for_message_update<F>(
+    subscription: &mut marmot_app::RuntimeMessagesSubscription,
+    mut matches_update: F,
+) -> RuntimeMessageUpdate
+where
+    F: FnMut(&RuntimeMessageUpdate) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("message update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime message update")
+}
+
+#[tokio::test]
+async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+
+    let mut bob_chats = runtime
+        .subscribe_chats(&bob.account.account_id_hex, false)
+        .unwrap();
+    assert!(bob_chats.snapshot.is_empty());
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "runtime chats",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let chat = wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
+    assert_eq!(chat.profile.name, "runtime chats");
+
+    let mut group_state = runtime
+        .subscribe_group_state(&bob.account.account_id_hex, &group_id_hex)
+        .unwrap();
+    assert_eq!(group_state.snapshot.group_id_hex, group_id_hex);
+
+    runtime
+        .update_group_profile(
+            &alice.account.account_id_hex,
+            &group_id,
+            Some("renamed runtime chat".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let updated = wait_for_group_state_update(&mut group_state, |group| {
+        group.profile.name == "renamed runtime chat"
+    })
+    .await;
+    assert_eq!(updated.group_id_hex, group_id_hex);
+
+    runtime.shutdown().await;
+}
+
+async fn wait_for_chat_update<F>(
+    subscription: &mut marmot_app::RuntimeChatsSubscription,
+    mut matches_update: F,
+) -> marmot_app::AppGroupRecord
+where
+    F: FnMut(&marmot_app::AppGroupRecord) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("chat update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime chat update")
+}
+
+async fn wait_for_group_state_update<F>(
+    subscription: &mut marmot_app::RuntimeGroupStateSubscription,
+    mut matches_update: F,
+) -> marmot_app::AppGroupRecord
+where
+    F: FnMut(&marmot_app::AppGroupRecord) -> bool,
+{
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = subscription.recv().await.expect("group state update");
+            if matches_update(&update) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("runtime group state update")
 }
 
 #[tokio::test]

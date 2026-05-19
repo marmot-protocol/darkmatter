@@ -39,7 +39,8 @@ impl AccountProjectionDb {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS account_state (
                 label TEXT PRIMARY KEY NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                last_transport_timestamp INTEGER
             );
             CREATE TABLE IF NOT EXISTS seen_events (
                 event_id TEXT PRIMARY KEY NOT NULL,
@@ -125,6 +126,12 @@ impl AccountProjectionDb {
         )?;
         ensure_column(&conn, "messages", "recorded_at", "INTEGER")?;
         ensure_column(&conn, "messages", "app_message_json", "TEXT")?;
+        ensure_column(
+            &conn,
+            "account_state",
+            "last_transport_timestamp",
+            "INTEGER",
+        )?;
         Ok(Self { conn })
     }
 
@@ -140,6 +147,14 @@ impl AccountProjectionDb {
 
     pub(crate) fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account(label)?;
+        let last_transport_timestamp = self
+            .conn
+            .query_row(
+                "SELECT last_transport_timestamp FROM account_state WHERE label = ?1",
+                params![label],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .and_then(|value| u64::try_from(value).ok());
         let mut seen_statement = self.conn.prepare(
             "SELECT event_id FROM seen_events
              ORDER BY seen_at, event_id",
@@ -215,6 +230,7 @@ impl AccountProjectionDb {
         Ok(AccountState {
             label: label.to_owned(),
             seen_events,
+            last_transport_timestamp,
             groups,
         })
     }
@@ -222,10 +238,18 @@ impl AccountProjectionDb {
     pub(crate) fn save_state(&mut self, state: &AccountState) -> Result<(), AppError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO account_state (label, updated_at)
-             VALUES (?1, ?2)
-             ON CONFLICT(label) DO NOTHING",
-            params![&state.label, unix_now_seconds() as i64],
+            "INSERT INTO account_state (label, updated_at, last_transport_timestamp)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(label) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                last_transport_timestamp = excluded.last_transport_timestamp",
+            params![
+                &state.label,
+                unix_now_seconds() as i64,
+                state
+                    .last_transport_timestamp
+                    .and_then(|value| i64::try_from(value).ok()),
+            ],
         )?;
 
         for event_id in &state.seen_events {
@@ -552,6 +576,7 @@ mod tests {
         let original = AccountState {
             label: "alice".to_owned(),
             seen_events: vec!["event-before".to_owned()],
+            last_transport_timestamp: Some(1_700_000_001),
             groups: vec![AppGroupRecord::new(
                 "aa".to_owned(),
                 test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
@@ -576,6 +601,7 @@ mod tests {
         let updated = AccountState {
             label: "alice".to_owned(),
             seen_events: vec!["event-after".to_owned()],
+            last_transport_timestamp: Some(1_700_000_002),
             groups: vec![AppGroupRecord::new(
                 "bb".to_owned(),
                 test_routing([0xBB; 32], "ws://127.0.0.1:18081"),
@@ -590,6 +616,10 @@ mod tests {
 
         let restored = db.load_state("alice").unwrap();
         assert_eq!(restored.seen_events, original.seen_events);
+        assert_eq!(
+            restored.last_transport_timestamp,
+            original.last_transport_timestamp
+        );
         assert_eq!(restored.groups[0].group_id_hex, "aa");
         assert_eq!(restored.groups[0].profile.name, "before");
     }
@@ -612,6 +642,7 @@ mod tests {
         let state = AccountState {
             label: "alice".to_owned(),
             seen_events: Vec::new(),
+            last_transport_timestamp: Some(1_700_000_003),
             groups: vec![group],
         };
 
@@ -619,6 +650,7 @@ mod tests {
         let restored = db.load_state("alice").unwrap();
 
         assert!(restored.groups[0].agent_text_stream.required);
+        assert_eq!(restored.last_transport_timestamp, Some(1_700_000_003));
         assert_eq!(
             restored.groups[0].agent_text_stream.data_hex,
             "0103020200001000000000000000"

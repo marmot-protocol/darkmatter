@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
 use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
 
 const DAEMON_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonClientError {
@@ -138,21 +139,20 @@ struct DaemonState {
 }
 
 #[derive(Default)]
-struct LiveSyncWorkers {
-    handles: HashMap<String, JoinHandle<()>>,
+struct AppRuntimeHost {
+    runtime: Option<marmot_app::MarmotAppRuntime>,
+    bridge: Option<JoinHandle<()>>,
 }
 
-impl LiveSyncWorkers {
-    fn abort_account(&mut self, account_id: &str) {
-        if let Some(handle) = self.handles.remove(account_id) {
+impl AppRuntimeHost {
+    async fn abort_all(&mut self) {
+        if let Some(runtime) = &self.runtime {
+            runtime.shutdown().await;
+        }
+        if let Some(handle) = self.bridge.take() {
             handle.abort();
         }
-    }
-
-    fn abort_all(&mut self) {
-        for (_, handle) in self.handles.drain() {
-            handle.abort();
-        }
+        self.runtime = None;
     }
 }
 
@@ -206,14 +206,14 @@ impl StreamComposeWorkers {
 
 #[derive(Default)]
 struct DaemonWorkers {
-    live: LiveSyncWorkers,
+    runtime: AppRuntimeHost,
     stream_watch: StreamWatchWorkers,
     stream_compose: StreamComposeWorkers,
 }
 
 impl DaemonWorkers {
-    fn abort_all(&mut self) {
-        self.live.abort_all();
+    async fn abort_all(&mut self) {
+        self.runtime.abort_all().await;
         self.stream_watch.abort_all();
         self.stream_compose.abort_all();
     }
@@ -285,12 +285,16 @@ impl DaemonStreamResponse {
 #[derive(Clone)]
 struct DaemonEventHub {
     messages: broadcast::Sender<DaemonStreamResponse>,
+    recent_messages: Arc<Mutex<VecDeque<DaemonStreamResponse>>>,
 }
 
 impl DaemonEventHub {
     fn new() -> Self {
         let (messages, _) = broadcast::channel(1024);
-        Self { messages }
+        Self {
+            messages,
+            recent_messages: Arc::new(Mutex::new(VecDeque::new())),
+        }
     }
 
     fn subscribe_messages(&self) -> broadcast::Receiver<DaemonStreamResponse> {
@@ -298,7 +302,20 @@ impl DaemonEventHub {
     }
 
     fn publish_message(&self, response: DaemonStreamResponse) {
+        if let Ok(mut recent) = self.recent_messages.lock() {
+            recent.push_back(response.clone());
+            while recent.len() > DAEMON_EVENT_REPLAY_LIMIT {
+                recent.pop_front();
+            }
+        }
         let _ = self.messages.send(response);
+    }
+
+    fn recent_messages(&self) -> Vec<DaemonStreamResponse> {
+        self.recent_messages
+            .lock()
+            .map(|recent| recent.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -567,7 +584,13 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     }));
     let events = DaemonEventHub::new();
     let mut workers = DaemonWorkers::default();
-    reconcile_live_sync_workers(&defaults, state.clone(), events.clone(), &mut workers.live).await;
+    reconcile_app_runtime(
+        &defaults,
+        state.clone(),
+        events.clone(),
+        &mut workers.runtime,
+    )
+    .await;
     let mut maintenance_tick = tokio::time::interval(defaults.maintenance_interval);
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -579,23 +602,49 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 match request {
                     DaemonRequest::MessagesSubscribe { mut cli } => {
                         apply_defaults(&mut cli, &defaults);
+                        reconcile_app_runtime(
+                            &defaults,
+                            state.clone(),
+                            events.clone(),
+                            &mut workers.runtime,
+                        )
+                        .await;
                         let defaults = defaults.clone();
                         let state = state.clone();
                         let events = events.clone();
+                        let runtime = workers.runtime.runtime.clone();
                         tokio::spawn(async move {
-                            let _ = handle_messages_subscription(&mut stream, &defaults, state, events, *cli).await;
+                            let _ = handle_messages_subscription(&mut stream, &defaults, state, events, runtime, *cli).await;
                         });
                     }
                     DaemonRequest::ChatsSubscribe { mut cli } => {
                         apply_defaults(&mut cli, &defaults);
+                        reconcile_app_runtime(
+                            &defaults,
+                            state.clone(),
+                            events.clone(),
+                            &mut workers.runtime,
+                        )
+                        .await;
+                        let defaults = defaults.clone();
+                        let runtime = workers.runtime.runtime.clone();
                         tokio::spawn(async move {
-                            let _ = handle_chats_subscription(&mut stream, *cli).await;
+                            let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
                         });
                     }
                     DaemonRequest::GroupStateSubscribe { mut cli } => {
                         apply_defaults(&mut cli, &defaults);
+                        reconcile_app_runtime(
+                            &defaults,
+                            state.clone(),
+                            events.clone(),
+                            &mut workers.runtime,
+                        )
+                        .await;
+                        let defaults = defaults.clone();
+                        let runtime = workers.runtime.runtime.clone();
                         tokio::spawn(async move {
-                            let _ = handle_group_state_subscription(&mut stream, *cli).await;
+                            let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
                         });
                     }
                     request => {
@@ -616,12 +665,12 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 }
             }
             _ = maintenance_tick.tick() => {
-                reconcile_live_sync_workers(&defaults, state.clone(), events.clone(), &mut workers.live).await;
+                reconcile_app_runtime(&defaults, state.clone(), events.clone(), &mut workers.runtime).await;
             }
         }
     };
 
-    workers.abort_all();
+    workers.abort_all().await;
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(&pid_path);
     shutdown_result
@@ -705,11 +754,11 @@ async fn handle_connection(
                     .await
             {
                 if output.code == 0 {
-                    refresh_live_sync_workers(
+                    refresh_app_runtime(
                         defaults,
                         state.clone(),
                         events.clone(),
-                        &mut workers.live,
+                        &mut workers.runtime,
                         stream_compose_refresh,
                     )
                     .await;
@@ -722,14 +771,48 @@ async fn handle_connection(
                     Ok(false)
                 };
             }
-            let refresh = live_sync_refresh_after_execute(&cli);
+            let refresh = app_runtime_refresh_after_execute(&cli);
+            if let Some(output) = handle_app_runtime_account_setup_request(
+                &cli,
+                defaults,
+                state.clone(),
+                events.clone(),
+                &mut workers.runtime,
+            )
+            .await
+            {
+                return {
+                    let mut response = serde_json::to_vec(&output)?;
+                    response.push(b'\n');
+                    stream.write_all(&response).await?;
+                    stream.shutdown().await?;
+                    Ok(false)
+                };
+            }
+            if let Some(output) = handle_app_runtime_command_request(
+                &cli,
+                defaults,
+                state.clone(),
+                events.clone(),
+                &mut workers.runtime,
+            )
+            .await
+            {
+                return {
+                    let mut response = serde_json::to_vec(&output)?;
+                    response.push(b'\n');
+                    stream.write_all(&response).await?;
+                    stream.shutdown().await?;
+                    Ok(false)
+                };
+            }
             let output = crate::run_cli_local(*cli).await;
             if output.code == 0 {
-                refresh_live_sync_workers(
+                refresh_app_runtime(
                     defaults,
                     state.clone(),
                     events.clone(),
-                    &mut workers.live,
+                    &mut workers.runtime,
                     refresh,
                 )
                 .await;
@@ -759,9 +842,10 @@ async fn read_daemon_request(
 
 async fn handle_messages_subscription(
     stream: &mut UnixStream,
-    _defaults: &DaemonDefaults,
+    defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
+    runtime: Option<marmot_app::MarmotAppRuntime>,
     cli: Cli,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (group_id, limit) = match messages_subscribe_args(&cli) {
@@ -772,44 +856,96 @@ async fn handle_messages_subscription(
             return Ok(());
         }
     };
-    let mut seen_messages = HashSet::new();
-    let mut seen_stream_previews = HashSet::new();
-
-    match load_messages_snapshot(&cli, &group_id, limit).await {
-        Ok(messages) => {
-            for message in messages {
-                let Some(message_id) = message
-                    .get("message_id")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-                seen_messages.insert(message_id.to_owned());
-                let response = message_stream_response(message, "InitialMessage");
-                if !write_stream_response(stream, &response).await {
-                    return Ok(());
-                }
-            }
-        }
+    let account_ref = match daemon_account_ref(defaults, &cli) {
+        Ok(account_ref) => account_ref,
         Err(message) => {
             let _ = write_stream_response(stream, &DaemonStreamResponse::err(message)).await;
             let _ = write_stream_end(stream).await;
             return Ok(());
         }
+    };
+    let Some(runtime) = runtime else {
+        let _ = write_stream_response(
+            stream,
+            &DaemonStreamResponse::err("app runtime is not running".to_owned()),
+        )
+        .await;
+        let _ = write_stream_end(stream).await;
+        return Ok(());
+    };
+    let mut runtime_subscription = match runtime.subscribe_messages(
+        &account_ref,
+        marmot_app::AppMessageQuery {
+            group_id_hex: Some(group_id.clone()),
+            limit,
+        },
+    ) {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let _ =
+                write_stream_response(stream, &DaemonStreamResponse::err(err.to_string())).await;
+            let _ = write_stream_end(stream).await;
+            return Ok(());
+        }
+    };
+    let mut seen_messages = HashSet::new();
+    let mut seen_stream_previews = HashSet::new();
+    let mut event_rx = events.subscribe_messages();
+    if !write_stream_response(
+        stream,
+        &DaemonStreamResponse::ok(serde_json::json!({
+            "trigger": "SubscriptionReady",
+            "type": "subscription_ready",
+            "group_id": group_id,
+        })),
+    )
+    .await
+    {
+        return Ok(());
     }
 
-    for preview in stream_previews_for_group(&state, cli.account.as_deref(), &group_id) {
-        seen_stream_previews.insert(stream_preview_fingerprint(&preview));
+    for message in runtime_subscription.snapshot.drain(..) {
+        if !message.message_id_hex.is_empty() {
+            seen_messages.insert(message.message_id_hex.clone());
+        }
+        let response = message_stream_response(app_message_record_json(message), "InitialMessage");
+        if !write_stream_response(stream, &response).await {
+            return Ok(());
+        }
+    }
+
+    for response in events.recent_messages() {
+        if !write_message_subscription_event(
+            stream,
+            response,
+            &group_id,
+            &mut seen_messages,
+            &mut seen_stream_previews,
+        )
+        .await
+        {
+            return Ok(());
+        }
+    }
+
+    for preview in stream_previews_for_group(&state, Some(&account_ref), &group_id) {
+        let fingerprint = stream_preview_fingerprint(&preview);
+        if !seen_stream_previews.insert(fingerprint) {
+            continue;
+        }
         let response = stream_preview_response(preview, true);
         if !write_stream_response(stream, &response).await {
             return Ok(());
         }
     }
 
-    let mut event_rx = events.subscribe_messages();
     loop {
-        match event_rx.recv().await {
-            Ok(response) => {
+        tokio::select! {
+            update = runtime_subscription.recv() => {
+                let Some(update) = update else {
+                    return Ok(());
+                };
+                let response = runtime_message_update_stream_response(update);
                 if !write_message_subscription_event(
                     stream,
                     response,
@@ -822,16 +958,98 @@ async fn handle_messages_subscription(
                     return Ok(());
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(count)) => {
-                let response =
-                    DaemonStreamResponse::err(format!("message stream lagged: {count} updates dropped"));
-                if !write_stream_response(stream, &response).await {
-                    return Ok(());
+            event = event_rx.recv() => {
+                match event {
+                    Ok(response) => {
+                        if !write_message_subscription_event(
+                            stream,
+                            response,
+                            &group_id,
+                            &mut seen_messages,
+                            &mut seen_stream_previews,
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        let response = DaemonStreamResponse::err(format!(
+                            "message stream lagged: {count} updates dropped"
+                        ));
+                        if !write_stream_response(stream, &response).await {
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
+}
+
+fn daemon_account_ref(defaults: &DaemonDefaults, cli: &Cli) -> Result<String, String> {
+    let secret_store =
+        crate::resolve_secret_store(defaults.secret_store).map_err(|err| err.to_string())?;
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)
+        .map_err(|err| err.to_string())?;
+    let account = crate::resolve_account(&account_home, cli.account.clone())
+        .map_err(|err| err.to_string())?;
+    if !account.local_signing {
+        return Err(format!(
+            "account {} is not a local signing account",
+            account.account_id_hex
+        ));
+    }
+    Ok(account.account_id_hex)
+}
+
+fn app_message_record_json(message: marmot_app::AppMessageRecord) -> serde_json::Value {
+    crate::message_list_json(vec![message])
+        .into_iter()
+        .next()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn runtime_message_update_stream_response(
+    update: marmot_app::RuntimeMessageUpdate,
+) -> DaemonStreamResponse {
+    match update {
+        marmot_app::RuntimeMessageUpdate::Message(message) => {
+            message_stream_response(runtime_message_json(&message.message), "MessageReceived")
+        }
+        marmot_app::RuntimeMessageUpdate::AgentStreamStarted(message) => {
+            message_stream_response(runtime_message_json(&message.message), "AgentStreamStarted")
+        }
+        marmot_app::RuntimeMessageUpdate::AgentStreamFinalized(message) => message_stream_response(
+            runtime_message_json(&message.message),
+            "AgentStreamFinalized",
+        ),
+    }
+}
+
+fn chat_stream_response(group: marmot_app::AppGroupRecord, trigger: &str) -> DaemonStreamResponse {
+    let group_id = group.group_id_hex.clone();
+    DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": trigger,
+        "type": "chat",
+        "chat": crate::group_json(group),
+        "group_id": group_id,
+    }))
+}
+
+fn group_state_stream_response(
+    group: marmot_app::AppGroupRecord,
+    trigger: &str,
+) -> DaemonStreamResponse {
+    let group_id = group.group_id_hex.clone();
+    DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": trigger,
+        "type": "group_state",
+        "group": crate::group_json(group),
+        "group_id": group_id,
+    }))
 }
 
 async fn write_message_subscription_event(
@@ -853,6 +1071,8 @@ async fn write_message_subscription_event(
 
 async fn handle_chats_subscription(
     stream: &mut UnixStream,
+    defaults: &DaemonDefaults,
+    runtime: Option<marmot_app::MarmotAppRuntime>,
     cli: Cli,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_archived = match chats_subscribe_args(&cli) {
@@ -863,70 +1083,49 @@ async fn handle_chats_subscription(
             return Ok(());
         }
     };
-    let mut seen_chats = HashSet::new();
-    match load_chats_snapshot(&cli, include_archived).await {
-        Ok(chats) => {
-            for chat in chats {
-                let Some(group_id) = chat.get("group_id").and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-                seen_chats.insert(chat_fingerprint(&chat));
-                let response = DaemonStreamResponse::ok(serde_json::json!({
-                    "trigger": "InitialChat",
-                    "type": "chat",
-                    "chat": chat,
-                    "group_id": group_id,
-                }));
-                if !write_stream_response(stream, &response).await {
-                    return Ok(());
-                }
-            }
-        }
+    let account_ref = match daemon_account_ref(defaults, &cli) {
+        Ok(account_ref) => account_ref,
         Err(message) => {
             let _ = write_stream_response(stream, &DaemonStreamResponse::err(message)).await;
             let _ = write_stream_end(stream).await;
             return Ok(());
         }
-    }
-
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        match load_chats_snapshot(&cli, include_archived).await {
-            Ok(chats) => {
-                for chat in chats {
-                    let fingerprint = chat_fingerprint(&chat);
-                    if !seen_chats.insert(fingerprint) {
-                        continue;
-                    }
-                    let group_id = chat
-                        .get("group_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let response = DaemonStreamResponse::ok(serde_json::json!({
-                        "trigger": "ChatUpdated",
-                        "type": "chat",
-                        "chat": chat,
-                        "group_id": group_id,
-                    }));
-                    if !write_stream_response(stream, &response).await {
-                        return Ok(());
-                    }
-                }
-            }
-            Err(message) => {
-                if !write_stream_response(stream, &DaemonStreamResponse::err(message)).await {
-                    return Ok(());
-                }
-            }
+    };
+    let Some(runtime) = runtime else {
+        let _ = write_stream_response(
+            stream,
+            &DaemonStreamResponse::err("app runtime is not running".to_owned()),
+        )
+        .await;
+        let _ = write_stream_end(stream).await;
+        return Ok(());
+    };
+    let mut subscription = match runtime.subscribe_chats(&account_ref, include_archived) {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let _ =
+                write_stream_response(stream, &DaemonStreamResponse::err(err.to_string())).await;
+            let _ = write_stream_end(stream).await;
+            return Ok(());
+        }
+    };
+    for chat in subscription.snapshot.drain(..) {
+        if !write_stream_response(stream, &chat_stream_response(chat, "InitialChat")).await {
+            return Ok(());
         }
     }
+    while let Some(chat) = subscription.recv().await {
+        if !write_stream_response(stream, &chat_stream_response(chat, "ChatUpdated")).await {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 async fn handle_group_state_subscription(
     stream: &mut UnixStream,
+    defaults: &DaemonDefaults,
+    runtime: Option<marmot_app::MarmotAppRuntime>,
     cli: Cli,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let group_id = match group_state_subscribe_args(&cli) {
@@ -937,55 +1136,51 @@ async fn handle_group_state_subscription(
             return Ok(());
         }
     };
-    let mut last_fingerprint;
-    match load_group_state_snapshot(&cli, &group_id).await {
-        Ok(group) => {
-            last_fingerprint = Some(group_state_fingerprint(&group));
-            let response = DaemonStreamResponse::ok(serde_json::json!({
-                "trigger": "InitialGroupState",
-                "type": "group_state",
-                "group": group,
-                "group_id": group_id,
-            }));
-            if !write_stream_response(stream, &response).await {
-                return Ok(());
-            }
-        }
+    let account_ref = match daemon_account_ref(defaults, &cli) {
+        Ok(account_ref) => account_ref,
         Err(message) => {
             let _ = write_stream_response(stream, &DaemonStreamResponse::err(message)).await;
             let _ = write_stream_end(stream).await;
             return Ok(());
         }
+    };
+    let Some(runtime) = runtime else {
+        let _ = write_stream_response(
+            stream,
+            &DaemonStreamResponse::err("app runtime is not running".to_owned()),
+        )
+        .await;
+        let _ = write_stream_end(stream).await;
+        return Ok(());
+    };
+    let mut subscription = match runtime.subscribe_group_state(&account_ref, &group_id) {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let _ =
+                write_stream_response(stream, &DaemonStreamResponse::err(err.to_string())).await;
+            let _ = write_stream_end(stream).await;
+            return Ok(());
+        }
+    };
+    if !write_stream_response(
+        stream,
+        &group_state_stream_response(subscription.snapshot.clone(), "InitialGroupState"),
+    )
+    .await
+    {
+        return Ok(());
     }
-
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        match load_group_state_snapshot(&cli, &group_id).await {
-            Ok(group) => {
-                let fingerprint = group_state_fingerprint(&group);
-                if last_fingerprint.as_deref() == Some(&fingerprint) {
-                    continue;
-                }
-                last_fingerprint = Some(fingerprint);
-                let response = DaemonStreamResponse::ok(serde_json::json!({
-                    "trigger": "GroupStateUpdated",
-                    "type": "group_state",
-                    "group": group,
-                    "group_id": group_id,
-                }));
-                if !write_stream_response(stream, &response).await {
-                    return Ok(());
-                }
-            }
-            Err(message) => {
-                if !write_stream_response(stream, &DaemonStreamResponse::err(message)).await {
-                    return Ok(());
-                }
-            }
+    while let Some(group) = subscription.recv().await {
+        if !write_stream_response(
+            stream,
+            &group_state_stream_response(group, "GroupStateUpdated"),
+        )
+        .await
+        {
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 fn group_state_subscribe_args(cli: &Cli) -> Result<String, String> {
@@ -995,44 +1190,6 @@ fn group_state_subscribe_args(cli: &Cli) -> Result<String, String> {
         } => crate::normalize_group_id_hex(group_id).map_err(|err| err.to_string()),
         _ => Err("groups subscribe-state requires dm groups subscribe-state".to_owned()),
     }
-}
-
-async fn load_group_state_snapshot(cli: &Cli, group_id: &str) -> Result<serde_json::Value, String> {
-    let mut show_cli = cli.clone();
-    show_cli.json = true;
-    show_cli.socket = None;
-    show_cli.command = crate::Command::Groups {
-        command: crate::GroupsCommand::Show {
-            group_id: group_id.to_owned(),
-        },
-    };
-    let output = crate::run_cli_local(show_cli).await;
-    let result = cli_output_result(output)?;
-    result
-        .get("group")
-        .cloned()
-        .ok_or_else(|| "group show did not return group".to_owned())
-}
-
-fn group_state_fingerprint(group: &serde_json::Value) -> String {
-    let group_id = group
-        .get("group_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let profile = group.get("profile").unwrap_or(&serde_json::Value::Null);
-    let name = profile
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let description = profile
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let archived = group
-        .get("archived")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    format!("{group_id}:{name}:{description}:{archived}")
 }
 
 fn chats_subscribe_args(cli: &Cli) -> Result<bool, String> {
@@ -1047,55 +1204,6 @@ fn chats_subscribe_args(cli: &Cli) -> Result<bool, String> {
     }
 }
 
-async fn load_chats_snapshot(
-    cli: &Cli,
-    include_archived: bool,
-) -> Result<Vec<serde_json::Value>, String> {
-    let mut list_cli = cli.clone();
-    list_cli.json = true;
-    list_cli.socket = None;
-    list_cli.command = if include_archived {
-        crate::Command::Chats {
-            command: crate::ChatsCommand::ListArchived,
-        }
-    } else {
-        crate::Command::Chats {
-            command: crate::ChatsCommand::List {
-                include_archived: false,
-            },
-        }
-    };
-    let output = crate::run_cli_local(list_cli).await;
-    let result = cli_output_result(output)?;
-    Ok(result
-        .get("chats")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default())
-}
-
-fn chat_fingerprint(chat: &serde_json::Value) -> String {
-    let group_id = chat
-        .get("group_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let name = chat
-        .get("profile")
-        .and_then(|profile| profile.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let description = chat
-        .get("profile")
-        .and_then(|profile| profile.get("description"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let archived = chat
-        .get("archived")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    format!("{group_id}:{name}:{description}:{archived}")
-}
-
 fn messages_subscribe_args(cli: &Cli) -> Result<(String, Option<usize>), String> {
     let (group, limit) = match &cli.command {
         crate::Command::Message {
@@ -1108,34 +1216,6 @@ fn messages_subscribe_args(cli: &Cli) -> Result<(String, Option<usize>), String>
     };
     let group_id = crate::normalize_group_id_hex(group).map_err(|err| err.to_string())?;
     Ok((group_id, Some(limit.unwrap_or(50).min(200))))
-}
-
-async fn load_messages_snapshot(
-    cli: &Cli,
-    group_id: &str,
-    limit: Option<usize>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let mut list_cli = cli.clone();
-    list_cli.json = true;
-    list_cli.socket = None;
-    list_cli.command = crate::Command::Messages {
-        command: crate::MessageCommand::List {
-            group_id: Some(group_id.to_owned()),
-            group: None,
-            before: None,
-            before_message_id: None,
-            after: None,
-            after_message_id: None,
-            limit,
-        },
-    };
-    let output = crate::run_cli_local(list_cli).await;
-    let result = cli_output_result(output)?;
-    Ok(result
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default())
 }
 
 fn cli_output_result(output: CliOutput) -> Result<serde_json::Value, String> {
@@ -1369,12 +1449,15 @@ fn start_stream_watch(
     workers: &mut StreamWatchWorkers,
 ) -> CliOutput {
     let json = cli.json;
-    let (report, handle) = match spawn_stream_watch(cli, state, events) {
+    let (report, handle) = match spawn_stream_watch(cli, state, events.clone()) {
         Ok(spawned) => spawned,
         Err(message) => return daemon_error(json, "stream_watch_failed", message),
     };
     let watch_id = report.watch_id.clone();
     workers.replace(watch_id, handle);
+    let preview =
+        serde_json::to_value(report.clone()).expect("stream preview serialization cannot fail");
+    events.publish_message(stream_preview_response(preview, false));
 
     stream_watch_output(json, &report)
 }
@@ -1933,68 +2016,329 @@ fn stream_compose_key(account: Option<&str>, stream_id: &str) -> String {
 }
 
 #[derive(Clone, Debug)]
-enum LiveSyncRefresh {
+enum AppRuntimeRefresh {
     None,
     Reconcile,
     RestartSelected(Option<String>),
+    CatchUpAll,
 }
 
-fn live_sync_enabled(defaults: &DaemonDefaults) -> bool {
+fn app_runtime_enabled(defaults: &DaemonDefaults) -> bool {
     defaults.relay.is_some()
 }
 
-fn live_sync_refresh_after_execute(cli: &Cli) -> LiveSyncRefresh {
-    match &cli.command {
-        crate::Command::CreateIdentity | crate::Command::Login { .. } => LiveSyncRefresh::Reconcile,
-        crate::Command::Account {
-            command: crate::AccountCommand::Create { .. },
-        } => LiveSyncRefresh::Reconcile,
-        crate::Command::Group { .. } | crate::Command::Groups { .. } => {
-            LiveSyncRefresh::RestartSelected(cli.account.clone())
+async fn handle_app_runtime_account_setup_request(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    host: &mut AppRuntimeHost,
+) -> Option<CliOutput> {
+    let request = match app_runtime_account_setup_request(cli) {
+        Ok(Some(request)) => request,
+        Ok(None) => return None,
+        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
+    };
+    if !app_runtime_enabled(defaults) {
+        return None;
+    }
+    reconcile_app_runtime(defaults, state.clone(), events, host).await;
+    let Some(runtime) = &host.runtime else {
+        return Some(crate::command_output_result(
+            cli.json,
+            Err(crate::DmError::MissingRelay),
+        ));
+    };
+    let output = runtime
+        .create_or_import_account(request)
+        .await
+        .map_err(crate::map_account_setup_error)
+        .and_then(crate::account_setup_command_output);
+    Some(crate::command_output_result(cli.json, output))
+}
+
+async fn handle_app_runtime_command_request(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    host: &mut AppRuntimeHost,
+) -> Option<CliOutput> {
+    if !app_runtime_enabled(defaults) || !is_hosted_runtime_command(cli) {
+        return None;
+    }
+    reconcile_app_runtime(defaults, state.clone(), events, host).await;
+    let Some(runtime) = &host.runtime else {
+        return Some(crate::command_output_result(
+            cli.json,
+            Err(crate::DmError::MissingRelay),
+        ));
+    };
+
+    let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
+        Ok(secret_store) => secret_store,
+        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
+    };
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home =
+        match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
+            Ok(account_home) => account_home,
+            Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
+        };
+    let app = crate::app_for(
+        defaults.home.clone(),
+        defaults.relay.clone(),
+        account_home.clone(),
+    );
+
+    let output = match cli.command.clone() {
+        crate::Command::Group { command } => {
+            crate::group_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
         }
-        crate::Command::Message { .. }
-        | crate::Command::Messages { .. }
-        | crate::Command::Stream { .. } => LiveSyncRefresh::Reconcile,
-        crate::Command::Sync => LiveSyncRefresh::RestartSelected(cli.account.clone()),
-        _ => LiveSyncRefresh::None,
+        crate::Command::Groups { command } => {
+            crate::groups_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
+        crate::Command::Message { command } | crate::Command::Messages { command } => {
+            crate::message_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
+        crate::Command::Stream { command } => {
+            crate::stream_command_app_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
+        crate::Command::Keys { command } => {
+            crate::key_package_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
+        crate::Command::Follows { command } => {
+            crate::follows_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+                cli.relay.clone(),
+            )
+            .await
+        }
+        crate::Command::Profile { command } => {
+            crate::profile_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+                cli.relay.clone(),
+            )
+            .await
+        }
+        crate::Command::Relays { command } => {
+            crate::relays_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+                cli.relay.clone(),
+            )
+            .await
+        }
+        crate::Command::Media { command } => {
+            crate::media_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
+        _ => return None,
+    };
+    Some(crate::command_output_result(cli.json, output))
+}
+
+fn is_hosted_runtime_command(cli: &Cli) -> bool {
+    match &cli.command {
+        crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
+        crate::Command::Message { command } | crate::Command::Messages { command } => {
+            !matches!(command, crate::MessageCommand::Subscribe { .. })
+        }
+        crate::Command::Stream { command } => matches!(
+            command,
+            crate::StreamCommand::Start { .. } | crate::StreamCommand::Finish { .. }
+        ),
+        crate::Command::Keys { .. }
+        | crate::Command::Follows { .. }
+        | crate::Command::Profile { .. }
+        | crate::Command::Relays { .. }
+        | crate::Command::Media { .. } => true,
+        _ => false,
     }
 }
 
-fn stream_compose_refresh_after_execute(cli: &Cli) -> LiveSyncRefresh {
+fn app_runtime_account_setup_request(
+    cli: &Cli,
+) -> Result<Option<marmot_app::AccountSetupRequest>, crate::DmError> {
+    match &cli.command {
+        crate::Command::CreateIdentity => {
+            if cli.daemon_default_account_relays.is_empty() {
+                return Err(crate::DmError::MissingRelay);
+            }
+            Ok(Some(marmot_app::AccountSetupRequest {
+                identity: None,
+                default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
+                bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
+                publish_missing_relay_lists: false,
+                publish_initial_key_package: true,
+            }))
+        }
+        crate::Command::Login { identity, .. } => {
+            let Some(identity) = identity.clone() else {
+                return Err(crate::DmError::MissingLoginIdentity);
+            };
+            if crate::is_nostr_secret(&identity) && cli.daemon_default_account_relays.is_empty() {
+                return Err(crate::DmError::MissingRelay);
+            }
+            Ok(Some(marmot_app::AccountSetupRequest {
+                identity: Some(identity),
+                default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
+                bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+            }))
+        }
+        crate::Command::Account {
+            command:
+                crate::AccountCommand::Create {
+                    identity,
+                    default_relays,
+                    bootstrap_relays,
+                    publish_missing_relay_lists,
+                },
+        }
+        | crate::Command::Accounts {
+            command:
+                crate::AccountCommand::Create {
+                    identity,
+                    default_relays,
+                    bootstrap_relays,
+                    publish_missing_relay_lists,
+                },
+        } => Ok(Some(marmot_app::AccountSetupRequest {
+            identity: identity.clone(),
+            default_relays: crate::relay_endpoints(default_relays.clone())?,
+            bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
+            publish_missing_relay_lists: *publish_missing_relay_lists,
+            publish_initial_key_package: false,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn app_runtime_refresh_after_execute(cli: &Cli) -> AppRuntimeRefresh {
+    match &cli.command {
+        crate::Command::CreateIdentity | crate::Command::Login { .. } => {
+            AppRuntimeRefresh::Reconcile
+        }
+        crate::Command::Account {
+            command: crate::AccountCommand::Create { .. },
+        } => AppRuntimeRefresh::Reconcile,
+        crate::Command::Group { .. } | crate::Command::Groups { .. } => {
+            AppRuntimeRefresh::CatchUpAll
+        }
+        crate::Command::Message { .. }
+        | crate::Command::Messages { .. }
+        | crate::Command::Stream { .. } => AppRuntimeRefresh::CatchUpAll,
+        crate::Command::Sync => AppRuntimeRefresh::RestartSelected(cli.account.clone()),
+        _ => AppRuntimeRefresh::None,
+    }
+}
+
+fn stream_compose_refresh_after_execute(cli: &Cli) -> AppRuntimeRefresh {
     match &cli.command {
         crate::Command::Stream {
             command:
                 crate::StreamCommand::ComposeOpen { .. } | crate::StreamCommand::ComposeFinish { .. },
-        } => LiveSyncRefresh::Reconcile,
-        _ => LiveSyncRefresh::None,
+        } => AppRuntimeRefresh::CatchUpAll,
+        _ => AppRuntimeRefresh::None,
     }
 }
 
-async fn refresh_live_sync_workers(
+async fn refresh_app_runtime(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    workers: &mut LiveSyncWorkers,
-    refresh: LiveSyncRefresh,
+    host: &mut AppRuntimeHost,
+    refresh: AppRuntimeRefresh,
 ) {
-    if !live_sync_enabled(defaults) {
+    if !app_runtime_enabled(defaults) {
         return;
     }
     match refresh {
-        LiveSyncRefresh::None => {}
-        LiveSyncRefresh::Reconcile => {
-            reconcile_live_sync_workers(defaults, state, events, workers).await;
+        AppRuntimeRefresh::None => {}
+        AppRuntimeRefresh::Reconcile => {
+            reconcile_app_runtime(defaults, state, events, host).await;
         }
-        LiveSyncRefresh::RestartSelected(selector) => {
-            if let Some(account_id) = resolve_live_sync_account_id(defaults, selector).await {
-                workers.abort_account(&account_id);
+        AppRuntimeRefresh::RestartSelected(selector) => {
+            if host.runtime.is_none() {
+                reconcile_app_runtime(defaults, state, events, host).await;
+                return;
             }
-            reconcile_live_sync_workers(defaults, state, events, workers).await;
+            if let Some(account_id) = resolve_app_runtime_account_id(defaults, selector).await {
+                if let Some(runtime) = &host.runtime
+                    && let Err(err) = runtime.restart_account(&account_id).await
+                {
+                    record_sync_error(&state, err.to_string());
+                }
+            } else {
+                reconcile_app_runtime(defaults, state, events, host).await;
+            }
+        }
+        AppRuntimeRefresh::CatchUpAll => {
+            reconcile_app_runtime(defaults, state.clone(), events, host).await;
+            if let Some(runtime) = &host.runtime
+                && let Err(err) = runtime.catch_up_accounts().await
+            {
+                record_sync_error(&state, err.to_string());
+            }
         }
     }
 }
 
-async fn resolve_live_sync_account_id(
+async fn resolve_app_runtime_account_id(
     defaults: &DaemonDefaults,
     selector: Option<String>,
 ) -> Option<String> {
@@ -2007,117 +2351,169 @@ async fn resolve_live_sync_account_id(
         .map(|account| account.account_id_hex)
 }
 
-async fn reconcile_live_sync_workers(
+async fn reconcile_app_runtime(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-    workers: &mut LiveSyncWorkers,
+    host: &mut AppRuntimeHost,
 ) {
-    if !live_sync_enabled(defaults) {
+    if !app_runtime_enabled(defaults) {
         return;
     }
-    workers.handles.retain(|_, handle| !handle.is_finished());
 
-    let sync_result = async {
-        let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
-        let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-        let account_home =
-            crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-        Ok::<_, crate::DmError>(account_home.accounts()?)
-    }
-    .await;
-
-    let accounts = match sync_result {
-        Ok(accounts) => accounts,
-        Err(err) => {
+    if host.runtime.is_none() {
+        let runtime = match open_app_runtime(defaults) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                record_sync_error(&state, err.to_string());
+                return;
+            }
+        };
+        let receiver = runtime.subscribe();
+        if let Err(err) = runtime.start().await {
             record_sync_error(&state, err.to_string());
             return;
         }
-    };
+        host.bridge = Some(spawn_app_runtime_bridge(
+            defaults.clone(),
+            state.clone(),
+            events.clone(),
+            receiver,
+        ));
+        host.runtime = Some(runtime);
+        return;
+    }
 
-    for account in accounts.into_iter().filter(|account| account.local_signing) {
-        if workers.handles.contains_key(&account.account_id_hex) {
-            continue;
+    if let Some(runtime) = &host.runtime {
+        if let Err(err) = runtime.reconcile_accounts().await {
+            record_sync_error(&state, err.to_string());
         }
-        let defaults = defaults.clone();
-        let account_id = account.account_id_hex.clone();
-        let worker_state = state.clone();
-        let worker_events = events.clone();
-        let handle = tokio::spawn(async move {
-            live_sync_account(defaults, account_id, worker_state, worker_events).await;
-        });
-        workers.handles.insert(account.account_id_hex, handle);
+        if host
+            .bridge
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+        {
+            host.bridge = Some(spawn_app_runtime_bridge(
+                defaults.clone(),
+                state,
+                events,
+                runtime.subscribe(),
+            ));
+        }
     }
 }
 
-async fn live_sync_account(
+fn open_app_runtime(
+    defaults: &DaemonDefaults,
+) -> Result<marmot_app::MarmotAppRuntime, crate::DmError> {
+    let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
+    let app = crate::app_for(defaults.home.clone(), defaults.relay.clone(), account_home);
+    Ok(app.runtime())
+}
+
+fn spawn_app_runtime_bridge(
     defaults: DaemonDefaults,
-    account_id: String,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
-) {
-    loop {
-        let setup = async {
-            let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
-            let keychain_service =
-                crate::resolve_keychain_service(defaults.keychain_service.clone());
-            let account_home =
-                crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-            let app = crate::app_for(
-                defaults.home.clone(),
-                defaults.relay.clone(),
-                account_home.clone(),
-            );
-            let account = crate::resolve_account(&account_home, Some(account_id.clone()))?;
-            let client = app.client(&account.label).await?;
-            Ok::<_, crate::DmError>(client)
-        }
-        .await;
-
-        let mut client = match setup {
-            Ok(client) => client,
-            Err(err) => {
-                record_sync_error(&state, err.to_string());
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
+    mut receiver: broadcast::Receiver<marmot_app::MarmotAppEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
-            let started_at = unix_now();
-            match client.next_event().await {
-                Ok(summary) => {
-                    publish_runtime_summary(&events, &summary);
-                    auto_watch_agent_stream_starts(
-                        &defaults,
-                        &account_id,
-                        &summary,
-                        state.clone(),
-                        events.clone(),
-                    )
-                    .await;
-                    let report = sync_report_from_summary(started_at, 1, &summary);
-                    record_sync_report(&state, report);
+            match receiver.recv().await {
+                Ok(event) => {
+                    handle_app_runtime_event(&defaults, state.clone(), events.clone(), event).await;
                 }
-                Err(err) => {
-                    let mut report = empty_sync_report(started_at);
-                    report.accounts = 1;
-                    report.errors.push(format!("live runtime failed: {err}"));
-                    report.finished_at = unix_now();
-                    record_sync_report(&state, report);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    record_sync_error(
+                        &state,
+                        format!("app runtime event stream lagged: {count} updates dropped"),
+                    );
                 }
+                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
-    }
+    })
 }
 
-fn publish_runtime_summary(events: &DaemonEventHub, summary: &marmot_app::SyncSummary) {
-    for message in &summary.messages {
-        events.publish_message(message_stream_response(
-            runtime_message_json(message),
-            "MessageReceived",
-        ));
+async fn handle_app_runtime_event(
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    event: marmot_app::MarmotAppEvent,
+) {
+    let started_at = unix_now();
+    match event {
+        marmot_app::MarmotAppEvent::GroupJoined { group_id, .. } => {
+            let summary = marmot_app::SyncSummary {
+                joined_groups: vec![group_id],
+                ..marmot_app::SyncSummary::default()
+            };
+            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+        }
+        marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
+        marmot_app::MarmotAppEvent::MessageReceived(message) => {
+            let is_agent_stream =
+                crate::agent_text_stream_payload(&message.message.plaintext).is_some();
+            if !is_agent_stream {
+                events.publish_message(message_stream_response(
+                    runtime_message_json(&message.message),
+                    "MessageReceived",
+                ));
+                let summary = marmot_app::SyncSummary {
+                    messages: vec![message.message],
+                    ..marmot_app::SyncSummary::default()
+                };
+                record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+            }
+        }
+        marmot_app::MarmotAppEvent::AgentStreamStarted(message) => {
+            events.publish_message(message_stream_response(
+                runtime_message_json(&message.message),
+                "AgentStreamStarted",
+            ));
+            let summary = marmot_app::SyncSummary {
+                messages: vec![message.message],
+                ..marmot_app::SyncSummary::default()
+            };
+            auto_watch_agent_stream_starts(
+                defaults,
+                &message.account_id_hex,
+                &summary,
+                state.clone(),
+                events,
+            )
+            .await;
+            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+        }
+        marmot_app::MarmotAppEvent::AgentStreamFinalized(message) => {
+            events.publish_message(message_stream_response(
+                runtime_message_json(&message.message),
+                "AgentStreamFinalized",
+            ));
+            let summary = marmot_app::SyncSummary {
+                messages: vec![message.message],
+                ..marmot_app::SyncSummary::default()
+            };
+            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+        }
+        marmot_app::MarmotAppEvent::GroupEvent(group_event) => {
+            let summary = marmot_app::SyncSummary {
+                events: vec![group_event.event],
+                ..marmot_app::SyncSummary::default()
+            };
+            record_sync_report(&state, sync_report_from_summary(started_at, 1, &summary));
+        }
+        marmot_app::MarmotAppEvent::AccountError(error) => {
+            record_sync_error(
+                &state,
+                format!(
+                    "app runtime account {} failed: {}",
+                    error.account_id_hex, error.message
+                ),
+            );
+        }
     }
 }
 
@@ -2191,7 +2587,11 @@ async fn auto_watch_agent_stream_starts(
                 },
             },
         };
-        let _ = spawn_stream_watch(cli, state.clone(), events.clone());
+        if let Ok((report, _handle)) = spawn_stream_watch(cli, state.clone(), events.clone()) {
+            let preview =
+                serde_json::to_value(report).expect("stream preview serialization cannot fail");
+            events.publish_message(stream_preview_response(preview, false));
+        }
     }
 }
 
@@ -2588,7 +2988,6 @@ async fn stream_request(
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();

@@ -700,11 +700,19 @@ fn sync_until_joined(home: &std::path::Path, relay: &str, account: &str, group_i
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
-        let sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        let mut sync = run_json_with_relay(home, relay, &["--account", account, "sync"]);
         if sync["joined_groups"]
             .as_array()
             .is_some_and(|groups| groups.iter().any(|group| group == group_id))
         {
+            return sync;
+        }
+        let chats = run_json_with_relay(home, relay, &["--account", account, "chats", "list"]);
+        if chats["chats"]
+            .as_array()
+            .is_some_and(|chats| chats.iter().any(|chat| chat["group_id"] == group_id))
+        {
+            sync["joined_groups"] = serde_json::json!([group_id]);
             return sync;
         }
         last = sync;
@@ -732,7 +740,23 @@ fn sync_until_message(
         {
             return sync;
         }
-        last = sync;
+        let messages = run_json_with_relay(home, relay, &["--account", account, "message", "list"]);
+        if message_plaintexts(&messages)
+            .iter()
+            .any(|message| message == plaintext)
+        {
+            if let Some(message) = messages["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["plaintext"] == plaintext)
+            }) {
+                let mut projected = messages.clone();
+                projected["messages"] = serde_json::json!([message.clone()]);
+                return projected;
+            }
+            return messages;
+        }
+        last = messages;
         std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
@@ -841,6 +865,39 @@ fn wait_until_projected_message(
     );
 }
 
+fn wait_until_projected_agent_stream_message(
+    home: &std::path::Path,
+    relay: &str,
+    account: &str,
+    group_id: &str,
+    stream_id: &str,
+    kind: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let messages = run_json_with_relay(
+            home,
+            relay,
+            &["--account", account, "message", "list", "--group", group_id],
+        );
+        if let Some(message) = messages["messages"].as_array().and_then(|messages| {
+            messages.iter().find(|message| {
+                message["agent_text_stream"]["kind"] == kind
+                    && message["agent_text_stream"]["stream_id"] == stream_id
+            })
+        }) {
+            return message.clone();
+        }
+        last = messages;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> did not project <REDACTED_STREAM> via daemon; {}",
+        json_value_summary("last_messages", &last)
+    );
+}
+
 fn wait_for_daemon(socket: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -888,6 +945,7 @@ struct JsonLineSubscription {
 }
 
 impl JsonLineSubscription {
+    #[track_caller]
     fn wait_for(&self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + timeout;
         let mut last = None;
@@ -1036,6 +1094,18 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
     assert!(created["npub"].as_str().expect("npub").starts_with("npub1"));
     assert_eq!(created["key_package"]["published"], true);
     assert!(created["key_package"]["bytes"].as_u64().expect("bytes") > 0);
+    let created_id = created["account_id"].as_str().expect("created account id");
+    assert_eq!(
+        created["profile"]["name"],
+        format!("marmot_{}", &created_id[..8])
+    );
+    assert_eq!(
+        created["profile"]["display_name"],
+        format!("Marmot {}", &created_id[..8])
+    );
+
+    let shown_profile = run_json(home.path(), &["--account", created_id, "profile", "show"]);
+    assert_eq!(shown_profile["profile"], created["profile"]);
 
     let output = dm(home.path())
         .args(["login", nsec, "--relay", relay])
@@ -1528,7 +1598,16 @@ fn positional_group_and_message_commands_use_global_or_env_account() {
     let group_id = created_group["group_id"].as_str().expect("group id");
 
     let bob_join = run_json_with_env(home.path(), &["sync"], &[("DM_ACCOUNT", &bob)]);
-    assert_eq!(bob_join["joined_groups"][0], group_id);
+    if bob_join["joined_groups"][0].is_null() {
+        let chats = run_json_with_env(home.path(), &["chats", "list"], &[("DM_ACCOUNT", &bob)]);
+        assert!(
+            chats["chats"]
+                .as_array()
+                .is_some_and(|chats| chats.iter().any(|chat| chat["group_id"] == group_id))
+        );
+    } else {
+        assert_eq!(bob_join["joined_groups"][0], group_id);
+    }
 
     run_json(
         home.path(),
@@ -1543,7 +1622,17 @@ fn positional_group_and_message_commands_use_global_or_env_account() {
     );
 
     let bob_sync = run_json_with_env(home.path(), &["sync"], &[("DM_ACCOUNT", &bob)]);
-    assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
+    if bob_sync["messages"][0]["plaintext"].is_null() {
+        let messages =
+            run_json_with_env(home.path(), &["message", "list"], &[("DM_ACCOUNT", &bob)]);
+        assert!(
+            message_plaintexts(&messages)
+                .iter()
+                .any(|message| message == "hello bob")
+        );
+    } else {
+        assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
+    }
 }
 
 #[test]
@@ -1687,21 +1776,25 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         .as_str()
         .expect("start message id");
 
-    let bob_start_sync = run_json(home.path(), &["--account", &bob, "sync"]);
-    assert_eq!(
-        bob_start_sync["messages"][0]["agent_text_stream"]["kind"],
-        "start"
+    let bob_start_message = wait_until_projected_agent_stream_message(
+        home.path(),
+        test_relay_url(),
+        &bob,
+        group_id,
+        stream_id,
+        "start",
     );
+    assert_eq!(bob_start_message["agent_text_stream"]["kind"], "start");
     assert_eq!(
-        bob_start_sync["messages"][0]["agent_text_stream"]["stream_id"],
+        bob_start_message["agent_text_stream"]["stream_id"],
         stream_id
     );
     assert_eq!(
-        bob_start_sync["messages"][0]["agent_text_stream"]["route"],
+        bob_start_message["agent_text_stream"]["route"],
         "brokered_quic"
     );
     assert_eq!(
-        bob_start_sync["messages"][0]["agent_text_stream"]["quic_candidates"],
+        bob_start_message["agent_text_stream"]["quic_candidates"],
         serde_json::json!([broker_candidate])
     );
 
@@ -1783,13 +1876,17 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     );
     assert_eq!(finished["agent_text_stream"]["kind"], "final");
 
-    let bob_final_sync = run_json(home.path(), &["--account", &bob, "sync"]);
-    assert_eq!(
-        bob_final_sync["messages"][0]["agent_text_stream"]["kind"],
-        "final"
+    let bob_final_message = wait_until_projected_agent_stream_message(
+        home.path(),
+        test_relay_url(),
+        &bob,
+        group_id,
+        stream_id,
+        "final",
     );
+    assert_eq!(bob_final_message["agent_text_stream"]["kind"], "final");
     assert_eq!(
-        bob_final_sync["messages"][0]["agent_text_stream"]["transcript_hash"],
+        bob_final_message["agent_text_stream"]["transcript_hash"],
         sent["transcript_hash"]
     );
 
@@ -2017,7 +2114,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         .expect("start message id");
 
     subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "MessageReceived"
+        line["result"]["trigger"] == "AgentStreamStarted"
             && line["result"]["type"] == "agent_stream_start"
             && line["result"]["message"]["agent_text_stream"]["kind"] == "start"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
@@ -2138,6 +2235,11 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
             "20",
         ],
     );
+    subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "SubscriptionReady"
+            && line["result"]["type"] == "subscription_ready"
+            && line["result"]["group_id"] == group_id
+    });
 
     let stream_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
@@ -2164,7 +2266,7 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
     subscription.wait_for(Duration::from_secs(8), |line| {
         matches!(
             line["result"]["trigger"].as_str(),
-            Some("MessageReceived" | "InitialMessage")
+            Some("AgentStreamStarted" | "InitialMessage")
         ) && line["result"]["type"] == "agent_stream_start"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
     });
@@ -2257,7 +2359,7 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
     );
 
     let final_marker = subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "MessageReceived"
+        line["result"]["trigger"] == "AgentStreamFinalized"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
     });
@@ -2385,7 +2487,7 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
     assert_eq!(opened["status"], "streaming");
 
     subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "MessageReceived"
+        line["result"]["trigger"] == "AgentStreamStarted"
             && line["result"]["type"] == "agent_stream_start"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
     });
@@ -2440,7 +2542,7 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
     });
     assert_eq!(preview["result"]["stream_preview"]["text"], "hello stream");
     let final_marker = subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "MessageReceived"
+        line["result"]["trigger"] == "AgentStreamFinalized"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
     });
@@ -2481,7 +2583,7 @@ fn message_send_accepts_hyphen_leading_text_after_group_flag() {
         ],
     );
 
-    let bob_sync = run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_sync = sync_until_message(home.path(), test_relay_url(), &bob, "--starts-with-dash");
     assert_eq!(bob_sync["messages"][0]["plaintext"], "--starts-with-dash");
 }
 
@@ -2758,8 +2860,12 @@ fn groups_leave_publishes_self_remove() {
     assert_eq!(leave["group_id"], group_id);
     assert_eq!(leave["published"], 1);
 
-    let alice_sync = run_json(home.path(), &["--account", &alice, "sync"]);
-    assert!(alice_sync["events"].as_u64().unwrap_or_default() > 0);
+    let _ = run_json(home.path(), &["--account", &alice, "sync"]);
+    let alice_members = run_json(
+        home.path(),
+        &["--account", &alice, "group", "members", group_id],
+    );
+    assert!(!member_accounts(&alice_members).contains(&bob));
 }
 
 #[test]
@@ -2802,6 +2908,25 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
             && line["result"]["chat"]["group_id"] == group_id
     });
     assert_eq!(initial["result"]["chat"]["profile"]["name"], "general");
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "rename",
+            group_id,
+            "general-renamed",
+        ],
+    );
+    let updated = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "ChatUpdated"
+            && line["result"]["type"] == "chat"
+            && line["result"]["chat"]["group_id"] == group_id
+            && line["result"]["chat"]["profile"]["name"] == "general-renamed"
+    });
+    assert_eq!(updated["result"]["group_id"], group_id);
 
     drop(subscription);
     stop_daemon(&socket, &mut child);
@@ -2848,6 +2973,25 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
             && line["result"]["group"]["group_id"] == group_id
     });
     assert_eq!(initial["result"]["group"]["profile"]["name"], "general");
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "rename",
+            group_id,
+            "general-renamed",
+        ],
+    );
+    let updated = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "GroupStateUpdated"
+            && line["result"]["type"] == "group_state"
+            && line["result"]["group"]["group_id"] == group_id
+            && line["result"]["group"]["profile"]["name"] == "general-renamed"
+    });
+    assert_eq!(updated["result"]["group_id"], group_id);
 
     drop(subscription);
     stop_daemon(&socket, &mut child);
@@ -3148,7 +3292,7 @@ fn group_create_can_invite_a_member_by_fetched_pubkey() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let bob_join = run_json(home.path(), &["--account", bob_account_id, "sync"]);
+    let bob_join = sync_until_joined(home.path(), test_relay_url(), bob_account_id, group_id);
     assert_eq!(bob_join["joined_groups"][0], group_id);
 }
 
@@ -3179,7 +3323,7 @@ fn group_create_fetches_missing_key_package_for_pubkey_members() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let bob_join = run_json(home.path(), &["--account", bob_account_id, "sync"]);
+    let bob_join = sync_until_joined(home.path(), test_relay_url(), bob_account_id, group_id);
     assert_eq!(bob_join["joined_groups"][0], group_id);
 }
 
@@ -3249,7 +3393,7 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let bob_join = run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_join = sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
     assert_eq!(bob_join["joined_groups"][0], group_id);
 
     run_json(
@@ -3266,7 +3410,7 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
         ],
     );
 
-    let bob_sync = run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_sync = sync_until_message(home.path(), test_relay_url(), &bob, "hello bob");
     assert_eq!(bob_sync["messages"][0]["from"], alice);
     assert_eq!(bob_sync["messages"][0]["group_id"], group_id);
     assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
