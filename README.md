@@ -155,8 +155,9 @@ just relay-down
 ```
 
 By default the stack binds `nostr-rs-relay` to `ws://127.0.0.1:28080` and `strfry` to
-`ws://127.0.0.1:27777`. To reuse another relay stack, set `DARKMATTER_E2E_RELAYS` to a comma-separated list, for
-example `DARKMATTER_E2E_RELAYS=ws://127.0.0.1:8080,ws://127.0.0.1:7777 just e2e-test`.
+`ws://127.0.0.1:27777`. The CLI E2E defaults use `27777` because it reliably ACKs the relay-list publishes used during
+account setup on macOS Docker Desktop. To reuse another relay stack, set `DARKMATTER_E2E_RELAYS` to a comma-separated
+list, for example `DARKMATTER_E2E_RELAYS=ws://127.0.0.1:8080,ws://127.0.0.1:7777 just e2e-test`.
 
 Run vector reports when you want saved JSON reports plus a pass/fail summary:
 

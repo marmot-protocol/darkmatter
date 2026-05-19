@@ -32,7 +32,11 @@ pub use cgka_traits::app_components::{
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
     NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
 };
-use cgka_traits::capabilities::{Capability, CapabilityRequirement, RequirementLevel};
+use cgka_traits::app_payload::{
+    MarmotAppMessageEnvelopeV1, MarmotAppMessagePayloadV1, MarmotMediaReferenceV1,
+    MarmotReactionActionV1, display_text_for_app_message,
+};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::group::Group;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -73,6 +77,7 @@ const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
+const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const SDK_RELAY_LIST_FETCH_WAIT: Duration = Duration::from_secs(3);
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
@@ -206,6 +211,7 @@ pub struct ReceivedMessage {
     pub sender: String,
     pub group_id: GroupId,
     pub plaintext: String,
+    pub app_message: Option<MarmotAppMessagePayloadV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +221,8 @@ pub struct AppMessageRecord {
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_message: Option<MarmotAppMessagePayloadV1>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -276,6 +284,8 @@ pub struct UserProfileMetadata {
     pub picture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nip05: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lud16: Option<String>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -536,6 +546,13 @@ impl AppGroupAdminPolicyComponent {
             data_hex: hex::encode(data),
         }
     }
+
+    fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
 }
 
 impl AppGroupNostrRoutingComponent {
@@ -672,6 +689,10 @@ pub enum AppError {
     InvalidNostrRouting(String),
     #[error("invalid agent text stream policy: {0}")]
     InvalidAgentTextStreamPolicy(String),
+    #[error("invalid app message payload: {0}")]
+    InvalidAppMessagePayload(String),
+    #[error("transport event stream closed")]
+    TransportClosed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -690,6 +711,8 @@ struct AppMessageProjection {
     group_id_hex: String,
     sender: String,
     plaintext: String,
+    app_message: Option<MarmotAppMessagePayloadV1>,
+    recorded_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -846,6 +869,31 @@ impl MarmotApp {
             .await
     }
 
+    pub async fn publish_account_relay_list_kind(
+        &self,
+        label: &str,
+        list_kind: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let list_kind = match list_kind {
+            "nip65" => NostrAccountRelayListKind::Nip65,
+            "inbox" => NostrAccountRelayListKind::Inbox,
+            "key_package" | "key-package" => NostrAccountRelayListKind::KeyPackage,
+            other => {
+                return Err(AppError::RelayDirectory(format!(
+                    "unsupported relay list type: {other}"
+                )));
+            }
+        };
+        self.publish_selected_account_relay_lists(
+            label,
+            AccountRelayListBootstrap::new(relays, bootstrap_relays),
+            &[list_kind],
+        )
+        .await
+    }
+
     async fn publish_selected_account_relay_lists(
         &self,
         label: &str,
@@ -892,10 +940,7 @@ impl MarmotApp {
                 .add_relay(relay_url.clone())
                 .await
                 .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
-            client
-                .connect_relay(relay_url.clone())
-                .await
-                .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
+            connect_sdk_relay(&client, relay_url.clone()).await?;
         }
 
         let mut events = Vec::new();
@@ -1200,10 +1245,7 @@ impl MarmotApp {
                 .add_relay(relay_url.clone())
                 .await
                 .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
-            client
-                .connect_relay(relay_url.clone())
-                .await
-                .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
+            connect_sdk_relay(&client, relay_url.clone()).await?;
         }
 
         let events = client
@@ -1297,10 +1339,7 @@ impl MarmotApp {
                 .add_relay(relay_url.clone())
                 .await
                 .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
-            client
-                .connect_relay(relay_url.clone())
-                .await
-                .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
+            connect_sdk_relay(&client, relay_url.clone()).await?;
         }
 
         let filter = Filter::new()
@@ -1905,12 +1944,97 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    pub async fn leave_group(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    pub async fn promote_admin(
+        &mut self,
+        group_id: &GroupId,
+        member_ref: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let mut admins = self.runtime.admin_pubkeys(group_id)?;
+        admins.push(admin_pubkey_from_member_id(
+            &self.app.member_id(member_ref)?,
+        )?);
+        self.update_admin_policy(group_id, admins).await
+    }
+
+    pub async fn demote_admin(
+        &mut self,
+        group_id: &GroupId,
+        member_ref: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let target = admin_pubkey_from_member_id(&self.app.member_id(member_ref)?)?;
+        let mut admins = self.runtime.admin_pubkeys(group_id)?;
+        admins.retain(|admin| admin != &target);
+        self.update_admin_policy(group_id, admins).await
+    }
+
+    pub async fn self_demote_admin(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let account = self.app.account_home().account(&self.state.label)?;
+        let local = admin_pubkey_from_account_id_hex(&account.account_id_hex)?;
+        let mut admins = self.runtime.admin_pubkeys(group_id)?;
+        admins.retain(|admin| admin != &local);
+        self.update_admin_policy(group_id, admins).await
+    }
+
+    async fn update_admin_policy(
+        &mut self,
+        group_id: &GroupId,
+        admins: Vec<[u8; 32]>,
+    ) -> Result<SendSummary, AppError> {
+        let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![component],
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
     pub async fn send(
         &mut self,
         group_id: &GroupId,
         payload: &[u8],
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        let plaintext = String::from_utf8_lossy(payload).to_string();
+        let app_message = MarmotAppMessageEnvelopeV1::decode(payload)
+            .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))?;
+        if let Some(envelope) = &app_message {
+            envelope
+                .validate()
+                .map_err(AppError::InvalidAppMessagePayload)?;
+        }
+        let app_message = app_message.map(|envelope| envelope.payload);
+        let plaintext = app_message
+            .as_ref()
+            .map(display_text_for_app_message)
+            .unwrap_or(plaintext);
 
         self.runtime.sync_transport_groups(None).await?;
         let effects = self
@@ -1923,7 +2047,6 @@ impl AppClient {
         fail_if_publish_failed(&effects.failures)?;
         self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
-        let plaintext = String::from_utf8_lossy(payload).to_string();
         let message_ids = effects
             .reports
             .iter()
@@ -1937,6 +2060,8 @@ impl AppClient {
                 group_id_hex: group_id_hex.clone(),
                 sender: self.state.label.clone(),
                 plaintext: plaintext.clone(),
+                app_message: app_message.clone(),
+                recorded_at: None,
             })?;
         }
         self.app.save_state(&self.state)?;
@@ -1944,6 +2069,71 @@ impl AppClient {
             published: effects.reports.len(),
             message_ids,
         })
+    }
+
+    pub async fn react_to_message(
+        &mut self,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: &str,
+    ) -> Result<SendSummary, AppError> {
+        let envelope = MarmotAppMessageEnvelopeV1::reaction(
+            target_message_id,
+            emoji,
+            MarmotReactionActionV1::Add,
+        );
+        let payload = encode_validated_app_message(&envelope)?;
+        self.send(group_id, &payload).await
+    }
+
+    pub async fn unreact_from_message(
+        &mut self,
+        group_id: &GroupId,
+        target_message_id: &str,
+    ) -> Result<SendSummary, AppError> {
+        let envelope = MarmotAppMessageEnvelopeV1::reaction(
+            target_message_id,
+            "",
+            MarmotReactionActionV1::Remove,
+        );
+        let payload = encode_validated_app_message(&envelope)?;
+        self.send(group_id, &payload).await
+    }
+
+    pub async fn delete_message(
+        &mut self,
+        group_id: &GroupId,
+        target_message_id: &str,
+    ) -> Result<SendSummary, AppError> {
+        let envelope = MarmotAppMessageEnvelopeV1::delete(target_message_id);
+        let payload = encode_validated_app_message(&envelope)?;
+        self.send(group_id, &payload).await
+    }
+
+    pub async fn send_media_reference(
+        &mut self,
+        group_id: &GroupId,
+        reference: MarmotMediaReferenceV1,
+        caption: Option<String>,
+    ) -> Result<SendSummary, AppError> {
+        let envelope = MarmotAppMessageEnvelopeV1::media(reference, caption);
+        let payload = encode_validated_app_message(&envelope)?;
+        self.send(group_id, &payload).await
+    }
+
+    pub async fn retry_group_convergence(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self.runtime.advance_convergence(group_id).await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
     }
 
     pub async fn update_group_profile(
@@ -2000,6 +2190,48 @@ impl AppClient {
         self.sync_sdk_relay().await
     }
 
+    pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
+        let profiles = self.app.profiles_by_id()?;
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+
+        loop {
+            let delivery = self
+                .adapter
+                .receive()
+                .await?
+                .ok_or(AppError::TransportClosed)?;
+            let event_id = hex::encode(delivery.message.id.as_slice());
+            let seen = self
+                .state
+                .seen_events
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
+                continue;
+            }
+            if seen.contains(&event_id) {
+                continue;
+            }
+            self.state.seen_events.push(event_id);
+
+            let mut summary = SyncSummary::default();
+            self.ingest_delivery(delivery, &profiles, &mut summary).await?;
+            self.app.save_state(&self.state)?;
+            if summary.joined_groups.is_empty()
+                && summary.messages.is_empty()
+                && summary.events.is_empty()
+            {
+                continue;
+            }
+            return Ok(summary);
+        }
+    }
+
     async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
         let profiles = self.app.profiles_by_id()?;
         let local_account_id_hex = self
@@ -2054,6 +2286,7 @@ impl AppClient {
         summary: &mut SyncSummary,
     ) -> Result<(), AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
+        let source_recorded_at = delivery.message.timestamp.0;
         let effects = self.runtime.ingest_delivery(delivery).await?;
         fail_if_publish_failed(&effects.effects.failures)?;
         for event in &effects.effects.events {
@@ -2090,6 +2323,8 @@ impl AppClient {
                         group_id_hex: hex::encode(message.group_id.as_slice()),
                         sender: message.sender.clone(),
                         plaintext: message.plaintext.clone(),
+                        app_message: message.app_message.clone(),
+                        recorded_at: Some(source_recorded_at),
                     })?;
             }
             if self.state.groups.len() != before {
@@ -2223,6 +2458,14 @@ impl Drop for AppClient {
 
 fn app_feature_registry() -> FeatureRegistry {
     let mut registry = FeatureRegistry::new();
+    registry.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03 SelfRemove group departure",
+        },
+    );
     for (feature, description) in [
         (
             AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE.clone(),
@@ -2582,6 +2825,9 @@ fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
     if let Some(nip05) = profile.nip05.as_ref().filter(|value| !value.is_empty()) {
         value.insert("nip05".to_owned(), serde_json::Value::String(nip05.clone()));
     }
+    if let Some(lud16) = profile.lud16.as_ref().filter(|value| !value.is_empty()) {
+        value.insert("lud16".to_owned(), serde_json::Value::String(lud16.clone()));
+    }
     serde_json::Value::Object(value)
 }
 
@@ -2652,6 +2898,7 @@ fn profile_from_record(record: RelayEventRecord) -> Option<(String, UserProfileM
             about: string_field(&content, "about"),
             picture: string_field(&content, "picture"),
             nip05: string_field(&content, "nip05"),
+            lud16: string_field(&content, "lud16"),
             created_at: record.event.created_at,
             source_relays: source_relays_from_record(&record),
         },
@@ -2782,6 +3029,18 @@ fn parse_account_id_hex(value: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::InvalidPublicKey)
 }
 
+fn admin_pubkey_from_account_id_hex(account_id_hex: &str) -> Result<[u8; 32], AppError> {
+    let bytes = hex::decode(parse_account_id_hex(account_id_hex)?)?;
+    bytes.try_into().map_err(|_| AppError::InvalidPublicKey)
+}
+
+fn admin_pubkey_from_member_id(member_id: &MemberId) -> Result<[u8; 32], AppError> {
+    member_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::InvalidPublicKey)
+}
+
 fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, AppError> {
     let mut values = values
         .into_iter()
@@ -2825,6 +3084,13 @@ fn relay_urls_from_endpoints(endpoints: &[TransportEndpoint]) -> Result<Vec<Rela
             })
         })
         .collect()
+}
+
+async fn connect_sdk_relay(client: &NostrSdkClient, relay_url: RelayUrl) -> Result<(), AppError> {
+    timeout(SDK_RELAY_CONNECT_WAIT, client.connect_relay(relay_url))
+        .await
+        .map_err(|_| AppError::RelayDirectory("connect relay timed out".to_owned()))?
+        .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))
 }
 
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
@@ -2901,11 +3167,21 @@ fn observe_event(
             let sender_hex = hex::encode(sender.as_slice());
             let sender_label = profiles.get(&sender_hex).cloned().unwrap_or(sender_hex);
             let plaintext = String::from_utf8_lossy(payload).to_string();
+            let app_message = MarmotAppMessageEnvelopeV1::decode(payload)
+                .ok()
+                .flatten()
+                .filter(|envelope| envelope.validate().is_ok())
+                .map(|envelope| envelope.payload);
+            let plaintext = app_message
+                .as_ref()
+                .map(display_text_for_app_message)
+                .unwrap_or(plaintext);
             let message = ReceivedMessage {
                 message_id_hex: source_message_id_hex.to_owned(),
                 sender: sender_label,
                 group_id: group_id.clone(),
                 plaintext,
+                app_message,
             };
             summary.messages.push(message.clone());
             summary.events.push(event.clone());
@@ -2995,6 +3271,17 @@ fn send_summary_from_effects(effects: &marmot_account::AccountDeviceEffects) -> 
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect(),
     }
+}
+
+fn encode_validated_app_message(
+    envelope: &MarmotAppMessageEnvelopeV1,
+) -> Result<Vec<u8>, AppError> {
+    envelope
+        .validate()
+        .map_err(AppError::InvalidAppMessagePayload)?;
+    envelope
+        .encode()
+        .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
 }
 
 fn validate_group_profile(name: &str, description: &str) -> Result<(), AppError> {

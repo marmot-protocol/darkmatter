@@ -220,6 +220,15 @@ pub struct PublishTextToBroker {
 }
 
 #[derive(Clone, Debug)]
+pub struct OpenBrokerTextPublisher {
+    pub broker_addr: SocketAddr,
+    pub server_name: String,
+    pub trust: BrokerServerTrust,
+    pub stream_id: Vec<u8>,
+    pub start_event_id: MessageId,
+}
+
+#[derive(Clone, Debug)]
 pub struct SubscribeTextFromBroker {
     pub broker_addr: SocketAddr,
     pub server_name: String,
@@ -228,57 +237,111 @@ pub struct SubscribeTextFromBroker {
     pub start_event_id: MessageId,
 }
 
+pub struct BrokerTextPublisher {
+    endpoint: Endpoint,
+    connection: quinn::Connection,
+    send: quinn::SendStream,
+    transcript: AgentTextStreamTranscriptV1,
+    next_seq: u64,
+}
+
+impl BrokerTextPublisher {
+    pub async fn connect(config: OpenBrokerTextPublisher) -> Result<Self, QuicBrokerError> {
+        let endpoint = client_endpoint(config.trust, config.broker_addr)?;
+        let connection = endpoint
+            .connect(config.broker_addr, &config.server_name)?
+            .await?;
+        let mut send = connection.open_uni().await?;
+        write_control_frame(
+            &mut send,
+            &QuicBrokerControlEnvelopeV1::publish(&config.stream_id, &config.start_event_id),
+        )
+        .await?;
+
+        Ok(Self {
+            endpoint,
+            connection,
+            send,
+            transcript: AgentTextStreamTranscriptV1::new(config.stream_id, config.start_event_id),
+            next_seq: 1,
+        })
+    }
+
+    pub async fn append_text(
+        &mut self,
+        text: &str,
+        max_chunk_bytes: usize,
+        chunk_delay: Duration,
+    ) -> Result<u64, QuicBrokerError> {
+        if max_chunk_bytes == 0 {
+            return Err(QuicBrokerError::EmptyChunkSize);
+        }
+        if max_chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
+            return Err(QuicBrokerError::ChunkSizeTooLarge(max_chunk_bytes));
+        }
+
+        let mut appended = 0_u64;
+        for chunk in transport_quic_stream::split_text_deltas(text, max_chunk_bytes) {
+            let record = AgentTextStreamRecordV1::text_delta(
+                self.transcript.stream_id().to_vec(),
+                self.next_seq,
+                chunk,
+            );
+            self.next_seq += 1;
+            write_record_frame(&mut self.send, &record).await?;
+            self.transcript
+                .append(record.seq, record.record_type, &record.plaintext_frame);
+            appended += 1;
+            if !chunk_delay.is_zero() {
+                sleep(chunk_delay).await;
+            }
+        }
+        Ok(appended)
+    }
+
+    pub async fn finish(mut self) -> Result<SentTextStream, QuicBrokerError> {
+        self.send.finish()?;
+        self.send.stopped().await?;
+        self.connection.close(0_u32.into(), b"done");
+        self.endpoint.wait_idle().await;
+        Ok(SentTextStream {
+            stream_id: self.transcript.stream_id().to_vec(),
+            transcript_hash: self.transcript.hash(),
+            chunk_count: self.transcript.chunk_count(),
+        })
+    }
+}
+
 pub async fn publish_text_to_broker(
     config: PublishTextToBroker,
 ) -> Result<SentTextStream, QuicBrokerError> {
-    if config.max_chunk_bytes == 0 {
-        return Err(QuicBrokerError::EmptyChunkSize);
-    }
-    if config.max_chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
-        return Err(QuicBrokerError::ChunkSizeTooLarge(config.max_chunk_bytes));
-    }
-
-    let endpoint = client_endpoint(config.trust, config.broker_addr)?;
-    let connection = endpoint
-        .connect(config.broker_addr, &config.server_name)?
-        .await?;
-    let mut send = connection.open_uni().await?;
-    write_control_frame(
-        &mut send,
-        &QuicBrokerControlEnvelopeV1::publish(&config.stream_id, &config.start_event_id),
-    )
-    .await?;
-
-    let mut transcript =
-        AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
-    for (index, chunk) in
-        transport_quic_stream::split_text_deltas(&config.text, config.max_chunk_bytes)
-            .into_iter()
-            .enumerate()
-    {
-        let record =
-            AgentTextStreamRecordV1::text_delta(config.stream_id.clone(), index as u64 + 1, chunk);
-        write_record_frame(&mut send, &record).await?;
-        transcript.append(record.seq, record.record_type, &record.plaintext_frame);
-        if !config.chunk_delay.is_zero() {
-            sleep(config.chunk_delay).await;
-        }
-    }
-
-    send.finish()?;
-    send.stopped().await?;
-    connection.close(0_u32.into(), b"done");
-    endpoint.wait_idle().await;
-    Ok(SentTextStream {
-        stream_id: transcript.stream_id().to_vec(),
-        transcript_hash: transcript.hash(),
-        chunk_count: transcript.chunk_count(),
+    let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+        broker_addr: config.broker_addr,
+        server_name: config.server_name,
+        trust: config.trust,
+        stream_id: config.stream_id,
+        start_event_id: config.start_event_id,
     })
+    .await?;
+    publisher
+        .append_text(&config.text, config.max_chunk_bytes, config.chunk_delay)
+        .await?;
+    publisher.finish().await
 }
 
 pub async fn subscribe_text_from_broker(
     config: SubscribeTextFromBroker,
 ) -> Result<ReceivedTextStream, QuicBrokerError> {
+    subscribe_text_from_broker_with_updates(config, |_| {}).await
+}
+
+pub async fn subscribe_text_from_broker_with_updates<F>(
+    config: SubscribeTextFromBroker,
+    mut on_chunk: F,
+) -> Result<ReceivedTextStream, QuicBrokerError>
+where
+    F: FnMut(&ReceivedTextChunk),
+{
     let endpoint = client_endpoint(config.trust, config.broker_addr)?;
     let connection = endpoint
         .connect(config.broker_addr, &config.server_name)?
@@ -317,16 +380,17 @@ pub async fn subscribe_text_from_broker(
             String::new()
         };
         transcript.append(record.seq, record.record_type, &record.plaintext_frame);
-        chunks.push(ReceivedTextChunk {
+        let chunk = ReceivedTextChunk {
             seq: record.seq,
             record_type: record.record_type,
             flags: record.flags,
             text: delta,
-        });
+        };
+        on_chunk(&chunk);
+        chunks.push(chunk);
     }
 
     connection.close(0_u32.into(), b"done");
-    endpoint.wait_idle().await;
     if chunks.is_empty() {
         return Err(QuicBrokerError::EmptyStream);
     }
@@ -347,8 +411,14 @@ struct BrokerState {
 
 #[derive(Debug, Default)]
 struct BrokerStateInner {
-    rooms: HashMap<BrokerStreamKey, Vec<Subscriber>>,
+    rooms: HashMap<BrokerStreamKey, BrokerRoom>,
     next_subscriber_id: u64,
+}
+
+#[derive(Debug, Default)]
+struct BrokerRoom {
+    subscribers: Vec<Subscriber>,
+    backlog: Vec<AgentTextStreamRecordV1>,
 }
 
 #[derive(Debug)]
@@ -373,20 +443,22 @@ impl BrokerState {
         let mut inner = self.inner.lock().await;
         let id = inner.next_subscriber_id;
         inner.next_subscriber_id += 1;
-        inner
-            .rooms
-            .entry(key)
-            .or_default()
-            .push(Subscriber { id, tx });
+        let room = inner.rooms.entry(key).or_default();
+        for record in &room.backlog {
+            if tx.try_send(record.clone()).is_err() {
+                break;
+            }
+        }
+        room.subscribers.push(Subscriber { id, tx });
         (id, rx)
     }
 
     async fn unsubscribe(&self, key: &BrokerStreamKey, id: u64) {
         let mut inner = self.inner.lock().await;
         let mut should_remove = false;
-        if let Some(subscribers) = inner.rooms.get_mut(key) {
-            subscribers.retain(|subscriber| subscriber.id != id);
-            should_remove = subscribers.is_empty();
+        if let Some(room) = inner.rooms.get_mut(key) {
+            room.subscribers.retain(|subscriber| subscriber.id != id);
+            should_remove = room.subscribers.is_empty() && room.backlog.is_empty();
         }
         if should_remove {
             inner.rooms.remove(key);
@@ -395,22 +467,17 @@ impl BrokerState {
 
     async fn publish(&self, key: &BrokerStreamKey, record: AgentTextStreamRecordV1) -> usize {
         let mut inner = self.inner.lock().await;
-        let mut should_remove = false;
         let mut delivered = 0;
-        if let Some(subscribers) = inner.rooms.get_mut(key) {
-            subscribers.retain(|subscriber| {
-                if subscriber.tx.try_send(record.clone()).is_ok() {
-                    delivered += 1;
-                    true
-                } else {
-                    false
-                }
-            });
-            should_remove = subscribers.is_empty();
-        }
-        if should_remove {
-            inner.rooms.remove(key);
-        }
+        let room = inner.rooms.entry(key.clone()).or_default();
+        room.backlog.push(record.clone());
+        room.subscribers.retain(|subscriber| {
+            if subscriber.tx.try_send(record.clone()).is_ok() {
+                delivered += 1;
+                true
+            } else {
+                false
+            }
+        });
         delivered
     }
 
@@ -420,7 +487,7 @@ impl BrokerState {
             .await
             .rooms
             .get(key)
-            .is_some_and(|subscribers| !subscribers.is_empty())
+            .is_some_and(|room| !room.subscribers.is_empty())
     }
 
     async fn wait_for_subscriber(&self, key: &BrokerStreamKey) {
@@ -911,6 +978,20 @@ mod tests {
 
         assert_eq!(state.live_room_count().await, 0);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn broker_buffers_records_until_subscriber_arrives() {
+        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH);
+        let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
+        let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
+
+        assert_eq!(state.publish(&key, record.clone()).await, 0);
+        let (_subscriber_id, mut rx) = state.subscribe(key).await;
+        let received = rx.recv().await.expect("subscriber should receive backlog");
+
+        assert_eq!(received.seq, record.seq);
+        assert_eq!(received.plaintext_frame, record.plaintext_frame);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::{
@@ -14,12 +15,16 @@ use nostr_sdk::prelude::{
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
     NostrTransportAdapter,
 };
+
+const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+const SDK_RELAY_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
 #[derive(Clone, Debug)]
@@ -232,10 +237,13 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 .add_relay(endpoint.clone())
                 .await
                 .map_err(|e| TransportAdapterError::Subscription(format!("add relay: {e}")))?;
-            self.client
-                .connect_relay(endpoint.clone())
-                .await
-                .map_err(|e| TransportAdapterError::Subscription(format!("connect relay: {e}")))?;
+            timeout(
+                SDK_RELAY_CONNECT_WAIT,
+                self.client.connect_relay(endpoint.clone()),
+            )
+            .await
+            .map_err(|_| TransportAdapterError::Subscription("connect relay timed out".to_owned()))?
+            .map_err(|e| TransportAdapterError::Subscription(format!("connect relay: {e}")))?;
         }
         self.client
             .subscribe_with_id_to(
@@ -319,16 +327,21 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 .add_relay(endpoint.clone())
                 .await
                 .map_err(|e| TransportAdapterError::Publish(format!("add relay: {e}")))?;
-            self.client
-                .connect_relay(endpoint.clone())
-                .await
-                .map_err(|e| TransportAdapterError::Publish(format!("connect relay: {e}")))?;
-        }
-        let output = self
-            .client
-            .send_event_to(parsed_endpoints, &event)
+            timeout(
+                SDK_RELAY_CONNECT_WAIT,
+                self.client.connect_relay(endpoint.clone()),
+            )
             .await
-            .map_err(|e| TransportAdapterError::Publish(format!("send event: {e}")))?;
+            .map_err(|_| TransportAdapterError::Publish("connect relay timed out".to_owned()))?
+            .map_err(|e| TransportAdapterError::Publish(format!("connect relay: {e}")))?;
+        }
+        let output = timeout(
+            SDK_RELAY_PUBLISH_WAIT,
+            self.client.send_event_to(parsed_endpoints, &event),
+        )
+        .await
+        .map_err(|_| TransportAdapterError::Publish("send event timed out".to_owned()))?
+        .map_err(|e| TransportAdapterError::Publish(format!("send event: {e}")))?;
 
         Ok(NostrPublishOutcome {
             message_id: Some(cgka_traits::MessageId::new(event.id.to_bytes().to_vec())),

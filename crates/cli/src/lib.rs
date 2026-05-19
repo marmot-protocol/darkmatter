@@ -9,20 +9,20 @@ use cgka_traits::agent_text_stream::{
     AgentTextStreamAppPayloadV1, AgentTextStreamRouteV1, AgentTextStreamStartPayloadV1,
 };
 use cgka_traits::error::EngineError;
-use cgka_traits::{GroupId, MessageId};
+use cgka_traits::{GroupId, MarmotAppMessagePayloadV1, MessageId};
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AppError, AppGroupMemberRecord,
     AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp,
-    SyncSummary,
+    SyncSummary, UserDirectorySearch, UserProfileMetadata,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use transport_quic_broker::{
     BrokerServerTrust, PublishTextToBroker, SubscribeTextFromBroker, publish_text_to_broker,
-    subscribe_text_from_broker,
+    subscribe_text_from_broker_with_updates,
 };
 use transport_quic_stream::{
     QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
@@ -38,8 +38,14 @@ struct Cli {
     home: Option<PathBuf>,
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
-    #[arg(long, global = true, value_name = "URL")]
+    #[arg(long, global = true, value_name = "URL", hide = true)]
     relay: Option<String>,
+    #[arg(skip)]
+    #[serde(default)]
+    daemon_discovery_relays: Vec<String>,
+    #[arg(skip)]
+    #[serde(default)]
+    daemon_default_account_relays: Vec<String>,
     #[arg(long, global = true, value_enum, value_name = "STORE")]
     secret_store: Option<SecretStoreKind>,
     #[arg(long, global = true, value_name = "SERVICE")]
@@ -77,7 +83,43 @@ struct CliRuntimeInfo {
 enum Command {
     #[command(about = "Open the interactive terminal UI")]
     Tui,
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+    #[command(
+        name = "create-identity",
+        about = "Create a new local signing identity"
+    )]
+    CreateIdentity,
+    #[command(about = "Log in with an nsec or add a public npub identity")]
+    Login {
+        #[arg(value_name = "NSEC_OR_NPUB")]
+        identity: Option<String>,
+        #[arg(long, value_name = "URL")]
+        relay: Option<String>,
+    },
+    #[command(about = "Show current account identities")]
+    Whoami,
+    #[command(about = "Log out and remove a local account")]
+    Logout {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
+    #[command(
+        name = "export-nsec",
+        about = "Exporting private keys is disabled by Darkmatter CLI policy"
+    )]
+    ExportNsec {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
+    #[command(hide = true)]
     Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+    Accounts {
         #[command(subcommand)]
         command: AccountCommand,
     },
@@ -89,13 +131,51 @@ enum Command {
         #[command(subcommand)]
         command: ChatsCommand,
     },
+    Media {
+        #[command(subcommand)]
+        command: MediaCommand,
+    },
+    #[command(hide = true)]
     Group {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    Groups {
+        #[command(subcommand)]
+        command: GroupsCommand,
+    },
+    #[command(hide = true)]
     Message {
         #[command(subcommand)]
         command: MessageCommand,
+    },
+    Messages {
+        #[command(subcommand)]
+        command: MessageCommand,
+    },
+    Follows {
+        #[command(subcommand)]
+        command: FollowsCommand,
+    },
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    Relays {
+        #[command(subcommand)]
+        command: RelaysCommand,
+    },
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
+    },
+    Users {
+        #[command(subcommand)]
+        command: UsersCommand,
+    },
+    Notifications {
+        #[command(subcommand)]
+        command: NotificationsCommand,
     },
     Stream {
         #[command(subcommand)]
@@ -105,7 +185,23 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(hide = true)]
     Sync,
+    Reset {
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum DebugCommand {
+    #[command(name = "relay-control-state")]
+    RelayControlState,
+    Health,
+    #[command(name = "ratchet-tree")]
+    RatchetTree {
+        group_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -135,7 +231,21 @@ enum AccountCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum KeyPackageCommand {
+    List,
+    #[command(hide = true)]
     Publish,
+    Delete {
+        event_id: String,
+    },
+    #[command(name = "delete-all")]
+    DeleteAll {
+        #[arg(long)]
+        confirm: bool,
+    },
+    Check {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
     Fetch {
         #[arg(value_name = "NPUB_OR_HEX")]
         account: Option<String>,
@@ -153,6 +263,7 @@ enum ChatsCommand {
     Show {
         group: String,
     },
+    Subscribe,
     Archive {
         group: String,
     },
@@ -161,6 +272,34 @@ enum ChatsCommand {
     },
     #[command(name = "list-archived")]
     ListArchived,
+    #[command(name = "subscribe-archived")]
+    SubscribeArchived,
+    Mute {
+        group: String,
+        duration: String,
+    },
+    Unmute {
+        group: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum MediaCommand {
+    Upload {
+        group: String,
+        file_path: String,
+        #[arg(long)]
+        send: bool,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    Download {
+        group: String,
+        file_hash: String,
+    },
+    List {
+        group: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -169,6 +308,8 @@ enum GroupCommand {
         name: String,
         #[arg(value_name = "MEMBER")]
         members: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
     },
     Members {
         group: String,
@@ -193,6 +334,72 @@ enum GroupCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum GroupsCommand {
+    List,
+    Create {
+        name: String,
+        #[arg(value_name = "MEMBER")]
+        members: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    Show {
+        group_id: String,
+    },
+    #[command(name = "add-members")]
+    AddMembers {
+        group_id: String,
+        #[arg(value_name = "MEMBER", required = true)]
+        members: Vec<String>,
+    },
+    #[command(name = "remove-members")]
+    RemoveMembers {
+        group_id: String,
+        #[arg(value_name = "MEMBER", required = true)]
+        members: Vec<String>,
+    },
+    Members {
+        group_id: String,
+    },
+    Admins {
+        group_id: String,
+    },
+    Relays {
+        group_id: String,
+    },
+    Leave {
+        group_id: String,
+    },
+    Rename {
+        group_id: String,
+        name: String,
+    },
+    Invites,
+    Accept {
+        group_id: String,
+    },
+    Decline {
+        group_id: String,
+    },
+    Promote {
+        group_id: String,
+        pubkey: String,
+    },
+    Demote {
+        group_id: String,
+        pubkey: String,
+    },
+    #[command(name = "self-demote")]
+    SelfDemote {
+        group_id: String,
+    },
+    #[command(name = "subscribe-state")]
+    SubscribeState {
+        group_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum MessageCommand {
     Send {
         #[arg(long = "group", value_name = "GROUP")]
@@ -200,12 +407,136 @@ enum MessageCommand {
         #[arg(value_name = "GROUP_OR_TEXT", allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    Delete {
+        group_id: String,
+        message_id: String,
+    },
+    Retry {
+        group_id: String,
+        event_id: String,
+    },
+    React {
+        group_id: String,
+        message_id: String,
+        #[arg(default_value = "+")]
+        emoji: String,
+    },
+    Unreact {
+        group_id: String,
+        message_id: String,
+    },
     List {
+        #[arg(value_name = "GROUP")]
+        group_id: Option<String>,
         #[arg(long)]
         group: Option<String>,
         #[arg(long)]
+        before: Option<u64>,
+        #[arg(long)]
+        before_message_id: Option<String>,
+        #[arg(long)]
+        after: Option<u64>,
+        #[arg(long)]
+        after_message_id: Option<String>,
+        #[arg(long)]
         limit: Option<usize>,
     },
+    Search {
+        group_id: String,
+        query: String,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    #[command(name = "search-all")]
+    SearchAll {
+        query: String,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    Subscribe {
+        group: String,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum FollowsCommand {
+    List,
+    Add {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
+    Remove {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
+    Check {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum ProfileCommand {
+    Show,
+    Update {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        about: Option<String>,
+        #[arg(long)]
+        picture: Option<String>,
+        #[arg(long)]
+        nip05: Option<String>,
+        #[arg(long)]
+        lud16: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum RelaysCommand {
+    List {
+        #[arg(long = "type", value_name = "TYPE")]
+        relay_type: Option<String>,
+    },
+    Add {
+        url: String,
+        #[arg(long = "type", value_name = "TYPE")]
+        relay_type: String,
+    },
+    Remove {
+        url: String,
+        #[arg(long = "type", value_name = "TYPE")]
+        relay_type: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum SettingsCommand {
+    Show,
+    Theme { mode: String },
+    Language { lang: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum UsersCommand {
+    Show {
+        #[arg(value_name = "NPUB_OR_HEX")]
+        pubkey: String,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value = "0..2", value_parser = parse_radius)]
+        radius: (u8, u8),
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum NotificationsCommand {
+    Subscribe,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -257,6 +588,37 @@ enum StreamCommand {
         server_cert_der_hex: Option<String>,
         #[arg(long)]
         insecure_local: bool,
+        #[arg(long)]
+        background: bool,
+    },
+    #[command(hide = true)]
+    ComposeOpen {
+        group: String,
+        #[arg(long, value_name = "HEX")]
+        stream_id: Option<String>,
+        #[arg(long = "quic-candidate", value_name = "ADDR")]
+        quic_candidates: Vec<String>,
+        #[arg(long)]
+        insecure_local: bool,
+        #[arg(long, default_value_t = 32, value_name = "BYTES")]
+        chunk_bytes: usize,
+    },
+    #[command(hide = true)]
+    ComposeAppend {
+        #[arg(long, value_name = "HEX")]
+        stream_id: String,
+        #[arg(value_name = "TEXT", required = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    #[command(hide = true)]
+    ComposeFinish {
+        #[arg(long, value_name = "HEX")]
+        stream_id: String,
+    },
+    #[command(hide = true)]
+    ComposeCancel {
+        #[arg(long, value_name = "HEX")]
+        stream_id: String,
     },
     #[command(about = "Commit the final agent text stream transcript over the MLS message path")]
     Finish {
@@ -285,8 +647,10 @@ enum StreamCommand {
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum DaemonCommand {
     Start {
-        #[arg(long, value_name = "MILLIS")]
-        sync_interval_ms: Option<u64>,
+        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        discovery_relays: Vec<String>,
+        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        default_account_relays: Vec<String>,
     },
     Stop,
     Status,
@@ -297,6 +661,17 @@ pub struct CliOutput {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AgentStreamDelta {
+    pub account: Option<String>,
+    pub group_id: String,
+    pub stream_id: String,
+    pub seq: u64,
+    pub record_type: u8,
+    pub flags: u8,
+    pub text: String,
 }
 
 #[derive(Debug)]
@@ -319,6 +694,10 @@ enum DmError {
     AgentTextStreamPayload(#[from] AgentTextStreamAppPayloadError),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error("message text is required")]
     EmptyMessage,
     #[error("group id is required")]
@@ -328,7 +707,7 @@ enum DmError {
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(String),
     #[error(
-        "relay URL is required; pass --relay, set DM_RELAY, or provide setup relays for account creation"
+        "relay URL is required; start the daemon with --discovery-relays and --default-account-relays, or pass setup relays for account creation"
     )]
     MissingRelay,
     #[error("no account selected")]
@@ -364,6 +743,15 @@ enum DmError {
     ConflictingStreamTrust,
     #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
     InsecureLocalRequiresLoopback(SocketAddr),
+    #[error("messages subscribe requires the daemon; start it with `dm daemon start`")]
+    MessagesSubscribeRequiresDaemon,
+    #[error("login requires an nsec or npub identity")]
+    MissingLoginIdentity,
+    #[error("{command} is not implemented yet: {reason}")]
+    UnsupportedCommand {
+        command: &'static str,
+        reason: &'static str,
+    },
     #[error("missing account relay lists: {0:?}")]
     MissingRelayLists(Vec<String>, Box<AccountRelayListStatus>),
     #[error(
@@ -406,6 +794,38 @@ where
     }
 
     let home = resolve_home(cli.home.clone());
+    if is_background_stream_watch(&cli) {
+        let socket = daemon_socket_path_for_client(&cli, &home);
+        return match daemon::send_stream_watch(&socket, cli.clone()).await {
+            Ok(output) => output,
+            Err(err) => daemon_client_error(cli.json, err),
+        };
+    }
+
+    if is_messages_subscribe(&cli) {
+        let socket = daemon_socket_path_for_client(&cli, &home);
+        return match daemon::send_messages_subscribe(&socket, cli.clone()).await {
+            Ok(output) => output,
+            Err(err) => daemon_client_error(cli.json, err),
+        };
+    }
+
+    if is_chats_subscribe(&cli) {
+        let socket = daemon_socket_path_for_client(&cli, &home);
+        return match daemon::send_chats_subscribe(&socket, cli.clone()).await {
+            Ok(output) => output,
+            Err(err) => daemon_client_error(cli.json, err),
+        };
+    }
+
+    if is_group_state_subscribe(&cli) {
+        let socket = daemon_socket_path_for_client(&cli, &home);
+        return match daemon::send_group_state_subscribe(&socket, cli.clone()).await {
+            Ok(output) => output,
+            Err(err) => daemon_client_error(cli.json, err),
+        };
+    }
+
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         match daemon::send_execute(&socket, cli.clone()).await {
             Ok(output) => return output,
@@ -417,6 +837,47 @@ where
     }
 
     run_cli_local(cli).await
+}
+
+fn is_background_stream_watch(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Stream {
+            command: StreamCommand::Watch {
+                background: true,
+                ..
+            }
+        }
+    )
+}
+
+fn is_messages_subscribe(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Message {
+            command: MessageCommand::Subscribe { .. },
+        } | Command::Messages {
+            command: MessageCommand::Subscribe { .. },
+        }
+    )
+}
+
+fn is_chats_subscribe(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Chats {
+            command: ChatsCommand::Subscribe | ChatsCommand::SubscribeArchived,
+        }
+    )
+}
+
+fn is_group_state_subscribe(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Groups {
+            command: GroupsCommand::SubscribeState { .. },
+        }
+    )
 }
 
 pub(crate) async fn run_cli_local(cli: Cli) -> CliOutput {
@@ -457,6 +918,85 @@ pub(crate) async fn run_cli_local(cli: Cli) -> CliOutput {
     }
 }
 
+pub(crate) async fn run_stream_watch_local_with_observer<F>(cli: Cli, on_delta: F) -> CliOutput
+where
+    F: FnMut(AgentStreamDelta) + Send,
+{
+    let json_output = cli.json;
+    match execute_stream_watch_with_observer(cli, on_delta).await {
+        Ok(output) if json_output => CliOutput {
+            code: 0,
+            stdout: format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "ok": true,
+                    "result": output.json,
+                }))
+                .expect("JSON response serialization cannot fail")
+            ),
+            stderr: String::new(),
+        },
+        Ok(output) => CliOutput {
+            code: 0,
+            stdout: ensure_trailing_newline(output.plain),
+            stderr: String::new(),
+        },
+        Err(err) if json_output => json_dm_error(err),
+        Err(err) => CliOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("error: {err}\n"),
+        },
+    }
+}
+
+async fn execute_stream_watch_with_observer<F>(
+    cli: Cli,
+    on_delta: F,
+) -> Result<CommandOutput, DmError>
+where
+    F: FnMut(AgentStreamDelta) + Send,
+{
+    let home = resolve_home(cli.home.clone());
+    let account_flag = cli.account.clone();
+    let command = cli.command.clone();
+    let Command::Stream {
+        command:
+            StreamCommand::Watch {
+                group,
+                stream_id,
+                server_cert_der_hex,
+                insecure_local,
+                background,
+            },
+    } = command
+    else {
+        return unsupported_command(
+            "stream watch",
+            "daemon stream observers only support stream watch",
+        );
+    };
+    let secret_store = resolve_secret_store(cli.secret_store)?;
+    let keychain_service = resolve_keychain_service(cli.keychain_service);
+    let account_home = open_account_home(&home, secret_store, &keychain_service)?;
+    let relay = resolve_relay(cli.relay)?;
+    let app = app_for(home, relay, account_home.clone());
+    stream_watch_command_app(
+        &account_home,
+        &app,
+        StreamCommand::Watch {
+            group,
+            stream_id,
+            server_cert_der_hex,
+            insecure_local,
+            background,
+        },
+        account_flag,
+        on_delta,
+    )
+    .await
+}
+
 async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, DmError)> {
     let json_output = cli.json;
     execute_inner(cli)
@@ -484,10 +1024,59 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
         keychain_service: keychain_service.clone(),
     };
     let account_home = open_account_home(&home, secret_store, &keychain_service)?;
-    let relay = resolve_relay(cli.relay.clone())?;
-    let app = app_for(home, relay.clone(), account_home.clone());
+    let command_relay = match &command {
+        Command::Login { relay, .. } => relay.clone().or_else(|| cli.relay.clone()),
+        _ => cli.relay.clone(),
+    };
+    let relay = resolve_relay(command_relay)?;
+    let app = app_for(
+        home.clone(),
+        relay
+            .clone()
+            .or_else(|| cli.daemon_discovery_relays.first().cloned())
+            .or_else(|| cli.daemon_default_account_relays.first().cloned()),
+        account_home.clone(),
+    );
     match command {
+        Command::Debug { command } => debug_command(&account_home, &app, command, account_flag),
+        Command::CreateIdentity => {
+            identity_create_command(
+                &account_home,
+                &app,
+                runtime_info,
+                relay,
+                cli.daemon_default_account_relays,
+                cli.daemon_discovery_relays,
+            )
+            .await
+        }
+        Command::Login { identity, relay: _ } => {
+            identity_login_command(
+                &account_home,
+                &app,
+                runtime_info,
+                identity,
+                relay,
+                cli.daemon_default_account_relays,
+                cli.daemon_discovery_relays,
+            )
+            .await
+        }
+        Command::Whoami => whoami_command(&account_home, &app, runtime_info, account_flag),
+        Command::Logout { pubkey } => logout_command(&account_home, pubkey),
+        Command::ExportNsec { pubkey } => export_nsec_command(pubkey),
         Command::Account { command } => {
+            account_command(
+                &account_home,
+                &app,
+                command,
+                runtime_info,
+                account_flag,
+                relay,
+            )
+            .await
+        }
+        Command::Accounts { command } => {
             account_command(
                 &account_home,
                 &app,
@@ -504,12 +1093,33 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
         Command::Chats { command } => {
             chats_command(&account_home, &app, command, account_flag).await
         }
+        Command::Media { command } => {
+            media_command(&account_home, &app, command, account_flag).await
+        }
         Command::Group { command } => {
             group_command(&account_home, &app, command, account_flag).await
+        }
+        Command::Groups { command } => {
+            groups_command(&account_home, &app, command, account_flag).await
         }
         Command::Message { command } => {
             message_command(&account_home, &app, command, account_flag).await
         }
+        Command::Messages { command } => {
+            message_command(&account_home, &app, command, account_flag).await
+        }
+        Command::Follows { command } => {
+            follows_command(&account_home, &app, command, account_flag, relay).await
+        }
+        Command::Profile { command } => {
+            profile_command(&account_home, &app, command, account_flag, relay).await
+        }
+        Command::Relays { command } => {
+            relays_command(&account_home, &app, command, account_flag, relay).await
+        }
+        Command::Settings { command } => settings_command(&home, command),
+        Command::Users { command } => users_command(&account_home, &app, command, account_flag),
+        Command::Notifications { command } => notifications_command(command),
         Command::Stream { command } => {
             stream_command_app(&account_home, &app, command, account_flag).await
         }
@@ -526,21 +1136,25 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             ensure_local_signing(&account)?;
             sync_command(&app, account).await
         }
+        Command::Reset { confirm } => reset_command(&home, confirm),
     }
 }
 
 fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
-    let env_socket = std::env::var_os("DM_SOCKET").map(PathBuf::from);
-    let socket = cli
-        .socket
-        .clone()
-        .or(env_socket.clone())
-        .unwrap_or_else(|| daemon::default_socket_path(home));
-    if cli.socket.is_some() || env_socket.is_some() || socket.exists() {
+    let socket = daemon_socket_path_for_client(cli, home);
+    if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() || socket.exists() {
         Some(socket)
     } else {
         None
     }
+}
+
+fn daemon_socket_path_for_client(cli: &Cli, home: &Path) -> PathBuf {
+    let env_socket = std::env::var_os("DM_SOCKET").map(PathBuf::from);
+    cli.socket
+        .clone()
+        .or(env_socket.clone())
+        .unwrap_or_else(|| daemon::default_socket_path(home))
 }
 
 fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
@@ -568,6 +1182,368 @@ fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> Cli
     }
 }
 
+async fn identity_create_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime_info: CliRuntimeInfo,
+    relay: Option<String>,
+    default_relays: Vec<String>,
+    bootstrap_relays: Vec<String>,
+) -> Result<CommandOutput, DmError> {
+    create_or_import_account_command(
+        account_home,
+        app,
+        None,
+        default_relays,
+        bootstrap_relays,
+        false,
+        true,
+        runtime_info,
+        relay,
+    )
+    .await
+}
+
+async fn identity_login_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime_info: CliRuntimeInfo,
+    identity: Option<String>,
+    relay: Option<String>,
+    default_relays: Vec<String>,
+    bootstrap_relays: Vec<String>,
+) -> Result<CommandOutput, DmError> {
+    let Some(identity) = identity else {
+        return Err(DmError::MissingLoginIdentity);
+    };
+    create_or_import_account_command(
+        account_home,
+        app,
+        Some(identity),
+        default_relays,
+        bootstrap_relays,
+        true,
+        true,
+        runtime_info,
+        relay,
+    )
+    .await
+}
+
+fn whoami_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime_info: CliRuntimeInfo,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    if account_flag.is_some() {
+        let account = resolve_account(account_home, account_flag)?;
+        let status = if account.local_signing {
+            app.status(&account.label)?;
+            dm_status_json(app.status(&account.label)?, &runtime_info)
+        } else {
+            public_account_status_json(
+                &account,
+                app.account_relay_list_status_for_account_id(&account.account_id_hex)?,
+            )
+        };
+        return Ok(CommandOutput {
+            plain: serde_json::to_string_pretty(&status)
+                .expect("JSON response serialization cannot fail"),
+            json: status,
+        });
+    }
+
+    let accounts = account_home.accounts()?;
+    let accounts_json = accounts
+        .into_iter()
+        .map(account_summary_json)
+        .collect::<Vec<_>>();
+    let plain = if accounts_json.is_empty() {
+        "no accounts".to_owned()
+    } else {
+        accounts_json
+            .iter()
+            .map(|account| {
+                format!(
+                    "{} {} local-signing={}",
+                    account.get("npub").and_then(Value::as_str).unwrap_or(""),
+                    account
+                        .get("account_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    account
+                        .get("local_signing")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(CommandOutput {
+        plain,
+        json: json!({ "accounts": accounts_json }),
+    })
+}
+
+fn debug_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: DebugCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    match command {
+        DebugCommand::RelayControlState => {
+            let accounts = account_home.accounts()?;
+            let statuses = accounts
+                .into_iter()
+                .map(|account| {
+                    let relay_lists = app
+                        .account_relay_list_status_for_account_id(&account.account_id_hex)
+                        .map(relay_lists_json)
+                        .unwrap_or_else(|err| json!({"error": err.to_string()}));
+                    json!({
+                        "account_id": account.account_id_hex,
+                        "npub": npub_for_account_id(&account.account_id_hex),
+                        "relay_lists": relay_lists,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(CommandOutput {
+                plain: serde_json::to_string_pretty(&statuses)
+                    .expect("JSON response serialization cannot fail"),
+                json: json!({ "accounts": statuses }),
+            })
+        }
+        DebugCommand::Health => {
+            let account = resolve_account(account_home, account_flag)?;
+            let status = app.status(&account.label)?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "healthy account={} groups={} messages={}",
+                    account.account_id_hex, status.group_count, status.message_count
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "healthy": true,
+                    "groups": status.group_count,
+                    "messages": status.message_count,
+                    "seen_events": status.seen_events,
+                }),
+            })
+        }
+        DebugCommand::RatchetTree { .. } => unsupported_command(
+            "debug ratchet-tree",
+            "ratchet-tree diagnostics are not exposed by marmot-app yet",
+        ),
+    }
+}
+
+fn logout_command(account_home: &AccountHome, pubkey: String) -> Result<CommandOutput, DmError> {
+    let account_id = parse_public_key(&pubkey)?;
+    account_home.remove_account(&account_id)?;
+    Ok(CommandOutput {
+        plain: format!("logged out {}", npub_for_account_id(&account_id)),
+        json: json!({
+            "account_id": account_id,
+            "npub": npub_for_account_id(&account_id),
+            "logged_out": true,
+        }),
+    })
+}
+
+fn export_nsec_command(_pubkey: String) -> Result<CommandOutput, DmError> {
+    unsupported_command(
+        "export-nsec",
+        "Darkmatter CLI policy forbids printing private keys",
+    )
+}
+
+fn unsupported_command<T>(command: &'static str, reason: &'static str) -> Result<T, DmError> {
+    Err(DmError::UnsupportedCommand { command, reason })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_or_import_account_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    identity: Option<String>,
+    mut default_relays: Vec<String>,
+    mut bootstrap_relays: Vec<String>,
+    publish_missing_relay_lists: bool,
+    publish_initial_key_package: bool,
+    _runtime_info: CliRuntimeInfo,
+    relay: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    let global_relay_defaults =
+        apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
+    let directory_bootstrap_relays = bootstrap_relays.clone();
+    let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
+    let creates_new_private_key = identity.is_none();
+    let account = create_nostr_account(account_home, identity)?;
+    let relay_lists = match account.local_signing {
+        true => {
+            if creates_new_private_key && default_relays.is_empty() {
+                rollback_account_after_setup_failure(
+                    account_home,
+                    &account.label,
+                    DmError::MissingRelay,
+                )?;
+            }
+            if imports_private_key && default_relays.is_empty() && bootstrap_relays.is_empty() {
+                rollback_account_after_setup_failure(
+                    account_home,
+                    &account.label,
+                    DmError::MissingRelay,
+                )?;
+            }
+            if imports_private_key && (!default_relays.is_empty() || !bootstrap_relays.is_empty()) {
+                let bootstrap =
+                    match relay_bootstrap(default_relays.clone(), bootstrap_relays.clone()) {
+                        Ok(Some(bootstrap)) => bootstrap,
+                        Ok(None) => unreachable!("import relay setup checked above"),
+                        Err(err) => {
+                            rollback_account_after_setup_failure(account_home, &account.label, err)?
+                        }
+                    };
+                let current_status = match relay_list_status_for_account_id(
+                    app,
+                    &account.account_id_hex,
+                    bootstrap.bootstrap_relays.clone(),
+                )
+                .await
+                {
+                    Ok(status) => status,
+                    Err(err) => {
+                        rollback_account_after_setup_failure(account_home, &account.label, err)?
+                    }
+                };
+                if current_status.complete {
+                    current_status
+                } else if !publish_missing_relay_lists || default_relays.is_empty() {
+                    rollback_account_after_setup_failure(
+                        account_home,
+                        &account.label,
+                        DmError::MissingRelayLists(
+                            current_status.missing.clone(),
+                            Box::new(current_status),
+                        ),
+                    )?
+                } else {
+                    let bootstrap = match relay_bootstrap_from_endpoints(
+                        default_relays,
+                        bootstrap.bootstrap_relays,
+                    )
+                    .and_then(|bootstrap| {
+                        bootstrap.ok_or_else(|| AppError::MissingDefaultRelays.into())
+                    }) {
+                        Ok(bootstrap) => bootstrap,
+                        Err(err) => {
+                            rollback_account_after_setup_failure(account_home, &account.label, err)?
+                        }
+                    };
+                    match app
+                        .publish_missing_account_relay_lists_from_status(
+                            &account.label,
+                            bootstrap,
+                            current_status,
+                        )
+                        .await
+                    {
+                        Ok(relay_lists) => relay_lists,
+                        Err(err) => rollback_account_after_setup_failure(
+                            account_home,
+                            &account.label,
+                            err.into(),
+                        )?,
+                    }
+                }
+            } else {
+                let bootstrap = match relay_bootstrap(default_relays, bootstrap_relays) {
+                    Ok(bootstrap) => bootstrap,
+                    Err(err) => {
+                        rollback_account_after_setup_failure(account_home, &account.label, err)?
+                    }
+                };
+                match maybe_publish_relay_lists(app, &account.label, bootstrap).await {
+                    Ok(relay_lists) => relay_lists,
+                    Err(err) => {
+                        rollback_account_after_setup_failure(account_home, &account.label, err)?
+                    }
+                }
+            }
+        }
+        false => {
+            if bootstrap_relays.is_empty() {
+                rollback_account_after_setup_failure(
+                    account_home,
+                    &account.label,
+                    DmError::MissingRelay,
+                )?;
+            }
+            if !default_relays.is_empty() && !global_relay_defaults.default_relays {
+                return Err(DmError::PublicAccountCannotSign);
+            }
+            relay_list_status_for_account_id(
+                app,
+                &account.account_id_hex,
+                relay_endpoints(bootstrap_relays)?,
+            )
+            .await?
+        }
+    };
+    let key_package_bytes = if publish_initial_key_package && account.local_signing {
+        match publish_initial_key_package_for_account(app, &account).await {
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                rollback_account_after_setup_failure(account_home, &account.label, err.into())?
+            }
+        }
+    } else {
+        None
+    };
+    warm_user_directory_after_account_setup(
+        app,
+        &account.account_id_hex,
+        directory_bootstrap_relays,
+    )
+    .await;
+    let key_package_plain = key_package_bytes
+        .map(|bytes| format!(" key-package-bytes={bytes}"))
+        .unwrap_or_default();
+    Ok(CommandOutput {
+        plain: format!(
+            "created identity {} local-signing={} relay-lists={}{}",
+            npub_for_account_id(&account.account_id_hex),
+            account.local_signing,
+            relay_setup_plain(&relay_lists),
+            key_package_plain
+        ),
+        json: json!({
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex),
+            "local_signing": account.local_signing,
+            "relay_lists": relay_lists_json(relay_lists),
+            "key_package": key_package_bytes.map(|bytes| json!({
+                "published": true,
+                "bytes": bytes,
+            })),
+        }),
+    })
+}
+
+async fn publish_initial_key_package_for_account(
+    app: &MarmotApp,
+    account: &marmot_account::AccountSummary,
+) -> Result<usize, AppError> {
+    app.status(&account.label)?;
+    let mut client = app.client(&account.label).await?;
+    let key_package = client.publish_key_package().await?;
+    Ok(key_package.0.len())
+}
+
 async fn account_command(
     account_home: &AccountHome,
     app: &MarmotApp,
@@ -579,163 +1555,22 @@ async fn account_command(
     match command {
         AccountCommand::Create {
             identity,
-            mut default_relays,
-            mut bootstrap_relays,
+            default_relays,
+            bootstrap_relays,
             publish_missing_relay_lists,
         } => {
-            let global_relay_defaults =
-                apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
-            let directory_bootstrap_relays = bootstrap_relays.clone();
-            let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
-            let creates_new_private_key = identity.is_none();
-            let account = create_nostr_account(account_home, identity)?;
-            let relay_lists = match account.local_signing {
-                true => {
-                    if creates_new_private_key && default_relays.is_empty() {
-                        rollback_account_after_setup_failure(
-                            account_home,
-                            &account.label,
-                            DmError::MissingRelay,
-                        )?;
-                    }
-                    if imports_private_key
-                        && default_relays.is_empty()
-                        && bootstrap_relays.is_empty()
-                    {
-                        rollback_account_after_setup_failure(
-                            account_home,
-                            &account.label,
-                            DmError::MissingRelay,
-                        )?;
-                    }
-                    if imports_private_key
-                        && (!default_relays.is_empty() || !bootstrap_relays.is_empty())
-                    {
-                        let bootstrap =
-                            match relay_bootstrap(default_relays.clone(), bootstrap_relays.clone())
-                            {
-                                Ok(Some(bootstrap)) => bootstrap,
-                                Ok(None) => unreachable!("import relay setup checked above"),
-                                Err(err) => rollback_account_after_setup_failure(
-                                    account_home,
-                                    &account.label,
-                                    err,
-                                )?,
-                            };
-                        let current_status = match relay_list_status_for_account_id(
-                            app,
-                            &account.account_id_hex,
-                            bootstrap.bootstrap_relays.clone(),
-                        )
-                        .await
-                        {
-                            Ok(status) => status,
-                            Err(err) => rollback_account_after_setup_failure(
-                                account_home,
-                                &account.label,
-                                err,
-                            )?,
-                        };
-                        if current_status.complete {
-                            current_status
-                        } else if !publish_missing_relay_lists || default_relays.is_empty() {
-                            rollback_account_after_setup_failure(
-                                account_home,
-                                &account.label,
-                                DmError::MissingRelayLists(
-                                    current_status.missing.clone(),
-                                    Box::new(current_status),
-                                ),
-                            )?
-                        } else {
-                            let bootstrap = match relay_bootstrap_from_endpoints(
-                                default_relays,
-                                bootstrap.bootstrap_relays,
-                            )
-                            .and_then(|bootstrap| {
-                                bootstrap.ok_or_else(|| AppError::MissingDefaultRelays.into())
-                            }) {
-                                Ok(bootstrap) => bootstrap,
-                                Err(err) => rollback_account_after_setup_failure(
-                                    account_home,
-                                    &account.label,
-                                    err,
-                                )?,
-                            };
-                            match app
-                                .publish_missing_account_relay_lists_from_status(
-                                    &account.label,
-                                    bootstrap,
-                                    current_status,
-                                )
-                                .await
-                            {
-                                Ok(relay_lists) => relay_lists,
-                                Err(err) => rollback_account_after_setup_failure(
-                                    account_home,
-                                    &account.label,
-                                    err.into(),
-                                )?,
-                            }
-                        }
-                    } else {
-                        let bootstrap = match relay_bootstrap(default_relays, bootstrap_relays) {
-                            Ok(bootstrap) => bootstrap,
-                            Err(err) => rollback_account_after_setup_failure(
-                                account_home,
-                                &account.label,
-                                err,
-                            )?,
-                        };
-                        match maybe_publish_relay_lists(app, &account.label, bootstrap).await {
-                            Ok(relay_lists) => relay_lists,
-                            Err(err) => rollback_account_after_setup_failure(
-                                account_home,
-                                &account.label,
-                                err,
-                            )?,
-                        }
-                    }
-                }
-                false => {
-                    if bootstrap_relays.is_empty() {
-                        rollback_account_after_setup_failure(
-                            account_home,
-                            &account.label,
-                            DmError::MissingRelay,
-                        )?;
-                    }
-                    if !default_relays.is_empty() && !global_relay_defaults.default_relays {
-                        return Err(DmError::PublicAccountCannotSign);
-                    }
-                    relay_list_status_for_account_id(
-                        app,
-                        &account.account_id_hex,
-                        relay_endpoints(bootstrap_relays)?,
-                    )
-                    .await?
-                }
-            };
-            warm_user_directory_after_account_setup(
+            create_or_import_account_command(
+                account_home,
                 app,
-                &account.account_id_hex,
-                directory_bootstrap_relays,
+                identity,
+                default_relays,
+                bootstrap_relays,
+                publish_missing_relay_lists,
+                false,
+                runtime_info,
+                relay,
             )
-            .await;
-            Ok(CommandOutput {
-                plain: format!(
-                    "created account {} local-signing={} relay-lists={}",
-                    npub_for_account_id(&account.account_id_hex),
-                    account.local_signing,
-                    relay_setup_plain(&relay_lists)
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "local_signing": account.local_signing,
-                    "relay_lists": relay_lists_json(relay_lists),
-                }),
-            })
+            .await
         }
         AccountCommand::List => {
             let accounts = account_home.accounts()?;
@@ -757,13 +1592,7 @@ async fn account_command(
             };
             let accounts_json = accounts
                 .into_iter()
-                .map(|account| {
-                    json!({
-                        "account_id": account.account_id_hex,
-                        "npub": npub_for_account_id(&account.account_id_hex),
-                        "local_signing": account.local_signing,
-                    })
-                })
+                .map(account_summary_json)
                 .collect::<Vec<_>>();
             Ok(CommandOutput {
                 plain,
@@ -832,6 +1661,37 @@ async fn key_package_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
+        KeyPackageCommand::List => {
+            let account = resolve_account(account_home, account_flag)?;
+            let relay_lists =
+                app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
+            let fetched = if relay_lists.key_package.relays.is_empty() {
+                None
+            } else {
+                app.fetch_latest_key_package_for_account_id(
+                    &account.account_id_hex,
+                    relay_endpoints(relay_lists.key_package.relays.clone())?,
+                )
+                .await
+                .ok()
+            };
+            let keys = fetched
+                .into_iter()
+                .map(key_package_fetch_json)
+                .collect::<Vec<_>>();
+            Ok(CommandOutput {
+                plain: if keys.is_empty() {
+                    "no key packages".to_owned()
+                } else {
+                    format!("{} key package(s)", keys.len())
+                },
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "keys": keys,
+                }),
+            })
+        }
         KeyPackageCommand::Publish => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -871,6 +1731,37 @@ async fn key_package_command(
                 json: key_package_fetch_json(fetched),
             })
         }
+        KeyPackageCommand::Check { pubkey } => {
+            let account_id = parse_public_key(&pubkey)?;
+            let fetched = app
+                .fetch_latest_key_package_for_account_id(&account_id, Vec::new())
+                .await?;
+            Ok(CommandOutput {
+                plain: format!("key package available for {account_id}"),
+                json: json!({
+                    "account_id": account_id,
+                    "npub": npub_for_account_id(&account_id),
+                    "available": true,
+                    "key_package": key_package_fetch_json(fetched),
+                }),
+            })
+        }
+        KeyPackageCommand::Delete { .. } => unsupported_command(
+            "keys delete",
+            "relay deletion for KeyPackage events is not implemented yet",
+        ),
+        KeyPackageCommand::DeleteAll { confirm } => {
+            if !confirm {
+                return unsupported_command(
+                    "keys delete-all",
+                    "pass --confirm once relay deletion is implemented",
+                );
+            }
+            unsupported_command(
+                "keys delete-all",
+                "relay deletion for KeyPackage events is not implemented yet",
+            )
+        }
     }
 }
 
@@ -905,6 +1796,7 @@ async fn chats_command(
             ensure_local_signing(&account)?;
             group_show_output(app, account, group)
         }
+        ChatsCommand::Subscribe => Err(DmError::MessagesSubscribeRequiresDaemon),
         ChatsCommand::Archive { group } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -933,6 +1825,64 @@ async fn chats_command(
                 }),
             })
         }
+        ChatsCommand::SubscribeArchived => Err(DmError::MessagesSubscribeRequiresDaemon),
+        ChatsCommand::Mute { .. } => unsupported_command(
+            "chats mute",
+            "chat notification mute state is not modeled in marmot-app yet",
+        ),
+        ChatsCommand::Unmute { .. } => unsupported_command(
+            "chats unmute",
+            "chat notification mute state is not modeled in marmot-app yet",
+        ),
+    }
+}
+
+async fn media_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: MediaCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    match command {
+        MediaCommand::Upload { .. } => unsupported_command(
+            "media upload",
+            "encrypted media upload/download is not implemented in Darkmatter yet",
+        ),
+        MediaCommand::Download { .. } => unsupported_command(
+            "media download",
+            "encrypted media upload/download is not implemented in Darkmatter yet",
+        ),
+        MediaCommand::List { group } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group)?;
+            let messages = app.messages_with_query(
+                &account.label,
+                AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    limit: None,
+                },
+            )?;
+            let media = media_records_json(messages);
+            Ok(CommandOutput {
+                plain: if media.is_empty() {
+                    "no media".to_owned()
+                } else {
+                    media
+                        .iter()
+                        .filter_map(|item| item.get("file_name").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": group_id_hex,
+                    "media": media,
+                }),
+            })
+        }
     }
 }
 
@@ -943,13 +1893,22 @@ async fn group_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
-        GroupCommand::Create { name, members } => {
+        GroupCommand::Create {
+            name,
+            members,
+            description,
+        } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
             let mut client = app.client(&account.label).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let group_id = client.create_group(&name, &member_refs).await?;
+            if description.is_some() {
+                client
+                    .update_group_profile(&group_id, None, description.as_deref())
+                    .await?;
+            }
             let group_id_hex = hex::encode(group_id.as_slice());
             let group = app
                 .group(&account.label, &group_id_hex)?
@@ -1068,6 +2027,257 @@ async fn group_command(
     }
 }
 
+async fn groups_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: GroupsCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    match command {
+        GroupsCommand::List => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let groups = app.visible_groups(&account.label)?;
+            Ok(CommandOutput {
+                plain: group_list_plain(&groups),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "groups": groups.into_iter().map(group_json).collect::<Vec<_>>(),
+                }),
+            })
+        }
+        GroupsCommand::Create {
+            name,
+            members,
+            description,
+        } => {
+            group_command(
+                account_home,
+                app,
+                GroupCommand::Create {
+                    name,
+                    members,
+                    description,
+                },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::Show { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            group_show_output(app, account, group_id)
+        }
+        GroupsCommand::AddMembers { group_id, members } => {
+            group_command(
+                account_home,
+                app,
+                GroupCommand::Invite {
+                    group: group_id,
+                    members,
+                },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::RemoveMembers { group_id, members } => {
+            group_command(
+                account_home,
+                app,
+                GroupCommand::Remove {
+                    group: group_id,
+                    members,
+                },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::Members { group_id } => {
+            group_command(
+                account_home,
+                app,
+                GroupCommand::Members { group: group_id },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::Admins { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = normalize_group_id_hex(&group_id)?;
+            let group = app
+                .group(&account.label, &group_id)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
+            let admins = group
+                .admin_policy
+                .admins
+                .iter()
+                .map(|admin| {
+                    json!({
+                        "admin_id": admin,
+                        "npub": npub_for_account_id(admin),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(CommandOutput {
+                plain: if admins.is_empty() {
+                    "no admins".to_owned()
+                } else {
+                    admins
+                        .iter()
+                        .filter_map(|admin| admin.get("npub").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": group_id,
+                    "admins": admins,
+                }),
+            })
+        }
+        GroupsCommand::Relays { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = normalize_group_id_hex(&group_id)?;
+            let group = app
+                .group(&account.label, &group_id)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
+            Ok(CommandOutput {
+                plain: group.endpoint.clone(),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": group_id,
+                    "relays": [group.endpoint],
+                }),
+            })
+        }
+        GroupsCommand::Leave { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let mut client = app.client(&account.label).await?;
+            let summary = client.leave_group(&group_id).await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "left group {} published={}",
+                    hex::encode(group_id.as_slice()),
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
+        GroupsCommand::Rename { group_id, name } => {
+            group_command(
+                account_home,
+                app,
+                GroupCommand::Update {
+                    group: group_id,
+                    name: Some(name),
+                    description: None,
+                },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::Invites => unsupported_command(
+            "groups invites",
+            "user-driven invite accept/decline state is not modeled yet",
+        ),
+        GroupsCommand::Accept { .. } => unsupported_command(
+            "groups accept",
+            "welcomes are auto-accepted today; user-driven accept is not modeled yet",
+        ),
+        GroupsCommand::Decline { .. } => unsupported_command(
+            "groups decline",
+            "user-driven invite decline is not modeled yet",
+        ),
+        GroupsCommand::Promote { group_id, pubkey } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            group_admin_policy_output(app, account, group_id, GroupAdminAction::Promote(pubkey))
+                .await
+        }
+        GroupsCommand::Demote { group_id, pubkey } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            group_admin_policy_output(app, account, group_id, GroupAdminAction::Demote(pubkey))
+                .await
+        }
+        GroupsCommand::SelfDemote { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            group_admin_policy_output(app, account, group_id, GroupAdminAction::SelfDemote).await
+        }
+        GroupsCommand::SubscribeState { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
+    }
+}
+
+enum GroupAdminAction {
+    Promote(String),
+    Demote(String),
+    SelfDemote,
+}
+
+async fn group_admin_policy_output(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+    group_id: String,
+    action: GroupAdminAction,
+) -> Result<CommandOutput, DmError> {
+    app.status(&account.label)?;
+    let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut client = app.client(&account.label).await?;
+    let (verb, admin_id, summary) = match action {
+        GroupAdminAction::Promote(pubkey) => {
+            let admin_id = parse_public_key(&pubkey)?;
+            let summary = client.promote_admin(&group_id, &pubkey).await?;
+            ("promoted", admin_id, summary)
+        }
+        GroupAdminAction::Demote(pubkey) => {
+            let admin_id = parse_public_key(&pubkey)?;
+            let summary = client.demote_admin(&group_id, &pubkey).await?;
+            ("demoted", admin_id, summary)
+        }
+        GroupAdminAction::SelfDemote => {
+            let admin_id = account.account_id_hex.clone();
+            let summary = client.self_demote_admin(&group_id).await?;
+            ("self-demoted", admin_id, summary)
+        }
+    };
+    let group = app
+        .group(&account.label, &group_id_hex)?
+        .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+    let admin_npub = npub_for_account_id(&admin_id);
+    Ok(CommandOutput {
+        plain: format!("{verb} admin {} published={}", admin_id, summary.published),
+        json: json!({
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex),
+            "group_id": group_id_hex,
+            "admin_id": admin_id,
+            "admin_npub": admin_npub,
+            "group": group_json(group),
+            "published": summary.published,
+            "message_ids": summary.message_ids,
+        }),
+    })
+}
+
 fn group_show_output(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
@@ -1152,19 +2362,144 @@ async fn message_command(
                 }),
             })
         }
-        MessageCommand::List { group, limit } => {
+        MessageCommand::Delete {
+            group_id,
+            message_id,
+        } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
-            let messages = app.messages_with_query(
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let mut client = app.client(&account.label).await?;
+            let summary = client.delete_message(&group_id, &message_id).await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "deleted message {message_id} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "target_message_id": message_id,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
+        MessageCommand::Retry { group_id, event_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let mut client = app.client(&account.label).await?;
+            let summary = client.retry_group_convergence(&group_id).await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "retried group convergence for {event_id} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "target_event_id": event_id,
+                    "retry_scope": "group_convergence",
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
+        MessageCommand::React {
+            group_id,
+            message_id,
+            emoji,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let mut client = app.client(&account.label).await?;
+            let summary = client
+                .react_to_message(&group_id, &message_id, &emoji)
+                .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "reacted {emoji} to {message_id} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "target_message_id": message_id,
+                    "emoji": emoji,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
+        MessageCommand::Unreact {
+            group_id,
+            message_id,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let mut client = app.client(&account.label).await?;
+            let summary = client.unreact_from_message(&group_id, &message_id).await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "removed reaction from {message_id} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "target_message_id": message_id,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
+        MessageCommand::List {
+            group_id,
+            group,
+            before,
+            before_message_id,
+            after,
+            after_message_id,
+            limit,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group = group.or(group_id);
+            let uses_cursor = before.is_some()
+                || before_message_id.is_some()
+                || after.is_some()
+                || after_message_id.is_some();
+            let mut messages = app.messages_with_query(
                 &account.label,
                 AppMessageQuery {
                     group_id_hex: group
                         .map(|group| normalize_group_id_hex(&group))
                         .transpose()?,
-                    limit,
+                    limit: if uses_cursor { None } else { limit },
                 },
             )?;
+            if uses_cursor {
+                messages = apply_message_cursors(
+                    messages,
+                    before,
+                    before_message_id.as_deref(),
+                    after,
+                    after_message_id.as_deref(),
+                    limit,
+                );
+            }
             Ok(CommandOutput {
                 plain: message_list_plain(&messages),
                 json: json!({
@@ -1174,7 +2509,508 @@ async fn message_command(
                 }),
             })
         }
+        MessageCommand::Search {
+            group_id,
+            query,
+            limit,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let messages = search_messages(app, &account.label, Some(group_id), &query, limit)?;
+            Ok(CommandOutput {
+                plain: message_list_plain(&messages),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "query": query,
+                    "messages": message_list_json(messages),
+                }),
+            })
+        }
+        MessageCommand::SearchAll { query, limit } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let messages = search_messages(app, &account.label, None, &query, limit)?;
+            Ok(CommandOutput {
+                plain: message_list_plain(&messages),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "query": query,
+                    "messages": message_list_json(messages),
+                }),
+            })
+        }
+        MessageCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
     }
+}
+
+fn search_messages(
+    app: &MarmotApp,
+    label: &str,
+    group_id: Option<String>,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<AppMessageRecord>, DmError> {
+    let group_id_hex = group_id
+        .map(|group| normalize_group_id_hex(&group))
+        .transpose()?;
+    let mut matches = app
+        .messages_with_query(
+            label,
+            AppMessageQuery {
+                group_id_hex,
+                limit: None,
+            },
+        )?
+        .into_iter()
+        .filter(|message| message.plaintext.contains(query))
+        .collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        matches.truncate(limit);
+    }
+    Ok(matches)
+}
+
+async fn follows_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: FollowsCommand,
+    account_flag: Option<String>,
+    relay: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    let account = resolve_account(account_home, account_flag)?;
+    ensure_local_signing(&account)?;
+    match command {
+        FollowsCommand::List => {
+            let follows = app
+                .directory_entry_for_account_id(&account.account_id_hex)?
+                .map(|entry| entry.follows)
+                .unwrap_or_default();
+            follows_output(account.account_id_hex, follows)
+        }
+        FollowsCommand::Check { pubkey } => {
+            let target = parse_public_key(&pubkey)?;
+            let follows = app
+                .directory_entry_for_account_id(&account.account_id_hex)?
+                .map(|entry| entry.follows)
+                .unwrap_or_default();
+            let follows_target = follows.iter().any(|follow| follow == &target);
+            Ok(CommandOutput {
+                plain: format!("follows {}: {follows_target}", npub_for_account_id(&target)),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "pubkey": target,
+                    "user": npub_for_account_id(&target),
+                    "follows": follows_target,
+                }),
+            })
+        }
+        FollowsCommand::Add { pubkey } => {
+            update_follows_command(app, account, relay, pubkey, true).await
+        }
+        FollowsCommand::Remove { pubkey } => {
+            update_follows_command(app, account, relay, pubkey, false).await
+        }
+    }
+}
+
+async fn update_follows_command(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+    relay: Option<String>,
+    pubkey: String,
+    add: bool,
+) -> Result<CommandOutput, DmError> {
+    let target = parse_public_key(&pubkey)?;
+    let relay = relay.ok_or(DmError::MissingRelay)?;
+    let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
+    let mut follows = app
+        .directory_entry_for_account_id(&account.account_id_hex)?
+        .map(|entry| entry.follows)
+        .unwrap_or_default();
+    if add {
+        if !follows.contains(&target) {
+            follows.push(target);
+        }
+    } else {
+        follows.retain(|follow| follow != &target);
+    }
+    follows.sort();
+    follows.dedup();
+    let follow_refs = follows.iter().map(String::as_str).collect::<Vec<_>>();
+    app.publish_account_follow_list(
+        &account.label,
+        &follow_refs,
+        AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint.clone()]),
+    )
+    .await?;
+    let _ = app
+        .refresh_user_directory_for_account_id(&account.account_id_hex, vec![endpoint])
+        .await;
+    follows_output(account.account_id_hex, follows)
+}
+
+fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOutput, DmError> {
+    let follows_json = follows
+        .iter()
+        .map(|follow| {
+            json!({
+                "account_id": follow,
+                "npub": npub_for_account_id(follow),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(CommandOutput {
+        plain: if follows_json.is_empty() {
+            "no follows".to_owned()
+        } else {
+            follows_json
+                .iter()
+                .filter_map(|follow| follow.get("npub").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        json: json!({
+            "account_id": account_id,
+            "npub": npub_for_account_id(&account_id),
+            "follows": follows_json,
+        }),
+    })
+}
+
+async fn profile_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: ProfileCommand,
+    account_flag: Option<String>,
+    relay: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    let account = resolve_account(account_home, account_flag)?;
+    ensure_local_signing(&account)?;
+    match command {
+        ProfileCommand::Show => {
+            let entry = app.directory_entry_for_account_id(&account.account_id_hex)?;
+            Ok(CommandOutput {
+                plain: serde_json::to_string_pretty(&entry)
+                    .expect("JSON response serialization cannot fail"),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "profile": entry.and_then(|entry| entry.profile),
+                }),
+            })
+        }
+        ProfileCommand::Update {
+            name,
+            display_name,
+            about,
+            picture,
+            nip05,
+            lud16,
+        } => {
+            let relay = relay.ok_or(DmError::MissingRelay)?;
+            let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
+            let profile = UserProfileMetadata {
+                name,
+                display_name,
+                about,
+                picture,
+                nip05,
+                lud16,
+                created_at: unix_now_seconds(),
+                source_relays: Vec::new(),
+            };
+            app.publish_user_profile(
+                &account.label,
+                profile.clone(),
+                AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint]),
+            )
+            .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "updated profile {}",
+                    npub_for_account_id(&account.account_id_hex)
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "profile": profile,
+                }),
+            })
+        }
+    }
+}
+
+async fn relays_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: RelaysCommand,
+    account_flag: Option<String>,
+    relay: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    let account = resolve_account(account_home, account_flag)?;
+    ensure_local_signing(&account)?;
+    match command {
+        RelaysCommand::List { relay_type } => {
+            let status = app.account_relay_list_status(&account.label)?;
+            let relays = relays_for_type(&status, relay_type.as_deref())?;
+            Ok(CommandOutput {
+                plain: if relays.is_empty() {
+                    "no relays".to_owned()
+                } else {
+                    relays.join("\n")
+                },
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "relay_type": relay_type,
+                    "relays": relays,
+                    "relay_lists": relay_lists_json(status),
+                }),
+            })
+        }
+        RelaysCommand::Add { url, relay_type } => {
+            update_relay_list(app, account, relay, relay_type, url, true).await
+        }
+        RelaysCommand::Remove { url, relay_type } => {
+            update_relay_list(app, account, relay, relay_type, url, false).await
+        }
+    }
+}
+
+async fn update_relay_list(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+    relay: Option<String>,
+    relay_type: String,
+    url: String,
+    add: bool,
+) -> Result<CommandOutput, DmError> {
+    let relay_type = normalize_relay_type(&relay_type)?;
+    let url = validate_relay_url(&url)?;
+    let status = app.account_relay_list_status(&account.label)?;
+    let mut relays = relays_for_type(&status, Some(&relay_type))?;
+    if add {
+        if !relays.contains(&url) {
+            relays.push(url.clone());
+        }
+    } else {
+        relays.retain(|relay| relay != &url);
+    }
+    relays.sort();
+    relays.dedup();
+    let publish_relays = relay_endpoints(relays.clone())?;
+    let bootstrap = relay
+        .map(validate_relay_url)
+        .transpose()?
+        .or_else(|| relays.first().cloned())
+        .ok_or(DmError::MissingRelay)?;
+    let bootstrap_relays = vec![TransportEndpoint(bootstrap)];
+    let status = app
+        .publish_account_relay_list_kind(
+            &account.label,
+            &relay_type,
+            publish_relays,
+            bootstrap_relays,
+        )
+        .await?;
+    Ok(CommandOutput {
+        plain: relays.join("\n"),
+        json: json!({
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex),
+            "relay_type": relay_type,
+            "relays": relays,
+            "relay_lists": relay_lists_json(status),
+        }),
+    })
+}
+
+fn relays_for_type(
+    status: &AccountRelayListStatus,
+    relay_type: Option<&str>,
+) -> Result<Vec<String>, DmError> {
+    match relay_type.map(normalize_relay_type).transpose()?.as_deref() {
+        Some("nip65") => Ok(status.nip65.relays.clone()),
+        Some("inbox") => Ok(status.inbox.relays.clone()),
+        Some("key_package") => Ok(status.key_package.relays.clone()),
+        None => {
+            let mut relays = status.default_relays.clone();
+            relays.extend(status.inbox.relays.clone());
+            relays.extend(status.key_package.relays.clone());
+            relays.sort();
+            relays.dedup();
+            Ok(relays)
+        }
+        Some(_) => unreachable!("normalize_relay_type constrains values"),
+    }
+}
+
+fn normalize_relay_type(value: &str) -> Result<String, DmError> {
+    match value {
+        "nip65" => Ok("nip65".to_owned()),
+        "inbox" => Ok("inbox".to_owned()),
+        "key_package" | "key-package" => Ok("key_package".to_owned()),
+        _ => unsupported_command("relays", "relay type must be nip65, inbox, or key_package"),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CliSettings {
+    theme: String,
+    language: String,
+}
+
+impl Default for CliSettings {
+    fn default() -> Self {
+        Self {
+            theme: "system".to_owned(),
+            language: "system".to_owned(),
+        }
+    }
+}
+
+fn settings_command(home: &Path, command: SettingsCommand) -> Result<CommandOutput, DmError> {
+    let mut settings = read_settings(home)?;
+    match command {
+        SettingsCommand::Show => {}
+        SettingsCommand::Theme { mode } => {
+            settings.theme = mode;
+            write_settings(home, &settings)?;
+        }
+        SettingsCommand::Language { lang } => {
+            settings.language = lang;
+            write_settings(home, &settings)?;
+        }
+    }
+    Ok(CommandOutput {
+        plain: format!("theme={} language={}", settings.theme, settings.language),
+        json: json!({
+            "theme": settings.theme,
+            "language": settings.language,
+        }),
+    })
+}
+
+fn settings_path(home: &Path) -> PathBuf {
+    home.join("dev").join("settings.json")
+}
+
+fn read_settings(home: &Path) -> Result<CliSettings, DmError> {
+    let path = settings_path(home);
+    if !path.exists() {
+        return Ok(CliSettings::default());
+    }
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_settings(home: &Path, settings: &CliSettings) -> Result<(), DmError> {
+    let path = settings_path(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(settings)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn users_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: UsersCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    match command {
+        UsersCommand::Show { pubkey } => {
+            let account_id = parse_public_key(&pubkey)?;
+            let entry = app
+                .directory_entry_for_account_id(&account_id)?
+                .ok_or_else(|| AppError::MissingDirectoryEntry(account_id.clone()))?;
+            Ok(CommandOutput {
+                plain: serde_json::to_string_pretty(&entry)
+                    .expect("JSON response serialization cannot fail"),
+                json: json!({ "user": entry }),
+            })
+        }
+        UsersCommand::Search { query, radius } => {
+            let account = resolve_account(account_home, account_flag)?;
+            let results = app.search_user_directory(UserDirectorySearch {
+                searcher_account_id_hex: account.account_id_hex.clone(),
+                query: query.clone(),
+                radius_start: radius.0,
+                radius_end: radius.1,
+                limit: None,
+            })?;
+            Ok(CommandOutput {
+                plain: if results.is_empty() {
+                    "no users".to_owned()
+                } else {
+                    results
+                        .iter()
+                        .map(|result| result.npub.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "query": query,
+                    "users": results,
+                }),
+            })
+        }
+    }
+}
+
+fn notifications_command(command: NotificationsCommand) -> Result<CommandOutput, DmError> {
+    match command {
+        NotificationsCommand::Subscribe => unsupported_command(
+            "notifications subscribe",
+            "notification derivation and delivery are not exposed by the daemon yet",
+        ),
+    }
+}
+
+fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, DmError> {
+    if !confirm {
+        return unsupported_command(
+            "reset",
+            "pass --confirm to delete all local Darkmatter data",
+        );
+    }
+    match std::fs::remove_dir_all(home) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(CommandOutput {
+        plain: format!("deleted {}", home.display()),
+        json: json!({
+            "deleted": true,
+            "home": home,
+        }),
+    })
+}
+
+fn parse_radius(s: &str) -> Result<(u8, u8), String> {
+    let Some((start, end)) = s.split_once("..") else {
+        return Err("expected format START..END".to_owned());
+    };
+    let start = start
+        .parse::<u8>()
+        .map_err(|_| format!("invalid radius start: {start}"))?;
+    let end = end
+        .parse::<u8>()
+        .map_err(|_| format!("invalid radius end: {end}"))?;
+    if start > end {
+        return Err(format!("radius start ({start}) must be <= end ({end})"));
+    }
+    Ok((start, end))
 }
 
 async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, DmError> {
@@ -1299,6 +3135,10 @@ async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, D
         }
         StreamCommand::Start { .. }
         | StreamCommand::Watch { .. }
+        | StreamCommand::ComposeOpen { .. }
+        | StreamCommand::ComposeAppend { .. }
+        | StreamCommand::ComposeFinish { .. }
+        | StreamCommand::ComposeCancel { .. }
         | StreamCommand::Finish { .. }
         | StreamCommand::Verify { .. } => {
             unreachable!("durable stream commands require app setup")
@@ -1357,73 +3197,30 @@ async fn stream_command_app(
             stream_id,
             server_cert_der_hex,
             insecure_local,
+            background,
         } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let group_id_hex = normalize_group_id_hex(&group)?;
-            let expected_stream_id_hex =
-                stream_id.map(|value| normalize_hex(&value)).transpose()?;
-            let messages = app.messages_with_query(
-                &account.label,
-                AppMessageQuery {
-                    group_id_hex: Some(group_id_hex.clone()),
-                    limit: None,
+            stream_watch_command_app(
+                account_home,
+                app,
+                StreamCommand::Watch {
+                    group,
+                    stream_id,
+                    server_cert_der_hex,
+                    insecure_local,
+                    background,
                 },
-            )?;
-            let (start_message_id_hex, start_payload) =
-                latest_stream_start(messages, expected_stream_id_hex.as_deref())?;
-            if start_payload.route != AgentTextStreamRouteV1::BrokeredQuic {
-                return Err(DmError::UnsupportedStreamRoute(
-                    route_name(&start_payload.route).to_owned(),
-                ));
-            }
-            let candidate = start_payload
-                .quic_candidates
-                .iter()
-                .find(|candidate| candidate.trim().starts_with("quic://"))
-                .ok_or(DmError::MissingQuicCandidate)?;
-            let candidate = parse_quic_candidate(candidate)?;
-            let trust = broker_trust(candidate.addr, server_cert_der_hex, insecure_local)?;
-            let stream_id = hex::decode(&start_payload.stream_id)?;
-            let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
-            let received = subscribe_text_from_broker(SubscribeTextFromBroker {
-                broker_addr: candidate.addr,
-                server_name: candidate.server_name.clone(),
-                trust: trust.clone(),
-                stream_id,
-                start_event_id,
-            })
-            .await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "received brokered stream {} chunks={}\n{}",
-                    hex::encode(&received.stream_id),
-                    received.chunk_count,
-                    received.text
-                ),
-                json: json!({
-                    "brokered": true,
-                    "candidate": candidate.original,
-                    "connect": candidate.addr.to_string(),
-                    "server_name": candidate.server_name,
-                    "trust": broker_trust_name(&trust),
-                    "stream_id": hex::encode(&received.stream_id),
-                    "start_message_id": start_message_id_hex,
-                    "chunks": received.chunks.into_iter().map(|chunk| {
-                        json!({
-                            "seq": chunk.seq,
-                            "record_type": chunk.record_type,
-                            "flags": chunk.flags,
-                            "text": chunk.text,
-                        })
-                    }).collect::<Vec<_>>(),
-                    "text": received.text,
-                    "transcript_hash": hex::encode(received.transcript_hash),
-                    "chunk_count": received.chunk_count,
-                }),
-            })
+                account_flag,
+                |_| {},
+            )
+            .await
         }
+        StreamCommand::ComposeOpen { .. }
+        | StreamCommand::ComposeAppend { .. }
+        | StreamCommand::ComposeFinish { .. }
+        | StreamCommand::ComposeCancel { .. } => unsupported_command(
+            "stream compose",
+            "stream compose sessions require the daemon",
+        ),
         StreamCommand::Finish {
             group,
             stream_id,
@@ -1542,6 +3339,109 @@ async fn stream_command_app(
             unreachable!("local QUIC stream commands return before app setup")
         }
     }
+}
+
+async fn stream_watch_command_app<F>(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: StreamCommand,
+    account_flag: Option<String>,
+    mut on_delta: F,
+) -> Result<CommandOutput, DmError>
+where
+    F: FnMut(AgentStreamDelta) + Send,
+{
+    let StreamCommand::Watch {
+        group,
+        stream_id,
+        server_cert_der_hex,
+        insecure_local,
+        background: _,
+    } = command
+    else {
+        unreachable!("stream watch helper only accepts stream watch commands");
+    };
+    let account = resolve_account(account_home, account_flag.clone())?;
+    ensure_local_signing(&account)?;
+    app.status(&account.label)?;
+    let group_id_hex = normalize_group_id_hex(&group)?;
+    let expected_stream_id_hex = stream_id.map(|value| normalize_hex(&value)).transpose()?;
+    let messages = app.messages_with_query(
+        &account.label,
+        AppMessageQuery {
+            group_id_hex: Some(group_id_hex.clone()),
+            limit: None,
+        },
+    )?;
+    let (start_message_id_hex, start_payload) =
+        latest_stream_start(messages, expected_stream_id_hex.as_deref())?;
+    if start_payload.route != AgentTextStreamRouteV1::BrokeredQuic {
+        return Err(DmError::UnsupportedStreamRoute(
+            route_name(&start_payload.route).to_owned(),
+        ));
+    }
+    let candidate = start_payload
+        .quic_candidates
+        .iter()
+        .find(|candidate| candidate.trim().starts_with("quic://"))
+        .ok_or(DmError::MissingQuicCandidate)?;
+    let candidate = parse_quic_candidate(candidate)?;
+    let trust = broker_trust(candidate.addr, server_cert_der_hex, insecure_local)?;
+    let stream_id = hex::decode(&start_payload.stream_id)?;
+    let stream_id_hex = start_payload.stream_id.clone();
+    let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+    let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
+    let delta_group_id = group_id_hex.clone();
+    let delta_stream_id = stream_id_hex.clone();
+    let received = subscribe_text_from_broker_with_updates(
+        SubscribeTextFromBroker {
+            broker_addr: candidate.addr,
+            server_name: candidate.server_name.clone(),
+            trust: trust.clone(),
+            stream_id,
+            start_event_id,
+        },
+        |chunk| {
+            on_delta(AgentStreamDelta {
+                account: delta_account.clone(),
+                group_id: delta_group_id.clone(),
+                stream_id: delta_stream_id.clone(),
+                seq: chunk.seq,
+                record_type: chunk.record_type,
+                flags: chunk.flags,
+                text: chunk.text.clone(),
+            });
+        },
+    )
+    .await?;
+    Ok(CommandOutput {
+        plain: format!(
+            "received brokered stream {} chunks={}\n{}",
+            hex::encode(&received.stream_id),
+            received.chunk_count,
+            received.text
+        ),
+        json: json!({
+            "brokered": true,
+            "candidate": candidate.original,
+            "connect": candidate.addr.to_string(),
+            "server_name": candidate.server_name,
+            "trust": broker_trust_name(&trust),
+            "stream_id": hex::encode(&received.stream_id),
+            "start_message_id": start_message_id_hex,
+            "chunks": received.chunks.into_iter().map(|chunk| {
+                json!({
+                    "seq": chunk.seq,
+                    "record_type": chunk.record_type,
+                    "flags": chunk.flags,
+                    "text": chunk.text,
+                })
+            }).collect::<Vec<_>>(),
+            "text": received.text,
+            "transcript_hash": hex::encode(received.transcript_hash),
+            "chunk_count": received.chunk_count,
+        }),
+    })
 }
 
 fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, bool), DmError> {
@@ -1782,6 +3682,7 @@ fn sync_json(account: marmot_account::AccountSummary, summary: SyncSummary) -> V
         }).collect::<Vec<_>>(),
         "messages": summary.messages.into_iter().map(|message| {
             let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
+            let app_message = message.app_message;
             let mut value = json!({
                 "message_id": message.message_id_hex,
                 "direction": "received",
@@ -1792,9 +3693,20 @@ fn sync_json(account: marmot_account::AccountSummary, summary: SyncSummary) -> V
             if let Some(agent_text_stream) = agent_text_stream {
                 value["agent_text_stream"] = agent_text_stream;
             }
+            if let Some(app_message) = app_message {
+                value["app_message"] = json!(app_message);
+            }
             value
         }).collect::<Vec<_>>(),
         "events": summary.events.len(),
+    })
+}
+
+fn account_summary_json(account: marmot_account::AccountSummary) -> Value {
+    json!({
+        "account_id": account.account_id_hex,
+        "npub": npub_for_account_id(&account.account_id_hex),
+        "local_signing": account.local_signing,
     })
 }
 
@@ -1852,6 +3764,42 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Vec<Value> {
         .collect()
 }
 
+fn apply_message_cursors(
+    mut messages: Vec<AppMessageRecord>,
+    before: Option<u64>,
+    before_message_id: Option<&str>,
+    after: Option<u64>,
+    after_message_id: Option<&str>,
+    limit: Option<usize>,
+) -> Vec<AppMessageRecord> {
+    messages.retain(|message| {
+        let before_matches = before.is_none_or(|cursor| {
+            message.recorded_at < cursor
+                || (message.recorded_at == cursor
+                    && before_message_id
+                        .is_some_and(|message_id| message.message_id_hex.as_str() < message_id))
+        });
+        let after_matches = after.is_none_or(|cursor| {
+            message.recorded_at > cursor
+                || (message.recorded_at == cursor
+                    && after_message_id
+                        .is_some_and(|message_id| message.message_id_hex.as_str() > message_id))
+        });
+        before_matches && after_matches
+    });
+
+    if let Some(limit) = limit
+        && messages.len() > limit
+    {
+        if before.is_some() && after.is_none() {
+            messages = messages.split_off(messages.len() - limit);
+        } else {
+            messages.truncate(limit);
+        }
+    }
+    messages
+}
+
 fn message_list_plain(messages: &[AppMessageRecord]) -> String {
     if messages.is_empty() {
         return "no messages".to_owned();
@@ -1873,6 +3821,7 @@ fn message_list_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
         .into_iter()
         .map(|message| {
             let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
+            let app_message = message.app_message;
             let mut value = json!({
                 "message_id": message.message_id_hex,
                 "direction": message.direction,
@@ -1885,7 +3834,32 @@ fn message_list_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
             if let Some(agent_text_stream) = agent_text_stream {
                 value["agent_text_stream"] = agent_text_stream;
             }
+            if let Some(app_message) = app_message {
+                value["app_message"] = json!(app_message);
+            }
             value
+        })
+        .collect()
+}
+
+fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .filter_map(|message| match message.app_message {
+            Some(MarmotAppMessagePayloadV1::Media { reference, caption }) => Some(json!({
+                "message_id": message.message_id_hex,
+                "direction": message.direction,
+                "group_id": message.group_id_hex,
+                "from": message.sender,
+                "file_hash_hex": reference.file_hash_hex,
+                "file_name": reference.file_name,
+                "media_type": reference.media_type,
+                "size_bytes": reference.size_bytes,
+                "caption": caption,
+                "recorded_at": message.recorded_at,
+                "received_at": message.received_at,
+            })),
+            _ => None,
         })
         .collect()
 }
@@ -2317,6 +4291,14 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "invalid_hex",
             "message": err.to_string(),
         }),
+        DmError::Io(err) => json!({
+            "code": "io_error",
+            "message": err.to_string(),
+        }),
+        DmError::Json(err) => json!({
+            "code": "json_error",
+            "message": err.to_string(),
+        }),
         DmError::EmptyMessage => json!({
             "code": "empty_message",
             "message": err.to_string(),
@@ -2364,6 +4346,26 @@ fn dm_error_json(err: &DmError) -> Value {
             "message": err.to_string(),
             "addr": addr.to_string(),
         }),
+        DmError::MessagesSubscribeRequiresDaemon => json!({
+            "code": "daemon_required",
+            "message": err.to_string(),
+            "repair": {
+                "start": "dm daemon start",
+            },
+        }),
+        DmError::MissingLoginIdentity => json!({
+            "code": "missing_login_identity",
+            "message": err.to_string(),
+            "repair": {
+                "login": "dm login <nsec-or-npub>",
+            },
+        }),
+        DmError::UnsupportedCommand { command, reason } => json!({
+            "code": "unsupported_command",
+            "message": err.to_string(),
+            "command": command,
+            "reason": reason,
+        }),
         DmError::MissingGroupId => json!({
             "code": "missing_group_id",
             "message": err.to_string(),
@@ -2376,8 +4378,8 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "invalid_relay_url",
             "message": err.to_string(),
             "repair": {
-                "flag": "--relay <ws-or-wss-url>",
-                "env": "DM_RELAY",
+                "login": "dm login <nsec> --relay <ws-or-wss-url>",
+                "daemon": "dm daemon start --discovery-relays <url> --default-account-relays <url>",
                 "account_setup": "--default-relays <ws-or-wss-url> --bootstrap-relays <ws-or-wss-url>",
             },
         }),
@@ -2385,8 +4387,7 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "missing_relay_url",
             "message": err.to_string(),
             "repair": {
-                "flag": "--relay <ws-or-wss-url>",
-                "env": "DM_RELAY",
+                "daemon": "dm daemon start --discovery-relays <url> --default-account-relays <url>",
                 "account_setup": "--default-relays <url> --bootstrap-relays <url>",
             },
         }),
@@ -2500,6 +4501,10 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "group_id": group_id,
         }),
+        AppError::Transport(err) => json!({
+            "code": "relay_transport",
+            "message": err.to_string(),
+        }),
         AppError::Publish(reason) => json!({
             "code": "publish_failed",
             "message": err.to_string(),
@@ -2602,8 +4607,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DmError, GlobalRelayDefaults, apply_global_relay_defaults, default_home_from_env,
-        relay_endpoints, resolve_relay,
+        AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
+        apply_message_cursors, default_home_from_env, relay_endpoints, resolve_relay,
     };
 
     #[test]
@@ -2699,6 +4704,43 @@ mod tests {
         assert_eq!(
             resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),
             Some("wss://relay.example/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn message_cursors_match_whitenoise_forward_order_paging_shape() {
+        let messages = ["a", "b", "c", "d"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| AppMessageRecord {
+                message_id_hex: id.to_owned(),
+                direction: "received".to_owned(),
+                group_id_hex: "group".to_owned(),
+                sender: "sender".to_owned(),
+                plaintext: id.to_owned(),
+                app_message: None,
+                recorded_at: 100 + u64::try_from(index / 2).unwrap(),
+                received_at: 100 + u64::try_from(index / 2).unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        let before =
+            apply_message_cursors(messages.clone(), Some(101), Some("d"), None, None, Some(2));
+        assert_eq!(
+            before
+                .iter()
+                .map(|message| message.message_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+
+        let after = apply_message_cursors(messages, None, None, Some(100), Some("a"), Some(2));
+        assert_eq!(
+            after
+                .iter()
+                .map(|message| message.message_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
         );
     }
 }

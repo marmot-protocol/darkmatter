@@ -9,6 +9,33 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Added Whitenoise-shaped identity and plural command entrypoints: `dm create-identity`, `dm login`, `dm whoami`,
+  `dm accounts`, and `dm groups`.
+- Added the remaining Whitenoise-shaped top-level command names (`debug`, `logout`, `export-nsec`, `media`,
+  `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, and `reset`) with real local behavior where
+  the app runtime supports it and explicit `unsupported_command` errors where lower-layer behavior does not exist yet.
+- Added `dm chats subscribe`, `dm chats subscribe-archived`, and `dm groups subscribe-state`, which stream typed
+  daemon responses for chat rows and group state.
+- Added `dm messages search` and `dm messages search-all` over local projected message history.
+- Added Whitenoise-shaped cursor flags for `dm messages list`: `--before`, `--before-message-id`, `--after`, and
+  `--after-message-id`.
+- Added real `dm groups leave` support over the Marmot SelfRemove path, including app-runtime SelfRemove capability
+  advertisement.
+- Added real `dm groups promote`, `dm groups demote`, and `dm groups self-demote` support over the Marmot admin-policy
+  app component.
+- Added typed app-message payloads for `dm messages react`, `dm messages unreact`, `dm messages delete`, and
+  `dm messages retry` group-convergence retries. Message projections and `messages subscribe` now expose typed
+  `app_message` metadata for reactions, deletions, and media references.
+- Added `dm media list <group>`, which lists typed media references already projected from group message history.
+- Added `dm messages subscribe <group>`, a daemon-backed newline-delimited stream that emits typed `message`,
+  `agent_stream_start`, `agent_stream_final`, `agent_stream_delta`, and `stream_preview` updates, including live
+  brokered QUIC text chunks from daemon-owned stream watches.
+- Added `dm stream watch --background`, which starts a brokered QUIC stream watch inside `dmd` and reports
+  running/completed/failed preview state through `dm daemon status --json`.
+- Added `dmd --default-account-relays`, matching `wnd` setup flags and applying daemon account-relay defaults to
+  daemon-forwarded account creation.
+- Added TUI `/stream` slash commands for starting, watching, finishing, verifying, and inspecting brokered agent text
+  stream previews from the selected chat.
 - Added `dm stream start`, `dm stream finish`, and `dm stream verify` for anchoring agent text
   stream starts/finals through normal encrypted Marmot messages and checking QUIC transcript hashes.
 - Added `dm stream watch` and `dm stream send --broker` for brokered QUIC preview streams anchored by the
@@ -17,10 +44,23 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-owned
+  subscription model. The older singular `dm message` spelling still works during the transition.
+- `dm create-identity` and `dm login <nsec>` now publish the initial local KeyPackage automatically after relay-list
+  setup, so the normal invite path does not require a separate `keys publish` repair step.
+- Message projections now order history by recorded transport time before local receipt/insertion order, so synced
+  stream anchors/finals no longer jump ahead of older chat text merely because they arrived first during catch-up.
+- The TUI uses higher-contrast neutral account labels and green focus accents instead of the low-contrast cyan account
+  treatment; daemon controls stay focused on start, status, and stop.
+- Typed app-message payloads are validated before publish/projection; malformed reaction, media, delete, or retry
+  envelopes are rejected instead of being treated as valid typed app messages.
 - `dmd` now keeps long-lived per-account relay subscriptions for real WebSocket relays instead of rebuilding
   subscriptions on every sync interval.
-- `dm account create --relay <url>` now publishes the required NIP-65, inbox, and KeyPackage relay lists for
-  new local signing accounts when command-specific relay-list flags are omitted.
+- Nostr SDK relay connect and publish calls are now bounded by timeouts so first-run account setup fails with JSON
+  instead of hanging indefinitely when a local relay does not ACK publishes.
+- `dm create-identity` and `dm login <nsec>` publish the required NIP-65, inbox, and KeyPackage relay lists for new
+  local signing identities from daemon account-relay defaults when relay-list flags are omitted; `dm login --relay
+  <url>` remains the command-local import fallback.
 - Imported `nsec` accounts now require `--publish-missing-relay-lists` before publishing missing required relay
   lists discovered from bootstrap relays.
 - Removed the file-backed local transport and Marmot Lab crate; local tests now use Nostr SDK mock relays and

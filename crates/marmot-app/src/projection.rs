@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, types::Type};
+
+use cgka_traits::MarmotAppMessagePayloadV1;
 
 use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
@@ -72,6 +74,7 @@ impl AccountProjectionDb {
                 group_id_hex TEXT NOT NULL,
                 sender TEXT NOT NULL,
                 plaintext TEXT NOT NULL,
+                app_message_json TEXT,
                 recorded_at INTEGER,
                 received_at INTEGER NOT NULL
             );
@@ -121,6 +124,7 @@ impl AccountProjectionDb {
             "TEXT NOT NULL DEFAULT 'received'",
         )?;
         ensure_column(&conn, "messages", "recorded_at", "INTEGER")?;
+        ensure_column(&conn, "messages", "app_message_json", "TEXT")?;
         Ok(Self { conn })
     }
 
@@ -224,7 +228,6 @@ impl AccountProjectionDb {
             params![&state.label, unix_now_seconds() as i64],
         )?;
 
-        tx.execute("DELETE FROM seen_events", [])?;
         for event_id in &state.seen_events {
             tx.execute(
                 "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
@@ -233,9 +236,11 @@ impl AccountProjectionDb {
             )?;
         }
 
-        tx.execute("DELETE FROM groups", [])?;
-        tx.execute("DELETE FROM group_app_components", [])?;
         for group in &state.groups {
+            tx.execute(
+                "DELETE FROM group_app_components WHERE group_id_hex = ?1",
+                params![&group.group_id_hex],
+            )?;
             tx.execute(
                 "INSERT INTO groups (
                     group_id_hex, endpoint, profile_name, profile_description,
@@ -364,19 +369,25 @@ impl AccountProjectionDb {
 
     pub(crate) fn record_message(&self, message: &AppMessageProjection) -> Result<(), AppError> {
         let now = unix_now_seconds() as i64;
+        let recorded_at = message
+            .recorded_at
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(now);
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (
-                message_id_hex, direction, group_id_hex, sender, plaintext, received_at, recorded_at
+                message_id_hex, direction, group_id_hex, sender, plaintext,
+                app_message_json, received_at, recorded_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 &message.message_id_hex,
                 &message.direction,
                 &message.group_id_hex,
                 &message.sender,
                 &message.plaintext,
+                serialize_app_message(&message.app_message)?,
                 now,
-                now,
+                recorded_at,
             ],
         )?;
         Ok(())
@@ -389,47 +400,54 @@ impl AccountProjectionDb {
         let sql = match (&query.group_id_hex, query.limit) {
             (Some(_), Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
+                        app_message_json,
                         COALESCE(recorded_at, received_at) AS recorded_at, received_at
                  FROM (
                     SELECT id, message_id_hex, direction, group_id_hex, sender, plaintext,
+                           app_message_json,
                            recorded_at, received_at FROM messages
                     WHERE group_id_hex = ?1
-                    ORDER BY id DESC
+                    ORDER BY COALESCE(recorded_at, received_at) DESC, received_at DESC, id DESC
                     LIMIT ?2
-                ) ORDER BY id"
+                ) ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
             (Some(_), None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
+                        app_message_json,
                         COALESCE(recorded_at, received_at), received_at FROM messages
                  WHERE group_id_hex = ?1
-                 ORDER BY id"
+                 ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
             (None, Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
+                        app_message_json,
                         COALESCE(recorded_at, received_at) AS recorded_at, received_at
                  FROM (
                     SELECT id, message_id_hex, direction, group_id_hex, sender, plaintext,
+                           app_message_json,
                            recorded_at, received_at FROM messages
-                    ORDER BY id DESC
+                    ORDER BY COALESCE(recorded_at, received_at) DESC, received_at DESC, id DESC
                     LIMIT ?1
-                ) ORDER BY id"
+                ) ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
             (None, None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
+                        app_message_json,
                         COALESCE(recorded_at, received_at), received_at FROM messages
-                 ORDER BY id"
+                 ORDER BY COALESCE(recorded_at, received_at), received_at, id"
             }
         };
         let mut statement = self.conn.prepare(sql)?;
         let map_row = |row: &rusqlite::Row<'_>| {
-            let recorded_at = row.get::<_, i64>(5)?;
-            let received_at = row.get::<_, i64>(6)?;
+            let recorded_at = row.get::<_, i64>(6)?;
+            let received_at = row.get::<_, i64>(7)?;
             Ok(AppMessageRecord {
                 message_id_hex: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 direction: row.get(1)?,
                 group_id_hex: row.get(2)?,
                 sender: row.get(3)?,
                 plaintext: row.get(4)?,
+                app_message: deserialize_app_message_row(row.get::<_, Option<String>>(5)?, 5)?,
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
             })
@@ -479,6 +497,27 @@ fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
             Some(array)
         })
         .collect()
+}
+
+fn serialize_app_message(
+    payload: &Option<MarmotAppMessagePayloadV1>,
+) -> Result<Option<String>, AppError> {
+    payload
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
+}
+
+fn deserialize_app_message_row(
+    payload: Option<String>,
+    column: usize,
+) -> Result<Option<MarmotAppMessagePayloadV1>, rusqlite::Error> {
+    payload
+        .filter(|payload| !payload.is_empty())
+        .map(|payload| serde_json::from_str(&payload))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(err)))
 }
 
 fn ensure_column(

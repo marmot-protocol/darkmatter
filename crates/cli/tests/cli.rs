@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{OnceLock, mpsc as std_mpsc};
@@ -60,6 +61,12 @@ fn dm(home: &std::path::Path) -> Command {
     command
 }
 
+fn dm_without_relay(home: &std::path::Path) -> Command {
+    let mut command = dm(home);
+    command.env_remove("DM_RELAY");
+    command
+}
+
 fn dm_with_relay(home: &std::path::Path, relay: &str) -> Command {
     let mut command = dm(home);
     command.arg("--relay").arg(relay);
@@ -85,8 +92,30 @@ fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
     try_run_json(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
 }
 
+fn run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Value {
+    try_run_json_without_relay(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
+}
+
 fn try_run_json(home: &std::path::Path, args: &[&str]) -> Result<Value, String> {
     let output = dm(home)
+        .args(args)
+        .output()
+        .expect("dm command should start");
+    if !output.status.success() {
+        return Err(format!(
+            "dm failed\nargs={args:?}\n{}",
+            command_output_summary(&output)
+        ));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    if value["ok"] != true {
+        return Err(format!("unexpected json response: {value}"));
+    }
+    Ok(value["result"].clone())
+}
+
+fn try_run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Result<Value, String> {
+    let output = dm_without_relay(home)
         .args(args)
         .output()
         .expect("dm command should start");
@@ -150,6 +179,164 @@ fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)
     value["result"].clone()
 }
 
+#[test]
+fn whitenoise_command_surface_names_are_present() {
+    let dm_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--help")
+        .output()
+        .expect("dm help should run");
+    assert!(
+        dm_help.status.success(),
+        "{}",
+        command_output_summary(&dm_help)
+    );
+    let dm_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dm_help.stdout),
+        String::from_utf8_lossy(&dm_help.stderr)
+    );
+    for command in [
+        "daemon",
+        "debug",
+        "create-identity",
+        "login",
+        "logout",
+        "whoami",
+        "export-nsec",
+        "accounts",
+        "chats",
+        "groups",
+        "media",
+        "messages",
+        "follows",
+        "profile",
+        "relays",
+        "settings",
+        "users",
+        "notifications",
+        "keys",
+        "reset",
+    ] {
+        assert!(dm_help.contains(command), "dm --help missing {command}");
+    }
+    assert!(
+        !dm_help.contains("--relay"),
+        "dm --help should not expose a global relay flag"
+    );
+
+    let login_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["login", "--help"])
+        .output()
+        .expect("dm login help should run");
+    assert!(
+        login_help.status.success(),
+        "{}",
+        command_output_summary(&login_help)
+    );
+    let login_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&login_help.stdout),
+        String::from_utf8_lossy(&login_help.stderr)
+    );
+    assert!(
+        login_help.contains("--relay"),
+        "dm login --help should expose the command-local relay override"
+    );
+
+    let dmd_help = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--help")
+        .output()
+        .expect("dmd help should run");
+    assert!(
+        dmd_help.status.success(),
+        "{}",
+        command_output_summary(&dmd_help)
+    );
+    let dmd_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dmd_help.stdout),
+        String::from_utf8_lossy(&dmd_help.stderr)
+    );
+    for flag in [
+        "--data-dir",
+        "--logs-dir",
+        "--discovery-relays",
+        "--default-account-relays",
+    ] {
+        assert!(dmd_help.contains(flag), "dmd --help missing {flag}");
+    }
+    assert!(
+        !dmd_help.contains("--relay"),
+        "dmd --help should match wnd-style relay defaults instead of singular --relay"
+    );
+
+    let daemon_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["daemon", "--help"])
+        .output()
+        .expect("dm daemon help should run");
+    assert!(
+        daemon_help.status.success(),
+        "{}",
+        command_output_summary(&daemon_help)
+    );
+    let daemon_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&daemon_help.stdout),
+        String::from_utf8_lossy(&daemon_help.stderr)
+    );
+    assert!(
+        !daemon_help.contains("sync-now"),
+        "daemon sync-now should not be a user-facing command"
+    );
+
+    let daemon_start_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["daemon", "start", "--help"])
+        .output()
+        .expect("dm daemon start help should run");
+    assert!(
+        daemon_start_help.status.success(),
+        "{}",
+        command_output_summary(&daemon_start_help)
+    );
+    let daemon_start_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&daemon_start_help.stdout),
+        String::from_utf8_lossy(&daemon_start_help.stderr)
+    );
+    for flag in ["--discovery-relays", "--default-account-relays"] {
+        assert!(
+            daemon_start_help.contains(flag),
+            "dm daemon start --help missing {flag}"
+        );
+    }
+
+    let messages_list_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["messages", "list", "--help"])
+        .output()
+        .expect("messages list help should run");
+    assert!(
+        messages_list_help.status.success(),
+        "{}",
+        command_output_summary(&messages_list_help)
+    );
+    let messages_list_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&messages_list_help.stdout),
+        String::from_utf8_lossy(&messages_list_help.stderr)
+    );
+    for flag in [
+        "--before",
+        "--before-message-id",
+        "--after",
+        "--after-message-id",
+    ] {
+        assert!(
+            messages_list_help.contains(flag),
+            "dm messages list --help missing {flag}"
+        );
+    }
+}
+
 fn create_account(home: &std::path::Path) -> String {
     run_json(home, &["account", "create"])["account_id"]
         .as_str()
@@ -181,6 +368,17 @@ fn member_accounts(value: &Value) -> Vec<String> {
         .expect("members array")
         .iter()
         .filter_map(|member| member["member_id"].as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    accounts.sort();
+    accounts
+}
+
+fn admin_accounts(value: &Value) -> Vec<String> {
+    let mut accounts = value["admins"]
+        .as_array()
+        .expect("admins array")
+        .iter()
+        .filter_map(|admin| admin["admin_id"].as_str().map(ToOwned::to_owned))
         .collect::<Vec<_>>();
     accounts.sort();
     accounts
@@ -319,6 +517,58 @@ fn run_json_until_success(home: &std::path::Path, args: &[&str], timeout: Durati
     );
 }
 
+fn poll_json_until(
+    home: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last_value = None;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match try_run_json(home, args) {
+            Ok(value) if predicate(&value) => return value,
+            Ok(value) => last_value = Some(value),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "dm did not reach expected JSON state\nlast_value={}\nlast_error={}",
+        last_value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        last_error.as_deref().unwrap_or("<none>")
+    );
+}
+
+fn poll_json_without_relay_until(
+    home: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last_value = None;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match try_run_json_without_relay(home, args) {
+            Ok(value) if predicate(&value) => return value,
+            Ok(value) => last_value = Some(value),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "dm did not reach expected JSON state\nlast_value={}\nlast_error={}",
+        last_value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        last_error.as_deref().unwrap_or("<none>")
+    );
+}
+
 fn wait_child_output_or_panic(child: Child, timeout: Duration, context: &str) -> Output {
     let output = wait_child_output(child, timeout);
     assert!(
@@ -403,12 +653,7 @@ fn real_relay_urls() -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .filter(|relays| !relays.is_empty())
-        .unwrap_or_else(|| {
-            vec![
-                "ws://127.0.0.1:28080".to_owned(),
-                "ws://127.0.0.1:27777".to_owned(),
-            ]
-        })
+        .unwrap_or_else(|| vec!["ws://127.0.0.1:27777".to_owned()])
 }
 
 fn require_real_relays() -> bool {
@@ -517,6 +762,30 @@ fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, memb
     );
 }
 
+fn sync_until_admins<const N: usize>(
+    home: &std::path::Path,
+    account: &str,
+    group_id: &str,
+    expected: [&str; N],
+) -> Value {
+    let expected = sorted_accounts(expected);
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let _ = run_json(home, &["--account", account, "sync"]);
+        let admins = run_json(home, &["--account", account, "groups", "admins", group_id]);
+        if admin_accounts(&admins) == expected {
+            return admins;
+        }
+        last = admins;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> did not see expected admins in <REDACTED_GROUP>; {}",
+        json_value_summary("last_admins", &last)
+    );
+}
+
 fn wait_until_chat_visible(
     home: &std::path::Path,
     relay: &str,
@@ -612,6 +881,89 @@ fn stop_daemon(socket: &std::path::Path, child: &mut Child) {
     let _ = child.wait();
 }
 
+struct JsonLineSubscription {
+    child: Child,
+    lines: std_mpsc::Receiver<Value>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl JsonLineSubscription {
+    fn wait_for(&self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + timeout;
+        let mut last = None;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(Duration::from_millis(100));
+            match self.lines.recv_timeout(wait) {
+                Ok(value) if predicate(&value) => return value,
+                Ok(value) => last = Some(value),
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!(
+            "subscription did not emit expected line\nlast_line={}",
+            last.map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_owned())
+        );
+    }
+}
+
+impl Drop for JsonLineSubscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn spawn_json_subscription(home: &std::path::Path, args: &[&str]) -> JsonLineSubscription {
+    spawn_json_subscription_with_command(dm(home), args)
+}
+
+fn spawn_json_subscription_without_relay(
+    home: &std::path::Path,
+    args: &[&str],
+) -> JsonLineSubscription {
+    spawn_json_subscription_with_command(dm_without_relay(home), args)
+}
+
+fn spawn_json_subscription_with_command(
+    mut command: Command,
+    args: &[&str],
+) -> JsonLineSubscription {
+    let mut child = command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("subscription should start");
+    let stdout = child.stdout.take().expect("subscription stdout");
+    let (tx, rx) = std_mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = serde_json::from_str::<Value>(&line)
+                .unwrap_or_else(|err| panic!("subscription line should be JSON: {err}; {line}"));
+            if tx.send(value).is_err() {
+                break;
+            }
+        }
+    });
+    JsonLineSubscription {
+        child,
+        lines: rx,
+        reader: Some(reader),
+    }
+}
+
 #[test]
 fn account_create_list_and_status_are_json_addressable() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -671,6 +1023,123 @@ fn account_create_accepts_nsec_without_echoing_it() {
 
     let status = run_json(home.path(), &["account", "status", account_id]);
     assert_eq!(status["account_id"], account_id);
+}
+
+#[test]
+fn whitenoise_identity_commands_create_login_and_show_accounts() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let created = run_json(home.path(), &["create-identity"]);
+    assert_eq!(created["local_signing"], true);
+    assert!(created["npub"].as_str().expect("npub").starts_with("npub1"));
+    assert_eq!(created["key_package"]["published"], true);
+    assert!(created["key_package"]["bytes"].as_u64().expect("bytes") > 0);
+
+    let output = dm(home.path())
+        .args(["login", nsec, "--relay", relay])
+        .output()
+        .expect("dm login should start");
+    assert!(
+        output.status.success(),
+        "dm failed\n{}",
+        command_output_summary(&output)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(nsec));
+    let logged_in: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(logged_in["ok"], true);
+    assert_eq!(logged_in["result"]["local_signing"], true);
+    assert_eq!(logged_in["result"]["key_package"]["published"], true);
+    assert!(
+        logged_in["result"]["key_package"]["bytes"]
+            .as_u64()
+            .expect("bytes")
+            > 0
+    );
+
+    let whoami = run_json(home.path(), &["whoami"]);
+    let accounts = whoami["accounts"].as_array().expect("accounts");
+    assert_eq!(accounts.len(), 2);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account["local_signing"] == true)
+    );
+
+    let accounts_list = run_json(home.path(), &["accounts", "list"]);
+    assert_eq!(
+        accounts_list["accounts"]
+            .as_array()
+            .expect("accounts")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn create_identity_publishes_key_package_for_direct_invites() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = run_json(home.path(), &["create-identity"]);
+    let bob = run_json(home.path(), &["create-identity"]);
+    let alice_id = alice["account_id"].as_str().expect("alice account id");
+    let bob_id = bob["account_id"].as_str().expect("bob account id");
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", alice_id, "groups", "create", "general", bob_id],
+    );
+    assert!(created_group["group_id"].as_str().is_some());
+}
+
+#[test]
+fn whitenoise_parity_commands_have_real_or_explicit_contracts() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let settings = run_json(home.path(), &["settings", "show"]);
+    assert_eq!(settings["theme"], "system");
+    let settings = run_json(home.path(), &["settings", "theme", "dark"]);
+    assert_eq!(settings["theme"], "dark");
+    let settings = run_json(home.path(), &["settings", "language", "en"]);
+    assert_eq!(settings["language"], "en");
+
+    let health = run_json(home.path(), &["--account", &alice, "debug", "health"]);
+    assert_eq!(health["healthy"], true);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "parity", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    let admins = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "admins", group_id],
+    );
+    assert_eq!(admins["admins"][0]["admin_id"], alice);
+    let relays = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "relays", group_id],
+    );
+    assert!(!relays["relays"].as_array().expect("relays").is_empty());
+
+    let export_error = run_json_error(home.path(), &["export-nsec", &alice]);
+    assert_eq!(export_error["code"], "unsupported_command");
+    assert_eq!(export_error["command"], "export-nsec");
+    let media = run_json(
+        home.path(),
+        &["--account", &alice, "media", "list", group_id],
+    );
+    assert_eq!(media["media"], serde_json::json!([]));
+
+    let logout = run_json(home.path(), &["logout", &bob]);
+    assert_eq!(logout["logged_out"], true);
+    let accounts = run_json(home.path(), &["accounts", "list"]);
+    assert_eq!(accounts["accounts"].as_array().expect("accounts").len(), 1);
 }
 
 #[test]
@@ -1345,6 +1814,646 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
 }
 
 #[test]
+fn daemon_background_stream_watch_records_brokered_preview() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let broker = spawn_quic_broker();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "agent", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
+    let started = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "start",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--quic-candidate",
+            &broker_candidate,
+        ],
+    );
+    let start_message_id = started["message_ids"][0]
+        .as_str()
+        .expect("start message id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dmd should start");
+    wait_for_daemon(&socket);
+
+    let watch = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "stream",
+            "watch",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--insecure-local",
+            "--background",
+        ],
+    );
+    assert_eq!(watch["status"], "running");
+    assert_eq!(watch["stream_id"], stream_id);
+    assert!(watch["watch_id"].as_str().is_some_and(|id| !id.is_empty()));
+
+    let sent = run_json_until_success(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            &broker.addr.to_string(),
+            "--server-name",
+            "localhost",
+            "--insecure-local",
+            "--stream-id",
+            stream_id,
+            "--start-event-id",
+            start_message_id,
+            "--chunk-bytes",
+            "8",
+            "daemon",
+            "preview",
+            "text",
+        ],
+        Duration::from_secs(5),
+    );
+
+    let status = poll_json_until(
+        home.path(),
+        &["daemon", "status"],
+        Duration::from_secs(8),
+        |status| {
+            status
+                .get("stream_watches")
+                .and_then(Value::as_array)
+                .and_then(|watches| watches.first())
+                .is_some_and(|watch| watch["status"] == "completed")
+        },
+    );
+    let stream_watch = status["stream_watches"][0].clone();
+    assert_eq!(stream_watch["stream_id"], stream_id);
+    assert_eq!(stream_watch["status"], "completed");
+    assert_eq!(stream_watch["text"], "daemon preview text");
+    assert_eq!(stream_watch["transcript_hash"], sent["transcript_hash"]);
+
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let broker = spawn_quic_broker();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "agent", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            group_id,
+            "hello",
+            "bob",
+        ],
+    );
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dmd should start");
+    wait_for_daemon(&socket);
+
+    let subscription = spawn_json_subscription(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "subscribe",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    let initial = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "InitialMessage"
+            && line["result"]["type"] == "message"
+            && line["result"]["message"]["plaintext"] == "hello bob"
+    });
+    assert_eq!(initial["result"]["message"]["group_id"], group_id);
+
+    let stream_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
+    let started = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "start",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--quic-candidate",
+            &broker_candidate,
+        ],
+    );
+    let start_message_id = started["message_ids"][0]
+        .as_str()
+        .expect("start message id");
+
+    subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "MessageReceived"
+            && line["result"]["type"] == "agent_stream_start"
+            && line["result"]["message"]["agent_text_stream"]["kind"] == "start"
+            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+    });
+
+    let watch = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "stream",
+            "watch",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--insecure-local",
+            "--background",
+        ],
+    );
+    assert_eq!(watch["status"], "running");
+
+    let sent = run_json_until_success(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            &broker.addr.to_string(),
+            "--server-name",
+            "localhost",
+            "--insecure-local",
+            "--stream-id",
+            stream_id,
+            "--start-event-id",
+            start_message_id,
+            "--chunk-bytes",
+            "8",
+            "daemon",
+            "preview",
+            "line",
+        ],
+        Duration::from_secs(5),
+    );
+
+    let delta = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "AgentStreamDelta"
+            && line["result"]["type"] == "agent_stream_delta"
+            && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
+    });
+    assert_eq!(delta["result"]["agent_stream_delta"]["group_id"], group_id);
+    assert!(
+        delta["result"]["agent_stream_delta"]["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+
+    let preview = subscription.wait_for(Duration::from_secs(15), |line| {
+        line["result"]["trigger"] == "StreamPreviewCompleted"
+            && line["result"]["type"] == "stream_preview"
+            && line["result"]["stream_preview"]["stream_id"] == stream_id
+    });
+    assert_eq!(
+        preview["result"]["stream_preview"]["text"],
+        "daemon preview line"
+    );
+    assert_eq!(
+        preview["result"]["stream_preview"]["transcript_hash"],
+        sent["transcript_hash"]
+    );
+
+    drop(subscription);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let broker = spawn_quic_broker();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "agent", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dmd should start");
+    wait_for_daemon(&socket);
+
+    let subscription = spawn_json_subscription(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "subscribe",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+
+    let stream_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
+    let opened = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "compose-open",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--quic-candidate",
+            &broker_candidate,
+            "--insecure-local",
+            "--chunk-bytes",
+            "8",
+        ],
+    );
+    assert_eq!(opened["status"], "streaming");
+    assert_eq!(opened["stream_id"], stream_id);
+
+    subscription.wait_for(Duration::from_secs(8), |line| {
+        matches!(
+            line["result"]["trigger"].as_str(),
+            Some("MessageReceived" | "InitialMessage")
+        ) && line["result"]["type"] == "agent_stream_start"
+            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+    });
+
+    poll_json_until(
+        home.path(),
+        &["daemon", "status"],
+        Duration::from_secs(8),
+        |status| {
+            status
+                .get("stream_watches")
+                .and_then(Value::as_array)
+                .is_some_and(|watches| {
+                    watches.iter().any(|watch| {
+                        watch["account"] == bob
+                            && watch["group_id"] == group_id
+                            && watch["stream_id"] == stream_id
+                            && watch["status"] == "running"
+                    })
+                })
+        },
+    );
+
+    subscription.wait_for(Duration::from_secs(8), |line| {
+        matches!(
+            line["result"]["trigger"].as_str(),
+            Some("InitialStreamPreview" | "StreamPreviewUpdated")
+        ) && line["result"]["type"] == "stream_preview"
+            && line["result"]["stream_preview"]["stream_id"] == stream_id
+            && line["result"]["stream_preview"]["status"] == "running"
+    });
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "compose-append",
+            "--stream-id",
+            stream_id,
+            "hello ",
+        ],
+    );
+    let delta = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "AgentStreamDelta"
+            && line["result"]["type"] == "agent_stream_delta"
+            && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
+            && line["result"]["agent_stream_delta"]["text"] == "hello "
+    });
+    assert_eq!(delta["result"]["agent_stream_delta"]["group_id"], group_id);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "compose-append",
+            "--stream-id",
+            stream_id,
+            "world",
+        ],
+    );
+    let finished = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "compose-finish",
+            "--stream-id",
+            stream_id,
+        ],
+    );
+    assert_eq!(finished["status"], "finished");
+    assert_eq!(finished["text"], "hello world");
+    assert_eq!(finished["chunk_count"], 2);
+    assert!(finished["transcript_hash"].as_str().is_some());
+
+    let preview = subscription.wait_for(Duration::from_secs(15), |line| {
+        line["result"]["trigger"] == "StreamPreviewCompleted"
+            && line["result"]["type"] == "stream_preview"
+            && line["result"]["stream_preview"]["stream_id"] == stream_id
+    });
+    assert_eq!(preview["result"]["stream_preview"]["text"], "hello world");
+    assert_eq!(
+        preview["result"]["stream_preview"]["transcript_hash"],
+        finished["transcript_hash"]
+    );
+
+    let final_marker = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "MessageReceived"
+            && line["result"]["type"] == "agent_stream_final"
+            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+    });
+    assert_eq!(
+        final_marker["result"]["message"]["agent_text_stream"]["final_text_or_reference"],
+        "hello world"
+    );
+
+    drop(subscription);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let broker = spawn_quic_broker();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dmd should start");
+    wait_for_daemon(&socket);
+
+    let alice_created = run_json_without_relay(home.path(), &["create-identity"]);
+    let bob_created = run_json_without_relay(home.path(), &["create-identity"]);
+    assert_eq!(alice_created["relay_lists"]["complete"], true);
+    assert_eq!(bob_created["relay_lists"]["complete"], true);
+    assert_eq!(alice_created["key_package"]["published"], true);
+    assert_eq!(bob_created["key_package"]["published"], true);
+    assert!(
+        alice_created["key_package"]["bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        bob_created["key_package"]["bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    let alice = alice_created["account_id"].as_str().expect("alice id");
+    let bob = bob_created["account_id"].as_str().expect("bob id");
+
+    let created_group = run_json_without_relay(
+        home.path(),
+        &["--account", alice, "groups", "create", "agent", bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+
+    poll_json_without_relay_until(
+        home.path(),
+        &["--account", bob, "chats", "list"],
+        Duration::from_secs(20),
+        |chats| {
+            chats
+                .get("chats")
+                .and_then(Value::as_array)
+                .is_some_and(|chats| chats.iter().any(|chat| chat["group_id"] == group_id))
+        },
+    );
+
+    let subscription = spawn_json_subscription_without_relay(
+        home.path(),
+        &[
+            "--account",
+            bob,
+            "messages",
+            "subscribe",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    run_json_without_relay(
+        home.path(),
+        &[
+            "--account",
+            alice,
+            "messages",
+            "send",
+            group_id,
+            "stream",
+            "readiness",
+            "probe",
+        ],
+    );
+    subscription.wait_for(Duration::from_secs(15), |line| {
+        matches!(
+            line["result"]["trigger"].as_str(),
+            Some("MessageReceived" | "InitialMessage")
+        ) && line["result"]["type"] == "message"
+            && line["result"]["message"]["plaintext"] == "stream readiness probe"
+    });
+
+    let stream_id = "abababababababababababababababababababababababababababababababab";
+    let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
+    let opened = run_json_without_relay(
+        home.path(),
+        &[
+            "--account",
+            alice,
+            "stream",
+            "compose-open",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--quic-candidate",
+            &broker_candidate,
+            "--insecure-local",
+            "--chunk-bytes",
+            "8",
+        ],
+    );
+    assert_eq!(opened["status"], "streaming");
+
+    subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "MessageReceived"
+            && line["result"]["type"] == "agent_stream_start"
+            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+    });
+
+    run_json_without_relay(
+        home.path(),
+        &[
+            "--account",
+            alice,
+            "stream",
+            "compose-append",
+            "--stream-id",
+            stream_id,
+            "hello ",
+        ],
+    );
+    run_json_without_relay(
+        home.path(),
+        &[
+            "--account",
+            alice,
+            "stream",
+            "compose-append",
+            "--stream-id",
+            stream_id,
+            "stream",
+        ],
+    );
+    let finished = run_json_without_relay(
+        home.path(),
+        &[
+            "--account",
+            alice,
+            "stream",
+            "compose-finish",
+            "--stream-id",
+            stream_id,
+        ],
+    );
+    assert_eq!(finished["status"], "finished");
+    assert_eq!(finished["text"], "hello stream");
+
+    subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "AgentStreamDelta"
+            && line["result"]["type"] == "agent_stream_delta"
+            && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
+    });
+    let preview = subscription.wait_for(Duration::from_secs(15), |line| {
+        line["result"]["trigger"] == "StreamPreviewCompleted"
+            && line["result"]["type"] == "stream_preview"
+            && line["result"]["stream_preview"]["stream_id"] == stream_id
+    });
+    assert_eq!(preview["result"]["stream_preview"]["text"], "hello stream");
+    let final_marker = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "MessageReceived"
+            && line["result"]["type"] == "agent_stream_final"
+            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+    });
+    assert_eq!(
+        final_marker["result"]["message"]["agent_text_stream"]["final_text_or_reference"],
+        "hello stream"
+    );
+
+    drop(subscription);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
 fn message_send_accepts_hyphen_leading_text_after_group_flag() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -1377,6 +2486,374 @@ fn message_send_accepts_hyphen_leading_text_after_group_flag() {
 }
 
 #[test]
+fn messages_plural_send_and_list_are_the_canonical_message_surface() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "plural",
+            "surface",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &bob, "plural surface");
+
+    let listed = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert_message_plaintexts(&listed, &["plural surface"]);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "another searchable line",
+        ],
+    );
+    sync_until_message(
+        home.path(),
+        test_relay_url(),
+        &bob,
+        "another searchable line",
+    );
+
+    let search = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "search",
+            group_id,
+            "searchable",
+        ],
+    );
+    assert_message_plaintexts(&search, &["another searchable line"]);
+    assert_no_message_plaintext(&search, "plural surface");
+
+    let search_all = run_json(
+        home.path(),
+        &["--account", &bob, "messages", "search-all", "plural"],
+    );
+    assert_message_plaintexts(&search_all, &["plural surface"]);
+}
+
+#[test]
+fn messages_react_unreact_and_delete_are_typed_app_messages() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "lifecycle", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let sent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "needs",
+            "a",
+            "reaction",
+        ],
+    );
+    let target_message_id = sent["message_ids"][0].as_str().expect("message id");
+    sync_until_message(home.path(), test_relay_url(), &bob, "needs a reaction");
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "react",
+            group_id,
+            target_message_id,
+            "+",
+        ],
+    );
+    let reaction_text = format!("reacted + to {target_message_id}");
+    let reaction_sync = sync_until_message(home.path(), test_relay_url(), &alice, &reaction_text);
+    assert_eq!(
+        reaction_sync["messages"][0]["app_message"]["kind"],
+        "reaction"
+    );
+    assert_eq!(
+        reaction_sync["messages"][0]["app_message"]["target_message_id"],
+        target_message_id
+    );
+    assert_eq!(reaction_sync["messages"][0]["app_message"]["action"], "add");
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "unreact",
+            group_id,
+            target_message_id,
+        ],
+    );
+    let unreact_text = format!("removed reaction from {target_message_id}");
+    let unreact_sync = sync_until_message(home.path(), test_relay_url(), &alice, &unreact_text);
+    assert_eq!(
+        unreact_sync["messages"][0]["app_message"]["action"],
+        "remove"
+    );
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "delete",
+            group_id,
+            target_message_id,
+        ],
+    );
+    let delete_text = format!("deleted {target_message_id}");
+    let delete_sync = sync_until_message(home.path(), test_relay_url(), &alice, &delete_text);
+    assert_eq!(delete_sync["messages"][0]["app_message"]["kind"], "delete");
+
+    let retry = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "retry",
+            group_id,
+            target_message_id,
+        ],
+    );
+    assert_eq!(retry["target_event_id"], target_message_id);
+    assert_eq!(retry["retry_scope"], "group_convergence");
+}
+
+#[test]
+fn whitenoise_groups_commands_cover_core_group_workflows() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    let carol = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    run_json(home.path(), &["--account", &carol, "keys", "publish"]);
+
+    let created = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "create",
+            "general",
+            &bob,
+            "--description",
+            "launch room",
+        ],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    assert_eq!(created["profile"]["description"], "launch room");
+
+    let shown = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "show", group_id],
+    );
+    assert_eq!(shown["group"]["group_id"], group_id);
+
+    let listed = run_json(home.path(), &["--account", &alice, "groups", "list"]);
+    assert!(
+        listed["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|group| group["group_id"] == group_id))
+    );
+
+    let renamed = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "rename", group_id, "ops"],
+    );
+    assert_eq!(renamed["group"]["profile"]["name"], "ops");
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "add-members",
+            group_id,
+            &carol,
+        ],
+    );
+    let members = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "members", group_id],
+    );
+    assert_eq!(
+        member_accounts(&members),
+        sorted_accounts([&alice, &bob, &carol])
+    );
+}
+
+#[test]
+fn groups_leave_publishes_self_remove() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "departures", &bob],
+    );
+    let group_id = created["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let leave = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "leave", group_id],
+    );
+    assert_eq!(leave["group_id"], group_id);
+    assert_eq!(leave["published"], 1);
+
+    let alice_sync = run_json(home.path(), &["--account", &alice, "sync"]);
+    assert!(alice_sync["events"].as_u64().unwrap_or_default() > 0);
+}
+
+#[test]
+fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dmd should start");
+    wait_for_daemon(&socket);
+
+    let subscription =
+        spawn_json_subscription(home.path(), &["--account", &bob, "chats", "subscribe"]);
+    let initial = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "InitialChat"
+            && line["result"]["type"] == "chat"
+            && line["result"]["chat"]["group_id"] == group_id
+    });
+    assert_eq!(initial["result"]["chat"]["profile"]["name"], "general");
+
+    drop(subscription);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dmd should start");
+    wait_for_daemon(&socket);
+
+    let subscription = spawn_json_subscription(
+        home.path(),
+        &["--account", &alice, "groups", "subscribe-state", group_id],
+    );
+    let initial = subscription.wait_for(Duration::from_secs(8), |line| {
+        line["result"]["trigger"] == "InitialGroupState"
+            && line["result"]["type"] == "group_state"
+            && line["result"]["group"]["group_id"] == group_id
+    });
+    assert_eq!(initial["result"]["group"]["profile"]["name"], "general");
+
+    drop(subscription);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
 fn chats_list_exposes_visible_groups() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -1405,7 +2882,9 @@ fn daemon_executes_cli_commands_over_socket() {
         .arg(home.path())
         .arg("--socket")
         .arg(&socket)
-        .arg("--relay")
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
@@ -1448,11 +2927,17 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .arg(home.path())
         .arg("--socket")
         .arg(&socket)
-        .env("DM_RELAY", test_relay_url())
         .arg("--secret-store")
         .arg("file")
         .arg("--json")
-        .args(["daemon", "start", "--sync-interval-ms", "100"])
+        .args([
+            "daemon",
+            "start",
+            "--discovery-relays",
+            test_relay_url(),
+            "--default-account-relays",
+            test_relay_url(),
+        ])
         .output()
         .expect("dm daemon start should run");
     assert!(
@@ -1478,15 +2963,15 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     assert_eq!(status_json["result"]["running"], true);
     assert!(status_json["result"]["pid"].as_u64().is_some());
     assert!(status_json["result"]["pid_file"].as_str().is_some());
-    assert_eq!(status_json["result"]["sync_interval_ms"], 100);
+    assert!(status_json["result"].get("sync_interval_ms").is_none());
 
     let created = Command::new(env!("CARGO_BIN_EXE_dm"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
-        .args(["account", "create"])
+        .args(["create-identity"])
         .output()
-        .expect("dm account create should run through daemon");
+        .expect("dm create-identity should run through daemon");
     assert!(
         created.status.success(),
         "daemon execute failed\n{}",
@@ -1495,6 +2980,28 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let created_json: Value =
         serde_json::from_slice(&created.stdout).expect("created stdout should be JSON");
     assert_eq!(created_json["result"]["local_signing"], true);
+    assert_eq!(created_json["result"]["key_package"]["published"], true);
+
+    let whoami = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["whoami"])
+        .output()
+        .expect("dm whoami should run through daemon");
+    assert!(
+        whoami.status.success(),
+        "daemon whoami failed\n{}",
+        command_output_summary(&whoami)
+    );
+    let whoami_json: Value = serde_json::from_slice(&whoami.stdout).expect("whoami stdout JSON");
+    assert_eq!(
+        whoami_json["result"]["accounts"]
+            .as_array()
+            .expect("accounts")
+            .len(),
+        1
+    );
 
     let stop = Command::new(env!("CARGO_BIN_EXE_dm"))
         .arg("--socket")
@@ -1528,11 +3035,17 @@ fn daemon_background_sync_updates_local_accounts() {
         .arg(home.path())
         .arg("--socket")
         .arg(&socket)
-        .env("DM_RELAY", test_relay_url())
         .arg("--secret-store")
         .arg("file")
         .arg("--json")
-        .args(["daemon", "start", "--sync-interval-ms", "100"])
+        .args([
+            "daemon",
+            "start",
+            "--discovery-relays",
+            test_relay_url(),
+            "--default-account-relays",
+            test_relay_url(),
+        ])
         .output()
         .expect("dm daemon start should run");
     assert!(
@@ -1976,6 +3489,111 @@ fn non_admin_group_mutations_return_admin_policy_errors() {
 }
 
 #[test]
+fn groups_promote_and_demote_update_admin_policy_authorization() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "admins", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    let initial_admins = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "admins", group_id],
+    );
+    assert_eq!(admin_accounts(&initial_admins), sorted_accounts([&alice]));
+
+    let promoted = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "promote", group_id, &bob],
+    );
+    assert_eq!(promoted["published"], 1);
+    assert_eq!(
+        promoted["group"]["admin_policy"]["admins"],
+        serde_json::json!(sorted_accounts([&alice, &bob]))
+    );
+
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+    sync_until_admins(home.path(), &bob, group_id, [&alice, &bob]);
+    let bob_rename = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "rename", group_id, "bob-led"],
+    );
+    assert_eq!(bob_rename["published"], 1);
+    assert_eq!(bob_rename["group"]["profile"]["name"], "bob-led");
+
+    let self_demoted = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "self-demote", group_id],
+    );
+    assert_eq!(self_demoted["published"], 1);
+    assert_eq!(
+        self_demoted["group"]["admin_policy"]["admins"],
+        serde_json::json!(sorted_accounts([&alice]))
+    );
+    let self_demoted_error = run_json_error(
+        home.path(),
+        &["--account", &bob, "groups", "rename", group_id, "nope"],
+    );
+    assert_eq!(self_demoted_error["code"], "not_group_admin");
+
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let demote_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "demotions", &bob],
+    );
+    let demote_group_id = demote_group["group_id"].as_str().expect("group id");
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "promote",
+            demote_group_id,
+            &bob,
+        ],
+    );
+    sync_until_joined(home.path(), test_relay_url(), &bob, demote_group_id);
+    sync_until_admins(home.path(), &bob, demote_group_id, [&alice, &bob]);
+
+    let demoted = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "demote",
+            demote_group_id,
+            &bob,
+        ],
+    );
+    assert_eq!(demoted["published"], 1);
+    assert_eq!(
+        demoted["group"]["admin_policy"]["admins"],
+        serde_json::json!(sorted_accounts([&alice]))
+    );
+
+    sync_until_admins(home.path(), &bob, demote_group_id, [&alice]);
+    let demoted_error = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "groups",
+            "rename",
+            demote_group_id,
+            "nope",
+        ],
+    );
+    assert_eq!(demoted_error["code"], "not_group_admin");
+}
+
+#[test]
 fn group_members_invite_and_remove_flow_updates_projected_members() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -2253,7 +3871,7 @@ fn real_local_relays_deliver_cli_messages_over_sdk_path() {
 }
 
 #[test]
-fn daemon_real_relay_keeps_live_subscriptions_between_sync_intervals() {
+fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     let relays = real_relay_urls();
     let Some(relay) = relays.iter().find(|relay| local_relay_available(relay)) else {
         assert!(
@@ -2272,7 +3890,7 @@ fn daemon_real_relay_keeps_live_subscriptions_between_sync_intervals() {
     run_json_with_relay(home.path(), relay, &["--account", &bob, "keys", "publish"]);
 
     let start = dm_with_relay(home.path(), relay)
-        .args(["daemon", "start", "--sync-interval-ms", "60000"])
+        .args(["daemon", "start"])
         .output()
         .expect("dm daemon start should run");
     assert!(

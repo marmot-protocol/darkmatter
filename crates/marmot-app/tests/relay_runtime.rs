@@ -1,4 +1,5 @@
 use cgka_traits::TransportEndpoint;
+use cgka_traits::{MarmotAppMessagePayloadV1, MarmotMediaReferenceV1, MarmotReactionActionV1};
 use marmot_account::AccountHome;
 use marmot_app::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, MarmotApp, UserDirectorySearch,
@@ -49,6 +50,129 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
     assert_eq!(received.messages[0].sender, "alice");
     assert_eq!(received.messages[0].group_id, group_id);
     assert_eq!(received.messages[0].plaintext, "hello from app runtime");
+}
+
+#[tokio::test]
+async fn relay_app_runtime_publishes_member_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let leave = bob.leave_group(&group_id).await.unwrap();
+    assert_eq!(leave.published, 1);
+
+    let alice_sync = alice.sync().await.unwrap();
+    assert!(alice_sync.events.iter().any(|event| matches!(
+        event,
+        cgka_traits::GroupEvent::MemberRemoved { group_id: removed_group, .. }
+            if removed_group == &group_id
+    )));
+}
+
+#[tokio::test]
+async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("updates", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let sent = alice
+        .send(&group_id, b"message with lifecycle")
+        .await
+        .unwrap();
+    let target_message_id = sent.message_ids[0].clone();
+    bob.sync().await.unwrap();
+
+    bob.react_to_message(&group_id, &target_message_id, "+")
+        .await
+        .unwrap();
+    let reaction = alice.sync().await.unwrap();
+    assert_eq!(reaction.messages.len(), 1);
+    assert_eq!(
+        reaction.messages[0].plaintext,
+        format!("reacted + to {target_message_id}")
+    );
+    assert_eq!(
+        reaction.messages[0].app_message,
+        Some(MarmotAppMessagePayloadV1::Reaction {
+            target_message_id: target_message_id.clone(),
+            emoji: "+".to_owned(),
+            action: MarmotReactionActionV1::Add,
+        })
+    );
+
+    let empty_reaction = bob
+        .react_to_message(&group_id, &target_message_id, "")
+        .await
+        .unwrap_err();
+    assert!(empty_reaction.to_string().contains("non-empty emoji"));
+
+    bob.delete_message(&group_id, &target_message_id)
+        .await
+        .unwrap();
+    let deletion = alice.sync().await.unwrap();
+    assert_eq!(
+        deletion.messages[0].plaintext,
+        format!("deleted {target_message_id}")
+    );
+    assert_eq!(
+        deletion.messages[0].app_message,
+        Some(MarmotAppMessagePayloadV1::Delete { target_message_id })
+    );
+
+    bob.send_media_reference(
+        &group_id,
+        MarmotMediaReferenceV1 {
+            file_hash_hex: hex::encode([0x42_u8; 32]),
+            file_name: "diagram.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            size_bytes: 1234,
+        },
+        Some("launch diagram".to_owned()),
+    )
+    .await
+    .unwrap();
+    let media = alice.sync().await.unwrap();
+    assert_eq!(
+        media.messages[0].plaintext,
+        "media diagram.png: launch diagram"
+    );
+    assert!(matches!(
+        media.messages[0].app_message,
+        Some(MarmotAppMessagePayloadV1::Media { .. })
+    ));
+
+    let bad_media = bob
+        .send_media_reference(
+            &group_id,
+            MarmotMediaReferenceV1 {
+                file_hash_hex: "not-hex".to_owned(),
+                file_name: "diagram.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                size_bytes: 1234,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(bad_media.to_string().contains("media hash"));
 }
 
 #[tokio::test]
@@ -278,6 +402,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             about: Some("Can we fix it".into()),
             picture: None,
             nip05: Some("bob@example.test".into()),
+            lud16: None,
             created_at: 0,
             source_relays: Vec::new(),
         },
@@ -293,6 +418,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             about: None,
             picture: None,
             nip05: None,
+            lud16: None,
             created_at: 0,
             source_relays: Vec::new(),
         },
