@@ -1548,10 +1548,6 @@ impl TuiApp {
             self.message_subscription = None;
             return;
         }
-        if self.selected_chat_row().is_none() {
-            self.message_subscription = None;
-            return;
-        }
         if let Err(err) = self.ensure_message_subscription(&account.account_id) {
             self.status = format!("message subscription failed: {err}");
         }
@@ -2222,15 +2218,18 @@ fn apply_tui_subscription_result(
         if subscription_result_counts_as_unread(result) {
             let unread_count = unread_counts.entry(group_id.clone()).or_default();
             *unread_count += 1;
-            return Some(format!(
+            let status = Some(format!(
                 "unread message in {}; count={}",
                 shorten(&group_id, 18),
                 unread_count
             ));
+            let _ = apply_subscription_result(messages, live_previews, result, true);
+            return status;
         }
+        let _ = apply_subscription_result(messages, live_previews, result, true);
         return None;
     }
-    apply_subscription_result(messages, live_previews, result)
+    apply_subscription_result(messages, live_previews, result, false)
 }
 
 fn is_initial_subscription_result(result: &Value) -> bool {
@@ -2269,6 +2268,7 @@ fn apply_subscription_result(
     messages: &mut Vec<MessageRow>,
     live_previews: &mut Vec<LiveStreamPreview>,
     result: &Value,
+    suppress_message_append: bool,
 ) -> Option<String> {
     match result.get("type").and_then(Value::as_str) {
         Some("message" | "reaction" | "message_delete" | "media" | "agent_stream_final") => {
@@ -2280,6 +2280,9 @@ fn apply_subscription_result(
             {
                 let group_id = value_string(message_value, "group_id");
                 remove_live_stream_preview(live_previews, group_id.as_deref(), &stream_id);
+            }
+            if suppress_message_append {
+                return None;
             }
             let message = parse_message(message_value)?;
             upsert_message(messages, message);
@@ -3183,6 +3186,7 @@ mod tests {
                     "text": "hello "
                 }
             }),
+            false,
         );
         apply_subscription_result(
             &mut messages,
@@ -3195,6 +3199,7 @@ mod tests {
                     "text": "stream"
                 }
             }),
+            false,
         );
 
         let rendered_preview =
@@ -3252,6 +3257,7 @@ mod tests {
                     }
                 }
             }),
+            false,
         );
         assert_eq!(previews.len(), 1);
         apply_subscription_result(
@@ -3272,6 +3278,7 @@ mod tests {
                     }
                 }
             }),
+            false,
         );
 
         let rendered = message_lines(&messages, None)
@@ -3315,6 +3322,51 @@ mod tests {
             status,
             Some("unread message in bbbbbbb...bbbbbbbb; count=1".to_owned())
         );
+    }
+
+    #[test]
+    fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_message() {
+        let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let stream_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let mut messages = Vec::new();
+        let mut previews = vec![LiveStreamPreview {
+            group_id: unread_group_id.to_owned(),
+            stream_id: stream_id.to_owned(),
+            author: "alice".to_owned(),
+            status: "streaming".to_owned(),
+            text: "partial".to_owned(),
+            error: None,
+            optimistic: false,
+        }];
+        let mut unread_counts = HashMap::new();
+
+        apply_tui_subscription_result(
+            &mut messages,
+            &mut previews,
+            &mut unread_counts,
+            Some(selected_group_id),
+            &serde_json::json!({
+                "trigger": "AgentStreamFinalized",
+                "type": "agent_stream_final",
+                "message": {
+                    "message_id": "final",
+                    "direction": "received",
+                    "group_id": unread_group_id,
+                    "from": "alice",
+                    "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
+                    "agent_text_stream": {
+                        "kind": "final",
+                        "stream_id": stream_id,
+                        "final_text_or_reference": "finished elsewhere"
+                    }
+                }
+            }),
+        );
+
+        assert!(messages.is_empty());
+        assert!(previews.is_empty());
+        assert_eq!(unread_counts.get(unread_group_id), Some(&1));
     }
 
     #[test]
@@ -3376,6 +3428,55 @@ mod tests {
         assert_eq!(status, None);
         assert!(messages.is_empty());
         assert!(unread_counts.is_empty());
+    }
+
+    #[test]
+    fn selected_message_subscription_retains_account_wide_stream_without_selected_chat() {
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut app = TuiApp {
+            client: DmClient {
+                exe: PathBuf::from("unused"),
+                home: None,
+                socket: None,
+                relay: None,
+                secret_store: None,
+                keychain_service: None,
+            },
+            initial_account: None,
+            running: true,
+            focus: Focus::Composer,
+            accounts: vec![AccountRow {
+                account_id: account_id.to_owned(),
+                npub: "npub1alice".to_owned(),
+                display_name: None,
+                local_signing: true,
+            }],
+            selected_account: 0,
+            chats: Vec::new(),
+            selected_chat: 0,
+            unread_counts: HashMap::new(),
+            show_archived_chats: false,
+            messages: Vec::new(),
+            live_stream_previews: Vec::new(),
+            message_subscription: Some(test_message_subscription(account_id)),
+            daemon: DaemonView {
+                running: true,
+                ..DaemonView::default()
+            },
+            input: String::new(),
+            streaming: None,
+            status: String::new(),
+            show_help: false,
+        };
+
+        app.ensure_selected_message_subscription();
+
+        assert_eq!(
+            app.message_subscription
+                .as_ref()
+                .map(|subscription| subscription.account_id.as_str()),
+            Some(account_id)
+        );
     }
 
     #[test]
@@ -3507,5 +3608,18 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn test_message_subscription(account_id: &str) -> MessageSubscription {
+        let child = StdCommand::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep test process");
+        let (_tx, rx) = mpsc::channel();
+        MessageSubscription {
+            account_id: account_id.to_owned(),
+            child,
+            rx,
+        }
     }
 }
