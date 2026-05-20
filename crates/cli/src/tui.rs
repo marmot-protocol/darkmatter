@@ -1490,6 +1490,7 @@ impl TuiApp {
         if self.accounts.is_empty() {
             self.chats.clear();
             self.messages.clear();
+            self.unread_counts.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_diagnostics = None;
@@ -1539,8 +1540,10 @@ impl TuiApp {
         }
         if self.chats.is_empty() {
             self.messages.clear();
-            self.message_subscription = None;
-            self.group_diagnostics = None;
+            if let Err(err) = self.ensure_message_subscription(&account.account_id) {
+                self.status = format!("message subscription failed: {err}");
+                return Ok(());
+            }
             self.status = format!(
                 "loaded account {}; no chats",
                 shorten(&account_display_label(&account), 18)
@@ -3896,43 +3899,8 @@ mod tests {
     #[test]
     fn selected_message_subscription_retains_account_wide_stream_without_selected_chat() {
         let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut app = TuiApp {
-            client: DmClient {
-                exe: PathBuf::from("unused"),
-                home: None,
-                socket: None,
-                relay: None,
-                secret_store: None,
-                keychain_service: None,
-            },
-            initial_account: None,
-            running: true,
-            focus: Focus::Composer,
-            accounts: vec![AccountRow {
-                account_id: account_id.to_owned(),
-                npub: "npub1alice".to_owned(),
-                display_name: None,
-                local_signing: true,
-            }],
-            selected_account: 0,
-            chats: Vec::new(),
-            selected_chat: 0,
-            unread_counts: HashMap::new(),
-            show_archived_chats: false,
-            messages: Vec::new(),
-            live_stream_previews: Vec::new(),
-            group_diagnostics: None,
-            chat_subscription: None,
-            message_subscription: Some(test_message_subscription(account_id)),
-            daemon: DaemonView {
-                running: true,
-                ..DaemonView::default()
-            },
-            input: String::new(),
-            streaming: None,
-            status: String::new(),
-            show_help: false,
-        };
+        let mut app = test_tui_app(test_unused_client(), account_id);
+        app.message_subscription = Some(test_message_subscription(account_id));
 
         app.ensure_selected_message_subscription();
 
@@ -3942,6 +3910,55 @@ mod tests {
                 .map(|subscription| subscription.account_id.as_str()),
             Some(account_id)
         );
+    }
+
+    #[test]
+    fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
+        let mut app = test_tui_app(client, account_id);
+        app.chats = vec![ChatRow {
+            group_id: group_id.to_owned(),
+            name: "general".to_owned(),
+            archived: false,
+        }];
+        app.unread_counts.insert(group_id.to_owned(), 3);
+        app.chat_subscription = Some(test_chat_subscription(account_id, false));
+        app.message_subscription = Some(test_message_subscription(account_id));
+        app.group_diagnostics = Some(GroupDiagnostics::unavailable(group_id, "old"));
+
+        app.refresh_accounts().expect("refresh accounts");
+
+        assert!(app.accounts.is_empty());
+        assert!(app.chats.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.unread_counts.is_empty());
+        assert!(app.chat_subscription.is_none());
+        assert!(app.message_subscription.is_none());
+        assert!(app.group_diagnostics.is_none());
+    }
+
+    #[test]
+    fn refresh_chats_starts_account_wide_stream_when_no_chats_are_visible() {
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"chats":[]}}"#);
+        let mut app = test_tui_app(client, account_id);
+        app.chat_subscription = Some(test_chat_subscription(account_id, false));
+        app.group_diagnostics = Some(GroupDiagnostics::unavailable(group_id, "old"));
+
+        app.refresh_chats().expect("refresh chats");
+
+        assert!(app.chats.is_empty());
+        assert!(app.messages.is_empty());
+        assert_eq!(
+            app.message_subscription
+                .as_ref()
+                .map(|subscription| subscription.account_id.as_str()),
+            Some(account_id)
+        );
+        assert!(app.group_diagnostics.is_some());
     }
 
     #[test]
@@ -4075,16 +4092,124 @@ mod tests {
             .collect::<String>()
     }
 
+    fn test_tui_app(client: DmClient, account_id: &str) -> TuiApp {
+        TuiApp {
+            client,
+            initial_account: None,
+            running: true,
+            focus: Focus::Composer,
+            accounts: vec![AccountRow {
+                account_id: account_id.to_owned(),
+                npub: "npub1alice".to_owned(),
+                display_name: None,
+                local_signing: true,
+            }],
+            selected_account: 0,
+            chats: Vec::new(),
+            selected_chat: 0,
+            unread_counts: HashMap::new(),
+            show_archived_chats: false,
+            messages: Vec::new(),
+            live_stream_previews: Vec::new(),
+            chat_subscription: None,
+            message_subscription: None,
+            daemon: DaemonView {
+                running: true,
+                ..DaemonView::default()
+            },
+            group_diagnostics: None,
+            input: String::new(),
+            streaming: None,
+            status: String::new(),
+            show_help: false,
+        }
+    }
+
+    fn test_unused_client() -> DmClient {
+        DmClient {
+            exe: PathBuf::from("unused"),
+            home: None,
+            socket: None,
+            relay: None,
+            secret_store: None,
+            keychain_service: None,
+        }
+    }
+
+    fn test_json_client(response: &str) -> (tempfile::TempDir, DmClient) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let exe = test_json_executable(tempdir.path(), response);
+        let client = DmClient {
+            exe,
+            home: None,
+            socket: None,
+            relay: None,
+            secret_store: None,
+            keychain_service: None,
+        };
+        (tempdir, client)
+    }
+
+    #[cfg(unix)]
+    fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let exe = dir.join("dm-json");
+        std::fs::write(&exe, format!("#!/bin/sh\ncat <<'JSON'\n{response}\nJSON\n"))
+            .expect("write fake dm");
+        let mut permissions = std::fs::metadata(&exe)
+            .expect("fake dm metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&exe, permissions).expect("chmod fake dm");
+        exe
+    }
+
+    #[cfg(windows)]
+    fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
+        let exe = dir.join("dm-json.cmd");
+        std::fs::write(&exe, format!("@echo off\r\necho {response}\r\n")).expect("write fake dm");
+        exe
+    }
+
+    fn test_chat_subscription(account_id: &str, include_archived: bool) -> ChatSubscription {
+        let child = test_sleep_child();
+        let (_tx, rx) = mpsc::channel();
+        ChatSubscription {
+            account_id: account_id.to_owned(),
+            include_archived,
+            child,
+            rx,
+        }
+    }
+
     fn test_message_subscription(account_id: &str) -> MessageSubscription {
-        let child = StdCommand::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("spawn sleep test process");
+        let child = test_sleep_child();
         let (_tx, rx) = mpsc::channel();
         MessageSubscription {
             account_id: account_id.to_owned(),
             child,
             rx,
         }
+    }
+
+    #[cfg(not(windows))]
+    fn test_sleep_child() -> Child {
+        StdCommand::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep test process")
+    }
+
+    #[cfg(windows)]
+    fn test_sleep_child() -> Child {
+        StdCommand::new("cmd")
+            .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn timeout test process")
     }
 }
