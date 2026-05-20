@@ -62,12 +62,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   component alongside the other group components.
 - The TUI now tails daemon-backed `messages subscribe` updates for the selected chat, so incoming messages and QUIC
   stream-preview deltas can render without timer-driven message-list refreshes.
+- The TUI now tails daemon-backed `chats subscribe` updates for the selected account, so newly processed invites appear
+  in the chat list without switching accounts.
 - Removed the daemon runtime maintenance timer and the TUI's periodic daemon/account/chat/message refresh paths; runtime
   state now advances from startup, explicit CLI/TUI intents, and subscription events.
 - TUI stream compose typing now batches append calls instead of blocking the interface on a daemon round-trip for every
   character.
 - The TUI uses higher-contrast neutral account labels and green focus accents instead of the low-contrast cyan account
   treatment; daemon controls stay focused on start, status, and stop.
+- TUI slash commands now accept quoted multi-word names for `/chat new`, so group names with spaces no longer consume
+  the first word after the space as a member pubkey.
 - Typed app-message payloads are validated before publish/projection; malformed reaction, media, delete, or retry
   envelopes are rejected instead of being treated as valid typed app messages.
 - `dmd` now keeps long-lived per-account relay subscriptions for real WebSocket relays instead of rebuilding

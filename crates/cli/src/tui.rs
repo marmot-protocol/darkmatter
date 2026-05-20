@@ -244,6 +244,20 @@ impl Drop for MessageSubscription {
     }
 }
 
+struct ChatSubscription {
+    account_id: String,
+    include_archived: bool,
+    child: Child,
+    rx: Receiver<SubscriptionEvent>,
+}
+
+impl Drop for ChatSubscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
     Accounts,
@@ -342,6 +356,7 @@ struct TuiApp {
     show_archived_chats: bool,
     messages: Vec<MessageRow>,
     live_stream_previews: Vec<LiveStreamPreview>,
+    chat_subscription: Option<ChatSubscription>,
     message_subscription: Option<MessageSubscription>,
     daemon: DaemonView,
     group_diagnostics: Option<GroupDiagnostics>,
@@ -392,6 +407,50 @@ fn subscription_error_message(envelope: &Value) -> String {
         .to_owned()
 }
 
+fn spawn_subscription_reader(
+    child: &mut Child,
+    label: &'static str,
+) -> TuiResult<Receiver<SubscriptionEvent>> {
+    let Some(stdout) = child.stdout.take() else {
+        return Err(TuiError::Cli(format!(
+            "{label} subscription did not expose stdout"
+        )));
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) if line.trim().is_empty() => {}
+                Ok(line) => match serde_json::from_str::<Value>(&line) {
+                    Ok(envelope) => {
+                        let event = subscription_event_from_json(envelope);
+                        let ended = matches!(event, SubscriptionEvent::Ended);
+                        if tx.send(event).is_err() || ended {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        if tx
+                            .send(SubscriptionEvent::Error(format!(
+                                "invalid {label} subscription JSON: {err}"
+                            )))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                },
+                Err(err) => {
+                    let _ = tx.send(SubscriptionEvent::Error(err.to_string()));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(SubscriptionEvent::Ended);
+    });
+    Ok(rx)
+}
+
 impl TuiApp {
     fn new(cli: Cli) -> TuiResult<Self> {
         let client = DmClient::from_cli(&cli)?;
@@ -407,6 +466,7 @@ impl TuiApp {
             show_archived_chats: false,
             messages: Vec::new(),
             live_stream_previews: Vec::new(),
+            chat_subscription: None,
             message_subscription: None,
             daemon: DaemonView::default(),
             group_diagnostics: None,
@@ -442,6 +502,7 @@ impl TuiApp {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        self.drain_chat_subscription();
         self.drain_message_subscription();
         if let Err(err) = self.flush_stream_append_if_due(now) {
             self.status = format!("stream append failed: {err}");
@@ -1395,6 +1456,7 @@ impl TuiApp {
     fn refresh_daemon_status(&mut self) -> TuiResult<()> {
         let result = self.client.run_json(None, &["daemon", "status"])?;
         self.daemon = parse_daemon_view(&result);
+        self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
         Ok(())
     }
@@ -1403,6 +1465,7 @@ impl TuiApp {
         let args = vec!["daemon".to_owned(), "start".to_owned()];
         let result = self.client.run_json(None, &args)?;
         self.daemon = parse_daemon_view(&result);
+        self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
@@ -1411,6 +1474,7 @@ impl TuiApp {
     fn stop_daemon(&mut self) -> TuiResult<()> {
         let result = self.client.run_json(None, &["daemon", "stop"])?;
         self.daemon = parse_daemon_view(&result);
+        self.chat_subscription = None;
         self.message_subscription = None;
         self.status = "daemon stopped".to_owned();
         Ok(())
@@ -1432,6 +1496,7 @@ impl TuiApp {
         if self.accounts.is_empty() {
             self.chats.clear();
             self.messages.clear();
+            self.chat_subscription = None;
             self.message_subscription = None;
             self.group_diagnostics = None;
             self.status = "no identities yet; create one with dm create-identity".to_owned();
@@ -1444,12 +1509,16 @@ impl TuiApp {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chats.clear();
             self.messages.clear();
+            self.chat_subscription = None;
+            self.message_subscription = None;
+            self.group_diagnostics = None;
             self.status = "no account selected".to_owned();
             return Ok(());
         };
         if !account.local_signing {
             self.chats.clear();
             self.messages.clear();
+            self.chat_subscription = None;
             self.message_subscription = None;
             self.group_diagnostics = None;
             self.status =
@@ -1470,6 +1539,9 @@ impl TuiApp {
             .unwrap_or_default();
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
+        if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
+            self.status = format!("chat subscription failed: {err}");
+        }
         if self.chats.is_empty() {
             self.messages.clear();
             self.message_subscription = None;
@@ -1527,6 +1599,35 @@ impl TuiApp {
         );
     }
 
+    fn ensure_chat_subscription(&mut self, account_id: &str) -> TuiResult<()> {
+        if !self.daemon.running {
+            self.chat_subscription = None;
+            return Ok(());
+        }
+        if self.chat_subscription.as_ref().is_some_and(|subscription| {
+            subscription.account_id == account_id
+                && subscription.include_archived == self.show_archived_chats
+        }) {
+            return Ok(());
+        }
+
+        self.chat_subscription = None;
+        let args = if self.show_archived_chats {
+            vec!["chats".to_owned(), "subscribe-archived".to_owned()]
+        } else {
+            vec!["chats".to_owned(), "subscribe".to_owned()]
+        };
+        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
+        let rx = spawn_subscription_reader(&mut child, "chat")?;
+        self.chat_subscription = Some(ChatSubscription {
+            account_id: account_id.to_owned(),
+            include_archived: self.show_archived_chats,
+            child,
+            rx,
+        });
+        Ok(())
+    }
+
     fn ensure_message_subscription(&mut self, account_id: &str, group_id: &str) -> TuiResult<()> {
         if !self.daemon.running {
             self.message_subscription = None;
@@ -1551,43 +1652,7 @@ impl TuiApp {
             "50".to_owned(),
         ];
         let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
-        let Some(stdout) = child.stdout.take() else {
-            return Err(TuiError::Cli(
-                "message subscription did not expose stdout".to_owned(),
-            ));
-        };
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) if line.trim().is_empty() => {}
-                    Ok(line) => match serde_json::from_str::<Value>(&line) {
-                        Ok(envelope) => {
-                            let event = subscription_event_from_json(envelope);
-                            let ended = matches!(event, SubscriptionEvent::Ended);
-                            if tx.send(event).is_err() || ended {
-                                return;
-                            }
-                        }
-                        Err(err) => {
-                            if tx
-                                .send(SubscriptionEvent::Error(format!(
-                                    "invalid message subscription JSON: {err}"
-                                )))
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    },
-                    Err(err) => {
-                        let _ = tx.send(SubscriptionEvent::Error(err.to_string()));
-                        return;
-                    }
-                }
-            }
-            let _ = tx.send(SubscriptionEvent::Ended);
-        });
+        let rx = spawn_subscription_reader(&mut child, "message")?;
         self.message_subscription = Some(MessageSubscription {
             account_id: account_id.to_owned(),
             group_id: group_id.to_owned(),
@@ -1595,6 +1660,20 @@ impl TuiApp {
             rx,
         });
         Ok(())
+    }
+
+    fn ensure_selected_chat_subscription(&mut self) {
+        let Some(account) = self.selected_account_row().cloned() else {
+            self.chat_subscription = None;
+            return;
+        };
+        if !account.local_signing {
+            self.chat_subscription = None;
+            return;
+        }
+        if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
+            self.status = format!("chat subscription failed: {err}");
+        }
     }
 
     fn ensure_selected_message_subscription(&mut self) {
@@ -1612,6 +1691,55 @@ impl TuiApp {
         };
         if let Err(err) = self.ensure_message_subscription(&account.account_id, &group_id) {
             self.status = format!("message subscription failed: {err}");
+        }
+    }
+
+    fn drain_chat_subscription(&mut self) {
+        let Some(subscription) = self.chat_subscription.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        loop {
+            match subscription.rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(SubscriptionEvent::Ended);
+                    break;
+                }
+            }
+        }
+        let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+        let mut chats_changed = false;
+        for event in events {
+            match event {
+                SubscriptionEvent::Result(result) => {
+                    if let Some(status) = apply_chat_subscription_result(
+                        &mut self.chats,
+                        &mut self.selected_chat,
+                        self.show_archived_chats,
+                        &result,
+                    ) {
+                        chats_changed = true;
+                        self.status = status;
+                    }
+                }
+                SubscriptionEvent::Error(err) => {
+                    self.status = format!("chat subscription failed: {err}");
+                }
+                SubscriptionEvent::Ended => {
+                    self.chat_subscription = None;
+                    break;
+                }
+            }
+        }
+        if chats_changed {
+            let selected_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+            if previous_group_id != selected_group_id {
+                self.messages.clear();
+                self.message_subscription = None;
+            }
+            self.ensure_selected_message_subscription();
         }
     }
 
@@ -1717,12 +1845,13 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
     if !trimmed.starts_with('/') {
         return Err("slash command must start with /".to_owned());
     }
-    let mut parts = trimmed[1..].split_whitespace();
-    let Some(command) = parts.next() else {
+    let mut parts = split_slash_command_words(&trimmed[1..])?;
+    if parts.is_empty() {
         return Err("empty slash command".to_owned());
-    };
-    let rest = parts.map(str::to_owned).collect::<Vec<_>>();
-    match command {
+    }
+    let command = parts.remove(0);
+    let rest = parts;
+    match command.as_str() {
         "help" | "?" => Ok(SlashCommand::Help),
         "refresh" => Ok(SlashCommand::Refresh),
         "sync" => {
@@ -1754,6 +1883,48 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
     }
+}
+
+fn split_slash_command_words(input: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut word_started = false;
+
+    for ch in input.chars() {
+        match quote {
+            Some(quote_ch) if ch == quote_ch => {
+                quote = None;
+                word_started = true;
+            }
+            Some(_) => {
+                word.push(ch);
+                word_started = true;
+            }
+            None if ch.is_whitespace() => {
+                if word_started {
+                    words.push(std::mem::take(&mut word));
+                    word_started = false;
+                }
+            }
+            None if matches!(ch, '"' | '\'') && !word_started => {
+                quote = Some(ch);
+                word_started = true;
+            }
+            None => {
+                word.push(ch);
+                word_started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err("unterminated quoted string".to_owned());
+    }
+    if word_started {
+        words.push(word);
+    }
+    Ok(words)
 }
 
 fn parse_chat_command(args: Vec<String>) -> Result<SlashCommand, String> {
@@ -2186,6 +2357,38 @@ fn selected_account_index(accounts: &[AccountRow], selector: Option<&str>) -> Op
 
 fn selected_chat_index(chats: &[ChatRow], group_id: Option<&str>) -> Option<usize> {
     group_id.and_then(|group_id| chats.iter().position(|chat| chat.group_id == group_id))
+}
+
+fn apply_chat_subscription_result(
+    chats: &mut Vec<ChatRow>,
+    selected_chat: &mut usize,
+    show_archived_chats: bool,
+    result: &Value,
+) -> Option<String> {
+    if result.get("type").and_then(Value::as_str) != Some("chat") {
+        return None;
+    }
+    let chat = result.get("chat").and_then(parse_chat)?;
+    let previous_group_id = chats.get(*selected_chat).map(|chat| chat.group_id.clone());
+    upsert_chat(chats, chat, show_archived_chats);
+    *selected_chat = selected_chat_index(chats, previous_group_id.as_deref())
+        .unwrap_or_else(|| (*selected_chat).min(chats.len().saturating_sub(1)));
+    Some(format!("live chat update: chats={}", chats.len()))
+}
+
+fn upsert_chat(chats: &mut Vec<ChatRow>, chat: ChatRow, show_archived_chats: bool) {
+    if chat.archived && !show_archived_chats {
+        chats.retain(|existing| existing.group_id != chat.group_id);
+        return;
+    }
+    if let Some(existing) = chats
+        .iter_mut()
+        .find(|existing| existing.group_id == chat.group_id)
+    {
+        *existing = chat;
+    } else {
+        chats.push(chat);
+    }
 }
 
 fn account_matches(account: &AccountRow, selector: &str) -> bool {
@@ -2980,9 +3183,21 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_slash_command("/chat new \"Project Room\" npub1bob deadbeef"),
+            Ok(SlashCommand::ChatNew {
+                name: "Project Room".to_owned(),
+                members: vec!["npub1bob".to_owned(), "deadbeef".to_owned()],
+            })
+        );
+        assert_eq!(
             parse_slash_command("/chat rename Project Room"),
             Ok(SlashCommand::ChatRename("Project Room".to_owned()))
         );
+        assert_eq!(
+            parse_slash_command("/chat rename Jeff's Room"),
+            Ok(SlashCommand::ChatRename("Jeff's Room".to_owned()))
+        );
+        assert!(parse_slash_command("/chat new \"Project Room npub1bob").is_err());
         assert_eq!(
             parse_slash_command("/chat describe planning space"),
             Ok(SlashCommand::ChatDescribe("planning space".to_owned()))
@@ -3312,6 +3527,40 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>();
         assert_eq!(rendered_preview, "stream: hello stream");
+    }
+
+    #[test]
+    fn chat_subscription_result_inserts_live_invite_without_account_switch() {
+        let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut chats = Vec::new();
+        let mut selected_chat = 0;
+
+        let status = apply_chat_subscription_result(
+            &mut chats,
+            &mut selected_chat,
+            false,
+            &serde_json::json!({
+                "trigger": "ChatUpdated",
+                "type": "chat",
+                "group_id": group_id,
+                "chat": {
+                    "group_id": group_id,
+                    "profile": {"name": "new invite"},
+                    "archived": false
+                }
+            }),
+        );
+
+        assert_eq!(status.as_deref(), Some("live chat update: chats=1"));
+        assert_eq!(selected_chat, 0);
+        assert_eq!(
+            chats,
+            vec![ChatRow {
+                group_id: group_id.to_owned(),
+                name: "new invite".to_owned(),
+                archived: false,
+            }]
+        );
     }
 
     #[test]
