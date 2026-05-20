@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-05-19
+updated: 2026-05-20
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -114,8 +114,8 @@ The first slice now proves the architecture without filling in every product sur
 7. `messages subscribe`, `chats subscribe`, and `groups subscribe-state` use runtime snapshots plus live receivers.
 8. Agent stream preview state and deltas are owned by a runtime shared stream manager and surfaced through message
    subscriptions.
-9. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, and redacted relay-health
-   reporting.
+9. The relay plane applies bounded replay lookback, relay endpoint parsing/deduplication, shared directory discovery
+   fetch coalescing, and redacted relay-health reporting.
 10. Daemon status reports `last_runtime_activity` instead of modeling the daemon as a background sync loop.
 11. The TUI remains a daemon client.
 
@@ -126,8 +126,8 @@ an agent stream, receive stream deltas, and finish the stream without calling `d
 
 The remaining work is narrower than the original refactor, but still real:
 
-- directory, profile, follow-list, and KeyPackage discovery are not yet fully coalesced through a shared relay-plane
-  subscription service;
+- directory, profile, follow-list, and KeyPackage discovery now use a shared relay-plane fetch path with in-flight
+  coalescing; the remaining production work is turning hot directory data into long-lived subscription maintenance;
 - relay auth, relay scoring, and explicit reconnect/backoff policy are still delegated mostly to `nostr-sdk`;
 - stream watch execution still lives in the CLI/daemon adapter, while runtime owns stream state and typed updates and
   the daemon tracks watch worker lifecycle;

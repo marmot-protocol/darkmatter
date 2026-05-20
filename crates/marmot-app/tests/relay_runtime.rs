@@ -64,6 +64,11 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
             .count(),
         1
     );
+    let relay_health = runtime.shared_services().relay_plane().relay_health().await;
+    assert!(
+        relay_health.directory_completed_fetches > 0,
+        "identity setup should use the runtime shared relay plane for directory discovery"
+    );
 
     let fetched = app
         .fetch_latest_key_package_for_account_id(

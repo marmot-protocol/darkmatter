@@ -9,10 +9,11 @@ use cgka_traits::{
     TransportDelivery, TransportEndpoint, TransportGroupSync, TransportPublishReport,
     TransportPublishRequest, TransportPublishTarget,
 };
-use nostr_sdk::prelude::{Client as NostrSdkClient, RelayUrl};
+use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
     NostrTransportAdapter,
@@ -21,6 +22,8 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
+const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -31,6 +34,7 @@ struct MarmotRelayPlaneInner {
     subscription_rebuild_lookback: Option<Duration>,
     relay_safety: RelaySafetyPolicy,
     transport: Arc<RelayPlaneTransport>,
+    directory: DirectoryRelayPlane,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +80,72 @@ pub struct RelayPlaneHealth {
     pub sleeping: usize,
     pub connection_attempts: usize,
     pub connection_successes: usize,
+    pub directory_inflight_fetches: usize,
+    pub directory_completed_fetches: usize,
+    pub directory_coalesced_waiters: usize,
+    pub directory_failed_fetches: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DirectoryEventQuery {
+    pub(crate) kind: u64,
+    pub(crate) authors: Vec<String>,
+    pub(crate) limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DirectoryRelayEventRecord {
+    pub(crate) endpoints: Vec<TransportEndpoint>,
+    pub(crate) event: NostrTransportEvent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirectoryFetchRequest {
+    endpoints: Vec<TransportEndpoint>,
+    queries: Vec<DirectoryEventQuery>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DirectoryFetchKey {
+    endpoints: Vec<TransportEndpoint>,
+    queries: Vec<DirectoryEventQuery>,
+}
+
+#[derive(Clone)]
+struct DirectoryRelayPlane {
+    fetcher: Arc<dyn DirectoryRelayFetcher>,
+    state: Arc<Mutex<DirectoryRelayPlaneState>>,
+}
+
+#[derive(Default)]
+struct DirectoryRelayPlaneState {
+    inflight: HashMap<DirectoryFetchKey, Vec<oneshot::Sender<DirectoryFetchResult>>>,
+    completed_fetches: usize,
+    coalesced_waiters: usize,
+    failed_fetches: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DirectoryRelayStats {
+    inflight_fetches: usize,
+    completed_fetches: usize,
+    coalesced_waiters: usize,
+    failed_fetches: usize,
+}
+
+type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
+
+#[async_trait]
+trait DirectoryRelayFetcher: Send + Sync {
+    async fn fetch_directory_events(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String>;
+}
+
+#[derive(Clone)]
+struct NostrSdkDirectoryRelayFetcher {
+    client: NostrSdkClient,
 }
 
 impl MarmotRelayPlane {
@@ -96,17 +166,25 @@ impl MarmotRelayPlane {
         relay_client: Arc<dyn NostrRelayClient>,
     ) -> Self {
         let adapter = NostrTransportAdapter::new(relay_client);
-        Self::from_adapter(subscription_rebuild_lookback, adapter, None, None)
+        Self::from_adapter(
+            subscription_rebuild_lookback,
+            adapter,
+            None,
+            None,
+            Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
+        )
     }
 
     fn from_sdk(subscription_rebuild_lookback: Option<Duration>) -> Self {
-        let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+        let client = NostrSdkClient::builder().build();
+        let relay_client = NostrSdkRelayClient::new(client.clone());
         let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
         Self::from_adapter(
             subscription_rebuild_lookback,
             adapter,
             Some(relay_client),
             None,
+            Arc::new(NostrSdkDirectoryRelayFetcher::new(client)),
         )
     }
 
@@ -115,6 +193,7 @@ impl MarmotRelayPlane {
         adapter: NostrTransportAdapter,
         sdk_relay_client: Option<NostrSdkRelayClient>,
         notification_forwarder: Option<JoinHandle<()>>,
+        directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
     ) -> Self {
         let transport = Arc::new(RelayPlaneTransport {
             adapter,
@@ -128,6 +207,7 @@ impl MarmotRelayPlane {
                 subscription_rebuild_lookback,
                 relay_safety: RelaySafetyPolicy::default(),
                 transport,
+                directory: DirectoryRelayPlane::new(directory_fetcher),
             }),
         };
         this.spawn_router();
@@ -167,10 +247,26 @@ impl MarmotRelayPlane {
     }
 
     pub async fn relay_health(&self) -> RelayPlaneHealth {
+        let directory = self.inner.directory.stats().await;
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
-            return RelayPlaneHealth::from_sdk(sdk_relay_client.relay_health().await);
+            return RelayPlaneHealth::from_sdk(sdk_relay_client.relay_health().await, directory);
         }
-        RelayPlaneHealth::default()
+        RelayPlaneHealth::from_directory(directory)
+    }
+
+    pub(crate) async fn fetch_directory_events(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        queries: Vec<DirectoryEventQuery>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "directory fetch")?;
+        self.inner
+            .directory
+            .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
+            .await
     }
 
     pub async fn shutdown(&self) {
@@ -242,7 +338,7 @@ impl MarmotRelayPlane {
 }
 
 impl RelayPlaneHealth {
-    fn from_sdk(health: NostrSdkRelayHealth) -> Self {
+    fn from_sdk(health: NostrSdkRelayHealth, directory: DirectoryRelayStats) -> Self {
         Self {
             sdk_backed: true,
             total_relays: health.total_relays,
@@ -256,7 +352,197 @@ impl RelayPlaneHealth {
             sleeping: health.sleeping,
             connection_attempts: health.connection_attempts,
             connection_successes: health.connection_successes,
+            directory_inflight_fetches: directory.inflight_fetches,
+            directory_completed_fetches: directory.completed_fetches,
+            directory_coalesced_waiters: directory.coalesced_waiters,
+            directory_failed_fetches: directory.failed_fetches,
         }
+    }
+
+    fn from_directory(directory: DirectoryRelayStats) -> Self {
+        Self {
+            directory_inflight_fetches: directory.inflight_fetches,
+            directory_completed_fetches: directory.completed_fetches,
+            directory_coalesced_waiters: directory.coalesced_waiters,
+            directory_failed_fetches: directory.failed_fetches,
+            ..Self::default()
+        }
+    }
+}
+
+impl DirectoryEventQuery {
+    pub(crate) fn new(kind: u64, mut authors: Vec<String>, limit: usize) -> Self {
+        authors.sort();
+        authors.dedup();
+        Self {
+            kind,
+            authors,
+            limit,
+        }
+    }
+}
+
+impl DirectoryFetchRequest {
+    fn new(
+        mut endpoints: Vec<TransportEndpoint>,
+        mut queries: Vec<DirectoryEventQuery>,
+    ) -> Result<Self, String> {
+        endpoints.sort();
+        endpoints.dedup();
+        queries.sort();
+        queries.dedup();
+        if endpoints.is_empty() {
+            return Err("directory fetch: no relay endpoints".to_owned());
+        }
+        if queries.is_empty() {
+            return Err("directory fetch: no queries".to_owned());
+        }
+        for query in &queries {
+            if query.authors.is_empty() {
+                return Err("directory fetch: no query authors".to_owned());
+            }
+            if query.limit == 0 {
+                return Err("directory fetch: query limit must be greater than zero".to_owned());
+            }
+        }
+        Ok(Self { endpoints, queries })
+    }
+
+    fn key(&self) -> DirectoryFetchKey {
+        DirectoryFetchKey {
+            endpoints: self.endpoints.clone(),
+            queries: self.queries.clone(),
+        }
+    }
+}
+
+impl DirectoryRelayPlane {
+    fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
+        Self {
+            fetcher,
+            state: Arc::new(Mutex::new(DirectoryRelayPlaneState::default())),
+        }
+    }
+
+    async fn fetch_events(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        let key = request.key();
+        let (rx, should_spawn) = {
+            let (tx, rx) = oneshot::channel();
+            let mut state = self.state.lock().await;
+            if let Some(waiters) = state.inflight.get_mut(&key) {
+                waiters.push(tx);
+                state.coalesced_waiters += 1;
+                (rx, false)
+            } else {
+                state.inflight.insert(key.clone(), vec![tx]);
+                (rx, true)
+            }
+        };
+
+        if should_spawn {
+            let fetcher = self.fetcher.clone();
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let result = fetcher.fetch_directory_events(request).await;
+                let mut state = state.lock().await;
+                if result.is_ok() {
+                    state.completed_fetches += 1;
+                } else {
+                    state.failed_fetches += 1;
+                }
+                if let Some(waiters) = state.inflight.remove(&key) {
+                    for waiter in waiters {
+                        let _ = waiter.send(result.clone());
+                    }
+                }
+            });
+        }
+
+        rx.await
+            .map_err(|_| "directory fetch owner dropped before completing".to_owned())?
+    }
+
+    async fn stats(&self) -> DirectoryRelayStats {
+        let state = self.state.lock().await;
+        DirectoryRelayStats {
+            inflight_fetches: state.inflight.len(),
+            completed_fetches: state.completed_fetches,
+            coalesced_waiters: state.coalesced_waiters,
+            failed_fetches: state.failed_fetches,
+        }
+    }
+}
+
+impl NostrSdkDirectoryRelayFetcher {
+    fn new(client: NostrSdkClient) -> Self {
+        Self { client }
+    }
+
+    fn standalone() -> Self {
+        Self::new(NostrSdkClient::builder().build())
+    }
+}
+
+#[async_trait]
+impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
+    async fn fetch_directory_events(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        let relay_urls = request
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                RelayUrl::parse(endpoint.as_str())
+                    .map_err(|e| format!("invalid relay URL {}: {e}", endpoint.as_str()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for relay_url in &relay_urls {
+            self.client
+                .add_relay(relay_url.clone())
+                .await
+                .map_err(|e| format!("add relay: {e}"))?;
+            timeout(
+                DIRECTORY_RELAY_CONNECT_WAIT,
+                self.client.connect_relay(relay_url.clone()),
+            )
+            .await
+            .map_err(|_| "connect relay timed out".to_owned())?
+            .map_err(|e| format!("connect relay: {e}"))?;
+        }
+
+        let mut records = Vec::new();
+        for query in request.queries {
+            let public_keys = query
+                .authors
+                .iter()
+                .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let kind = u16::try_from(query.kind)
+                .map(Kind::from)
+                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
+            let filter = Filter::new()
+                .authors(public_keys)
+                .kind(kind)
+                .limit(query.limit);
+            let events = self
+                .client
+                .fetch_events_from(relay_urls.clone(), filter, DIRECTORY_RELAY_FETCH_WAIT)
+                .await
+                .map_err(|e| format!("fetch directory events: {e}"))?;
+            for event in events {
+                let event = NostrTransportEvent::from_nostr_event(&event)
+                    .map_err(|e| format!("map directory event: {e}"))?;
+                records.push(DirectoryRelayEventRecord {
+                    endpoints: request.endpoints.clone(),
+                    event,
+                });
+            }
+        }
+        Ok(records)
     }
 }
 
@@ -432,12 +718,14 @@ fn publish_report_from_outcome(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
     use cgka_traits::{
         GroupId, MessageId, TransportDeliveryPlane, TransportEndpoint, TransportEndpointFailure,
         TransportEndpointReceipt, TransportGroupSubscription,
     };
+    use tokio::sync::Notify;
     use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
     use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE};
 
@@ -491,6 +779,57 @@ mod tests {
                 failed: Vec::<TransportEndpointFailure>::new(),
             })
         }
+    }
+
+    struct BlockingDirectoryFetcher {
+        fetch_count: AtomicUsize,
+        started: Notify,
+        release: Notify,
+        events: Vec<DirectoryRelayEventRecord>,
+    }
+
+    #[async_trait]
+    impl DirectoryRelayFetcher for BlockingDirectoryFetcher {
+        async fn fetch_directory_events(
+            &self,
+            _request: DirectoryFetchRequest,
+        ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(self.events.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDirectoryFetcher {
+        fetch_count: AtomicUsize,
+        requests: StdMutex<Vec<DirectoryFetchRequest>>,
+    }
+
+    #[async_trait]
+    impl DirectoryRelayFetcher for RecordingDirectoryFetcher {
+        async fn fetch_directory_events(
+            &self,
+            request: DirectoryFetchRequest,
+        ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request);
+            Ok(Vec::new())
+        }
+    }
+
+    fn relay_plane_with_directory_fetcher(
+        relay: Arc<dyn NostrRelayClient>,
+        directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
+    ) -> MarmotRelayPlane {
+        MarmotRelayPlane::from_adapter(
+            Some(Duration::from_secs(30)),
+            NostrTransportAdapter::new(relay),
+            None,
+            None,
+            directory_fetcher,
+        )
     }
 
     #[tokio::test]
@@ -547,6 +886,116 @@ mod tests {
             NostrSubscription::AccountInbox { endpoints, .. }
             | NostrSubscription::Group { endpoints, .. } => endpoints.len() == 1,
         }));
+    }
+
+    #[tokio::test]
+    async fn directory_fetches_coalesce_identical_inflight_requests() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let event = DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+            event: group_event("33", &[0x44; 32]),
+        };
+        let directory_fetcher = Arc::new(BlockingDirectoryFetcher {
+            fetch_count: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+            events: vec![event.clone()],
+        });
+        let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
+        let endpoints = vec![TransportEndpoint(" wss://relay.example ".into())];
+        let query = DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12);
+
+        let first_plane = relay_plane.clone();
+        let first_endpoints = endpoints.clone();
+        let first_query = query.clone();
+        let first = tokio::spawn(async move {
+            first_plane
+                .fetch_directory_events(first_endpoints, vec![first_query])
+                .await
+        });
+        directory_fetcher.started.notified().await;
+
+        let second_plane = relay_plane.clone();
+        let second = tokio::spawn(async move {
+            second_plane
+                .fetch_directory_events(endpoints, vec![query])
+                .await
+        });
+        tokio::task::yield_now().await;
+        directory_fetcher.release.notify_waiters();
+
+        assert_eq!(first.await.unwrap().unwrap(), vec![event.clone()]);
+        assert_eq!(second.await.unwrap().unwrap(), vec![event]);
+        assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 1);
+
+        let health = relay_plane.relay_health().await;
+        assert_eq!(health.directory_inflight_fetches, 0);
+        assert_eq!(health.directory_completed_fetches, 1);
+        assert_eq!(health.directory_coalesced_waiters, 1);
+        assert_eq!(health.directory_failed_fetches, 0);
+    }
+
+    #[tokio::test]
+    async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let event = DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+            event: group_event("44", &[0x55; 32]),
+        };
+        let directory_fetcher = Arc::new(BlockingDirectoryFetcher {
+            fetch_count: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+            events: vec![event.clone()],
+        });
+        let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
+        let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+        let query = DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12);
+
+        let first_plane = relay_plane.clone();
+        let first_endpoints = endpoints.clone();
+        let first_query = query.clone();
+        let first = tokio::spawn(async move {
+            first_plane
+                .fetch_directory_events(first_endpoints, vec![first_query])
+                .await
+        });
+        directory_fetcher.started.notified().await;
+        first.abort();
+
+        let second_plane = relay_plane.clone();
+        let second = tokio::spawn(async move {
+            second_plane
+                .fetch_directory_events(endpoints, vec![query])
+                .await
+        });
+        tokio::task::yield_now().await;
+        directory_fetcher.release.notify_waiters();
+
+        assert_eq!(second.await.unwrap().unwrap(), vec![event]);
+        assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            relay_plane.relay_health().await.directory_coalesced_waiters,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_fetches_reject_invalid_relay_endpoints_before_fetching() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let directory_fetcher = Arc::new(RecordingDirectoryFetcher::default());
+        let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
+
+        let err = relay_plane
+            .fetch_directory_events(
+                vec![TransportEndpoint("https://relay.example".into())],
+                vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)],
+            )
+            .await
+            .expect_err("invalid relay endpoint should be rejected");
+
+        assert!(err.contains("invalid relay endpoint"));
+        assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

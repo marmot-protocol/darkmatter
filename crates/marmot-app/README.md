@@ -35,5 +35,6 @@ signed MLS app data, and project the decoded `nostr_group_id` plus relay list in
 targets.
 
 `MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live account workers, runtime event hubs, and
-the shared agent stream watch manager. Explicit catch-up remains available for repair and tests, but the daemon path is
-runtime-owned subscriptions plus typed events.
+the shared agent stream watch manager. The relay plane now also owns shared directory discovery fetches for relay lists,
+profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. Explicit catch-up remains
+available for repair and tests, but the daemon path is runtime-owned subscriptions plus typed events.

@@ -49,7 +49,7 @@ use marmot_account::{
     KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
 };
 use nostr::ToBech32;
-use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
+use nostr_sdk::prelude::{Client as NostrSdkClient, PublicKey};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
@@ -80,14 +80,13 @@ pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPla
 
 use directory_cache::DirectoryCache;
 use projection::AccountProjectionDb;
+use relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 const ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
-const SDK_RELAY_LIST_FETCH_WAIT: Duration = Duration::from_secs(3);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(3);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
@@ -105,6 +104,7 @@ pub struct MarmotApp {
     root: PathBuf,
     relay_urls: Vec<String>,
     account_home: AccountHome,
+    relay_plane: MarmotRelayPlane,
 }
 
 #[derive(Clone)]
@@ -138,6 +138,13 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    fn for_app(app: &MarmotApp) -> Self {
+        Self {
+            relay_plane: app.relay_plane.clone(),
+            agent_streams: AgentStreamWatchManager::default(),
+        }
+    }
+
     pub fn relay_plane(&self) -> &MarmotRelayPlane {
         &self.relay_plane
     }
@@ -490,7 +497,7 @@ pub enum MarmotAppEvent {
 impl MarmotAppRuntime {
     pub fn new(app: MarmotApp) -> Self {
         let (events, _) = broadcast::channel(1024);
-        let shared = RuntimeSharedServices::default();
+        let shared = RuntimeSharedServices::for_app(&app);
         let accounts = AccountManager::new(app, events.clone(), shared.clone());
         Self {
             events,
@@ -2189,12 +2196,6 @@ struct FetchedFollowList {
     source_relays: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RelayEventRecord {
-    endpoints: Vec<TransportEndpoint>,
-    event: NostrTransportEvent,
-}
-
 struct OpenAppAccount {
     runtime: AppRuntime,
     adapter: MarmotRelayPlaneAccountAdapter,
@@ -2222,6 +2223,7 @@ impl MarmotApp {
             account_home: AccountHome::open(&root),
             root,
             relay_urls,
+            relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
         }
     }
 
@@ -2234,6 +2236,7 @@ impl MarmotApp {
             root: root.as_ref().to_path_buf(),
             relay_urls,
             account_home,
+            relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
         }
     }
 
@@ -2406,47 +2409,24 @@ impl MarmotApp {
     ) -> Result<AccountRelayListStatus, AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
         let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
-        let relay_urls = relay_urls_from_endpoints(&bootstrap_relays)?;
-        let client = NostrSdkClient::builder().build();
-        for relay_url in &relay_urls {
-            client
-                .add_relay(relay_url.clone())
-                .await
-                .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
-            connect_sdk_relay(&client, relay_url.clone()).await?;
-        }
-
-        let mut events = Vec::new();
-        for filter in relay_list_filters(public_key) {
-            events.extend(
-                client
-                    .fetch_events_from(relay_urls.clone(), filter, SDK_RELAY_LIST_FETCH_WAIT)
-                    .await
-                    .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?,
-            );
-        }
-        client.shutdown().await;
-
-        let records = events
-            .into_iter()
-            .map(|event| {
-                NostrTransportEvent::from_nostr_event(&event)
-                    .map(|event| RelayEventRecord {
-                        endpoints: bootstrap_relays.clone(),
-                        event,
-                    })
-                    .map_err(|e| AppError::RelayDirectory(format!("map relay-list event: {e}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut status = relay_list_status_from_records(account_id_hex, records);
+        let records = self
+            .relay_plane
+            .fetch_directory_events(
+                bootstrap_relays.clone(),
+                relay_list_queries(account_id_hex.clone()),
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let mut status = relay_list_status_from_records(&account_id_hex, records);
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = bootstrap_relays
                 .iter()
                 .map(|endpoint| endpoint.0.clone())
                 .collect();
         }
-        self.remember_directory_relay_lists(account_id_hex, &status)?;
+        self.remember_directory_relay_lists(&account_id_hex, &status)?;
         Ok(status)
     }
 
@@ -2712,37 +2692,17 @@ impl MarmotApp {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let source_relays = self.directory_source_relays(source_relays);
-        let relay_urls = relay_urls_from_endpoints(&source_relays)?;
-        let client = NostrSdkClient::builder().build();
-        for relay_url in &relay_urls {
-            client
-                .add_relay(relay_url.clone())
-                .await
-                .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
-            connect_sdk_relay(&client, relay_url.clone()).await?;
-        }
-
-        let events = client
-            .fetch_events_from(
-                relay_urls,
-                key_package_filter(public_key),
-                SDK_RELAY_LIST_FETCH_WAIT,
+        self.relay_plane
+            .fetch_directory_events(
+                source_relays,
+                vec![DirectoryEventQuery::new(
+                    KIND_MARMOT_KEY_PACKAGE,
+                    vec![public_key.to_hex()],
+                    12,
+                )],
             )
             .await
-            .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))?;
-        client.shutdown().await;
-
-        events
-            .into_iter()
-            .map(|event| {
-                NostrTransportEvent::from_nostr_event(&event)
-                    .map(|event| RelayEventRecord {
-                        endpoints: source_relays.to_vec(),
-                        event,
-                    })
-                    .map_err(|e| AppError::RelayDirectory(format!("map key-package event: {e}")))
-            })
-            .collect()
+            .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))
     }
 
     async fn fetch_follow_list_for_account_id(
@@ -2802,41 +2762,14 @@ impl MarmotApp {
             .iter()
             .map(|account_id| parse_account_id_hex(account_id))
             .collect::<Result<Vec<_>, _>>()?;
-        let public_keys = account_ids
-            .iter()
-            .map(|account_id| PublicKey::parse(account_id).map_err(|_| AppError::InvalidPublicKey))
-            .collect::<Result<Vec<_>, _>>()?;
-        let relay_urls = relay_urls_from_endpoints(&source_relays)?;
-        let client = NostrSdkClient::builder().build();
-        for relay_url in &relay_urls {
-            client
-                .add_relay(relay_url.clone())
-                .await
-                .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
-            connect_sdk_relay(&client, relay_url.clone()).await?;
-        }
-
-        let filter = Filter::new()
-            .authors(public_keys)
-            .kind(Kind::from(kind as u16))
-            .limit((account_ids.len() * 4).max(1));
-        let events = client
-            .fetch_events_from(relay_urls, filter, SDK_RELAY_LIST_FETCH_WAIT)
+        let limit = (account_ids.len() * 4).max(1);
+        self.relay_plane
+            .fetch_directory_events(
+                source_relays,
+                vec![DirectoryEventQuery::new(kind, account_ids, limit)],
+            )
             .await
-            .map_err(|e| AppError::RelayDirectory(format!("fetch user directory events: {e}")))?;
-        client.shutdown().await;
-
-        events
-            .into_iter()
-            .map(|event| {
-                NostrTransportEvent::from_nostr_event(&event)
-                    .map(|event| RelayEventRecord {
-                        endpoints: source_relays.to_vec(),
-                        event,
-                    })
-                    .map_err(|e| AppError::RelayDirectory(format!("map directory event: {e}")))
-            })
-            .collect()
+            .map_err(|e| AppError::RelayDirectory(format!("fetch user directory events: {e}")))
     }
 
     fn directory_source_relays(
@@ -4563,29 +4496,15 @@ fn relay_list_status_from_records(
     status
 }
 
-fn relay_list_filters(public_key: PublicKey) -> Vec<Filter> {
+fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
     [
         KIND_NIP65_RELAY_LIST,
         KIND_MARMOT_INBOX_RELAY_LIST,
         KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
     ]
     .into_iter()
-    .map(|kind| relay_list_filter(public_key, kind))
+    .map(|kind| DirectoryEventQuery::new(kind, vec![account_id_hex.clone()], 12))
     .collect()
-}
-
-fn relay_list_filter(public_key: PublicKey, kind: u64) -> Filter {
-    Filter::new()
-        .author(public_key)
-        .kind(Kind::from(kind as u16))
-        .limit(12)
-}
-
-fn key_package_filter(public_key: PublicKey) -> Filter {
-    Filter::new()
-        .author(public_key)
-        .kind(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16))
-        .limit(12)
 }
 
 fn latest_key_package_from_records(
@@ -4955,24 +4874,6 @@ fn sqlite_file_requires_key(path: &Path) -> bool {
         .is_err()
 }
 
-fn relay_urls_from_endpoints(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, AppError> {
-    endpoints
-        .iter()
-        .map(|endpoint| {
-            RelayUrl::parse(endpoint.as_str()).map_err(|e| {
-                AppError::RelayDirectory(format!("invalid relay URL {}: {e}", endpoint.as_str()))
-            })
-        })
-        .collect()
-}
-
-async fn connect_sdk_relay(client: &NostrSdkClient, relay_url: RelayUrl) -> Result<(), AppError> {
-    timeout(SDK_RELAY_CONNECT_WAIT, client.connect_relay(relay_url))
-        .await
-        .map_err(|_| AppError::RelayDirectory("connect relay timed out".to_owned()))?
-        .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))
-}
-
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
     let tag_name = match event.kind {
         KIND_NIP65_RELAY_LIST => "r",
@@ -5223,21 +5124,19 @@ mod tests {
     }
 
     #[test]
-    fn relay_list_discovery_builds_one_limited_filter_per_required_kind() {
-        let public_key =
-            PublicKey::parse("0000000000000000000000000000000000000000000000000000000000000001")
-                .unwrap();
+    fn relay_list_discovery_builds_one_limited_query_per_required_kind() {
+        let account_id_hex =
+            "0000000000000000000000000000000000000000000000000000000000000001".to_owned();
 
-        let filters = relay_list_filters(public_key);
+        let queries = relay_list_queries(account_id_hex.clone());
 
-        assert_eq!(filters.len(), 3);
-        let kinds = filters
+        assert_eq!(queries.len(), 3);
+        let kinds = queries
             .iter()
-            .map(|filter| {
-                let kinds = filter.kinds.as_ref().expect("kind filter");
-                assert_eq!(kinds.len(), 1);
-                assert_eq!(filter.limit, Some(12));
-                kinds.iter().next().unwrap().as_u16() as u64
+            .map(|query| {
+                assert_eq!(query.authors, vec![account_id_hex.clone()]);
+                assert_eq!(query.limit, 12);
+                query.kind
             })
             .collect::<Vec<_>>();
         assert_eq!(
