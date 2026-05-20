@@ -412,6 +412,7 @@ Composer slash commands:
 /members remove <npub-or-hex> [...]
 /members list
 /keys fetch <npub-or-hex>
+/stream [--stream-id <hex>] [--quic-candidate <quic-url>]
 /stream start [--stream-id <hex>] --quic-candidate <quic-url>
 /stream watch [--stream-id <hex>] [--insecure-local]
 /stream status
@@ -424,7 +425,9 @@ Composer slash commands:
 can be selected and unarchived; `/chat archived off` returns to the visible-chat list. Member commands operate
 on the selected chat and call the same group membership commands exposed by the CLI.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews
-appear as provisional preview rows in the message panel.
+appear as provisional preview rows in the message panel. `/stream` opens the TUI stream composer, publishes the stream
+anchor, starts the receiver watch through the daemon, and then treats the next submitted composer line as the streamed
+text to finish.
 `/sync` is a diagnostic escape hatch for explicit catch-up; it is not part of the normal live runtime path.
 
 ## JSON Output
