@@ -1048,6 +1048,31 @@ impl JsonLineSubscription {
                 .unwrap_or_else(|| "<none>".to_owned())
         );
     }
+
+    #[track_caller]
+    fn wait_until(&self, timeout: Duration, mut complete: impl FnMut(&Value) -> bool) {
+        let deadline = Instant::now() + timeout;
+        let mut last = None;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(Duration::from_millis(100));
+            match self.lines.recv_timeout(wait) {
+                Ok(value) => {
+                    if complete(&value) {
+                        return;
+                    }
+                    last = Some(value);
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!(
+            "subscription did not emit expected lines\nlast_line={}",
+            last.map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_owned())
+        );
+    }
 }
 
 impl Drop for JsonLineSubscription {
@@ -2498,22 +2523,30 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
     assert_eq!(finished["chunk_count"], 2);
     assert!(finished["transcript_hash"].as_str().is_some());
 
-    let preview = subscription.wait_for(Duration::from_secs(15), |line| {
-        line["result"]["trigger"] == "StreamPreviewCompleted"
+    let mut preview = None;
+    let mut final_marker = None;
+    subscription.wait_until(Duration::from_secs(20), |line| {
+        if line["result"]["trigger"] == "StreamPreviewCompleted"
             && line["result"]["type"] == "stream_preview"
             && line["result"]["stream_preview"]["stream_id"] == stream_id
+        {
+            preview = Some(line.clone());
+        }
+        if line["result"]["trigger"] == "AgentStreamFinalized"
+            && line["result"]["type"] == "agent_stream_final"
+            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+        {
+            final_marker = Some(line.clone());
+        }
+        preview.is_some() && final_marker.is_some()
     });
+    let preview = preview.expect("completed stream preview");
     assert_eq!(preview["result"]["stream_preview"]["text"], "hello world");
     assert_eq!(
         preview["result"]["stream_preview"]["transcript_hash"],
         finished["transcript_hash"]
     );
-
-    let final_marker = subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "AgentStreamFinalized"
-            && line["result"]["type"] == "agent_stream_final"
-            && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
-    });
+    let final_marker = final_marker.expect("agent stream final marker");
     assert_eq!(
         final_marker["result"]["message"]["agent_text_stream"]["final_text_or_reference"],
         "hello world"
@@ -2681,22 +2714,33 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
     assert_eq!(finished["status"], "finished");
     assert_eq!(finished["text"], "hello stream");
 
-    subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "AgentStreamDelta"
+    let mut delta_seen = false;
+    let mut preview = None;
+    let mut final_marker = None;
+    subscription.wait_until(Duration::from_secs(20), |line| {
+        if line["result"]["trigger"] == "AgentStreamDelta"
             && line["result"]["type"] == "agent_stream_delta"
             && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
-    });
-    let preview = subscription.wait_for(Duration::from_secs(15), |line| {
-        line["result"]["trigger"] == "StreamPreviewCompleted"
+        {
+            delta_seen = true;
+        }
+        if line["result"]["trigger"] == "StreamPreviewCompleted"
             && line["result"]["type"] == "stream_preview"
             && line["result"]["stream_preview"]["stream_id"] == stream_id
-    });
-    assert_eq!(preview["result"]["stream_preview"]["text"], "hello stream");
-    let final_marker = subscription.wait_for(Duration::from_secs(8), |line| {
-        line["result"]["trigger"] == "AgentStreamFinalized"
+        {
+            preview = Some(line.clone());
+        }
+        if line["result"]["trigger"] == "AgentStreamFinalized"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
+        {
+            final_marker = Some(line.clone());
+        }
+        delta_seen && preview.is_some() && final_marker.is_some()
     });
+    let preview = preview.expect("completed stream preview");
+    assert_eq!(preview["result"]["stream_preview"]["text"], "hello stream");
+    let final_marker = final_marker.expect("agent stream final marker");
     assert_eq!(
         final_marker["result"]["message"]["agent_text_stream"]["final_text_or_reference"],
         "hello stream"
