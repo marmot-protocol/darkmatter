@@ -73,6 +73,7 @@ just relay-up
 
 export DM_HOME="$PWD/dev/data/quickstart"
 export DM_SECRET_STORE=file
+unset DM_SOCKET
 rm -rf "$DM_HOME"
 
 dm daemon start \
@@ -292,6 +293,7 @@ and stream mutations.
 ```sh
 export DM_HOME="$PWD/dev/data/daemon-demo"
 export DM_SECRET_STORE=file
+unset DM_SOCKET
 dm daemon start \
   --discovery-relays ws://127.0.0.1:27777 \
   --default-account-relays ws://127.0.0.1:27777
@@ -333,6 +335,7 @@ just relay-up
 
 export DM_HOME="$PWD/dev/data/stream-demo"
 export DM_SECRET_STORE=file
+unset DM_SOCKET
 rm -rf "$DM_HOME"
 
 dm daemon start \
@@ -348,6 +351,7 @@ Terminal 2 creates Alice/Bob, starts the durable stream, and sends live broker c
 ```sh
 export DM_HOME="$PWD/dev/data/stream-demo"
 export DM_SECRET_STORE=file
+unset DM_SOCKET
 
 ALICE=$(dm --json create-identity | jq -r '.result.account_id')
 BOB=$(dm --json create-identity | jq -r '.result.account_id')
