@@ -291,6 +291,29 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Best-effort cached display name for an account id. Returns the Nostr
+    /// kind:0 display_name/name when the runtime has projected one, or the
+    /// local account label if the id refers to one of our own accounts.
+    /// `None` when nothing is known yet — call `refresh_directory` to fetch.
+    pub fn display_name(&self, account_id_hex: String) -> Option<String> {
+        self.runtime.display_name_for_account_id(&account_id_hex)
+    }
+
+    /// Refresh the user-directory entry for `account_id_hex` from the given
+    /// relays. After this resolves successfully, `display_name` will return
+    /// the freshly-projected name (if any was published).
+    pub async fn refresh_directory(
+        &self,
+        account_id_hex: String,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<(), MarmotKitError> {
+        let _ = self
+            .runtime
+            .refresh_user_directory_for_account_id(&account_id_hex, endpoints(&bootstrap_relays))
+            .await?;
+        Ok(())
+    }
+
     /// Initial history fetch for a group (or, when `group_id_hex` is None,
     /// the account-wide tail). Used to populate the conversation view before
     /// the subscription stream takes over.

@@ -22,6 +22,10 @@ thiserror.workspace = true
 hex.workspace = true
 uniffi = { version = "0.28", features = ["tokio"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
