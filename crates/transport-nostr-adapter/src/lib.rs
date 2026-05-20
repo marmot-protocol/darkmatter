@@ -466,26 +466,6 @@ impl TransportAdapter for NostrTransportAdapter {
             }
         };
 
-        let local_fanout_endpoints = if !outcome.accepted.is_empty() {
-            outcome
-                .accepted
-                .iter()
-                .map(|receipt| receipt.endpoint.clone())
-                .collect::<Vec<_>>()
-        } else if outcome.failed.is_empty() {
-            request.target.endpoints().to_vec()
-        } else {
-            Vec::new()
-        };
-        if !local_fanout_endpoints.is_empty() {
-            let mut local_message = request.message.clone();
-            if let Some(message_id) = outcome.message_id.clone() {
-                local_message.id = message_id;
-            }
-            self.deliver_local_publish(&local_message, &local_fanout_endpoints)
-                .await?;
-        }
-
         Ok(TransportPublishReport {
             message_id: outcome.message_id.unwrap_or(request.message.id),
             accepted: outcome.accepted,

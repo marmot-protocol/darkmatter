@@ -316,7 +316,7 @@ impl BrokerTextPublisher {
         match stopped {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => return Err(err.into()),
-            Err(_) => return Err(QuicBrokerError::SendStopTimedOut),
+            Err(_) => {}
         }
         Ok(SentTextStream {
             stream_id: self.transcript.stream_id().to_vec(),
@@ -905,8 +905,6 @@ pub enum QuicBrokerError {
     EmptySubscriberQueue,
     #[error("broker backlog depth cannot be zero")]
     EmptyBacklog,
-    #[error("broker send stream did not stop within the close timeout")]
-    SendStopTimedOut,
     #[error("broker control frame is missing")]
     MissingControlFrame,
     #[error("wrong broker control protocol: {0}")]
