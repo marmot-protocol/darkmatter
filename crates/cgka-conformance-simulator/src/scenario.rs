@@ -650,6 +650,7 @@ fn admin_gated_actor(step: &ScenarioStep) -> Option<&str> {
     match step {
         ScenarioStep::InviteMembers { inviter, .. } => Some(inviter),
         ScenarioStep::UpdateGroupData { client, .. } => Some(client),
+        ScenarioStep::UpdateAdminPolicy { client, .. } => Some(client),
         _ => None,
     }
 }
@@ -769,4 +770,38 @@ fn invariant_failures(expectation_failures: &[ExpectationFailure]) -> Vec<Invari
             message: failure.message.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_initial_admins_include_future_admin_policy_actors() {
+        let spec = ScenarioSpec {
+            name: "admin policy fallback".to_owned(),
+            spec_version: "1".to_owned(),
+            clients: vec!["alice".to_owned(), "bob".to_owned(), "carol".to_owned()],
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".to_owned(),
+                    name: "agent".to_owned(),
+                    invitees: vec!["bob".to_owned(), "carol".to_owned()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".to_owned(),
+                },
+                ScenarioStep::UpdateAdminPolicy {
+                    client: "bob".to_owned(),
+                    admins: vec!["alice".to_owned(), "bob".to_owned()],
+                    pending: "admins".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            scenario_initial_admins(&spec, 0, &["bob".to_owned(), "carol".to_owned()]),
+            vec!["bob".to_owned()]
+        );
+    }
 }

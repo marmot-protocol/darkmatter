@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
@@ -24,17 +24,20 @@ use transport_quic_stream::{ReceivedTextChunk, ReceivedTextStream, SentTextStrea
 
 pub const QUIC_BROKER_PROTOCOL_V1: &str = "marmot.quic_broker.v1";
 pub const DEFAULT_SUBSCRIBER_QUEUE_DEPTH: usize = 32;
+pub const DEFAULT_BROKER_BACKLOG_DEPTH: usize = 1024;
 
 const FRAME_LEN_BYTES: usize = 4;
 #[cfg(test)]
 const LOCAL_SERVER_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
+const SEND_STOP_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct QuicBrokerConfig {
     pub bind_addr: SocketAddr,
     pub per_subscriber_queue: usize,
+    pub max_backlog: usize,
     pub tls: QuicBrokerTlsConfig,
 }
 
@@ -54,6 +57,7 @@ impl Default for QuicBrokerConfig {
         Self {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4450),
             per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            max_backlog: DEFAULT_BROKER_BACKLOG_DEPTH,
             tls: QuicBrokerTlsConfig::GenerateSelfSigned {
                 subject_alt_names: vec!["localhost".to_owned()],
             },
@@ -72,12 +76,18 @@ impl QuicBrokerServer {
         if config.per_subscriber_queue == 0 {
             return Err(QuicBrokerError::EmptySubscriberQueue);
         }
+        if config.max_backlog == 0 {
+            return Err(QuicBrokerError::EmptyBacklog);
+        }
         let (server_config, server_cert_der) = configure_server(&config.tls)?;
         let endpoint = Endpoint::server(server_config, config.bind_addr)?;
         Ok(Self {
             endpoint,
             server_cert_der,
-            state: Arc::new(BrokerState::new(config.per_subscriber_queue)),
+            state: Arc::new(BrokerState::new(
+                config.per_subscriber_queue,
+                config.max_backlog,
+            )),
         })
     }
 
@@ -300,9 +310,14 @@ impl BrokerTextPublisher {
 
     pub async fn finish(mut self) -> Result<SentTextStream, QuicBrokerError> {
         self.send.finish()?;
-        self.send.stopped().await?;
+        let stopped = timeout(SEND_STOP_WAIT, self.send.stopped()).await;
         self.connection.close(0_u32.into(), b"done");
         self.endpoint.wait_idle().await;
+        match stopped {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => return Err(QuicBrokerError::SendStopTimedOut),
+        }
         Ok(SentTextStream {
             stream_id: self.transcript.stream_id().to_vec(),
             transcript_hash: self.transcript.hash(),
@@ -405,6 +420,7 @@ where
 #[derive(Debug)]
 struct BrokerState {
     per_subscriber_queue: usize,
+    max_backlog: usize,
     inner: Mutex<BrokerStateInner>,
 }
 
@@ -417,7 +433,7 @@ struct BrokerStateInner {
 #[derive(Debug)]
 struct BrokerRoom {
     subscribers: Vec<Subscriber>,
-    backlog: Vec<AgentTextStreamRecordV1>,
+    backlog: VecDeque<AgentTextStreamRecordV1>,
     subscriber_notify: Arc<Notify>,
 }
 
@@ -425,7 +441,7 @@ impl Default for BrokerRoom {
     fn default() -> Self {
         Self {
             subscribers: Vec::new(),
-            backlog: Vec::new(),
+            backlog: VecDeque::new(),
             subscriber_notify: Arc::new(Notify::new()),
         }
     }
@@ -438,9 +454,10 @@ struct Subscriber {
 }
 
 impl BrokerState {
-    fn new(per_subscriber_queue: usize) -> Self {
+    fn new(per_subscriber_queue: usize, max_backlog: usize) -> Self {
         Self {
             per_subscriber_queue,
+            max_backlog,
             inner: Mutex::new(BrokerStateInner::default()),
         }
     }
@@ -481,7 +498,10 @@ impl BrokerState {
         let mut inner = self.inner.lock().await;
         let mut delivered = 0;
         let room = inner.rooms.entry(key.clone()).or_default();
-        room.backlog.push(record.clone());
+        room.backlog.push_back(record.clone());
+        while room.backlog.len() > self.max_backlog {
+            room.backlog.pop_front();
+        }
         room.subscribers.retain(|subscriber| {
             if subscriber.tx.try_send(record.clone()).is_ok() {
                 delivered += 1;
@@ -883,6 +903,10 @@ pub enum QuicBrokerError {
     InsecureLocalRequiresLoopback(SocketAddr),
     #[error("broker subscriber queue depth cannot be zero")]
     EmptySubscriberQueue,
+    #[error("broker backlog depth cannot be zero")]
+    EmptyBacklog,
+    #[error("broker send stream did not stop within the close timeout")]
+    SendStopTimedOut,
     #[error("broker control frame is missing")]
     MissingControlFrame,
     #[error("wrong broker control protocol: {0}")]
@@ -977,7 +1001,7 @@ mod tests {
 
     #[tokio::test]
     async fn broker_closes_rooms_when_publisher_finishes() {
-        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH);
+        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH, DEFAULT_BROKER_BACKLOG_DEPTH);
         let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
         let (_subscriber_id, mut rx) = state.subscribe(key.clone()).await;
         assert_eq!(state.live_room_count().await, 1);
@@ -990,7 +1014,7 @@ mod tests {
 
     #[tokio::test]
     async fn broker_buffers_records_until_subscriber_arrives() {
-        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH);
+        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH, DEFAULT_BROKER_BACKLOG_DEPTH);
         let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
         let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
 
@@ -1000,6 +1024,27 @@ mod tests {
 
         assert_eq!(received.seq, record.seq);
         assert_eq!(received.plaintext_frame, record.plaintext_frame);
+    }
+
+    #[tokio::test]
+    async fn broker_backlog_drops_oldest_records_when_bound_reached() {
+        let state = BrokerState::new(DEFAULT_SUBSCRIBER_QUEUE_DEPTH, 2);
+        let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
+        for seq in 1..=3 {
+            let record = AgentTextStreamRecordV1::text_delta(
+                vec![0xaa; 32],
+                seq,
+                format!("chunk-{seq}").into_bytes(),
+            );
+            assert_eq!(state.publish(&key, record).await, 0);
+        }
+
+        let (_subscriber_id, mut rx) = state.subscribe(key).await;
+        let first = rx.recv().await.expect("subscriber should receive backlog");
+        let second = rx.recv().await.expect("subscriber should receive backlog");
+        assert_eq!(first.seq, 2);
+        assert_eq!(second.seq, 3);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1056,6 +1101,7 @@ mod tests {
         let server = QuicBrokerServer::bind(QuicBrokerConfig {
             bind_addr: LOCAL_SERVER_BIND,
             per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            max_backlog: DEFAULT_BROKER_BACKLOG_DEPTH,
             tls: QuicBrokerTlsConfig::PemFiles {
                 cert_path,
                 key_path,

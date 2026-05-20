@@ -660,6 +660,9 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     }
 
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
+        if account_id != &self.account_id {
+            return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
+        }
         self.relay_plane
             .inner
             .transport

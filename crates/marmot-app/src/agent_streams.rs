@@ -168,7 +168,7 @@ impl AgentStreamWatchManager {
                         && matches!(watch.status.as_str(), "running" | "completed")
                 })
             })
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     pub fn reports(&self) -> Vec<AgentStreamWatchReport> {

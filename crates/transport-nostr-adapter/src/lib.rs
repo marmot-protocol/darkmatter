@@ -721,7 +721,7 @@ fn endpoint_set_digest(endpoints: &[TransportEndpoint]) -> String {
 
     let mut hasher = Sha256::new();
     for value in values {
-        hasher.update(value.len().to_be_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
     hex::encode(hasher.finalize())

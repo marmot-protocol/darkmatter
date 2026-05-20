@@ -17,6 +17,15 @@ require_command() {
     fi
 }
 
+require_docker_compose() {
+    require_command docker
+    if ! docker compose version >/dev/null 2>&1; then
+        echo "error: docker is installed, but the Docker Compose plugin is not available" >&2
+        echo "install Docker Compose or use a Docker Desktop version that includes 'docker compose'" >&2
+        exit 127
+    fi
+}
+
 run_json() {
     local output
     if ! output="$("$@" 2>&1)"; then
@@ -115,7 +124,7 @@ require_command curl
 stop_daemon_if_running
 
 echo "==> stopping local relays and QUIC broker"
-require_command docker
+require_docker_compose
 docker compose down -v --remove-orphans
 
 echo "==> deleting $HOME_ARG"
