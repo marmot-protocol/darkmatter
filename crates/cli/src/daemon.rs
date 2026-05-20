@@ -6,18 +6,19 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
 use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
 
 use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
 
-const DAEMON_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
@@ -36,25 +37,51 @@ pub enum DaemonClientError {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "dmd", about = "Darkmatter daemon")]
+#[command(
+    name = "dmd",
+    about = "Darkmatter background runtime daemon for live subscriptions and stream previews"
+)]
 struct DaemonArgs {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Use this Darkmatter data directory")]
     home: Option<PathBuf>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Alias for --home")]
     data_dir: Option<PathBuf>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write daemon logs in this directory"
+    )]
     logs_dir: Option<PathBuf>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Listen on this Unix socket")]
     socket: Option<PathBuf>,
     #[arg(long, value_name = "URL", hide = true)]
     relay: Option<String>,
-    #[arg(long, value_name = "URLS", value_delimiter = ',')]
+    #[arg(
+        long,
+        value_name = "URLS",
+        value_delimiter = ',',
+        help = "Comma-separated discovery relays for profiles, relay lists, and KeyPackages"
+    )]
     discovery_relays: Vec<String>,
-    #[arg(long, value_name = "URLS", value_delimiter = ',')]
+    #[arg(
+        long,
+        value_name = "URLS",
+        value_delimiter = ',',
+        help = "Comma-separated default account relays used when creating identities"
+    )]
     default_account_relays: Vec<String>,
-    #[arg(long, value_enum, value_name = "STORE")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "STORE",
+        help = "Store account secrets in the OS keychain or local files"
+    )]
     secret_store: Option<SecretStoreKind>,
-    #[arg(long, value_name = "SERVICE")]
+    #[arg(
+        long,
+        value_name = "SERVICE",
+        help = "Use this OS keychain service name for local secret storage"
+    )]
     keychain_service: Option<String>,
 }
 
@@ -69,7 +96,6 @@ struct DaemonDefaults {
     default_account_relays: Vec<String>,
     secret_store: Option<SecretStoreKind>,
     keychain_service: Option<String>,
-    maintenance_interval: Duration,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -567,7 +593,6 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         default_account_relays,
         secret_store: args.secret_store,
         keychain_service: args.keychain_service,
-        maintenance_interval: DAEMON_MAINTENANCE_INTERVAL,
     };
     let state = Arc::new(Mutex::new(DaemonState {
         pid: std::process::id(),
@@ -583,81 +608,79 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         &mut workers.runtime,
     )
     .await;
-    let mut maintenance_tick = tokio::time::interval(defaults.maintenance_interval);
-    maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
     let shutdown_result = loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (mut stream, _) = accepted?;
-                let request = read_daemon_request(&mut stream).await?;
-                match request {
-                    DaemonRequest::MessagesSubscribe { mut cli } => {
-                        apply_defaults(&mut cli, &defaults);
-                        reconcile_app_runtime(
-                            &defaults,
-                            state.clone(),
-                            events.clone(),
-                            &mut workers.runtime,
-                        )
-                        .await;
-                        let defaults = defaults.clone();
-                        let state = state.clone();
-                        let events = events.clone();
-                        let runtime = workers.runtime.runtime.clone();
-                        tokio::spawn(async move {
-                            let _ = handle_messages_subscription(&mut stream, &defaults, state, events, runtime, *cli).await;
-                        });
-                    }
-                    DaemonRequest::ChatsSubscribe { mut cli } => {
-                        apply_defaults(&mut cli, &defaults);
-                        reconcile_app_runtime(
-                            &defaults,
-                            state.clone(),
-                            events.clone(),
-                            &mut workers.runtime,
-                        )
-                        .await;
-                        let defaults = defaults.clone();
-                        let runtime = workers.runtime.runtime.clone();
-                        tokio::spawn(async move {
-                            let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
-                        });
-                    }
-                    DaemonRequest::GroupStateSubscribe { mut cli } => {
-                        apply_defaults(&mut cli, &defaults);
-                        reconcile_app_runtime(
-                            &defaults,
-                            state.clone(),
-                            events.clone(),
-                            &mut workers.runtime,
-                        )
-                        .await;
-                        let defaults = defaults.clone();
-                        let runtime = workers.runtime.runtime.clone();
-                        tokio::spawn(async move {
-                            let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
-                        });
-                    }
-                    request => {
-                        let should_shutdown =
-                            handle_connection(
-                                request,
-                                &mut stream,
-                                &defaults,
-                                state.clone(),
-                                events.clone(),
-                                &mut workers,
-                            )
-                            .await?;
-                        if should_shutdown {
-                            break Ok(());
-                        }
-                    }
-                }
+        let (mut stream, _) = listener.accept().await?;
+        let request = read_daemon_request(&mut stream).await?;
+        match request {
+            DaemonRequest::MessagesSubscribe { mut cli } => {
+                apply_defaults(&mut cli, &defaults);
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers.runtime,
+                )
+                .await;
+                let defaults = defaults.clone();
+                let state = state.clone();
+                let events = events.clone();
+                let runtime = workers.runtime.runtime.clone();
+                tokio::spawn(async move {
+                    let _ = handle_messages_subscription(
+                        &mut stream,
+                        &defaults,
+                        state,
+                        events,
+                        runtime,
+                        *cli,
+                    )
+                    .await;
+                });
             }
-            _ = maintenance_tick.tick() => {
-                reconcile_app_runtime(&defaults, state.clone(), events.clone(), &mut workers.runtime).await;
+            DaemonRequest::ChatsSubscribe { mut cli } => {
+                apply_defaults(&mut cli, &defaults);
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers.runtime,
+                )
+                .await;
+                let defaults = defaults.clone();
+                let runtime = workers.runtime.runtime.clone();
+                tokio::spawn(async move {
+                    let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
+                });
+            }
+            DaemonRequest::GroupStateSubscribe { mut cli } => {
+                apply_defaults(&mut cli, &defaults);
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers.runtime,
+                )
+                .await;
+                let defaults = defaults.clone();
+                let runtime = workers.runtime.runtime.clone();
+                tokio::spawn(async move {
+                    let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli)
+                        .await;
+                });
+            }
+            request => {
+                let should_shutdown = handle_connection(
+                    request,
+                    &mut stream,
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers,
+                )
+                .await?;
+                if should_shutdown {
+                    break Ok(());
+                }
             }
         }
     };
@@ -746,28 +769,18 @@ async fn handle_connection(
         ),
         DaemonRequest::Execute { mut cli } => {
             apply_defaults(&mut cli, defaults);
-            let stream_compose_refresh = stream_compose_refresh_after_execute(&cli);
-            if let Some(output) =
-                handle_stream_compose_request(&cli, &mut workers.stream_compose, state.clone())
-                    .await
+            if let Some(output) = handle_stream_compose_request(
+                &cli,
+                defaults,
+                state.clone(),
+                events.clone(),
+                &mut workers.runtime,
+                &mut workers.stream_compose,
+            )
+            .await
             {
-                if output.code == 0 {
-                    refresh_app_runtime(
-                        defaults,
-                        state.clone(),
-                        events.clone(),
-                        &mut workers.runtime,
-                        stream_compose_refresh,
-                    )
-                    .await;
-                }
-                return {
-                    let mut response = serde_json::to_vec(&output)?;
-                    response.push(b'\n');
-                    stream.write_all(&response).await?;
-                    stream.shutdown().await?;
-                    Ok(false)
-                };
+                write_daemon_output(stream, &output).await;
+                return Ok(false);
             }
             let refresh = app_runtime_refresh_after_execute(&cli);
             if let Some(output) = handle_app_runtime_account_setup_request(
@@ -779,13 +792,8 @@ async fn handle_connection(
             )
             .await
             {
-                return {
-                    let mut response = serde_json::to_vec(&output)?;
-                    response.push(b'\n');
-                    stream.write_all(&response).await?;
-                    stream.shutdown().await?;
-                    Ok(false)
-                };
+                write_daemon_output(stream, &output).await;
+                return Ok(false);
             }
             if let Some(output) = handle_app_runtime_command_request(
                 &cli,
@@ -796,13 +804,8 @@ async fn handle_connection(
             )
             .await
             {
-                return {
-                    let mut response = serde_json::to_vec(&output)?;
-                    response.push(b'\n');
-                    stream.write_all(&response).await?;
-                    stream.shutdown().await?;
-                    Ok(false)
-                };
+                write_daemon_output(stream, &output).await;
+                return Ok(false);
             }
             let output = crate::run_cli_local(*cli).await;
             if output.code == 0 {
@@ -819,11 +822,17 @@ async fn handle_connection(
         }
     };
 
-    let mut response = serde_json::to_vec(&output)?;
-    response.push(b'\n');
-    stream.write_all(&response).await?;
-    stream.shutdown().await?;
+    write_daemon_output(stream, &output).await;
     Ok(shutdown)
+}
+
+async fn write_daemon_output(stream: &mut UnixStream, output: &CliOutput) {
+    let Ok(mut response) = serde_json::to_vec(output) else {
+        return;
+    };
+    response.push(b'\n');
+    let _ = stream.write_all(&response).await;
+    let _ = stream.shutdown().await;
 }
 
 async fn read_daemon_request(
@@ -908,7 +917,11 @@ async fn handle_messages_subscription(
         if !message.message_id_hex.is_empty() {
             seen_messages.insert(message.message_id_hex.clone());
         }
-        let response = message_stream_response(app_message_record_json(message), "InitialMessage");
+        let display_name = runtime.display_name_for_account_id(&message.sender);
+        let response = message_stream_response(
+            app_message_record_json(message, display_name),
+            "InitialMessage",
+        );
         if !write_stream_response(stream, &response).await {
             return Ok(());
         }
@@ -919,6 +932,7 @@ async fn handle_messages_subscription(
             stream,
             response,
             &group_id,
+            &account_ref,
             &mut seen_messages,
             &mut seen_stream_previews,
         )
@@ -934,6 +948,7 @@ async fn handle_messages_subscription(
             stream,
             response,
             &group_id,
+            &account_ref,
             &mut seen_messages,
             &mut seen_stream_previews,
         )
@@ -967,6 +982,7 @@ async fn handle_messages_subscription(
                     stream,
                     response,
                     &group_id,
+                    &account_ref,
                     &mut seen_messages,
                     &mut seen_stream_previews,
                 )
@@ -982,6 +998,7 @@ async fn handle_messages_subscription(
                             stream,
                             response,
                             &group_id,
+                            &account_ref,
                             &mut seen_messages,
                             &mut seen_stream_previews,
                         )
@@ -1009,6 +1026,7 @@ async fn handle_messages_subscription(
                             stream,
                             response,
                             &group_id,
+                            &account_ref,
                             &mut seen_messages,
                             &mut seen_stream_previews,
                         )
@@ -1049,25 +1067,39 @@ fn daemon_account_ref(defaults: &DaemonDefaults, cli: &Cli) -> Result<String, St
     Ok(account.account_id_hex)
 }
 
-fn app_message_record_json(message: marmot_app::AppMessageRecord) -> serde_json::Value {
-    crate::message_list_json(vec![message])
-        .into_iter()
-        .next()
-        .unwrap_or(serde_json::Value::Null)
+fn app_message_record_json(
+    message: marmot_app::AppMessageRecord,
+    from_display_name: Option<String>,
+) -> serde_json::Value {
+    crate::message_record_json(message, from_display_name)
 }
 
 fn runtime_message_update_stream_response(
     update: marmot_app::RuntimeMessageUpdate,
 ) -> DaemonStreamResponse {
     match update {
-        marmot_app::RuntimeMessageUpdate::Message(message) => {
-            message_stream_response(runtime_message_json(&message.message), "MessageReceived")
-        }
-        marmot_app::RuntimeMessageUpdate::AgentStreamStarted(message) => {
-            message_stream_response(runtime_message_json(&message.message), "AgentStreamStarted")
-        }
+        marmot_app::RuntimeMessageUpdate::Message(message) => message_stream_response(
+            runtime_message_json(
+                &message.message,
+                &message.account_id_hex,
+                &message.account_label,
+            ),
+            "MessageReceived",
+        ),
+        marmot_app::RuntimeMessageUpdate::AgentStreamStarted(message) => message_stream_response(
+            runtime_message_json(
+                &message.message,
+                &message.account_id_hex,
+                &message.account_label,
+            ),
+            "AgentStreamStarted",
+        ),
         marmot_app::RuntimeMessageUpdate::AgentStreamFinalized(message) => message_stream_response(
-            runtime_message_json(&message.message),
+            runtime_message_json(
+                &message.message,
+                &message.account_id_hex,
+                &message.account_label,
+            ),
             "AgentStreamFinalized",
         ),
     }
@@ -1100,10 +1132,11 @@ async fn write_message_subscription_event(
     stream: &mut UnixStream,
     response: DaemonStreamResponse,
     group_id: &str,
+    account_id: &str,
     seen_messages: &mut HashSet<String>,
     seen_stream_previews: &mut HashSet<String>,
 ) -> bool {
-    if !stream_response_matches_group(&response, group_id) {
+    if !stream_response_matches_subscription(&response, group_id, account_id) {
         return true;
     }
     if mark_stream_response_seen(&response, seen_messages, seen_stream_previews) {
@@ -1385,7 +1418,11 @@ fn message_stream_type(message: &serde_json::Value) -> &'static str {
     }
 }
 
-fn stream_response_matches_group(response: &DaemonStreamResponse, group_id: &str) -> bool {
+fn stream_response_matches_subscription(
+    response: &DaemonStreamResponse,
+    group_id: &str,
+    account_id: &str,
+) -> bool {
     let Some(result) = &response.result else {
         return true;
     };
@@ -1396,28 +1433,38 @@ fn stream_response_matches_group(response: &DaemonStreamResponse, group_id: &str
         | Some("media")
         | Some("agent_stream_start")
         | Some("agent_stream_final") => {
-            result
-                .get("message")
-                .and_then(|message| message.get("group_id"))
-                .and_then(serde_json::Value::as_str)
-                == Some(group_id)
+            let Some(message) = result.get("message") else {
+                return false;
+            };
+            value_matches_group_and_account(message, group_id, account_id)
         }
         Some("stream_preview") => {
-            result
-                .get("stream_preview")
-                .and_then(|preview| preview.get("group_id"))
-                .and_then(serde_json::Value::as_str)
-                == Some(group_id)
+            let Some(preview) = result.get("stream_preview") else {
+                return false;
+            };
+            value_matches_group_and_account(preview, group_id, account_id)
         }
         Some("agent_stream_delta") => {
-            result
-                .get("agent_stream_delta")
-                .and_then(|delta| delta.get("group_id"))
-                .and_then(serde_json::Value::as_str)
-                == Some(group_id)
+            let Some(delta) = result.get("agent_stream_delta") else {
+                return false;
+            };
+            value_matches_group_and_account(delta, group_id, account_id)
         }
         _ => false,
     }
+}
+
+fn value_matches_group_and_account(
+    value: &serde_json::Value,
+    group_id: &str,
+    account_id: &str,
+) -> bool {
+    value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
+        && value
+            .get("account")
+            .or_else(|| value.get("account_id"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|event_account| event_account == account_id)
 }
 
 fn mark_stream_response_seen(
@@ -1642,8 +1689,11 @@ fn stream_watch_output(json: bool, report: &DaemonStreamWatchReport) -> CliOutpu
 
 async fn handle_stream_compose_request(
     cli: &Cli,
-    workers: &mut StreamComposeWorkers,
+    defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    runtime_host: &mut AppRuntimeHost,
+    workers: &mut StreamComposeWorkers,
 ) -> Option<CliOutput> {
     let crate::Command::Stream { command } = &cli.command else {
         return None;
@@ -1658,6 +1708,10 @@ async fn handle_stream_compose_request(
         } => Some(
             open_stream_compose(
                 cli,
+                defaults,
+                state,
+                events,
+                runtime_host,
                 workers,
                 group,
                 stream_id.clone(),
@@ -1670,9 +1724,18 @@ async fn handle_stream_compose_request(
         crate::StreamCommand::ComposeAppend { stream_id, text } => {
             Some(append_stream_compose(cli, workers, stream_id, text.join(" ")).await)
         }
-        crate::StreamCommand::ComposeFinish { stream_id } => {
-            Some(finish_stream_compose(cli, workers, stream_id, state).await)
-        }
+        crate::StreamCommand::ComposeFinish { stream_id } => Some(
+            finish_stream_compose(
+                cli,
+                defaults,
+                state,
+                events,
+                runtime_host,
+                workers,
+                stream_id,
+            )
+            .await,
+        ),
         crate::StreamCommand::ComposeCancel { stream_id } => {
             Some(cancel_stream_compose(cli, workers, stream_id))
         }
@@ -1683,6 +1746,10 @@ async fn handle_stream_compose_request(
 #[allow(clippy::too_many_arguments)]
 async fn open_stream_compose(
     cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    runtime_host: &mut AppRuntimeHost,
     workers: &mut StreamComposeWorkers,
     group: &str,
     stream_id: Option<String>,
@@ -1732,10 +1799,13 @@ async fn open_stream_compose(
             quic_candidates: quic_candidates.clone(),
         },
     };
-    let start = match cli_output_result(crate::run_cli_local(start_cli).await) {
-        Ok(result) => result,
-        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err),
-    };
+    let start =
+        match run_hosted_stream_marker_cli_json(&start_cli, defaults, state, events, runtime_host)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => return daemon_error(cli.json, "stream_compose_failed", err),
+        };
     let Some(start_message_id) = start
         .get("message_ids")
         .and_then(serde_json::Value::as_array)
@@ -1842,9 +1912,12 @@ async fn append_stream_compose(
 
 async fn finish_stream_compose(
     cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    runtime_host: &mut AppRuntimeHost,
     workers: &mut StreamComposeWorkers,
     stream_id: &str,
-    _state: Arc<Mutex<DaemonState>>,
 ) -> CliOutput {
     let stream_id = match crate::normalize_hex(stream_id) {
         Ok(stream_id) => stream_id,
@@ -1902,7 +1975,9 @@ async fn finish_stream_compose(
             text: vec![report.text.clone()],
         },
     };
-    if let Err(err) = cli_output_result(crate::run_cli_local(finish_cli).await) {
+    if let Err(err) =
+        run_hosted_stream_marker_cli_json(&finish_cli, defaults, state, events, runtime_host).await
+    {
         return daemon_error(cli.json, "stream_compose_failed", err);
     }
     daemon_output(
@@ -1941,6 +2016,21 @@ fn cancel_stream_compose(
         "stream_compose_not_found",
         format!("no active stream compose session for {stream_id}"),
     )
+}
+
+async fn run_hosted_stream_marker_cli_json(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    runtime_host: &mut AppRuntimeHost,
+) -> Result<serde_json::Value, String> {
+    let Some(output) =
+        handle_app_runtime_command_request(cli, defaults, state, events, runtime_host).await
+    else {
+        return Err("stream marker command did not use the daemon runtime".to_owned());
+    };
+    cli_output_result(output)
 }
 
 async fn run_stream_compose_session(
@@ -2284,16 +2374,6 @@ fn app_runtime_refresh_after_execute(cli: &Cli) -> AppRuntimeRefresh {
     }
 }
 
-fn stream_compose_refresh_after_execute(cli: &Cli) -> AppRuntimeRefresh {
-    match &cli.command {
-        crate::Command::Stream {
-            command:
-                crate::StreamCommand::ComposeOpen { .. } | crate::StreamCommand::ComposeFinish { .. },
-        } => AppRuntimeRefresh::CatchUpAll,
-        _ => AppRuntimeRefresh::None,
-    }
-}
-
 async fn refresh_app_runtime(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
@@ -2474,7 +2554,11 @@ async fn handle_app_runtime_event(
                 crate::agent_text_stream_payload(&message.message.plaintext).is_some();
             if !is_agent_stream {
                 events.publish_message(message_stream_response(
-                    runtime_message_json(&message.message),
+                    runtime_message_json(
+                        &message.message,
+                        &message.account_id_hex,
+                        &message.account_label,
+                    ),
                     "MessageReceived",
                 ));
                 let summary = marmot_app::SyncSummary {
@@ -2489,7 +2573,11 @@ async fn handle_app_runtime_event(
         }
         marmot_app::MarmotAppEvent::AgentStreamStarted(message) => {
             events.publish_message(message_stream_response(
-                runtime_message_json(&message.message),
+                runtime_message_json(
+                    &message.message,
+                    &message.account_id_hex,
+                    &message.account_label,
+                ),
                 "AgentStreamStarted",
             ));
             let summary = marmot_app::SyncSummary {
@@ -2511,7 +2599,11 @@ async fn handle_app_runtime_event(
         }
         marmot_app::MarmotAppEvent::AgentStreamFinalized(message) => {
             events.publish_message(message_stream_response(
-                runtime_message_json(&message.message),
+                runtime_message_json(
+                    &message.message,
+                    &message.account_id_hex,
+                    &message.account_label,
+                ),
                 "AgentStreamFinalized",
             ));
             let summary = marmot_app::SyncSummary {
@@ -2545,12 +2637,24 @@ async fn handle_app_runtime_event(
     }
 }
 
-fn runtime_message_json(message: &marmot_app::ReceivedMessage) -> serde_json::Value {
+fn runtime_message_json(
+    message: &marmot_app::ReceivedMessage,
+    account_id_hex: &str,
+    account_label: &str,
+) -> serde_json::Value {
     let now = unix_now();
+    let is_own_sender = message.sender == account_id_hex || message.sender == account_label;
+    let from_display_name = if is_own_sender {
+        None
+    } else {
+        message.sender_display_name.clone()
+    };
     let mut value = serde_json::json!({
+        "account_id": account_id_hex,
         "message_id": message.message_id_hex,
-        "direction": "received",
+        "direction": if is_own_sender { "sent" } else { "received" },
         "from": message.sender,
+        "from_display_name": from_display_name,
         "group_id": hex::encode(message.group_id.as_slice()),
         "plaintext": message.plaintext,
         "recorded_at": now,
@@ -2788,6 +2892,7 @@ async fn start_daemon(
     if let Some(keychain_service) = &cli.keychain_service {
         command.arg("--keychain-service").arg(keychain_service);
     }
+    detach_daemon_command(&mut command);
     let log_path = default_log_path(home);
     let log = match open_daemon_log(&log_path) {
         Ok(log) => log,
@@ -3258,6 +3363,14 @@ fn relay_error_code(err: &crate::DmError) -> &'static str {
     }
 }
 
+#[cfg(unix)]
+fn detach_daemon_command(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_daemon_command(_command: &mut Command) {}
+
 fn daemon_executable() -> Result<PathBuf, String> {
     if let Ok(current) = std::env::current_exe()
         && let Some(parent) = current.parent()
@@ -3281,6 +3394,7 @@ fn daemon_executable() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgka_traits::GroupId;
 
     #[test]
     fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
@@ -3294,7 +3408,6 @@ mod tests {
             default_account_relays: vec!["wss://account.example".to_owned()],
             secret_store: Some(crate::SecretStoreKind::File),
             keychain_service: Some("daemon-keychain".to_owned()),
-            maintenance_interval: DAEMON_MAINTENANCE_INTERVAL,
         };
         let mut cli = Cli {
             home: None,
@@ -3327,7 +3440,6 @@ mod tests {
             default_account_relays: vec!["wss://account.example".to_owned()],
             secret_store: Some(crate::SecretStoreKind::File),
             keychain_service: Some("daemon-keychain".to_owned()),
-            maintenance_interval: DAEMON_MAINTENANCE_INTERVAL,
         };
         let mut cli = Cli {
             home: None,
@@ -3364,5 +3476,125 @@ mod tests {
         };
         assert_eq!(default_relays, vec!["wss://account.example"]);
         assert_eq!(bootstrap_relays, vec!["wss://discovery.example"]);
+    }
+
+    #[test]
+    fn runtime_message_json_marks_account_label_sender_as_me() {
+        let message = marmot_app::ReceivedMessage {
+            message_id_hex: "01".to_owned(),
+            sender: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            sender_display_name: Some("Alice Example".to_owned()),
+            group_id: GroupId::new(vec![0xab; 32]),
+            plaintext: "hello".to_owned(),
+            app_message: None,
+        };
+
+        let value = runtime_message_json(
+            &message,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Alice Example",
+        );
+
+        assert_eq!(value["direction"], "sent");
+        assert_eq!(
+            value["from"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            value["account_id"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(value["from_display_name"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn runtime_message_json_carries_named_peer_display_name() {
+        let message = marmot_app::ReceivedMessage {
+            message_id_hex: "02".to_owned(),
+            sender: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            sender_display_name: Some("Bob Example".to_owned()),
+            group_id: GroupId::new(vec![0xcd; 32]),
+            plaintext: "hello back".to_owned(),
+            app_message: None,
+        };
+
+        let value = runtime_message_json(
+            &message,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Alice Example",
+        );
+
+        assert_eq!(value["direction"], "received");
+        assert_eq!(
+            value["from"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            value["account_id"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(value["from_display_name"], "Bob Example");
+    }
+
+    #[test]
+    fn message_subscription_filters_group_events_by_account() {
+        let response = DaemonStreamResponse::ok(serde_json::json!({
+            "type": "message",
+            "message": {
+                "account_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "group_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "message_id": "01",
+                "plaintext": "wrong account copy"
+            }
+        }));
+
+        assert!(!stream_response_matches_subscription(
+            &response,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(stream_response_matches_subscription(
+            &response,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+    }
+
+    #[test]
+    fn message_subscription_filters_stream_updates_by_account_when_present() {
+        let scoped_delta = DaemonStreamResponse::ok(serde_json::json!({
+            "type": "agent_stream_delta",
+            "agent_stream_delta": {
+                "account": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "group_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "stream_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "text": "hello"
+            }
+        }));
+        let accountless_preview = DaemonStreamResponse::ok(serde_json::json!({
+            "type": "stream_preview",
+            "stream_preview": {
+                "group_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "stream_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "status": "running",
+                "text": "hello"
+            }
+        }));
+
+        assert!(!stream_response_matches_subscription(
+            &scoped_delta,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(stream_response_matches_subscription(
+            &scoped_delta,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+        assert!(stream_response_matches_subscription(
+            &accountless_preview,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
     }
 }

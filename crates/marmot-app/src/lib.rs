@@ -11,7 +11,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_engine::{FeatureRegistry, canonicalization::CanonicalizationPolicy};
+use cgka_engine::{
+    FeatureRegistry, canonicalization::CanonicalizationPolicy,
+    key_package::is_last_resort_key_package,
+};
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
@@ -228,6 +231,9 @@ enum AccountWorkerCommand {
     PublishKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    RotateKeyPackage {
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -381,6 +387,7 @@ pub struct SyncSummary {
 pub struct ReceivedMessage {
     pub message_id_hex: String,
     pub sender: String,
+    pub sender_display_name: Option<String>,
     pub group_id: GroupId,
     pub plaintext: String,
     pub app_message: Option<MarmotAppMessagePayloadV1>,
@@ -512,6 +519,14 @@ impl MarmotAppRuntime {
 
     pub fn subscribe(&self) -> broadcast::Receiver<MarmotAppEvent> {
         self.events.subscribe()
+    }
+
+    pub fn display_name_for_account_id(&self, account_id_hex: &str) -> Option<String> {
+        self.accounts
+            .app
+            .display_name_for_account_id(account_id_hex)
+            .ok()
+            .flatten()
     }
 
     pub fn subscribe_messages(
@@ -913,6 +928,10 @@ impl MarmotAppRuntime {
 
     pub async fn publish_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.accounts.publish_key_package(account_ref).await
+    }
+
+    pub async fn rotate_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
+        self.accounts.rotate_key_package(account_ref).await
     }
 
     pub async fn publish_user_profile(
@@ -1372,9 +1391,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
-        Ok(summary)
+        account_worker_response(response).await
     }
 
     pub async fn retry_group_convergence(
@@ -1401,6 +1418,16 @@ impl AccountManager {
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::PublishKeyPackage { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn rotate_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RotateKeyPackage { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
@@ -2346,6 +2373,27 @@ impl MarmotApp {
             .await
     }
 
+    async fn ensure_local_account_relay_lists(
+        &self,
+        label: &str,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.account_home().account(label)?;
+        let status = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
+        if status.complete {
+            return Ok(status);
+        }
+        let default_relays = self.relay_endpoints();
+        if default_relays.is_empty() {
+            return Err(AppError::MissingRelayLists(status.missing));
+        }
+        self.publish_missing_account_relay_lists_from_status(
+            label,
+            AccountRelayListBootstrap::new(default_relays.clone(), default_relays),
+            status,
+        )
+        .await
+    }
+
     pub async fn publish_account_relay_list_kind(
         &self,
         label: &str,
@@ -2435,12 +2483,21 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<FetchedKeyPackage, AppError> {
-        let relay_lists = if bootstrap_relays.is_empty() {
-            self.account_relay_list_status_for_account_id(account_id_hex)?
-        } else {
+        let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
+        let mut relay_lists = if has_explicit_bootstrap_relays {
             self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
                 .await?
+        } else {
+            self.account_relay_list_status_for_account_id(account_id_hex)?
         };
+        if !has_explicit_bootstrap_relays && relay_lists.key_package.relays.is_empty() {
+            let source_relays = self.directory_source_relays(&[]);
+            if !source_relays.is_empty() {
+                relay_lists = self
+                    .fetch_account_relay_list_status_for_account_id(account_id_hex, source_relays)
+                    .await?;
+            }
+        }
         self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
         if relay_lists.key_package.relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
@@ -2814,11 +2871,7 @@ impl MarmotApp {
             app: self.clone(),
             account_label: label.to_owned(),
             keys: keys.clone(),
-            app_components: self
-                .supported_app_component_ids()
-                .into_iter()
-                .map(|id| format!("0x{id:04x}"))
-                .collect(),
+            app_components: self.supported_app_component_tags(),
         };
         let routing = self.routing_for(&state)?;
         let runtime =
@@ -2889,6 +2942,34 @@ impl MarmotApp {
         Ok(KeyPackage(hex::decode(record.key_package_hex)?))
     }
 
+    async fn publish_cached_key_package(
+        &self,
+        label: &str,
+        key_package: KeyPackage,
+    ) -> Result<KeyPackage, AppError> {
+        let keys = self.account_home().load_signing_keys(label)?;
+        let account_id_hex = keys.public_key().to_hex();
+        let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+        if relay_lists.key_package.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
+        }
+        let publisher = AppKeyPackagePublisher {
+            app: self.clone(),
+            account_label: label.to_owned(),
+            keys: keys.clone(),
+            app_components: self.supported_app_component_tags(),
+        };
+        publisher
+            .publish_key_package(KeyPackagePublication {
+                account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
+                key_package: key_package.clone(),
+                endpoints: self.key_package_endpoints(&relay_lists),
+            })
+            .await
+            .map_err(|err| AppError::Publish(err.to_string()))?;
+        Ok(key_package)
+    }
+
     async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
         if self.account_home().account(member_ref).is_ok() {
             return self.latest_key_package(member_ref);
@@ -2955,6 +3036,34 @@ impl MarmotApp {
             .collect())
     }
 
+    fn display_names_by_id(&self) -> Result<HashMap<String, String>, AppError> {
+        let mut names = self.profiles_by_id()?;
+        for entry in self.directory_entries()? {
+            let Some(name) = display_name_for_profile(entry.profile.as_ref()) else {
+                continue;
+            };
+            names.insert(entry.account_id_hex, name);
+        }
+        Ok(names)
+    }
+
+    fn display_name_for_account_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<String>, AppError> {
+        if let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
+            && let Some(name) = display_name_for_profile(entry.profile.as_ref())
+        {
+            return Ok(Some(name));
+        }
+        Ok(self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex)
+            .map(|account| account.label))
+    }
+
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account_state(label)?;
         self.account_projection(label)?.load_state(label)
@@ -2975,13 +3084,19 @@ impl MarmotApp {
         let relay_lists = self
             .account_relay_list_status_for_account_id(&account.account_id_hex)
             .unwrap_or_else(|_| AccountRelayListStatus::empty());
+        let label = self
+            .directory_entry_for_account_id(&account.account_id_hex)
+            .ok()
+            .flatten()
+            .and_then(|entry| display_name_for_profile(entry.profile.as_ref()))
+            .unwrap_or(account.label.clone());
         AccountProfile {
             inbox_endpoints: self
                 .account_inbox_endpoints(&account.label, &relay_lists)
                 .into_iter()
                 .map(|endpoint| endpoint.0)
                 .collect(),
-            label: account.label,
+            label,
             account_id_hex: account.account_id_hex,
         }
     }
@@ -3215,6 +3330,13 @@ impl MarmotApp {
         components.into_iter().collect()
     }
 
+    fn supported_app_component_tags(&self) -> Vec<String> {
+        self.supported_app_component_ids()
+            .into_iter()
+            .map(|id| format!("0x{id:04x}"))
+            .collect()
+    }
+
     fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
@@ -3389,6 +3511,14 @@ async fn run_app_runtime_account_worker(
                     Some(AccountWorkerCommand::PublishKeyPackage { respond }) => {
                         let result = async {
                             let key_package = client.publish_key_package().await?;
+                            Ok(key_package.0.len())
+                        }
+                        .await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::RotateKeyPackage { respond }) => {
+                        let result = async {
+                            let key_package = client.rotate_key_package().await?;
                             Ok(key_package.0.len())
                         }
                         .await;
@@ -3589,6 +3719,30 @@ impl AppClient {
     }
 
     pub async fn publish_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        self.app
+            .ensure_local_account_relay_lists(&self.state.label)
+            .await?;
+        self.refresh_routing()?;
+        self.runtime.activate_transport(None).await?;
+        match self.app.latest_key_package(&self.state.label) {
+            Ok(key_package) if is_last_resort_key_package(&key_package).unwrap_or(false) => {
+                self.app
+                    .publish_cached_key_package(&self.state.label, key_package)
+                    .await
+            }
+            Ok(_) => Ok(self.runtime.publish_fresh_key_package().await?),
+            Err(AppError::MissingKeyPackage(_)) => {
+                Ok(self.runtime.publish_fresh_key_package().await?)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        self.app
+            .ensure_local_account_relay_lists(&self.state.label)
+            .await?;
+        self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
@@ -3825,13 +3979,18 @@ impl AppClient {
             .iter()
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect::<Vec<_>>();
+        let sender = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
         let projection = self.app.account_projection(&self.state.label)?;
         for message_id_hex in &message_ids {
             projection.record_message(&AppMessageProjection {
                 message_id_hex: message_id_hex.clone(),
                 direction: "sent".to_owned(),
                 group_id_hex: group_id_hex.clone(),
-                sender: self.state.label.clone(),
+                sender: sender.clone(),
                 plaintext: plaintext.clone(),
                 app_message: app_message.clone(),
                 recorded_at: None,
@@ -3968,7 +4127,7 @@ impl AppClient {
     }
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
-        let profiles = self.app.profiles_by_id()?;
+        let display_names = self.app.display_names_by_id()?;
         let local_account_id_hex = self
             .app
             .account_home()
@@ -3997,7 +4156,7 @@ impl AppClient {
             self.state.seen_events.push(event_id);
 
             let mut summary = SyncSummary::default();
-            self.ingest_delivery(delivery, &profiles, &mut summary)
+            self.ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
             self.app.save_state(&self.state)?;
             if summary.joined_groups.is_empty()
@@ -4011,7 +4170,7 @@ impl AppClient {
     }
 
     async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
-        let profiles = self.app.profiles_by_id()?;
+        let display_names = self.app.display_names_by_id()?;
         let local_account_id_hex = self
             .app
             .account_home()
@@ -4049,7 +4208,7 @@ impl AppClient {
             }
             seen.insert(event_id.clone());
             self.state.seen_events.push(event_id);
-            self.ingest_delivery(delivery, &profiles, &mut summary)
+            self.ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
         }
 
@@ -4060,7 +4219,7 @@ impl AppClient {
     async fn ingest_delivery(
         &mut self,
         delivery: cgka_traits::TransportDelivery,
-        profiles: &HashMap<String, String>,
+        display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
     ) -> Result<(), AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
@@ -4088,7 +4247,7 @@ impl AppClient {
                 .transpose()?;
             if let Some(message) = observe_event(
                 &mut self.state,
-                profiles,
+                display_names,
                 summary,
                 event,
                 group_projection.as_ref(),
@@ -4614,6 +4773,17 @@ fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
     serde_json::Value::Object(value)
 }
 
+fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<String> {
+    let profile = profile?;
+    profile
+        .display_name
+        .as_deref()
+        .or(profile.name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4908,7 +5078,7 @@ struct EventGroupProjection<'a> {
 
 fn observe_event(
     state: &mut AccountState,
-    profiles: &HashMap<String, String>,
+    display_names: &HashMap<String, String>,
     summary: &mut SyncSummary,
     event: &GroupEvent,
     group_projection: Option<&EventGroupProjection<'_>>,
@@ -4946,7 +5116,7 @@ fn observe_event(
                 );
             }
             let sender_hex = hex::encode(sender.as_slice());
-            let sender_label = profiles.get(&sender_hex).cloned().unwrap_or(sender_hex);
+            let sender_display_name = display_names.get(&sender_hex).cloned();
             let plaintext = String::from_utf8_lossy(payload).to_string();
             let app_message = MarmotAppMessageEnvelopeV1::decode(payload)
                 .ok()
@@ -4959,7 +5129,8 @@ fn observe_event(
                 .unwrap_or(plaintext);
             let message = ReceivedMessage {
                 message_id_hex: source_message_id_hex.to_owned(),
-                sender: sender_label,
+                sender: sender_hex,
+                sender_display_name,
                 group_id: group_id.clone(),
                 plaintext,
                 app_message,

@@ -33,11 +33,25 @@ pub mod daemon;
 pub mod tui;
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
-#[command(name = "dm", about = "Darkmatter CLI", disable_help_subcommand = true)]
+#[command(
+    name = "dm",
+    about = "Darkmatter account, group, message, stream, and daemon CLI",
+    disable_help_subcommand = true
+)]
 struct Cli {
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Use this Darkmatter data directory"
+    )]
     home: Option<PathBuf>,
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Connect to this dmd daemon socket"
+    )]
     socket: Option<PathBuf>,
     #[arg(long, global = true, value_name = "URL", hide = true)]
     relay: Option<String>,
@@ -47,13 +61,28 @@ struct Cli {
     #[arg(skip)]
     #[serde(default)]
     daemon_default_account_relays: Vec<String>,
-    #[arg(long, global = true, value_enum, value_name = "STORE")]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "STORE",
+        help = "Store account secrets in the OS keychain or local files"
+    )]
     secret_store: Option<SecretStoreKind>,
-    #[arg(long, global = true, value_name = "SERVICE")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "SERVICE",
+        help = "Use this OS keychain service name for local secret storage"
+    )]
     keychain_service: Option<String>,
-    #[arg(long, value_name = "ACCOUNT")]
+    #[arg(
+        long,
+        value_name = "ACCOUNT",
+        help = "Select the local account label, npub, or hex pubkey"
+    )]
     account: Option<String>,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Emit machine-readable JSON")]
     json: bool,
     #[command(subcommand)]
     command: Command,
@@ -84,6 +113,7 @@ struct CliRuntimeInfo {
 enum Command {
     #[command(about = "Open the interactive terminal UI")]
     Tui,
+    #[command(about = "Inspect local runtime diagnostics")]
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
@@ -95,16 +125,23 @@ enum Command {
     CreateIdentity,
     #[command(about = "Log in with an nsec or add a public npub identity")]
     Login {
-        #[arg(value_name = "NSEC_OR_NPUB")]
+        #[arg(
+            value_name = "NSEC_OR_NPUB",
+            help = "nsec to import or npub to track as a public account"
+        )]
         identity: Option<String>,
-        #[arg(long, value_name = "URL")]
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Command-local relay used for account setup"
+        )]
         relay: Option<String>,
     },
     #[command(about = "Show current account identities")]
     Whoami,
     #[command(about = "Log out and remove a local account")]
     Logout {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(value_name = "NPUB_OR_HEX", help = "Account to remove")]
         pubkey: String,
     },
     #[command(
@@ -112,7 +149,10 @@ enum Command {
         about = "Exporting private keys is disabled by Darkmatter CLI policy"
     )]
     ExportNsec {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "Account whose secret key was requested"
+        )]
         pubkey: String,
     },
     #[command(hide = true)]
@@ -120,18 +160,22 @@ enum Command {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    #[command(about = "Manage local account identities and relay lists")]
     Accounts {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    #[command(about = "Inspect and repair MLS KeyPackage publication")]
     Keys {
         #[command(subcommand)]
         command: KeyPackageCommand,
     },
+    #[command(about = "List chats and subscribe to chat projection updates")]
     Chats {
         #[command(subcommand)]
         command: ChatsCommand,
     },
+    #[command(about = "List media references in a group")]
     Media {
         #[command(subcommand)]
         command: MediaCommand,
@@ -141,6 +185,7 @@ enum Command {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    #[command(about = "Create groups and manage membership and admin state")]
     Groups {
         #[command(subcommand)]
         command: GroupsCommand,
@@ -150,142 +195,209 @@ enum Command {
         #[command(subcommand)]
         command: MessageCommand,
     },
+    #[command(about = "Send, list, search, delete, retry, and react to messages")]
     Messages {
         #[command(subcommand)]
         command: MessageCommand,
     },
+    #[command(about = "Manage the local account follow list")]
     Follows {
         #[command(subcommand)]
         command: FollowsCommand,
     },
+    #[command(about = "Show or publish the selected account Nostr profile")]
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    #[command(about = "Inspect and update account relay lists")]
     Relays {
         #[command(subcommand)]
         command: RelaysCommand,
     },
+    #[command(about = "Read and update local CLI preferences")]
     Settings {
         #[command(subcommand)]
         command: SettingsCommand,
     },
+    #[command(about = "Look up known Nostr users from the local directory")]
     Users {
         #[command(subcommand)]
         command: UsersCommand,
     },
+    #[command(hide = true)]
     Notifications {
         #[command(subcommand)]
         command: NotificationsCommand,
     },
+    #[command(about = "Start, watch, finish, and verify agent text streams")]
     Stream {
         #[command(subcommand)]
         command: StreamCommand,
     },
+    #[command(about = "Start, stop, and inspect the local dmd runtime")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
     #[command(hide = true)]
     Sync,
+    #[command(about = "Delete all local Darkmatter CLI data after confirmation")]
     Reset {
-        #[arg(long)]
+        #[arg(long, help = "Required safety flag before deleting local data")]
         confirm: bool,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum DebugCommand {
-    #[command(name = "relay-control-state")]
+    #[command(
+        name = "relay-control-state",
+        about = "Show the relay-plane subscription and control-state snapshot"
+    )]
     RelayControlState,
+    #[command(about = "Run a local runtime health check for the selected account")]
     Health,
-    #[command(name = "ratchet-tree")]
-    RatchetTree {
-        group_id: String,
-    },
+    #[command(name = "ratchet-tree", hide = true)]
+    RatchetTree { group_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum AccountCommand {
+    #[command(about = "Create a local account and publish its bootstrap records")]
     Create {
-        #[arg(value_name = "NSEC_OR_NPUB")]
+        #[arg(
+            value_name = "NSEC_OR_NPUB",
+            help = "Optional nsec to import or npub to track"
+        )]
         identity: Option<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated account relay list to publish"
+        )]
         default_relays: Vec<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated bootstrap relays used to find account records"
+        )]
         bootstrap_relays: Vec<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Publish missing relay-list records during account creation"
+        )]
         publish_missing_relay_lists: bool,
     },
+    #[command(about = "List local accounts")]
     List,
+    #[command(about = "Show account readiness, relay-list, and KeyPackage status")]
     Status {
+        #[arg(help = "Optional account label, npub, or hex pubkey")]
         account: Option<String>,
     },
-    #[command(name = "relay-lists")]
+    #[command(
+        name = "relay-lists",
+        about = "Fetch and inspect published relay lists"
+    )]
     RelayLists {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "Account to inspect; defaults to selected account"
+        )]
         account: Option<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated relays to use for relay-list discovery"
+        )]
         bootstrap_relays: Vec<String>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum KeyPackageCommand {
+    #[command(about = "List local KeyPackage publication records")]
     List,
-    #[command(hide = true)]
+    #[command(about = "Republish the currently cached KeyPackage")]
     Publish,
-    Delete {
-        event_id: String,
-    },
-    #[command(name = "delete-all")]
+    #[command(
+        about = "Force mint and publish a fresh replacement KeyPackage",
+        alias = "force-publish"
+    )]
+    Rotate,
+    #[command(hide = true)]
+    Delete { event_id: String },
+    #[command(name = "delete-all", hide = true)]
     DeleteAll {
         #[arg(long)]
         confirm: bool,
     },
+    #[command(about = "Check whether a user has relay lists and a fetchable KeyPackage")]
     Check {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(value_name = "NPUB_OR_HEX", help = "User to check")]
         pubkey: String,
     },
+    #[command(about = "Fetch and cache another user's KeyPackage")]
     Fetch {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "User to fetch; defaults to selected account"
+        )]
         account: Option<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated relays to use for relay-list discovery"
+        )]
         bootstrap_relays: Vec<String>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum ChatsCommand {
+    #[command(about = "List current chats")]
     List {
-        #[arg(long)]
+        #[arg(long, help = "Include archived chats")]
         include_archived: bool,
     },
+    #[command(about = "Show one chat")]
     Show {
+        #[arg(help = "Group id to show")]
         group: String,
     },
+    #[command(about = "Subscribe to live chat-list updates through the daemon")]
     Subscribe,
+    #[command(about = "Archive a chat locally")]
     Archive {
+        #[arg(help = "Group id to archive")]
         group: String,
     },
+    #[command(about = "Unarchive a chat locally")]
     Unarchive {
+        #[arg(help = "Group id to unarchive")]
         group: String,
     },
-    #[command(name = "list-archived")]
+    #[command(name = "list-archived", about = "List archived chats")]
     ListArchived,
-    #[command(name = "subscribe-archived")]
+    #[command(
+        name = "subscribe-archived",
+        about = "Subscribe to live archived-chat updates through the daemon"
+    )]
     SubscribeArchived,
-    Mute {
-        group: String,
-        duration: String,
-    },
-    Unmute {
-        group: String,
-    },
+    #[command(hide = true)]
+    Mute { group: String, duration: String },
+    #[command(hide = true)]
+    Unmute { group: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum MediaCommand {
+    #[command(hide = true)]
     Upload {
         group: String,
         file_path: String,
@@ -294,11 +406,11 @@ enum MediaCommand {
         #[arg(long)]
         message: Option<String>,
     },
-    Download {
-        group: String,
-        file_hash: String,
-    },
+    #[command(hide = true)]
+    Download { group: String, file_hash: String },
+    #[command(about = "List media references for a group")]
     List {
+        #[arg(help = "Group id to inspect")]
         group: String,
     },
 }
@@ -336,207 +448,308 @@ enum GroupCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum GroupsCommand {
+    #[command(about = "List groups for the selected account")]
     List,
+    #[command(about = "Create a group and invite members by pubkey")]
     Create {
+        #[arg(help = "Group display name")]
         name: String,
-        #[arg(value_name = "MEMBER")]
+        #[arg(value_name = "MEMBER", help = "Member npub or hex pubkey to add")]
         members: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "Optional group description")]
         description: Option<String>,
     },
+    #[command(about = "Show group metadata and membership state")]
     Show {
+        #[arg(help = "Group id to show")]
         group_id: String,
     },
-    #[command(name = "add-members")]
+    #[command(name = "add-members", about = "Add members to a group")]
     AddMembers {
+        #[arg(help = "Group id to update")]
         group_id: String,
-        #[arg(value_name = "MEMBER", required = true)]
+        #[arg(
+            value_name = "MEMBER",
+            required = true,
+            help = "Member npub or hex pubkey to add"
+        )]
         members: Vec<String>,
     },
-    #[command(name = "remove-members")]
+    #[command(name = "remove-members", about = "Remove members from a group")]
     RemoveMembers {
+        #[arg(help = "Group id to update")]
         group_id: String,
-        #[arg(value_name = "MEMBER", required = true)]
+        #[arg(
+            value_name = "MEMBER",
+            required = true,
+            help = "Member npub or hex pubkey to remove"
+        )]
         members: Vec<String>,
     },
+    #[command(about = "List group members")]
     Members {
+        #[arg(help = "Group id to inspect")]
         group_id: String,
     },
+    #[command(about = "List group admins")]
     Admins {
+        #[arg(help = "Group id to inspect")]
         group_id: String,
     },
+    #[command(about = "List group relay hints")]
     Relays {
+        #[arg(help = "Group id to inspect")]
         group_id: String,
     },
+    #[command(about = "Leave a group")]
     Leave {
+        #[arg(help = "Group id to leave")]
         group_id: String,
     },
+    #[command(about = "Rename a group")]
     Rename {
+        #[arg(help = "Group id to rename")]
         group_id: String,
+        #[arg(help = "New group name")]
         name: String,
     },
+    #[command(hide = true)]
     Invites,
-    Accept {
-        group_id: String,
-    },
-    Decline {
-        group_id: String,
-    },
+    #[command(hide = true)]
+    Accept { group_id: String },
+    #[command(hide = true)]
+    Decline { group_id: String },
+    #[command(about = "Promote a member to group admin")]
     Promote {
+        #[arg(help = "Group id to update")]
         group_id: String,
+        #[arg(help = "Member npub or hex pubkey to promote")]
         pubkey: String,
     },
+    #[command(about = "Demote a group admin")]
     Demote {
+        #[arg(help = "Group id to update")]
         group_id: String,
+        #[arg(help = "Admin npub or hex pubkey to demote")]
         pubkey: String,
     },
-    #[command(name = "self-demote")]
+    #[command(name = "self-demote", about = "Demote the selected account from admin")]
     SelfDemote {
+        #[arg(help = "Group id to update")]
         group_id: String,
     },
-    #[command(name = "subscribe-state")]
+    #[command(
+        name = "subscribe-state",
+        about = "Subscribe to live group-state updates through the daemon"
+    )]
     SubscribeState {
+        #[arg(help = "Group id to watch")]
         group_id: String,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum MessageCommand {
+    #[command(about = "Send a message to a group")]
     Send {
-        #[arg(long = "group", value_name = "GROUP")]
+        #[arg(long = "group", value_name = "GROUP", help = "Group id to send to")]
         group_flag: Option<String>,
-        #[arg(value_name = "GROUP_OR_TEXT", allow_hyphen_values = true)]
+        #[arg(
+            value_name = "GROUP_OR_TEXT",
+            allow_hyphen_values = true,
+            help = "Either GROUP TEXT... or TEXT... when --group is provided"
+        )]
         args: Vec<String>,
     },
+    #[command(about = "Delete a message for the selected account's local view")]
     Delete {
+        #[arg(help = "Group id containing the message")]
         group_id: String,
+        #[arg(help = "Message id to delete")]
         message_id: String,
     },
+    #[command(about = "Retry a failed outbound message event")]
     Retry {
+        #[arg(help = "Group id containing the failed event")]
         group_id: String,
+        #[arg(help = "Event id to retry")]
         event_id: String,
     },
+    #[command(about = "React to a message")]
     React {
+        #[arg(help = "Group id containing the message")]
         group_id: String,
+        #[arg(help = "Message id to react to")]
         message_id: String,
-        #[arg(default_value = "+")]
+        #[arg(default_value = "+", help = "Emoji reaction to add")]
         emoji: String,
     },
+    #[command(about = "Remove your reaction from a message")]
     Unreact {
+        #[arg(help = "Group id containing the message")]
         group_id: String,
+        #[arg(help = "Message id to unreact from")]
         message_id: String,
     },
+    #[command(about = "List messages from one group")]
     List {
-        #[arg(value_name = "GROUP")]
+        #[arg(value_name = "GROUP", help = "Group id to list")]
         group_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Group id to list")]
         group: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Only include messages before this unix timestamp")]
         before: Option<u64>,
-        #[arg(long)]
+        #[arg(long, help = "Only include messages before this message id")]
         before_message_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Only include messages after this unix timestamp")]
         after: Option<u64>,
-        #[arg(long)]
+        #[arg(long, help = "Only include messages after this message id")]
         after_message_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Maximum number of messages to return")]
         limit: Option<usize>,
     },
+    #[command(about = "Search messages in one group")]
     Search {
+        #[arg(help = "Group id to search")]
         group_id: String,
+        #[arg(help = "Search query")]
         query: String,
-        #[arg(long)]
+        #[arg(long, help = "Maximum number of results to return")]
         limit: Option<usize>,
     },
-    #[command(name = "search-all")]
+    #[command(name = "search-all", about = "Search messages across all local groups")]
     SearchAll {
+        #[arg(help = "Search query")]
         query: String,
-        #[arg(long)]
+        #[arg(long, help = "Maximum number of results to return")]
         limit: Option<usize>,
     },
+    #[command(about = "Subscribe to live message updates through the daemon")]
     Subscribe {
+        #[arg(help = "Group id to watch")]
         group: String,
-        #[arg(long)]
+        #[arg(long, help = "Initial replay limit")]
         limit: Option<usize>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum FollowsCommand {
+    #[command(about = "List followed users")]
     List,
+    #[command(about = "Follow a user")]
     Add {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(value_name = "NPUB_OR_HEX", help = "User to follow")]
         pubkey: String,
     },
+    #[command(about = "Unfollow a user")]
     Remove {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(value_name = "NPUB_OR_HEX", help = "User to unfollow")]
         pubkey: String,
     },
+    #[command(about = "Check whether a user is followed")]
     Check {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(value_name = "NPUB_OR_HEX", help = "User to check")]
         pubkey: String,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum ProfileCommand {
+    #[command(about = "Show the selected account Nostr profile")]
     Show,
+    #[command(about = "Update and publish the selected account Nostr profile")]
     Update {
-        #[arg(long)]
+        #[arg(long, help = "Set the short profile name")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Set the display name")]
         display_name: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Set the profile bio")]
         about: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Set the profile picture URL")]
         picture: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Set the NIP-05 identifier")]
         nip05: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Set the Lightning address")]
         lud16: Option<String>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum RelaysCommand {
+    #[command(about = "List account relay URLs")]
     List {
-        #[arg(long = "type", value_name = "TYPE")]
+        #[arg(
+            long = "type",
+            value_name = "TYPE",
+            help = "Relay list type: nip65, inbox, or key_package"
+        )]
         relay_type: Option<String>,
     },
+    #[command(about = "Add a relay URL to an account relay list")]
     Add {
+        #[arg(help = "Relay URL to add")]
         url: String,
-        #[arg(long = "type", value_name = "TYPE")]
+        #[arg(
+            long = "type",
+            value_name = "TYPE",
+            help = "Relay list type: nip65, inbox, or key_package"
+        )]
         relay_type: String,
     },
+    #[command(about = "Remove a relay URL from an account relay list")]
     Remove {
+        #[arg(help = "Relay URL to remove")]
         url: String,
-        #[arg(long = "type", value_name = "TYPE")]
+        #[arg(
+            long = "type",
+            value_name = "TYPE",
+            help = "Relay list type: nip65, inbox, or key_package"
+        )]
         relay_type: String,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum SettingsCommand {
+    #[command(about = "Show local CLI settings")]
     Show,
-    Theme { mode: String },
-    Language { lang: String },
+    #[command(about = "Set the local TUI theme")]
+    Theme {
+        #[arg(help = "Theme mode such as system, light, or dark")]
+        mode: String,
+    },
+    #[command(about = "Set the local UI language")]
+    Language {
+        #[arg(help = "Language tag such as en")]
+        lang: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum UsersCommand {
+    #[command(about = "Show a known user from the local directory")]
     Show {
-        #[arg(value_name = "NPUB_OR_HEX")]
+        #[arg(value_name = "NPUB_OR_HEX", help = "User to show")]
         pubkey: String,
     },
+    #[command(about = "Search known users in the local directory")]
     Search {
+        #[arg(help = "Search query")]
         query: String,
-        #[arg(long, default_value = "0..2", value_parser = parse_radius)]
+        #[arg(
+            long,
+            default_value = "0..2",
+            value_parser = parse_radius,
+            help = "Directory graph radius as START..END"
+        )]
         radius: (u8, u8),
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum NotificationsCommand {
+    #[command(about = "Subscribe to notification updates")]
     Subscribe,
 }
 
@@ -544,52 +757,97 @@ enum NotificationsCommand {
 enum StreamCommand {
     #[command(about = "Anchor a durable agent text stream start over the MLS message path")]
     Start {
+        #[arg(help = "Group id to anchor the stream in")]
         group: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Optional stream id to use")]
         stream_id: Option<String>,
-        #[arg(long = "quic-candidate", value_name = "ADDR")]
+        #[arg(
+            long = "quic-candidate",
+            value_name = "ADDR",
+            help = "QUIC candidate URI such as quic://127.0.0.1:4450"
+        )]
         quic_candidates: Vec<String>,
     },
     #[command(about = "Receive one provisional QUIC agent text stream")]
     Receive {
-        #[arg(long, default_value = "127.0.0.1:4450", value_name = "ADDR")]
+        #[arg(
+            long,
+            default_value = "127.0.0.1:4450",
+            value_name = "ADDR",
+            help = "Local address to bind"
+        )]
         bind: SocketAddr,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Expected stream-start event id")]
         start_event_id: Option<String>,
     },
     #[command(about = "Send one provisional QUIC agent text stream")]
     Send {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Use the broker protocol instead of direct QUIC stream receive"
+        )]
         broker: bool,
-        #[arg(long, value_name = "ADDR")]
+        #[arg(long, value_name = "ADDR", help = "Remote QUIC address")]
         connect: SocketAddr,
-        #[arg(long, default_value = "localhost", value_name = "NAME")]
+        #[arg(
+            long,
+            default_value = "localhost",
+            value_name = "NAME",
+            help = "TLS server name"
+        )]
         server_name: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(
+            long,
+            value_name = "HEX",
+            help = "Pinned server certificate DER bytes as hex"
+        )]
         server_cert_der_hex: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Trust loopback QUIC certificates for local testing")]
         insecure_local: bool,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Optional stream id to use")]
         stream_id: Option<String>,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Expected stream-start event id")]
         start_event_id: Option<String>,
-        #[arg(long, default_value_t = 1024, value_name = "BYTES")]
+        #[arg(
+            long,
+            default_value_t = 1024,
+            value_name = "BYTES",
+            help = "Maximum bytes per streamed chunk"
+        )]
         chunk_bytes: usize,
-        #[arg(long, default_value_t = 0, value_name = "MILLIS")]
+        #[arg(
+            long,
+            default_value_t = 0,
+            value_name = "MILLIS",
+            help = "Delay between streamed chunks"
+        )]
         chunk_delay_ms: u64,
-        #[arg(value_name = "TEXT", required = true, allow_hyphen_values = true)]
+        #[arg(
+            value_name = "TEXT",
+            required = true,
+            allow_hyphen_values = true,
+            help = "Text to stream"
+        )]
         text: Vec<String>,
     },
     #[command(about = "Watch one brokered QUIC agent text stream from a durable MLS start payload")]
     Watch {
+        #[arg(help = "Group id containing the stream start")]
         group: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to watch")]
         stream_id: Option<String>,
-        #[arg(long, value_name = "HEX")]
+        #[arg(
+            long,
+            value_name = "HEX",
+            help = "Pinned server certificate DER bytes as hex"
+        )]
         server_cert_der_hex: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Trust loopback QUIC certificates for local testing")]
         insecure_local: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Register the watch with the daemon and return immediately"
+        )]
         background: bool,
     },
     #[command(hide = true)]
@@ -623,37 +881,57 @@ enum StreamCommand {
     },
     #[command(about = "Commit the final agent text stream transcript over the MLS message path")]
     Finish {
+        #[arg(help = "Group id containing the stream")]
         group: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to finish")]
         stream_id: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Final transcript hash")]
         transcript_hash: String,
-        #[arg(long)]
+        #[arg(long, help = "Number of streamed chunks")]
         chunk_count: u64,
-        #[arg(value_name = "TEXT", required = true, allow_hyphen_values = true)]
+        #[arg(
+            value_name = "TEXT",
+            required = true,
+            allow_hyphen_values = true,
+            help = "Final text"
+        )]
         text: Vec<String>,
     },
     #[command(about = "Verify a local QUIC transcript against the durable MLS final payload")]
     Verify {
+        #[arg(help = "Group id containing the stream")]
         group: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to verify")]
         stream_id: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Expected transcript hash")]
         transcript_hash: String,
-        #[arg(long)]
+        #[arg(long, help = "Expected streamed chunk count")]
         chunk_count: Option<u64>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum DaemonCommand {
+    #[command(about = "Start dmd in the background")]
     Start {
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated discovery relays for profiles, relay lists, and KeyPackages"
+        )]
         discovery_relays: Vec<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated default account relays used when creating identities"
+        )]
         default_account_relays: Vec<String>,
     },
+    #[command(about = "Stop the background dmd daemon")]
     Stop,
+    #[command(about = "Show daemon status, relay health, and stream watches")]
     Status,
 }
 
@@ -1235,7 +1513,7 @@ fn whoami_command(
     let accounts = account_home.accounts()?;
     let accounts_json = accounts
         .into_iter()
-        .map(account_summary_json)
+        .map(|account| account_summary_json(app, account))
         .collect::<Vec<_>>();
     let plain = if accounts_json.is_empty() {
         "no accounts".to_owned()
@@ -1245,7 +1523,7 @@ fn whoami_command(
             .map(|account| {
                 format!(
                     "{} {} local-signing={}",
-                    account.get("npub").and_then(Value::as_str).unwrap_or(""),
+                    account_display_name_or_npub(account),
                     account
                         .get("account_id")
                         .and_then(Value::as_str)
@@ -1478,26 +1756,32 @@ async fn account_command(
         }
         AccountCommand::List => {
             let accounts = account_home.accounts()?;
-            let plain = if accounts.is_empty() {
+            let accounts_json = accounts
+                .into_iter()
+                .map(|account| account_summary_json(app, account))
+                .collect::<Vec<_>>();
+            let plain = if accounts_json.is_empty() {
                 "no accounts".to_owned()
             } else {
-                accounts
+                accounts_json
                     .iter()
                     .map(|account| {
                         format!(
                             "{} {} local-signing={}",
-                            npub_for_account_id(&account.account_id_hex),
-                            account.account_id_hex,
-                            account.local_signing
+                            account_display_name_or_npub(account),
+                            account
+                                .get("account_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            account
+                                .get("local_signing")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            let accounts_json = accounts
-                .into_iter()
-                .map(account_summary_json)
-                .collect::<Vec<_>>();
             Ok(CommandOutput {
                 plain,
                 json: json!({ "accounts": accounts_json }),
@@ -1609,6 +1893,25 @@ pub(crate) async fn key_package_command_with_runtime(
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex),
                     "key_package_bytes": key_package_bytes,
+                }),
+            })
+        }
+        KeyPackageCommand::Rotate => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let key_package_bytes = runtime.rotate_key_package(&account.label).await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "rotated key package for {} bytes={}",
+                    npub_for_account_id(&account.account_id_hex),
+                    key_package_bytes
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "key_package_bytes": key_package_bytes,
+                    "rotated": true,
                 }),
             })
         }
@@ -2473,7 +2776,7 @@ pub(crate) async fn message_command_with_runtime(
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex),
-                    "messages": message_list_json(messages),
+                    "messages": message_list_json_with_profiles(app, messages),
                 }),
             })
         }
@@ -2492,7 +2795,7 @@ pub(crate) async fn message_command_with_runtime(
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex),
                     "query": query,
-                    "messages": message_list_json(messages),
+                    "messages": message_list_json_with_profiles(app, messages),
                 }),
             })
         }
@@ -2507,7 +2810,7 @@ pub(crate) async fn message_command_with_runtime(
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex),
                     "query": query,
-                    "messages": message_list_json(messages),
+                    "messages": message_list_json_with_profiles(app, messages),
                 }),
             })
         }
@@ -3667,7 +3970,7 @@ async fn sync_command(
     let summary = client.sync().await?;
     Ok(CommandOutput {
         plain: sync_plain(&summary),
-        json: sync_json(account, summary),
+        json: sync_json(app, account, summary),
     })
 }
 
@@ -3695,7 +3998,11 @@ fn sync_plain(summary: &SyncSummary) -> String {
     }
 }
 
-fn sync_json(account: marmot_account::AccountSummary, summary: SyncSummary) -> Value {
+fn sync_json(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+    summary: SyncSummary,
+) -> Value {
     json!({
         "account_id": account.account_id_hex,
         "npub": npub_for_account_id(&account.account_id_hex),
@@ -3704,11 +4011,16 @@ fn sync_json(account: marmot_account::AccountSummary, summary: SyncSummary) -> V
         }).collect::<Vec<_>>(),
         "messages": summary.messages.into_iter().map(|message| {
             let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
+            let from_display_name = message
+                .sender_display_name
+                .clone()
+                .or_else(|| display_name_for_sender(app, &message.sender));
             let app_message = message.app_message;
             let mut value = json!({
                 "message_id": message.message_id_hex,
                 "direction": "received",
                 "from": message.sender,
+                "from_display_name": from_display_name,
                 "group_id": hex::encode(message.group_id.as_slice()),
                 "plaintext": message.plaintext,
             });
@@ -3724,12 +4036,40 @@ fn sync_json(account: marmot_account::AccountSummary, summary: SyncSummary) -> V
     })
 }
 
-fn account_summary_json(account: marmot_account::AccountSummary) -> Value {
+fn account_summary_json(app: &MarmotApp, account: marmot_account::AccountSummary) -> Value {
+    let profile = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.profile);
+    let display_name = profile_display_name(profile.as_ref());
     json!({
         "account_id": account.account_id_hex,
         "npub": npub_for_account_id(&account.account_id_hex),
+        "display_name": display_name,
+        "profile": profile,
         "local_signing": account.local_signing,
     })
+}
+
+fn account_display_name_or_npub(account: &Value) -> &str {
+    account
+        .get("display_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| account.get("npub").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn profile_display_name(profile: Option<&UserProfileMetadata>) -> Option<String> {
+    let profile = profile?;
+    profile
+        .display_name
+        .as_deref()
+        .or(profile.name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn group_list_plain(groups: &[AppGroupRecord]) -> String {
@@ -3838,30 +4178,46 @@ fn message_list_plain(messages: &[AppMessageRecord]) -> String {
         .join("\n")
 }
 
-fn message_list_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
+fn message_list_json_with_profiles(app: &MarmotApp, messages: Vec<AppMessageRecord>) -> Vec<Value> {
     messages
         .into_iter()
         .map(|message| {
-            let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
-            let app_message = message.app_message;
-            let mut value = json!({
-                "message_id": message.message_id_hex,
-                "direction": message.direction,
-                "group_id": message.group_id_hex,
-                "from": message.sender,
-                "plaintext": message.plaintext,
-                "recorded_at": message.recorded_at,
-                "received_at": message.received_at,
-            });
-            if let Some(agent_text_stream) = agent_text_stream {
-                value["agent_text_stream"] = agent_text_stream;
-            }
-            if let Some(app_message) = app_message {
-                value["app_message"] = json!(app_message);
-            }
-            value
+            let from_display_name = display_name_for_sender(app, &message.sender);
+            message_record_json(message, from_display_name)
         })
         .collect()
+}
+
+fn message_record_json(message: AppMessageRecord, from_display_name: Option<String>) -> Value {
+    let agent_text_stream = agent_text_stream_payload_json(&message.plaintext);
+    let app_message = message.app_message;
+    let mut value = json!({
+        "message_id": message.message_id_hex,
+        "direction": message.direction,
+        "group_id": message.group_id_hex,
+        "from": message.sender,
+        "from_display_name": from_display_name,
+        "plaintext": message.plaintext,
+        "recorded_at": message.recorded_at,
+        "received_at": message.received_at,
+    });
+    if let Some(agent_text_stream) = agent_text_stream {
+        value["agent_text_stream"] = agent_text_stream;
+    }
+    if let Some(app_message) = app_message {
+        value["app_message"] = json!(app_message);
+    }
+    value
+}
+
+fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<String> {
+    let account_id = parse_public_key(sender).ok()?;
+    let profile = app
+        .directory_entry_for_account_id(&account_id)
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.profile);
+    profile_display_name(profile.as_ref())
 }
 
 fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {

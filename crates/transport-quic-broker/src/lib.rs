@@ -18,7 +18,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{ReceivedTextChunk, ReceivedTextStream, SentTextStream};
 
@@ -30,7 +30,6 @@ const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_SERVER_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
-const SUBSCRIBER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug)]
 pub struct QuicBrokerConfig {
@@ -415,10 +414,21 @@ struct BrokerStateInner {
     next_subscriber_id: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BrokerRoom {
     subscribers: Vec<Subscriber>,
     backlog: Vec<AgentTextStreamRecordV1>,
+    subscriber_notify: Arc<Notify>,
+}
+
+impl Default for BrokerRoom {
+    fn default() -> Self {
+        Self {
+            subscribers: Vec::new(),
+            backlog: Vec::new(),
+            subscriber_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -450,6 +460,8 @@ impl BrokerState {
             }
         }
         room.subscribers.push(Subscriber { id, tx });
+        room.subscriber_notify.notify_waiters();
+        room.subscriber_notify.notify_one();
         (id, rx)
     }
 
@@ -481,22 +493,18 @@ impl BrokerState {
         delivered
     }
 
-    async fn has_subscribers(&self, key: &BrokerStreamKey) -> bool {
-        self.inner
-            .lock()
-            .await
-            .rooms
-            .get(key)
-            .is_some_and(|room| !room.subscribers.is_empty())
-    }
-
     async fn wait_for_subscriber(&self, key: &BrokerStreamKey) {
         let _ = timeout(PUBLISH_SUBSCRIBER_GRACE, async {
             loop {
-                if self.has_subscribers(key).await {
-                    return;
-                }
-                sleep(SUBSCRIBER_POLL_INTERVAL).await;
+                let notify = {
+                    let mut inner = self.inner.lock().await;
+                    let room = inner.rooms.entry(key.clone()).or_default();
+                    if !room.subscribers.is_empty() {
+                        return;
+                    }
+                    room.subscriber_notify.clone()
+                };
+                notify.notified().await;
             }
         })
         .await;

@@ -42,6 +42,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added `dm stream watch` and `dm stream send --broker` for brokered QUIC preview streams anchored by the
   durable start message.
 - Added `dm stream receive` and `dm stream send` for provisional raw QUIC agent text stream previews.
+- Added `dm keys rotate` as an explicit repair command that force-mints and publishes a fresh replacement KeyPackage.
 
 ### Changed
 
@@ -49,8 +50,18 @@ versioning through the workspace version in the root `Cargo.toml`.
   runtime subscription model. The older singular `dm message` spelling still works during the transition.
 - `dm create-identity` and `dm login <nsec>` now publish the initial local KeyPackage automatically after relay-list
   setup, so the normal invite path does not require a separate `keys publish` repair step.
+- `dm keys publish` now republishes the cached initial KeyPackage instead of minting a replacement package during
+  normal repair/setup flows.
 - Message projections now order history by recorded transport time before local receipt/insertion order, so synced
   stream anchors/finals no longer jump ahead of older chat text merely because they arrived first during catch-up.
+- Account list, `whoami`, sync, and message-list JSON now include cached Nostr profile display names where available,
+  and the TUI uses those names in account chrome and received-message authors before falling back to npubs.
+- The TUI now tails daemon-backed `messages subscribe` updates for the selected chat, so incoming messages and QUIC
+  stream-preview deltas can render without timer-driven message-list refreshes.
+- Removed the daemon runtime maintenance timer and the TUI's periodic daemon/account/chat/message refresh paths; runtime
+  state now advances from startup, explicit CLI/TUI intents, and subscription events.
+- TUI stream compose typing now batches append calls instead of blocking the interface on a daemon round-trip for every
+  character.
 - The TUI uses higher-contrast neutral account labels and green focus accents instead of the low-contrast cyan account
   treatment; daemon controls stay focused on start, status, and stop.
 - Typed app-message payloads are validated before publish/projection; malformed reaction, media, delete, or retry

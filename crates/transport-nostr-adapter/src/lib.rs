@@ -466,6 +466,26 @@ impl TransportAdapter for NostrTransportAdapter {
             }
         };
 
+        let local_fanout_endpoints = if !outcome.accepted.is_empty() {
+            outcome
+                .accepted
+                .iter()
+                .map(|receipt| receipt.endpoint.clone())
+                .collect::<Vec<_>>()
+        } else if outcome.failed.is_empty() {
+            request.target.endpoints().to_vec()
+        } else {
+            Vec::new()
+        };
+        if !local_fanout_endpoints.is_empty() {
+            let mut local_message = request.message.clone();
+            if let Some(message_id) = outcome.message_id.clone() {
+                local_message.id = message_id;
+            }
+            self.deliver_local_publish(&local_message, &local_fanout_endpoints)
+                .await?;
+        }
+
         Ok(TransportPublishReport {
             message_id: outcome.message_id.unwrap_or(request.message.id),
             accepted: outcome.accepted,
@@ -476,6 +496,50 @@ impl TransportAdapter for NostrTransportAdapter {
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
         Ok(self.delivery_rx.lock().await.recv().await)
+    }
+}
+
+impl NostrTransportAdapter {
+    pub async fn deliver_local_publish(
+        &self,
+        message: &TransportMessage,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<usize, TransportAdapterError> {
+        let mut delivered = 0;
+        let mut seen_routes = HashSet::new();
+        for endpoint in endpoints {
+            let routes = {
+                let state = self.state.read().await;
+                state.routes_for(message, endpoint)
+            };
+            for route in routes {
+                let key = (
+                    route.account_id.clone(),
+                    route.group_id_hint.clone(),
+                    route.plane,
+                );
+                if !seen_routes.insert(key) {
+                    continue;
+                }
+                self.delivery_tx
+                    .send(TransportDelivery {
+                        account_id: route.account_id,
+                        group_id_hint: route.group_id_hint,
+                        message: message.clone(),
+                        received_at: message.timestamp,
+                        source: TransportDeliverySource {
+                            transport: TransportSource(NOSTR_SOURCE.into()),
+                            plane: route.plane,
+                            endpoint: Some(endpoint.clone()),
+                            subscription_id: Some("local-publish".to_owned()),
+                        },
+                    })
+                    .await
+                    .map_err(|_| TransportAdapterError::Backend("delivery queue closed".into()))?;
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
     }
 }
 

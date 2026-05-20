@@ -195,33 +195,41 @@ fn whitenoise_command_surface_names_are_present() {
         String::from_utf8_lossy(&dm_help.stdout),
         String::from_utf8_lossy(&dm_help.stderr)
     );
-    for command in [
-        "daemon",
-        "debug",
-        "create-identity",
-        "login",
-        "logout",
-        "whoami",
-        "export-nsec",
-        "accounts",
-        "chats",
-        "groups",
-        "media",
-        "messages",
-        "follows",
-        "profile",
-        "relays",
-        "settings",
-        "users",
-        "notifications",
-        "keys",
-        "reset",
+    for (command, description) in [
+        ("daemon", "Start, stop, and inspect"),
+        ("debug", "Inspect local runtime diagnostics"),
+        ("create-identity", "Create a new local signing identity"),
+        ("login", "Log in with an nsec"),
+        ("logout", "Log out and remove a local account"),
+        ("whoami", "Show current account identities"),
+        ("export-nsec", "Exporting private keys is disabled"),
+        ("accounts", "Manage local account identities"),
+        ("chats", "List chats and subscribe"),
+        ("groups", "Create groups and manage membership"),
+        ("media", "List media references"),
+        ("messages", "Send, list, search"),
+        ("follows", "Manage the local account follow list"),
+        ("profile", "Show or publish"),
+        ("relays", "Inspect and update account relay lists"),
+        ("settings", "Read and update local CLI preferences"),
+        ("users", "Look up known Nostr users"),
+        ("keys", "Inspect and repair MLS KeyPackage"),
+        ("stream", "Start, watch, finish"),
+        ("reset", "Delete all local Darkmatter CLI data"),
     ] {
         assert!(dm_help.contains(command), "dm --help missing {command}");
+        assert!(
+            dm_help.contains(description),
+            "dm --help missing description for {command}: {description}"
+        );
     }
     assert!(
         !dm_help.contains("--relay"),
         "dm --help should not expose a global relay flag"
+    );
+    assert!(
+        !dm_help.contains("notifications"),
+        "dm --help should not expose placeholder notification commands"
     );
 
     let login_help = Command::new(env!("CARGO_BIN_EXE_dm"))
@@ -333,6 +341,81 @@ fn whitenoise_command_surface_names_are_present() {
         assert!(
             messages_list_help.contains(flag),
             "dm messages list --help missing {flag}"
+        );
+    }
+
+    let keys_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["keys", "--help"])
+        .output()
+        .expect("keys help should run");
+    assert!(
+        keys_help.status.success(),
+        "{}",
+        command_output_summary(&keys_help)
+    );
+    let keys_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&keys_help.stdout),
+        String::from_utf8_lossy(&keys_help.stderr)
+    );
+    for expected in [
+        "Republish the currently cached KeyPackage",
+        "Force mint and publish a fresh replacement KeyPackage",
+        "Check whether a user has relay lists",
+        "Fetch and cache another user's KeyPackage",
+    ] {
+        assert!(
+            keys_help.contains(expected),
+            "dm keys --help missing {expected}"
+        );
+    }
+    for stale in ["delete", "delete-all"] {
+        assert!(
+            !keys_help.contains(stale),
+            "dm keys --help should not expose stale {stale}"
+        );
+    }
+
+    let groups_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["groups", "--help"])
+        .output()
+        .expect("groups help should run");
+    assert!(
+        groups_help.status.success(),
+        "{}",
+        command_output_summary(&groups_help)
+    );
+    let groups_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&groups_help.stdout),
+        String::from_utf8_lossy(&groups_help.stderr)
+    );
+    for stale in ["invites", "accept", "decline"] {
+        assert!(
+            !groups_help.contains(stale),
+            "dm groups --help should not expose stale {stale}"
+        );
+    }
+
+    for (args, hidden) in [
+        (vec!["debug", "--help"], "ratchet-tree"),
+        (vec!["chats", "--help"], "mute"),
+        (vec!["media", "--help"], "upload"),
+        (vec!["media", "--help"], "download"),
+    ] {
+        let help = Command::new(env!("CARGO_BIN_EXE_dm"))
+            .args(args)
+            .output()
+            .expect("nested help should run");
+        assert!(help.status.success(), "{}", command_output_summary(&help));
+        let help = format!(
+            "{}{}",
+            String::from_utf8_lossy(&help.stdout),
+            String::from_utf8_lossy(&help.stderr)
+        );
+        assert!(
+            !help.contains(hidden),
+            "nested help should not expose stale {hidden}"
         );
     }
 }
@@ -1035,6 +1118,11 @@ fn account_create_list_and_status_are_json_addressable() {
     let listed = run_json(home.path(), &["account", "list"]);
     assert_eq!(listed["accounts"][0]["account_id"], account_id);
     assert_eq!(listed["accounts"][0]["npub"], created["npub"]);
+    assert_eq!(listed["accounts"][0]["profile"], created["profile"]);
+    assert_eq!(
+        listed["accounts"][0]["display_name"],
+        created["profile"]["display_name"]
+    );
 
     let status = run_json(home.path(), &["account", "status", account_id]);
     assert_eq!(status["account_id"], account_id);
@@ -1144,6 +1232,17 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
             .expect("accounts")
             .len(),
         2
+    );
+    let created_account = accounts_list["accounts"]
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|account| account["account_id"] == created_id)
+        .expect("created account in list");
+    assert_eq!(created_account["profile"], created["profile"]);
+    assert_eq!(
+        created_account["display_name"],
+        created["profile"]["display_name"]
     );
 }
 
@@ -1479,6 +1578,58 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
         serde_json::json!([relay])
     );
     assert_eq!(fetched["source_relays"], serde_json::json!([relay]));
+}
+
+#[test]
+fn keys_publish_reuses_create_identity_key_package() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
+
+    let created = run_json_with_relay(home.path(), relay, &["create-identity"]);
+    let account_id = created["account_id"].as_str().expect("account id");
+    let first = run_json(
+        home.path(),
+        &["keys", "fetch", account_id, "--bootstrap-relays", relay],
+    );
+
+    let republished = run_json(home.path(), &["--account", account_id, "keys", "publish"]);
+    let second = run_json(
+        home.path(),
+        &["keys", "fetch", account_id, "--bootstrap-relays", relay],
+    );
+
+    assert_eq!(republished["key_package_bytes"], first["key_package_bytes"]);
+    assert_eq!(second["key_package_id"], first["key_package_id"]);
+    assert_eq!(second["key_package_bytes"], first["key_package_bytes"]);
+}
+
+#[test]
+fn keys_rotate_forces_a_new_key_package_then_publish_reuses_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
+
+    let created = run_json_with_relay(home.path(), relay, &["create-identity"]);
+    let account_id = created["account_id"].as_str().expect("account id");
+    let first = run_json(
+        home.path(),
+        &["keys", "fetch", account_id, "--bootstrap-relays", relay],
+    );
+
+    let rotated = run_json(home.path(), &["--account", account_id, "keys", "rotate"]);
+    assert_eq!(rotated["rotated"], true);
+    let second = run_json(
+        home.path(),
+        &["keys", "fetch", account_id, "--bootstrap-relays", relay],
+    );
+    run_json(home.path(), &["--account", account_id, "keys", "publish"]);
+    let third = run_json(
+        home.path(),
+        &["keys", "fetch", account_id, "--bootstrap-relays", relay],
+    );
+
+    assert_ne!(second["key_package_id"], first["key_package_id"]);
+    assert_eq!(second["key_package_bytes"], rotated["key_package_bytes"]);
+    assert_eq!(third["key_package_id"], second["key_package_id"]);
 }
 
 #[test]
@@ -3111,7 +3262,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     assert!(status_json["result"].get("last_sync").is_none());
     assert!(status_json["result"].get("last_runtime_activity").is_some());
 
-    let created = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let alice_created = Command::new(env!("CARGO_BIN_EXE_dm"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -3119,14 +3270,50 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .output()
         .expect("dm create-identity should run through daemon");
     assert!(
-        created.status.success(),
+        alice_created.status.success(),
         "daemon execute failed\n{}",
-        command_output_summary(&created)
+        command_output_summary(&alice_created)
     );
     let created_json: Value =
-        serde_json::from_slice(&created.stdout).expect("created stdout should be JSON");
+        serde_json::from_slice(&alice_created.stdout).expect("created stdout should be JSON");
     assert_eq!(created_json["result"]["local_signing"], true);
     assert_eq!(created_json["result"]["key_package"]["published"], true);
+    let alice = created_json["result"]["account_id"]
+        .as_str()
+        .expect("alice account id");
+
+    let bob_created = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["create-identity"])
+        .output()
+        .expect("dm second create-identity should run through daemon");
+    assert!(
+        bob_created.status.success(),
+        "daemon second create failed\n{}",
+        command_output_summary(&bob_created)
+    );
+    let bob_created_json: Value =
+        serde_json::from_slice(&bob_created.stdout).expect("bob created stdout should be JSON");
+    let bob = bob_created_json["result"]["account_id"]
+        .as_str()
+        .expect("bob account id");
+
+    let group_created = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--account")
+        .arg(alice)
+        .arg("--json")
+        .args(["groups", "create", "agent", bob])
+        .output()
+        .expect("dm groups create should run through daemon");
+    assert!(
+        group_created.status.success(),
+        "daemon group create failed\n{}",
+        command_output_summary(&group_created)
+    );
 
     let whoami = Command::new(env!("CARGO_BIN_EXE_dm"))
         .arg("--socket")
@@ -3146,7 +3333,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
             .as_array()
             .expect("accounts")
             .len(),
-        1
+        2
     );
 
     let stop = Command::new(env!("CARGO_BIN_EXE_dm"))
@@ -3330,6 +3517,34 @@ fn group_create_fetches_missing_key_package_for_pubkey_members() {
 }
 
 #[test]
+fn group_create_fetches_rotated_remote_key_package_via_discovery_relays() {
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
+    let relay = test_relay_url();
+
+    let bob_created = run_json_with_relay(bob_home.path(), relay, &["create-identity"]);
+    let bob = bob_created["account_id"].as_str().expect("bob account id");
+    run_json_with_relay(
+        bob_home.path(),
+        relay,
+        &["--account", bob, "keys", "rotate"],
+    );
+
+    let alice_created = run_json_with_relay(alice_home.path(), relay, &["create-identity"]);
+    let alice = alice_created["account_id"]
+        .as_str()
+        .expect("alice account id");
+
+    let created_group = run_json_with_relay(
+        alice_home.path(),
+        relay,
+        &["--account", alice, "groups", "create", "remote", bob],
+    );
+
+    assert!(created_group["group_id"].as_str().is_some());
+}
+
+#[test]
 fn group_archive_is_local_state_not_membership_state() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -3414,11 +3629,19 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
 
     let bob_sync = sync_until_message(home.path(), test_relay_url(), &bob, "hello bob");
     assert_eq!(bob_sync["messages"][0]["from"], alice);
+    assert_eq!(
+        bob_sync["messages"][0]["from_display_name"],
+        format!("Marmot {}", &alice[..8])
+    );
     assert_eq!(bob_sync["messages"][0]["group_id"], group_id);
     assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
 
     let bob_messages = run_json(home.path(), &["--account", &bob, "message", "list"]);
     assert_eq!(bob_messages["messages"][0]["from"], alice);
+    assert_eq!(
+        bob_messages["messages"][0]["from_display_name"],
+        format!("Marmot {}", &alice[..8])
+    );
     assert_eq!(bob_messages["messages"][0]["group_id"], group_id);
     assert_eq!(bob_messages["messages"][0]["plaintext"], "hello bob");
 }

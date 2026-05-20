@@ -695,6 +695,29 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .publish_client
             .publish_event(request.target.endpoints(), &event, request.required_acks)
             .await?;
+        let local_fanout_endpoints = if !outcome.accepted.is_empty() {
+            outcome
+                .accepted
+                .iter()
+                .map(|receipt| receipt.endpoint.clone())
+                .collect::<Vec<_>>()
+        } else if outcome.failed.is_empty() {
+            request.target.endpoints().to_vec()
+        } else {
+            Vec::new()
+        };
+        if !local_fanout_endpoints.is_empty() {
+            let mut local_message = request.message.clone();
+            if let Some(message_id) = outcome.message_id.clone() {
+                local_message.id = message_id;
+            }
+            self.relay_plane
+                .inner
+                .transport
+                .adapter
+                .deliver_local_publish(&local_message, &local_fanout_endpoints)
+                .await?;
+        }
         Ok(publish_report_from_outcome(outcome, request))
     }
 
@@ -1107,6 +1130,69 @@ mod tests {
         assert_eq!(bob_delivery.group_id_hint, Some(group_id));
         assert_eq!(alice_delivery.source.plane, TransportDeliveryPlane::Group);
         assert_eq!(bob_delivery.source.plane, TransportDeliveryPlane::Group);
+    }
+
+    #[tokio::test]
+    async fn published_group_event_is_fanned_out_to_matching_local_accounts() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let bob = MemberId::new(vec![0xB2; 32]);
+        let group_id = GroupId::new(vec![0xC3; 32]);
+        let transport_group_id = vec![0xD4; 32];
+        let endpoint = TransportEndpoint("wss://relay.example".into());
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+        let bob_adapter = relay_plane.account_adapter(bob.clone(), relay.clone());
+        let subscription = TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id: transport_group_id.clone(),
+            endpoints: vec![endpoint.clone()],
+        };
+
+        alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![subscription.clone()],
+                since: None,
+            })
+            .await
+            .unwrap();
+        bob_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: bob.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![subscription],
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let message = group_event("33", &transport_group_id)
+            .to_transport_message()
+            .unwrap();
+        alice_adapter
+            .publish(TransportPublishRequest {
+                account_id: alice,
+                message: message.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group_id.clone(),
+                    transport_group_id,
+                    endpoints: vec![endpoint],
+                },
+                required_acks: 0,
+            })
+            .await
+            .unwrap();
+
+        let bob_delivery = bob_adapter.receive().await.unwrap().unwrap();
+        assert_eq!(bob_delivery.account_id, bob);
+        assert_eq!(bob_delivery.group_id_hint, Some(group_id));
+        assert_eq!(bob_delivery.message, message);
+        assert_eq!(
+            bob_delivery.source.subscription_id.as_deref(),
+            Some("local-publish")
+        );
     }
 
     fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEvent {

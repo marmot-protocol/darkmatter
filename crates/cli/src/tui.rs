@@ -1,6 +1,9 @@
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command as StdCommand;
-use std::time::{Duration, Instant};
+use std::process::{Child, Command as StdCommand, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -14,8 +17,8 @@ use crate::{Cli, CliOutput, SecretStoreKind};
 
 type TuiResult<T> = Result<T, TuiError>;
 
-const DAEMON_STATUS_INTERVAL: Duration = Duration::from_secs(2);
-const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const UI_EVENT_WAIT: Duration = Duration::from_millis(50);
+const STREAM_APPEND_FLUSH_INTERVAL: Duration = Duration::from_millis(125);
 const FOCUS_ACCENT: Color = Color::Green;
 const ACCOUNT_ACCENT: Color = Color::White;
 const DEFAULT_STREAM_CANDIDATE: &str = "quic://127.0.0.1:4450";
@@ -69,30 +72,7 @@ impl DmClient {
     where
         S: AsRef<str>,
     {
-        let mut command = StdCommand::new(&self.exe);
-        command.arg("--json");
-        if let Some(home) = &self.home {
-            command.arg("--home").arg(home);
-        }
-        if let Some(socket) = &self.socket {
-            command.arg("--socket").arg(socket);
-        }
-        if let Some(relay) = &self.relay {
-            command.arg("--relay").arg(relay);
-        }
-        if let Some(secret_store) = self.secret_store {
-            command.arg("--secret-store").arg(secret_store.as_str());
-        }
-        if let Some(service) = &self.keychain_service {
-            command.arg("--keychain-service").arg(service);
-        }
-        if let Some(account) = account {
-            command.arg("--account").arg(account);
-        }
-        for arg in args {
-            command.arg(arg.as_ref());
-        }
-
+        let mut command = self.command(account, args);
         let output = command.output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -119,12 +99,52 @@ impl DmClient {
             .unwrap_or_else(|| stderr.trim());
         Err(TuiError::Cli(message.to_owned()))
     }
+
+    fn spawn_json_lines<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Child>
+    where
+        S: AsRef<str>,
+    {
+        let mut command = self.command(account, args);
+        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        Ok(command.spawn()?)
+    }
+
+    fn command<S>(&self, account: Option<&str>, args: &[S]) -> StdCommand
+    where
+        S: AsRef<str>,
+    {
+        let mut command = StdCommand::new(&self.exe);
+        command.arg("--json");
+        if let Some(home) = &self.home {
+            command.arg("--home").arg(home);
+        }
+        if let Some(socket) = &self.socket {
+            command.arg("--socket").arg(socket);
+        }
+        if let Some(relay) = &self.relay {
+            command.arg("--relay").arg(relay);
+        }
+        if let Some(secret_store) = self.secret_store {
+            command.arg("--secret-store").arg(secret_store.as_str());
+        }
+        if let Some(service) = &self.keychain_service {
+            command.arg("--keychain-service").arg(service);
+        }
+        if let Some(account) = account {
+            command.arg("--account").arg(account);
+        }
+        for arg in args {
+            command.arg(arg.as_ref());
+        }
+        command
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AccountRow {
     account_id: String,
     npub: String,
+    display_name: Option<String>,
     local_signing: bool,
 }
 
@@ -140,6 +160,7 @@ struct MessageRow {
     message_id: String,
     direction: String,
     from: String,
+    from_display_name: Option<String>,
     plaintext: String,
     display_text: String,
     recorded_at: u64,
@@ -173,6 +194,38 @@ struct DaemonStreamWatchView {
     transcript_hash: Option<String>,
     chunk_count: Option<u64>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveStreamPreview {
+    group_id: String,
+    stream_id: String,
+    author: String,
+    status: String,
+    text: String,
+    error: Option<String>,
+    optimistic: bool,
+}
+
+#[derive(Debug)]
+enum SubscriptionEvent {
+    Result(Value),
+    Error(String),
+    Ended,
+}
+
+struct MessageSubscription {
+    account_id: String,
+    group_id: String,
+    child: Child,
+    rx: Receiver<SubscriptionEvent>,
+}
+
+impl Drop for MessageSubscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,7 +265,6 @@ impl Focus {
 enum SlashCommand {
     Help,
     Refresh,
-    Sync,
     Account(String),
     AccountCreate,
     AccountAddPublic(String),
@@ -233,6 +285,8 @@ enum SlashCommand {
     MembersRemove(Vec<String>),
     MembersList,
     KeysFetch(String),
+    KeysRotate,
+    ProfileName(String),
     StreamCompose {
         stream_id: Option<String>,
         quic_candidates: Vec<String>,
@@ -271,9 +325,9 @@ struct TuiApp {
     selected_chat: usize,
     show_archived_chats: bool,
     messages: Vec<MessageRow>,
+    live_stream_previews: Vec<LiveStreamPreview>,
+    message_subscription: Option<MessageSubscription>,
     daemon: DaemonView,
-    last_daemon_poll: Instant,
-    last_live_refresh: Instant,
     input: String,
     streaming: Option<StreamComposer>,
     status: String,
@@ -283,12 +337,47 @@ struct TuiApp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StreamComposer {
     stream_id: String,
+    pending_text: String,
+    last_flush: Instant,
+}
+
+fn subscription_event_from_json(envelope: Value) -> SubscriptionEvent {
+    if envelope.get("stream_end").and_then(Value::as_bool) == Some(true) {
+        return SubscriptionEvent::Ended;
+    }
+    if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+        return SubscriptionEvent::Result(envelope.get("result").cloned().unwrap_or(Value::Null));
+    }
+    if envelope.get("ok").and_then(Value::as_bool) == Some(false) {
+        return SubscriptionEvent::Error(subscription_error_message(&envelope));
+    }
+    if let Some(result) = envelope.get("result") {
+        return SubscriptionEvent::Result(result.clone());
+    }
+    if envelope.get("error").is_some() {
+        return SubscriptionEvent::Error(subscription_error_message(&envelope));
+    }
+    SubscriptionEvent::Error("message subscription returned an unrecognized event".to_owned())
+}
+
+fn subscription_error_message(envelope: &Value) -> String {
+    envelope
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("message subscription failed")
+        .to_owned()
 }
 
 impl TuiApp {
     fn new(cli: Cli) -> TuiResult<Self> {
         let client = DmClient::from_cli(&cli)?;
-        let now = Instant::now();
         Ok(Self {
             client,
             initial_account: cli.account.clone(),
@@ -300,9 +389,9 @@ impl TuiApp {
             selected_chat: 0,
             show_archived_chats: false,
             messages: Vec::new(),
+            live_stream_previews: Vec::new(),
+            message_subscription: None,
             daemon: DaemonView::default(),
-            last_daemon_poll: now,
-            last_live_refresh: now,
             input: String::new(),
             streaming: None,
             status: "loading accounts".to_owned(),
@@ -318,7 +407,7 @@ impl TuiApp {
             while self.running {
                 self.tick();
                 terminal.draw(|frame| self.render(frame))?;
-                if event::poll(Duration::from_millis(200))? {
+                if event::poll(UI_EVENT_WAIT)? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             self.handle_key(key)?;
@@ -335,31 +424,9 @@ impl TuiApp {
 
     fn tick(&mut self) {
         let now = Instant::now();
-        if now.duration_since(self.last_daemon_poll) >= DAEMON_STATUS_INTERVAL {
-            if let Err(err) = self.refresh_daemon_status() {
-                self.status = format!("daemon status failed: {err}");
-            }
-            self.last_daemon_poll = now;
-        }
-
-        if should_live_refresh(
-            &self.daemon,
-            &self.input,
-            now.duration_since(self.last_live_refresh),
-        ) {
-            match self.refresh_accounts() {
-                Ok(()) => {
-                    self.status = live_refresh_status(
-                        self.accounts.len(),
-                        self.chats.len(),
-                        self.messages.len(),
-                    );
-                }
-                Err(err) => {
-                    self.status = format!("live refresh failed: {err}");
-                }
-            }
-            self.last_live_refresh = now;
+        self.drain_message_subscription();
+        if let Err(err) = self.flush_stream_append_if_due(now) {
+            self.status = format!("stream append failed: {err}");
         }
     }
 
@@ -398,7 +465,7 @@ impl TuiApp {
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let account = self
             .selected_account_row()
-            .map(|account| shorten(&account.npub, 18))
+            .map(|account| shorten(&account_display_label(account), 18))
             .unwrap_or_else(|| "no account".to_owned());
         let chat = self
             .selected_chat_row()
@@ -447,7 +514,7 @@ impl TuiApp {
                     ListItem::new(Line::from(vec![
                         Span::raw(format!("{marker} ")),
                         Span::styled(
-                            shorten(&account.npub, 22),
+                            shorten(&account_display_label(account), 22),
                             row_label_style(index == self.selected_account, ACCOUNT_ACCENT),
                         ),
                         Span::raw(format!(" {signing}")),
@@ -499,10 +566,10 @@ impl TuiApp {
         let mut lines = if self.messages.is_empty() {
             vec![Line::from("no messages")]
         } else {
-            message_lines(&self.messages)
+            message_lines(&self.messages, self.selected_account_row())
         };
         let group_id = self.selected_chat_row().map(|chat| chat.group_id.as_str());
-        for preview in stream_preview_lines(&self.daemon, group_id) {
+        for preview in stream_preview_lines(&self.daemon, &self.live_stream_previews, group_id) {
             lines.push(preview);
         }
         frame.render_widget(
@@ -547,7 +614,6 @@ impl TuiApp {
             Line::from(""),
             Line::from("Tab cycles panels. Arrows move. Enter selects or submits. Ctrl-C quits."),
             Line::from(""),
-            Line::from("/sync"),
             Line::from("/refresh"),
             Line::from("/account <npub-or-hex>"),
             Line::from("/create-identity"),
@@ -565,6 +631,9 @@ impl TuiApp {
             Line::from("/members remove <npub-or-hex> [...]"),
             Line::from("/members list"),
             Line::from("/keys fetch <npub-or-hex>"),
+            Line::from("/keys rotate"),
+            Line::from("/name <display-name>"),
+            Line::from("/profile name <display-name>"),
             Line::from("/quit"),
         ];
         frame.render_widget(Clear, area);
@@ -666,9 +735,21 @@ impl TuiApp {
                 Ok(())
             }
             KeyCode::Char(character) => {
-                let text = character.to_string();
                 self.input.push(character);
-                self.append_stream_text(text)
+                let mut stream_id = None;
+                if let Some(streaming) = self.streaming.as_mut() {
+                    streaming.pending_text.push(character);
+                    stream_id = Some(streaming.stream_id.clone());
+                    self.status = format!(
+                        "queued {} byte(s) on {}",
+                        streaming.pending_text.len(),
+                        shorten(&streaming.stream_id, 18)
+                    );
+                }
+                if let Some(stream_id) = stream_id {
+                    self.upsert_active_stream_preview(&stream_id);
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -681,14 +762,6 @@ impl TuiApp {
                 Ok(())
             }
             SlashCommand::Refresh => self.refresh_accounts(),
-            SlashCommand::Sync => {
-                let account_id = self.require_selected_local_account()?;
-                let result = self.client.run_json(Some(&account_id), &["sync"])?;
-                let status = sync_status(&result);
-                self.refresh_chats()?;
-                self.status = status;
-                Ok(())
-            }
             SlashCommand::Account(selector) => self.select_account_by_selector(&selector),
             SlashCommand::AccountCreate => self.create_or_import_account(None, "created identity"),
             SlashCommand::AccountAddPublic(account) => {
@@ -724,6 +797,19 @@ impl TuiApp {
                 self.status = format!("fetched key package bytes={bytes}");
                 Ok(())
             }
+            SlashCommand::KeysRotate => {
+                let account_id = self.require_selected_local_account()?;
+                let result = self
+                    .client
+                    .run_json(Some(&account_id), &["keys", "rotate"])?;
+                let bytes = result
+                    .get("key_package_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                self.status = format!("rotated key package bytes={bytes}");
+                Ok(())
+            }
+            SlashCommand::ProfileName(name) => self.update_profile_name(name),
             SlashCommand::StreamCompose {
                 stream_id,
                 quic_candidates,
@@ -765,7 +851,30 @@ impl TuiApp {
         let args = vec!["message", "send", &group_id, &text];
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("sent message", &result);
-        self.refresh_messages()?;
+        if let Some(message_id) = result
+            .get("message_ids")
+            .and_then(Value::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+        {
+            let now = unix_now_seconds();
+            upsert_message(
+                &mut self.messages,
+                MessageRow {
+                    message_id: message_id.to_owned(),
+                    direction: "sent".to_owned(),
+                    from: account_id,
+                    from_display_name: None,
+                    plaintext: text.clone(),
+                    display_text: text,
+                    recorded_at: now,
+                    received_at: now,
+                },
+            );
+            sort_messages_chronologically(&mut self.messages);
+        } else {
+            self.refresh_messages()?;
+        }
         self.status = status;
         Ok(())
     }
@@ -777,6 +886,7 @@ impl TuiApp {
     ) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
+        let preview_group_id = group_id.clone();
         let mut args = vec![
             "stream".to_owned(),
             "compose-open".to_owned(),
@@ -795,9 +905,24 @@ impl TuiApp {
         let stream_id = value_string(&result, "stream_id").unwrap_or_else(|| "unknown".to_owned());
         self.streaming = Some(StreamComposer {
             stream_id: stream_id.clone(),
+            pending_text: String::new(),
+            last_flush: Instant::now(),
         });
         self.input.clear();
         self.refresh_messages()?;
+        upsert_live_stream_preview(
+            &mut self.live_stream_previews,
+            LiveStreamPreview {
+                group_id: preview_group_id,
+                stream_id: stream_id.clone(),
+                author: "me".to_owned(),
+                status: "streaming".to_owned(),
+                text: String::new(),
+                error: None,
+                optimistic: true,
+            },
+            false,
+        );
         self.status = format!(
             "now streaming {}; type text and press Enter to finish",
             shorten(&stream_id, 18)
@@ -805,29 +930,78 @@ impl TuiApp {
         Ok(())
     }
 
-    fn append_stream_text(&mut self, text: String) -> TuiResult<()> {
-        let account_id = self.require_selected_local_account()?;
+    fn upsert_active_stream_preview(&mut self, stream_id: &str) {
+        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+            return;
+        };
+        upsert_live_stream_preview(
+            &mut self.live_stream_previews,
+            LiveStreamPreview {
+                group_id,
+                stream_id: stream_id.to_owned(),
+                author: "me".to_owned(),
+                status: "streaming".to_owned(),
+                text: self.input.clone(),
+                error: None,
+                optimistic: true,
+            },
+            true,
+        );
+    }
+
+    fn flush_stream_append_if_due(&mut self, now: Instant) -> TuiResult<()> {
         let Some(streaming) = self.streaming.as_ref() else {
+            return Ok(());
+        };
+        if streaming.pending_text.is_empty()
+            || now.duration_since(streaming.last_flush) < STREAM_APPEND_FLUSH_INTERVAL
+        {
+            return Ok(());
+        }
+        self.flush_stream_append()
+    }
+
+    fn flush_stream_append(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let Some((stream_id, text)) = self.streaming.as_mut().and_then(|streaming| {
+            if streaming.pending_text.is_empty() {
+                None
+            } else {
+                let text = std::mem::take(&mut streaming.pending_text);
+                Some((streaming.stream_id.clone(), text))
+            }
+        }) else {
             return Ok(());
         };
         let args = vec![
             "stream".to_owned(),
             "compose-append".to_owned(),
             "--stream-id".to_owned(),
-            streaming.stream_id.clone(),
-            text,
+            stream_id.clone(),
+            text.clone(),
         ];
-        let result = self.client.run_json(Some(&account_id), &args)?;
+        let result = match self.client.run_json(Some(&account_id), &args) {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some(streaming) = self.streaming.as_mut()
+                    && streaming.stream_id == stream_id
+                {
+                    streaming.pending_text.insert_str(0, &text);
+                }
+                return Err(err);
+            }
+        };
+        if let Some(streaming) = self.streaming.as_mut()
+            && streaming.stream_id == stream_id
+        {
+            streaming.last_flush = Instant::now();
+        }
         let bytes = result
             .get("text")
             .and_then(Value::as_str)
             .map(str::len)
             .unwrap_or_default();
-        self.status = format!(
-            "streaming {} bytes on {}",
-            bytes,
-            shorten(&streaming.stream_id, 18)
-        );
+        self.status = format!("streaming {} bytes on {}", bytes, shorten(&stream_id, 18));
         Ok(())
     }
 
@@ -841,6 +1015,11 @@ impl TuiApp {
             self.status = "stream text is empty; type text or Esc cancels".to_owned();
             return Ok(());
         }
+        self.streaming = Some(streaming);
+        self.flush_stream_append()?;
+        let Some(streaming) = self.streaming.take() else {
+            return Ok(());
+        };
         let args = vec![
             "stream".to_owned(),
             "compose-finish".to_owned(),
@@ -849,6 +1028,12 @@ impl TuiApp {
         ];
         let result = self.client.run_json(Some(&account_id), &args)?;
         self.input.clear();
+        let group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+        remove_live_stream_preview(
+            &mut self.live_stream_previews,
+            group_id.as_deref(),
+            &streaming.stream_id,
+        );
         self.refresh_messages()?;
         self.refresh_daemon_status()?;
         let chunk_count = result
@@ -875,7 +1060,35 @@ impl TuiApp {
         ];
         let _ = self.client.run_json(Some(&account_id), &args);
         self.input.clear();
+        let group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+        remove_live_stream_preview(
+            &mut self.live_stream_previews,
+            group_id.as_deref(),
+            &streaming.stream_id,
+        );
         self.status = format!("cancelled stream {}", shorten(&streaming.stream_id, 18));
+        Ok(())
+    }
+
+    fn update_profile_name(&mut self, name: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self.client.run_json(
+            Some(&account_id),
+            &[
+                "profile",
+                "update",
+                "--name",
+                &name,
+                "--display-name",
+                &name,
+            ],
+        )?;
+        self.refresh_accounts()?;
+        let label = result
+            .get("profile")
+            .and_then(profile_display_name_from_value)
+            .unwrap_or(name);
+        self.status = format!("published profile name {label}");
         Ok(())
     }
 
@@ -1003,6 +1216,10 @@ impl TuiApp {
         let selector =
             value_string(&result, "account_id").or_else(|| value_string(&result, "npub"));
         let npub = value_string(&result, "npub").unwrap_or_else(|| "unknown".to_owned());
+        let result_display_name = result
+            .get("profile")
+            .and_then(profile_display_name_from_value)
+            .or_else(|| non_empty_value_string(&result, "display_name"));
         let local_signing = result
             .get("local_signing")
             .and_then(Value::as_bool)
@@ -1026,7 +1243,12 @@ impl TuiApp {
         } else {
             "public-only"
         };
-        self.status = format!("{action} {} {signing}", shorten(&npub, 18));
+        let display_name = self
+            .selected_account_row()
+            .map(account_display_label)
+            .or(result_display_name)
+            .unwrap_or(npub);
+        self.status = format!("{action} {} {signing}", shorten(&display_name, 18));
         Ok(())
     }
 
@@ -1144,6 +1366,7 @@ impl TuiApp {
     fn refresh_daemon_status(&mut self) -> TuiResult<()> {
         let result = self.client.run_json(None, &["daemon", "status"])?;
         self.daemon = parse_daemon_view(&result);
+        self.ensure_selected_message_subscription();
         Ok(())
     }
 
@@ -1151,6 +1374,7 @@ impl TuiApp {
         let args = vec!["daemon".to_owned(), "start".to_owned()];
         let result = self.client.run_json(None, &args)?;
         self.daemon = parse_daemon_view(&result);
+        self.ensure_selected_message_subscription();
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
     }
@@ -1158,6 +1382,7 @@ impl TuiApp {
     fn stop_daemon(&mut self) -> TuiResult<()> {
         let result = self.client.run_json(None, &["daemon", "stop"])?;
         self.daemon = parse_daemon_view(&result);
+        self.message_subscription = None;
         self.status = "daemon stopped".to_owned();
         Ok(())
     }
@@ -1178,6 +1403,7 @@ impl TuiApp {
         if self.accounts.is_empty() {
             self.chats.clear();
             self.messages.clear();
+            self.message_subscription = None;
             self.status = "no identities yet; create one with dm create-identity".to_owned();
             return Ok(());
         }
@@ -1194,6 +1420,7 @@ impl TuiApp {
         if !account.local_signing {
             self.chats.clear();
             self.messages.clear();
+            self.message_subscription = None;
             self.status =
                 "selected account is public-only; choose a local signing account".to_owned();
             return Ok(());
@@ -1214,7 +1441,11 @@ impl TuiApp {
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
         if self.chats.is_empty() {
             self.messages.clear();
-            self.status = format!("loaded account {}; no chats", shorten(&account.npub, 18));
+            self.message_subscription = None;
+            self.status = format!(
+                "loaded account {}; no chats",
+                shorten(&account_display_label(&account), 18)
+            );
             return Ok(());
         }
         self.refresh_messages()
@@ -1238,8 +1469,137 @@ impl TuiApp {
             .map(|messages| messages.iter().filter_map(parse_message).collect())
             .unwrap_or_default();
         sort_messages_chronologically(&mut self.messages);
+        if let Err(err) = self.ensure_message_subscription(&account_id, &group_id) {
+            self.status = format!("message subscription failed: {err}");
+            return Ok(());
+        }
         self.status = format!("loaded {} message(s)", self.messages.len());
         Ok(())
+    }
+
+    fn ensure_message_subscription(&mut self, account_id: &str, group_id: &str) -> TuiResult<()> {
+        if !self.daemon.running {
+            self.message_subscription = None;
+            return Ok(());
+        }
+        if self
+            .message_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.account_id == account_id && subscription.group_id == group_id
+            })
+        {
+            return Ok(());
+        }
+
+        self.message_subscription = None;
+        let args = vec![
+            "messages".to_owned(),
+            "subscribe".to_owned(),
+            group_id.to_owned(),
+            "--limit".to_owned(),
+            "50".to_owned(),
+        ];
+        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
+        let Some(stdout) = child.stdout.take() else {
+            return Err(TuiError::Cli(
+                "message subscription did not expose stdout".to_owned(),
+            ));
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.trim().is_empty() => {}
+                    Ok(line) => match serde_json::from_str::<Value>(&line) {
+                        Ok(envelope) => {
+                            let event = subscription_event_from_json(envelope);
+                            let ended = matches!(event, SubscriptionEvent::Ended);
+                            if tx.send(event).is_err() || ended {
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            if tx
+                                .send(SubscriptionEvent::Error(format!(
+                                    "invalid message subscription JSON: {err}"
+                                )))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        let _ = tx.send(SubscriptionEvent::Error(err.to_string()));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(SubscriptionEvent::Ended);
+        });
+        self.message_subscription = Some(MessageSubscription {
+            account_id: account_id.to_owned(),
+            group_id: group_id.to_owned(),
+            child,
+            rx,
+        });
+        Ok(())
+    }
+
+    fn ensure_selected_message_subscription(&mut self) {
+        let Some(account) = self.selected_account_row().cloned() else {
+            self.message_subscription = None;
+            return;
+        };
+        if !account.local_signing {
+            self.message_subscription = None;
+            return;
+        }
+        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+            self.message_subscription = None;
+            return;
+        };
+        if let Err(err) = self.ensure_message_subscription(&account.account_id, &group_id) {
+            self.status = format!("message subscription failed: {err}");
+        }
+    }
+
+    fn drain_message_subscription(&mut self) {
+        let Some(subscription) = self.message_subscription.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        loop {
+            match subscription.rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(SubscriptionEvent::Ended);
+                    break;
+                }
+            }
+        }
+        for event in events {
+            match event {
+                SubscriptionEvent::Result(result) => {
+                    if let Some(status) = apply_subscription_result(
+                        &mut self.messages,
+                        &mut self.live_stream_previews,
+                        &result,
+                    ) {
+                        self.status = status;
+                    }
+                }
+                SubscriptionEvent::Error(err) => {
+                    self.status = format!("message subscription failed: {err}");
+                }
+                SubscriptionEvent::Ended => {
+                    self.message_subscription = None;
+                    break;
+                }
+            }
+        }
     }
 
     fn select_current_account(&mut self) -> TuiResult<()> {
@@ -1258,7 +1618,12 @@ impl TuiApp {
             return Err(TuiError::Cli(format!("account not loaded: {selector}")));
         };
         self.selected_account = index;
-        self.status = format!("selected account {}", shorten(selector, 18));
+        self.status = format!(
+            "selected account {}",
+            self.selected_account_row()
+                .map(|account| shorten(&account_display_label(account), 18))
+                .unwrap_or_else(|| shorten(selector, 18))
+        );
         self.refresh_chats()
     }
 
@@ -1310,7 +1675,9 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
     match command {
         "help" | "?" => Ok(SlashCommand::Help),
         "refresh" => Ok(SlashCommand::Refresh),
-        "sync" => Ok(SlashCommand::Sync),
+        "sync" => {
+            Err("manual sync is not a TUI command; live updates come from subscriptions".to_owned())
+        }
         "create-identity" => {
             if rest.is_empty() {
                 Ok(SlashCommand::AccountCreate)
@@ -1331,6 +1698,8 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "chat" => parse_chat_command(rest),
         "members" => parse_members_command(rest),
         "keys" => parse_keys_command(rest),
+        "profile" => parse_profile_command(rest),
+        "name" => parse_profile_name_command(rest),
         "stream" => parse_stream_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
@@ -1423,8 +1792,27 @@ fn parse_account_command(args: Vec<String>) -> Result<SlashCommand, String> {
 fn parse_keys_command(args: Vec<String>) -> Result<SlashCommand, String> {
     match args.as_slice() {
         [command, account] if command == "fetch" => Ok(SlashCommand::KeysFetch(account.clone())),
-        _ => Err("/keys expects 'fetch <npub-or-hex>'".to_owned()),
+        [command] if command == "rotate" => Ok(SlashCommand::KeysRotate),
+        _ => Err("/keys expects 'fetch <npub-or-hex>' or 'rotate'".to_owned()),
     }
+}
+
+fn parse_profile_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [command, name @ ..] if command == "name" && !name.is_empty() => {
+            Ok(SlashCommand::ProfileName(name.join(" ")))
+        }
+        [command] if command == "name" => Err("/profile name requires a name".to_owned()),
+        [] => Err("/profile expects name <display-name>".to_owned()),
+        _ => Err("/profile expects name <display-name>".to_owned()),
+    }
+}
+
+fn parse_profile_name_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    if args.is_empty() {
+        return Err("/name requires a name".to_owned());
+    }
+    Ok(SlashCommand::ProfileName(args.join(" ")))
 }
 
 fn parse_stream_command(args: Vec<String>) -> Result<SlashCommand, String> {
@@ -1587,6 +1975,11 @@ fn parse_account(value: &Value) -> Option<AccountRow> {
     Some(AccountRow {
         account_id: value_string(value, "account_id")?,
         npub: value_string(value, "npub")?,
+        display_name: non_empty_value_string(value, "display_name").or_else(|| {
+            value
+                .get("profile")
+                .and_then(profile_display_name_from_value)
+        }),
         local_signing: value.get("local_signing").and_then(Value::as_bool)?,
     })
 }
@@ -1621,6 +2014,7 @@ fn parse_message(value: &Value) -> Option<MessageRow> {
         message_id: value_string(value, "message_id").unwrap_or_default(),
         direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
         from: value_string(value, "from").unwrap_or_else(|| "unknown".to_owned()),
+        from_display_name: non_empty_value_string(value, "from_display_name"),
         plaintext,
         display_text,
         recorded_at: value
@@ -1672,6 +2066,66 @@ fn value_string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+fn non_empty_value_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn profile_display_name_from_value(value: &Value) -> Option<String> {
+    non_empty_value_string(value, "display_name")
+        .or_else(|| non_empty_value_string(value, "displayName"))
+        .or_else(|| non_empty_value_string(value, "name"))
+}
+
+fn account_display_label(account: &AccountRow) -> String {
+    account
+        .display_name
+        .clone()
+        .unwrap_or_else(|| account.npub.clone())
+}
+
+fn message_author_label(message: &MessageRow, selected_account: Option<&AccountRow>) -> String {
+    if message.direction == "sent" {
+        return "me".to_owned();
+    }
+    if selected_account.is_some_and(|account| {
+        message.from == account.account_id
+            || message.from == account.npub
+            || message.from == account_display_label(account)
+    }) {
+        return "me".to_owned();
+    }
+    message
+        .from_display_name
+        .clone()
+        .unwrap_or_else(|| shorten(&message.from, 18))
+}
+
+fn stream_preview_author(message: &Value, selected_account: Option<&AccountRow>) -> String {
+    let direction = value_string(message, "direction").unwrap_or_else(|| "received".to_owned());
+    let from = value_string(message, "from").unwrap_or_else(|| "stream".to_owned());
+    if direction == "sent" {
+        return "me".to_owned();
+    }
+    if selected_account.is_some_and(|account| {
+        from == account.account_id || from == account.npub || from == account_display_label(account)
+    }) {
+        return "me".to_owned();
+    }
+    non_empty_value_string(message, "from_display_name").unwrap_or_else(|| shorten(&from, 18))
+}
+
+fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn selected_account_index(accounts: &[AccountRow], selector: Option<&str>) -> Option<usize> {
     selector.and_then(|selector| {
         accounts
@@ -1694,22 +2148,6 @@ fn move_index(current: usize, len: usize, delta: isize) -> usize {
     }
     let max = len.saturating_sub(1) as isize;
     (current as isize + delta).clamp(0, max) as usize
-}
-
-fn sync_status(result: &Value) -> String {
-    let events = result
-        .get("events")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let joined = result
-        .get("joined_groups")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let messages = result
-        .get("messages")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    format!("sync: events={events} joined={joined} messages={messages}")
 }
 
 fn publish_status(action: &str, result: &Value) -> String {
@@ -1770,6 +2208,166 @@ fn parse_daemon_stream_watch(value: &Value) -> Option<DaemonStreamWatchView> {
         chunk_count: value.get("chunk_count").and_then(Value::as_u64),
         error: value_string(value, "error"),
     })
+}
+
+fn apply_subscription_result(
+    messages: &mut Vec<MessageRow>,
+    live_previews: &mut Vec<LiveStreamPreview>,
+    result: &Value,
+) -> Option<String> {
+    match result.get("type").and_then(Value::as_str) {
+        Some("message" | "reaction" | "message_delete" | "media" | "agent_stream_final") => {
+            let message_value = result.get("message")?;
+            if result.get("type").and_then(Value::as_str) == Some("agent_stream_final")
+                && let Some(stream_id) = message_value
+                    .get("agent_text_stream")
+                    .and_then(|stream| value_string(stream, "stream_id"))
+            {
+                let group_id = value_string(message_value, "group_id");
+                remove_live_stream_preview(live_previews, group_id.as_deref(), &stream_id);
+            }
+            let message = parse_message(message_value)?;
+            upsert_message(messages, message);
+            sort_messages_chronologically(messages);
+            Some(format!("live update: messages={}", messages.len()))
+        }
+        Some("agent_stream_start") => {
+            let message = result.get("message")?;
+            let stream = message
+                .get("agent_text_stream")
+                .and_then(|stream| value_string(stream, "stream_id"))?;
+            let group_id = value_string(message, "group_id")?;
+            let author = stream_preview_author(message, None);
+            upsert_live_stream_preview(
+                live_previews,
+                LiveStreamPreview {
+                    group_id,
+                    stream_id: stream.clone(),
+                    author,
+                    status: "streaming".to_owned(),
+                    text: String::new(),
+                    error: None,
+                    optimistic: false,
+                },
+                false,
+            );
+            Some(format!("stream started {}", shorten(&stream, 18)))
+        }
+        Some("agent_stream_delta") => {
+            let delta = result.get("agent_stream_delta")?;
+            let group_id = value_string(delta, "group_id")?;
+            let stream_id = value_string(delta, "stream_id")?;
+            let text = value_string(delta, "text").unwrap_or_default();
+            append_live_stream_delta(live_previews, group_id, stream_id.clone(), text);
+            Some(format!("streaming {}", shorten(&stream_id, 18)))
+        }
+        Some("stream_preview") => {
+            let preview = result.get("stream_preview")?;
+            let group_id = value_string(preview, "group_id")?;
+            let stream_id =
+                value_string(preview, "stream_id").or_else(|| value_string(preview, "watch_id"))?;
+            let status = value_string(preview, "status").unwrap_or_else(|| "streaming".to_owned());
+            let text = value_string(preview, "text").unwrap_or_default();
+            let error = value_string(preview, "error");
+            upsert_live_stream_preview(
+                live_previews,
+                LiveStreamPreview {
+                    group_id,
+                    stream_id: stream_id.clone(),
+                    author: "stream".to_owned(),
+                    status: status.clone(),
+                    text,
+                    error,
+                    optimistic: false,
+                },
+                true,
+            );
+            Some(format!("stream {status} {}", shorten(&stream_id, 18)))
+        }
+        _ => None,
+    }
+}
+
+fn upsert_message(messages: &mut Vec<MessageRow>, message: MessageRow) {
+    if !message.message_id.is_empty()
+        && let Some(existing) = messages
+            .iter_mut()
+            .find(|existing| existing.message_id == message.message_id)
+    {
+        *existing = message;
+        return;
+    }
+    messages.push(message);
+}
+
+fn append_live_stream_delta(
+    live_previews: &mut Vec<LiveStreamPreview>,
+    group_id: String,
+    stream_id: String,
+    text: String,
+) {
+    if let Some(preview) = live_previews
+        .iter_mut()
+        .find(|preview| preview.group_id == group_id && preview.stream_id == stream_id)
+    {
+        if preview.optimistic {
+            return;
+        }
+        preview.status = "streaming".to_owned();
+        preview.text.push_str(&text);
+        preview.error = None;
+        return;
+    }
+    live_previews.push(LiveStreamPreview {
+        group_id,
+        stream_id,
+        author: "stream".to_owned(),
+        status: "streaming".to_owned(),
+        text,
+        error: None,
+        optimistic: false,
+    });
+}
+
+fn upsert_live_stream_preview(
+    live_previews: &mut Vec<LiveStreamPreview>,
+    preview: LiveStreamPreview,
+    replace_text: bool,
+) {
+    if let Some(existing) = live_previews.iter_mut().find(|existing| {
+        existing.group_id == preview.group_id && existing.stream_id == preview.stream_id
+    }) {
+        if existing.optimistic && !preview.optimistic && !replace_text {
+            existing.status = preview.status;
+            existing.error = preview.error;
+            return;
+        }
+        existing.author = preview.author;
+        existing.status = preview.status;
+        existing.error = preview.error;
+        existing.optimistic = preview.optimistic;
+        if replace_text || existing.text.is_empty() {
+            existing.text = preview.text;
+        }
+        return;
+    }
+    live_previews.push(preview);
+}
+
+fn remove_live_stream_preview(
+    live_previews: &mut Vec<LiveStreamPreview>,
+    group_id: Option<&str>,
+    stream_id: &str,
+) {
+    live_previews.retain(|preview| {
+        if preview.stream_id != stream_id {
+            return true;
+        }
+        if let Some(group_id) = group_id {
+            return preview.group_id != group_id;
+        }
+        false
+    });
 }
 
 fn daemon_header_label(daemon: &DaemonView) -> String {
@@ -1860,52 +2458,88 @@ fn stream_watch_status(daemon: &DaemonView) -> String {
     format!("streams: running={running} completed={completed} failed={failed} latest={latest}")
 }
 
-fn stream_preview_lines(daemon: &DaemonView, group_id: Option<&str>) -> Vec<Line<'static>> {
+fn stream_preview_lines(
+    daemon: &DaemonView,
+    live_previews: &[LiveStreamPreview],
+    group_id: Option<&str>,
+) -> Vec<Line<'static>> {
     let Some(group_id) = group_id else {
         return Vec::new();
     };
-    daemon
-        .stream_watches
+    let mut lines = live_previews
         .iter()
-        .filter(|watch| watch.group_id == group_id)
-        .flat_map(|watch| {
-            let stream = watch
-                .stream_id
-                .as_deref()
-                .map(|stream_id| shorten(stream_id, 18))
-                .unwrap_or_else(|| shorten(&watch.watch_id, 18));
-            let body = match watch.status.as_str() {
-                "completed" => watch.text.clone().unwrap_or_else(|| "<empty>".to_owned()),
-                "failed" => watch
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "stream watch failed".to_owned()),
-                _ => "waiting for stream preview".to_owned(),
-            };
-            [
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        format!("preview {stream} [{}]", watch.status),
-                        Style::default().fg(Color::Magenta),
-                    ),
-                    Span::raw(": "),
-                    Span::raw(body),
-                ]),
-            ]
+        .filter(|preview| preview.group_id == group_id)
+        .filter_map(|preview| {
+            stream_preview_line_pair(
+                &preview.author,
+                &preview.status,
+                &preview.text,
+                preview.error.as_deref(),
+            )
         })
-        .collect()
+        .flatten()
+        .collect::<Vec<_>>();
+    lines.extend(
+        daemon
+            .stream_watches
+            .iter()
+            .filter(|watch| watch.group_id == group_id)
+            .filter(|watch| {
+                let Some(stream_id) = watch.stream_id.as_deref() else {
+                    return true;
+                };
+                !live_previews
+                    .iter()
+                    .any(|preview| preview.group_id == group_id && preview.stream_id == stream_id)
+            })
+            .filter_map(|watch| {
+                stream_preview_line_pair(
+                    "stream",
+                    &watch.status,
+                    watch.text.as_deref().unwrap_or_default(),
+                    watch.error.as_deref(),
+                )
+            })
+            .flatten(),
+    );
+    lines
 }
 
-fn message_lines(messages: &[MessageRow]) -> Vec<Line<'static>> {
+fn stream_preview_line_pair(
+    author: &str,
+    status: &str,
+    text: &str,
+    error: Option<&str>,
+) -> Option<[Line<'static>; 2]> {
+    let body = match status {
+        "completed" => return None,
+        "failed" => format!("stream failed: {}", error.unwrap_or("stream watch failed")),
+        _ => {
+            if text.is_empty() {
+                return None;
+            } else {
+                text.to_owned()
+            }
+        }
+    };
+    Some([
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(author.to_owned(), Style::default().fg(Color::Yellow)),
+            Span::raw(": "),
+            Span::raw(body),
+        ]),
+    ])
+}
+
+fn message_lines(
+    messages: &[MessageRow],
+    selected_account: Option<&AccountRow>,
+) -> Vec<Line<'static>> {
     messages
         .iter()
         .flat_map(|message| {
-            let author = if message.direction == "sent" {
-                "me".to_owned()
-            } else {
-                shorten(&message.from, 18)
-            };
+            let author = message_author_label(message, selected_account);
             [
                 Line::from(vec![
                     Span::styled(author, Style::default().fg(Color::Yellow)),
@@ -1916,14 +2550,6 @@ fn message_lines(messages: &[MessageRow]) -> Vec<Line<'static>> {
             ]
         })
         .collect()
-}
-
-fn should_live_refresh(daemon: &DaemonView, input: &str, elapsed: Duration) -> bool {
-    daemon.running && input.is_empty() && elapsed >= LIVE_REFRESH_INTERVAL
-}
-
-fn live_refresh_status(accounts: usize, chats: usize, messages: usize) -> String {
-    format!("live refresh: accounts={accounts} chats={chats} messages={messages}")
 }
 
 fn unique_member_refs(members: Vec<String>) -> Vec<String> {
@@ -2054,7 +2680,7 @@ mod tests {
     #[test]
     fn slash_command_parser_understands_core_commands() {
         assert_eq!(parse_slash_command("/help"), Ok(SlashCommand::Help));
-        assert_eq!(parse_slash_command("/sync"), Ok(SlashCommand::Sync));
+        assert!(parse_slash_command("/sync").is_err());
         assert_eq!(
             parse_slash_command("/account npub1abc"),
             Ok(SlashCommand::Account("npub1abc".to_owned()))
@@ -2068,8 +2694,26 @@ mod tests {
             parse_slash_command("/keys fetch npub1bob"),
             Ok(SlashCommand::KeysFetch("npub1bob".to_owned()))
         );
+        assert_eq!(
+            parse_slash_command("/keys rotate"),
+            Ok(SlashCommand::KeysRotate)
+        );
         assert!(parse_slash_command("/keys publish").is_err());
         assert!(parse_slash_command("/keys").is_err());
+    }
+
+    #[test]
+    fn slash_command_parser_handles_profile_name_updates() {
+        assert_eq!(
+            parse_slash_command("/name Alice Example"),
+            Ok(SlashCommand::ProfileName("Alice Example".to_owned()))
+        );
+        assert_eq!(
+            parse_slash_command("/profile name Bob Example"),
+            Ok(SlashCommand::ProfileName("Bob Example".to_owned()))
+        );
+        assert!(parse_slash_command("/name").is_err());
+        assert!(parse_slash_command("/profile name").is_err());
     }
 
     #[test]
@@ -2296,7 +2940,7 @@ mod tests {
         .collect::<Vec<_>>();
         sort_messages_chronologically(&mut messages);
 
-        let rendered = message_lines(&messages)
+        let rendered = message_lines(&messages, None)
             .iter()
             .map(line_text)
             .filter(|line| !line.is_empty())
@@ -2353,7 +2997,8 @@ mod tests {
                     "watch_id": "watch-1",
                     "group_id": group_id,
                     "stream_id": stream_id,
-                    "status": "running"
+                    "status": "running",
+                    "text": "daemon live text"
                 },
                 {
                     "watch_id": "watch-2",
@@ -2373,47 +3018,163 @@ mod tests {
             "daemon running streams: running=1 completed=1 failed=0 latest=bbbbbbb...bbbbbbbb"
         );
 
-        let preview_lines = stream_preview_lines(&daemon, Some(group_id));
-        let rendered_preview = preview_lines[3]
+        let preview_lines = stream_preview_lines(&daemon, &[], Some(group_id));
+        let rendered_preview = preview_lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(
-            rendered_preview,
-            "preview bbbbbbb...bbbbbbbb [completed]: daemon preview text"
-        );
-        assert!(stream_preview_lines(&daemon, Some("different-group")).is_empty());
+        assert_eq!(rendered_preview, "stream: daemon live text");
+        assert_eq!(preview_lines.len(), 2);
+        assert!(stream_preview_lines(&daemon, &[], Some("different-group")).is_empty());
     }
 
     #[test]
-    fn live_refresh_waits_for_running_daemon_idle_input_and_interval() {
-        let running = DaemonView {
-            running: true,
-            ..DaemonView::default()
-        };
-        let stopped = DaemonView::default();
+    fn stream_preview_lines_hide_empty_and_completed_previews() {
+        let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let daemon = parse_daemon_view(&serde_json::json!({
+            "running": true,
+            "pid": 1234,
+            "stream_watches": [
+                {
+                    "watch_id": "watch-1",
+                    "group_id": group_id,
+                    "stream_id": stream_id,
+                    "status": "completed",
+                    "text": "final text should be rendered from MLS instead"
+                }
+            ]
+        }));
+        let previews = vec![LiveStreamPreview {
+            group_id: group_id.to_owned(),
+            stream_id: stream_id.to_owned(),
+            author: "me".to_owned(),
+            status: "streaming".to_owned(),
+            text: String::new(),
+            error: None,
+            optimistic: true,
+        }];
 
-        assert!(should_live_refresh(
-            &running,
-            "",
-            LIVE_REFRESH_INTERVAL + Duration::from_millis(1)
-        ));
-        assert!(!should_live_refresh(
-            &running,
-            "/account",
-            LIVE_REFRESH_INTERVAL + Duration::from_millis(1)
-        ));
-        assert!(!should_live_refresh(
-            &stopped,
-            "",
-            LIVE_REFRESH_INTERVAL + Duration::from_millis(1)
-        ));
-        assert!(!should_live_refresh(
-            &running,
-            "",
-            LIVE_REFRESH_INTERVAL - Duration::from_millis(1)
-        ));
+        assert!(stream_preview_lines(&daemon, &previews, Some(group_id)).is_empty());
+    }
+
+    #[test]
+    fn subscription_stream_deltas_update_live_preview_text() {
+        let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut messages = Vec::new();
+        let mut previews = Vec::new();
+
+        apply_subscription_result(
+            &mut messages,
+            &mut previews,
+            &serde_json::json!({
+                "type": "agent_stream_delta",
+                "agent_stream_delta": {
+                    "group_id": group_id,
+                    "stream_id": stream_id,
+                    "text": "hello "
+                }
+            }),
+        );
+        apply_subscription_result(
+            &mut messages,
+            &mut previews,
+            &serde_json::json!({
+                "type": "agent_stream_delta",
+                "agent_stream_delta": {
+                    "group_id": group_id,
+                    "stream_id": stream_id,
+                    "text": "stream"
+                }
+            }),
+        );
+
+        let rendered_preview =
+            stream_preview_lines(&DaemonView::default(), &previews, Some(group_id))[1]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+        assert_eq!(rendered_preview, "stream: hello stream");
+    }
+
+    #[test]
+    fn local_stream_preview_ignores_echoed_deltas() {
+        let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut previews = vec![LiveStreamPreview {
+            group_id: group_id.to_owned(),
+            stream_id: stream_id.to_owned(),
+            author: "me".to_owned(),
+            status: "streaming".to_owned(),
+            text: "hello stream".to_owned(),
+            error: None,
+            optimistic: true,
+        }];
+
+        append_live_stream_delta(
+            &mut previews,
+            group_id.to_owned(),
+            stream_id.to_owned(),
+            "eam".to_owned(),
+        );
+
+        assert_eq!(previews[0].text, "hello stream");
+    }
+
+    #[test]
+    fn subscription_final_message_replaces_stream_marker_with_mls_text() {
+        let mut messages = Vec::new();
+        let mut previews = Vec::new();
+
+        apply_subscription_result(
+            &mut messages,
+            &mut previews,
+            &serde_json::json!({
+                "type": "agent_stream_start",
+                "message": {
+                    "message_id": "start",
+                    "direction": "received",
+                    "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "from": "alice",
+                    "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
+                    "agent_text_stream": {
+                        "kind": "start",
+                        "stream_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                }
+            }),
+        );
+        assert_eq!(previews.len(), 1);
+        apply_subscription_result(
+            &mut messages,
+            &mut previews,
+            &serde_json::json!({
+                "type": "agent_stream_final",
+                "message": {
+                    "message_id": "final",
+                    "direction": "received",
+                    "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "from": "alice",
+                    "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
+                    "agent_text_stream": {
+                        "kind": "final",
+                        "stream_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "final_text_or_reference": "hello from MLS"
+                    }
+                }
+            }),
+        );
+
+        let rendered = message_lines(&messages, None)
+            .iter()
+            .map(line_text)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, vec!["alice: hello from MLS"]);
+        assert!(previews.is_empty());
     }
 
     #[test]
@@ -2426,10 +3187,104 @@ mod tests {
     }
 
     #[test]
+    fn subscription_reader_accepts_daemon_stream_frames() {
+        match subscription_event_from_json(serde_json::json!({
+            "result": {
+                "type": "message",
+                "message": {
+                    "message_id": "abc",
+                    "plaintext": "hello"
+                }
+            }
+        })) {
+            SubscriptionEvent::Result(result) => {
+                assert_eq!(result["type"], "message");
+                assert_eq!(result["message"]["plaintext"], "hello");
+            }
+            other => panic!("expected result event, got {other:?}"),
+        }
+
+        match subscription_event_from_json(serde_json::json!({
+            "error": {
+                "message": "app runtime is not running"
+            }
+        })) {
+            SubscriptionEvent::Error(message) => {
+                assert_eq!(message, "app runtime is not running");
+            }
+            other => panic!("expected error event, got {other:?}"),
+        }
+
+        assert!(matches!(
+            subscription_event_from_json(serde_json::json!({"stream_end": true})),
+            SubscriptionEvent::Ended
+        ));
+    }
+
+    #[test]
+    fn account_rows_prefer_profile_display_name_then_name_then_npub() {
+        let with_display_name = parse_account(&serde_json::json!({
+            "account_id": "abc123",
+            "npub": "npub1abc",
+            "local_signing": true,
+            "profile": {
+                "name": "alice",
+                "display_name": "Alice Example"
+            }
+        }))
+        .expect("account");
+        assert_eq!(account_display_label(&with_display_name), "Alice Example");
+
+        let with_name = parse_account(&serde_json::json!({
+            "account_id": "def456",
+            "npub": "npub1def",
+            "local_signing": true,
+            "profile": {
+                "name": "bob"
+            }
+        }))
+        .expect("account");
+        assert_eq!(account_display_label(&with_name), "bob");
+
+        let without_profile = parse_account(&serde_json::json!({
+            "account_id": "0123456789abcdef",
+            "npub": "npub1fallback",
+            "local_signing": false
+        }))
+        .expect("account");
+        assert_eq!(account_display_label(&without_profile), "npub1fallback");
+    }
+
+    #[test]
+    fn message_lines_use_sender_display_name_when_available() {
+        let messages = [serde_json::json!({
+            "message_id": "01",
+            "recorded_at": 10,
+            "received_at": 10,
+            "direction": "received",
+            "from": "abc123",
+            "from_display_name": "Alice Example",
+            "plaintext": "hello"
+        })]
+        .iter()
+        .filter_map(parse_message)
+        .collect::<Vec<_>>();
+
+        let rendered = message_lines(&messages, None)
+            .iter()
+            .map(line_text)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["Alice Example: hello"]);
+    }
+
+    #[test]
     fn account_selection_matches_npub_or_hex_pubkey() {
         let account = AccountRow {
             account_id: "abc123".to_owned(),
             npub: "npub1abc".to_owned(),
+            display_name: None,
             local_signing: true,
         };
 

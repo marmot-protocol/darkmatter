@@ -86,6 +86,182 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
 }
 
 #[tokio::test]
+async fn app_runtime_reuses_initial_key_package_when_republishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let first = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    let republished_bytes = runtime
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let second = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(republished_bytes, first.key_package.0.len());
+    assert_eq!(second.key_package_id, first.key_package_id);
+    assert_eq!(second.key_package, first.key_package);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_can_rotate_key_package_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let first = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    let rotated_bytes = runtime
+        .rotate_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let rotated = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+    runtime
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let republished = app
+        .fetch_latest_key_package_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rotated_bytes, rotated.key_package.0.len());
+    assert_ne!(rotated.key_package_id, first.key_package_id);
+    assert_eq!(republished.key_package_id, rotated.key_package_id);
+    assert_eq!(republished.key_package, rotated.key_package);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_rotate_repairs_missing_key_package_relay_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("bob").unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+
+    app.publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let incomplete = app
+        .publish_account_relay_list_kind("bob", "inbox", vec![endpoint(&url)], vec![endpoint(&url)])
+        .await
+        .unwrap();
+    assert_eq!(incomplete.missing, vec!["key_package"]);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let bob = home.account("bob").unwrap().account_id_hex;
+    let rotated_bytes = runtime.rotate_key_package("bob").await.unwrap();
+    let repaired = app
+        .fetch_account_relay_list_status_for_account_id(&bob, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let fetched = app
+        .fetch_latest_key_package_for_account_id(&bob, vec![endpoint(&url)])
+        .await
+        .unwrap();
+
+    assert!(repaired.complete);
+    assert_eq!(repaired.key_package.relays, vec![url]);
+    assert_eq!(fetched.key_package.0.len(), rotated_bytes);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_replaces_invalid_cached_key_package_when_republishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let cache_path = dir
+        .path()
+        .join("key-packages")
+        .join(format!("{}.json", created.account.label));
+    std::fs::write(
+        &cache_path,
+        serde_json::json!({
+            "account_label": created.account.label,
+            "account_id_hex": created.account.account_id_hex,
+            "key_package_id": "legacy-invalid",
+            "key_package_hex": "010203",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let republished_bytes = runtime
+        .publish_key_package(&created.account.account_id_hex)
+        .await
+        .unwrap();
+    let cache: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+
+    assert!(republished_bytes > 3);
+    assert_ne!(cache["key_package_id"], "legacy-invalid");
+    assert_ne!(cache["key_package_hex"], "010203");
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -431,6 +607,7 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -449,7 +626,11 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
 
     let received = bob.sync().await.unwrap();
     assert_eq!(received.messages.len(), 1);
-    assert_eq!(received.messages[0].sender, "alice");
+    assert_eq!(received.messages[0].sender, alice_id);
+    assert_eq!(
+        received.messages[0].sender_display_name.as_deref(),
+        Some("alice")
+    );
     assert_eq!(received.messages[0].group_id, group_id);
     assert_eq!(received.messages[0].plaintext, "hello from app runtime");
 }
@@ -583,6 +764,7 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -627,7 +809,11 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     alice.send(&group_id, b"write a summary").await.unwrap();
     let prompt = bob.sync().await.unwrap();
     assert_eq!(prompt.messages.len(), 1);
-    assert_eq!(prompt.messages[0].sender, "alice");
+    assert_eq!(prompt.messages[0].sender, alice_id);
+    assert_eq!(
+        prompt.messages[0].sender_display_name.as_deref(),
+        Some("alice")
+    );
     assert_eq!(prompt.messages[0].plaintext, "write a summary");
 
     let alice_secret = alice
@@ -909,6 +1095,7 @@ async fn account_projection_db_records_received_messages() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -946,7 +1133,7 @@ async fn account_projection_db_records_received_messages() {
         .unwrap();
     assert_eq!(alice_messages.len(), 1);
     assert_eq!(alice_messages[0].direction, "sent");
-    assert_eq!(alice_messages[0].sender, "alice");
+    assert_eq!(alice_messages[0].sender, alice_id);
     assert_eq!(alice_messages[0].plaintext, "persist this projection");
 
     alice.sync().await.unwrap();
@@ -962,7 +1149,7 @@ async fn account_projection_db_records_received_messages() {
         .unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].direction, "received");
-    assert_eq!(messages[0].sender, "alice");
+    assert_eq!(messages[0].sender, alice_id);
     assert_eq!(messages[0].group_id_hex, hex::encode(group_id.as_slice()));
     assert_eq!(messages[0].plaintext, "persist this projection");
 }
