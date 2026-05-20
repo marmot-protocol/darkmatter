@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
@@ -216,7 +217,6 @@ enum SubscriptionEvent {
 
 struct MessageSubscription {
     account_id: String,
-    group_id: String,
     child: Child,
     rx: Receiver<SubscriptionEvent>,
 }
@@ -323,6 +323,7 @@ struct TuiApp {
     selected_account: usize,
     chats: Vec<ChatRow>,
     selected_chat: usize,
+    unread_counts: HashMap<String, usize>,
     show_archived_chats: bool,
     messages: Vec<MessageRow>,
     live_stream_previews: Vec<LiveStreamPreview>,
@@ -387,6 +388,7 @@ impl TuiApp {
             selected_account: 0,
             chats: Vec::new(),
             selected_chat: 0,
+            unread_counts: HashMap::new(),
             show_archived_chats: false,
             messages: Vec::new(),
             live_stream_previews: Vec::new(),
@@ -537,22 +539,14 @@ impl TuiApp {
                 .iter()
                 .enumerate()
                 .map(|(index, chat)| {
-                    let marker = if index == self.selected_chat {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    let archived = if chat.archived { " archived" } else { "" };
-                    let style = selected_style(index == self.selected_chat);
-                    ListItem::new(Line::from(vec![
-                        Span::raw(format!("{marker} ")),
-                        Span::styled(
-                            shorten(&chat.name, 24),
-                            row_label_style(index == self.selected_chat, Color::Green),
-                        ),
-                        Span::raw(archived),
-                    ]))
-                    .style(style)
+                    let selected = index == self.selected_chat;
+                    let unread_count = self
+                        .unread_counts
+                        .get(&chat.group_id)
+                        .copied()
+                        .unwrap_or_default();
+                    ListItem::new(chat_row_line(chat, selected, unread_count))
+                        .style(selected_style(selected))
                 })
                 .collect()
         };
@@ -1437,6 +1431,7 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
+        retain_unread_counts_for_chats(&mut self.unread_counts, &self.chats);
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
         if self.chats.is_empty() {
@@ -1468,8 +1463,9 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|messages| messages.iter().filter_map(parse_message).collect())
             .unwrap_or_default();
+        self.unread_counts.remove(&group_id);
         sort_messages_chronologically(&mut self.messages);
-        if let Err(err) = self.ensure_message_subscription(&account_id, &group_id) {
+        if let Err(err) = self.ensure_message_subscription(&account_id) {
             self.status = format!("message subscription failed: {err}");
             return Ok(());
         }
@@ -1477,7 +1473,7 @@ impl TuiApp {
         Ok(())
     }
 
-    fn ensure_message_subscription(&mut self, account_id: &str, group_id: &str) -> TuiResult<()> {
+    fn ensure_message_subscription(&mut self, account_id: &str) -> TuiResult<()> {
         if !self.daemon.running {
             self.message_subscription = None;
             return Ok(());
@@ -1485,9 +1481,7 @@ impl TuiApp {
         if self
             .message_subscription
             .as_ref()
-            .is_some_and(|subscription| {
-                subscription.account_id == account_id && subscription.group_id == group_id
-            })
+            .is_some_and(|subscription| subscription.account_id == account_id)
         {
             return Ok(());
         }
@@ -1496,9 +1490,8 @@ impl TuiApp {
         let args = vec![
             "messages".to_owned(),
             "subscribe".to_owned(),
-            group_id.to_owned(),
             "--limit".to_owned(),
-            "50".to_owned(),
+            "200".to_owned(),
         ];
         let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
         let Some(stdout) = child.stdout.take() else {
@@ -1540,7 +1533,6 @@ impl TuiApp {
         });
         self.message_subscription = Some(MessageSubscription {
             account_id: account_id.to_owned(),
-            group_id: group_id.to_owned(),
             child,
             rx,
         });
@@ -1556,11 +1548,11 @@ impl TuiApp {
             self.message_subscription = None;
             return;
         }
-        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+        if self.selected_chat_row().is_none() {
             self.message_subscription = None;
             return;
-        };
-        if let Err(err) = self.ensure_message_subscription(&account.account_id, &group_id) {
+        }
+        if let Err(err) = self.ensure_message_subscription(&account.account_id) {
             self.status = format!("message subscription failed: {err}");
         }
     }
@@ -1583,9 +1575,13 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
-                    if let Some(status) = apply_subscription_result(
+                    let selected_group_id =
+                        self.selected_chat_row().map(|chat| chat.group_id.clone());
+                    if let Some(status) = apply_tui_subscription_result(
                         &mut self.messages,
                         &mut self.live_stream_previews,
+                        &mut self.unread_counts,
+                        selected_group_id.as_deref(),
                         &result,
                     ) {
                         self.status = status;
@@ -2210,6 +2206,65 @@ fn parse_daemon_stream_watch(value: &Value) -> Option<DaemonStreamWatchView> {
     })
 }
 
+fn apply_tui_subscription_result(
+    messages: &mut Vec<MessageRow>,
+    live_previews: &mut Vec<LiveStreamPreview>,
+    unread_counts: &mut HashMap<String, usize>,
+    selected_group_id: Option<&str>,
+    result: &Value,
+) -> Option<String> {
+    if is_initial_subscription_result(result) {
+        return None;
+    }
+    if let Some(group_id) = subscription_result_group_id(result)
+        && Some(group_id.as_str()) != selected_group_id
+    {
+        if subscription_result_counts_as_unread(result) {
+            let unread_count = unread_counts.entry(group_id.clone()).or_default();
+            *unread_count += 1;
+            return Some(format!(
+                "unread message in {}; count={}",
+                shorten(&group_id, 18),
+                unread_count
+            ));
+        }
+        return None;
+    }
+    apply_subscription_result(messages, live_previews, result)
+}
+
+fn is_initial_subscription_result(result: &Value) -> bool {
+    matches!(
+        result.get("trigger").and_then(Value::as_str),
+        Some("InitialMessage" | "InitialAgentStreamWatch")
+    )
+}
+
+fn subscription_result_group_id(result: &Value) -> Option<String> {
+    match result.get("type").and_then(Value::as_str) {
+        Some(
+            "message" | "reaction" | "message_delete" | "media" | "agent_stream_start"
+            | "agent_stream_final",
+        ) => result
+            .get("message")
+            .and_then(|message| value_string(message, "group_id")),
+        Some("agent_stream_delta") => result
+            .get("agent_stream_delta")
+            .and_then(|delta| value_string(delta, "group_id")),
+        Some("stream_preview") => result
+            .get("stream_preview")
+            .and_then(|preview| value_string(preview, "group_id")),
+        _ => None,
+    }
+}
+
+fn subscription_result_counts_as_unread(result: &Value) -> bool {
+    matches!(
+        result.get("type").and_then(Value::as_str),
+        Some("message" | "reaction" | "media" | "agent_stream_final")
+    )
+}
+
 fn apply_subscription_result(
     messages: &mut Vec<MessageRow>,
     live_previews: &mut Vec<LiveStreamPreview>,
@@ -2589,6 +2644,33 @@ fn group_members_status(result: &Value) -> String {
     format!("members: {}", member_ref_summary(&members))
 }
 
+fn chat_row_line(chat: &ChatRow, selected: bool, unread_count: usize) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    let archived = if chat.archived { " archived" } else { "" };
+    let mut ambient_style = Style::default();
+    let mut label_style = row_label_style(selected, Color::Green);
+    if unread_count > 0 {
+        ambient_style = ambient_style.add_modifier(Modifier::BOLD);
+        label_style = label_style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(vec![
+        Span::styled(format!("{marker} "), ambient_style),
+        Span::styled(chat_label(&chat.name, unread_count, 24), label_style),
+        Span::styled(archived.to_owned(), ambient_style),
+    ])
+}
+
+fn chat_label(name: &str, unread_count: usize, max_len: usize) -> String {
+    if unread_count == 0 {
+        return shorten(name, max_len);
+    }
+    shorten(&format!("{name} ({unread_count})"), max_len)
+}
+
+fn retain_unread_counts_for_chats(unread_counts: &mut HashMap<String, usize>, chats: &[ChatRow]) {
+    unread_counts.retain(|group_id, _| chats.iter().any(|chat| chat.group_id == *group_id));
+}
+
 fn selected_style(selected: bool) -> Style {
     if selected {
         Style::default()
@@ -2895,6 +2977,30 @@ mod tests {
     }
 
     #[test]
+    fn chat_row_line_shows_unread_count_in_bold() {
+        let chat = ChatRow {
+            group_id: "group-a".to_owned(),
+            name: "Project Room".to_owned(),
+            archived: false,
+        };
+
+        let line = chat_row_line(&chat, false, 3);
+
+        assert_eq!(line_text(&line), "  Project Room (3)");
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[1].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn chat_label_keeps_unread_count_when_truncated() {
+        assert_eq!(
+            chat_label("A very long group display name", 12, 18),
+            "A very ...ame (12)"
+        );
+    }
+
+    #[test]
     fn message_lines_keep_chronological_order_and_summarize_stream_markers() {
         let mut messages = [
             serde_json::json!({
@@ -3175,6 +3281,101 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rendered, vec!["alice: hello from MLS"]);
         assert!(previews.is_empty());
+    }
+
+    #[test]
+    fn all_chat_subscription_marks_nonselected_messages_unread() {
+        let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut messages = Vec::new();
+        let mut previews = Vec::new();
+        let mut unread_counts = HashMap::new();
+
+        let status = apply_tui_subscription_result(
+            &mut messages,
+            &mut previews,
+            &mut unread_counts,
+            Some(selected_group_id),
+            &serde_json::json!({
+                "trigger": "MessageReceived",
+                "type": "message",
+                "message": {
+                    "message_id": "02",
+                    "direction": "received",
+                    "group_id": unread_group_id,
+                    "from": "alice",
+                    "plaintext": "hello elsewhere"
+                }
+            }),
+        );
+
+        assert_eq!(messages.len(), 0);
+        assert_eq!(unread_counts.get(unread_group_id), Some(&1));
+        assert_eq!(
+            status,
+            Some("unread message in bbbbbbb...bbbbbbbb; count=1".to_owned())
+        );
+    }
+
+    #[test]
+    fn all_chat_subscription_applies_selected_messages_without_unread_count() {
+        let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut messages = Vec::new();
+        let mut previews = Vec::new();
+        let mut unread_counts = HashMap::new();
+
+        apply_tui_subscription_result(
+            &mut messages,
+            &mut previews,
+            &mut unread_counts,
+            Some(selected_group_id),
+            &serde_json::json!({
+                "trigger": "MessageReceived",
+                "type": "message",
+                "message": {
+                    "message_id": "01",
+                    "direction": "received",
+                    "group_id": selected_group_id,
+                    "from": "alice",
+                    "plaintext": "hello here"
+                }
+            }),
+        );
+
+        assert_eq!(unread_counts.get(selected_group_id), None);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].display_text, "hello here");
+    }
+
+    #[test]
+    fn all_chat_subscription_ignores_initial_replay_for_unread_counts() {
+        let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let replay_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut messages = Vec::new();
+        let mut previews = Vec::new();
+        let mut unread_counts = HashMap::new();
+
+        let status = apply_tui_subscription_result(
+            &mut messages,
+            &mut previews,
+            &mut unread_counts,
+            Some(selected_group_id),
+            &serde_json::json!({
+                "trigger": "InitialMessage",
+                "type": "message",
+                "message": {
+                    "message_id": "old",
+                    "direction": "received",
+                    "group_id": replay_group_id,
+                    "from": "alice",
+                    "plaintext": "old message"
+                }
+            }),
+        );
+
+        assert_eq!(status, None);
+        assert!(messages.is_empty());
+        assert!(unread_counts.is_empty());
     }
 
     #[test]
