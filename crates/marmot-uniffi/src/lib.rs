@@ -418,6 +418,23 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Mark `target_message_id` deleted for the whole group. This is a
+    /// tombstone — the original stays in everyone's store; clients render a
+    /// "message deleted" placeholder.
+    pub async fn delete_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .delete_message(&account_ref, &group_id, &target_message_id)
+            .await?;
+        Ok(summary.into())
+    }
+
     /// Best-effort cached display name for an account id. Returns the Nostr
     /// kind:0 display_name/name when the runtime has projected one, or the
     /// local account label if the id refers to one of our own accounts.
