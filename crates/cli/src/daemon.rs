@@ -998,6 +998,10 @@ async fn handle_messages_subscription(
 
     loop {
         tokio::select! {
+            // Stream-start messages are published before their preview updates; keep that
+            // ordering stable when both broadcast channels are ready in the same poll.
+            biased;
+
             update = runtime_subscription.recv() => {
                 let Some(update) = update else {
                     return Ok(());
