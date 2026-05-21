@@ -2467,24 +2467,29 @@ impl MarmotApp {
         }
         let keys = self.account_home().load_signing_keys(label)?;
         let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
-        let relay_client = self.relay_client_for_endpoints(&keys, &bootstrap.bootstrap_relays);
+        let account_id_hex = keys.public_key().to_hex();
+        // Outbox routing: publish relay-list events to the account's own NIP-65
+        // write relays; fall back to the bootstrap/seed relays on first publish
+        // (no NIP-65 yet). The declared list (content) is `default_relays`, but
+        // the relays we publish *through* must be reachable — the account's own
+        // relays or the seed, never the (possibly not-yet-reachable) declared set.
+        let endpoints = self.outbox_endpoints(
+            &account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
+        let relay_client = self.relay_client_for_endpoints(&keys, &endpoints);
         for list_kind in list_kinds {
             let publication = NostrAccountRelayListPublication {
                 account_id: account_id.clone(),
                 list_kind: *list_kind,
                 relays: bootstrap.default_relays.clone(),
-                publish_endpoints: bootstrap.bootstrap_relays.clone(),
+                publish_endpoints: endpoints.clone(),
             };
             let event = publication.to_event()?;
-            relay_client
-                .publish_event(&bootstrap.bootstrap_relays, &event, 1)
-                .await?;
+            relay_client.publish_event(&endpoints, &event, 1).await?;
         }
-        self.fetch_account_relay_list_status_for_account_id(
-            &keys.public_key().to_hex(),
-            bootstrap.bootstrap_relays,
-        )
-        .await
+        self.fetch_account_relay_list_status_for_account_id(&account_id_hex, endpoints)
+            .await
     }
 
     pub async fn fetch_account_relay_list_status_for_account_id(
@@ -2602,6 +2607,27 @@ impl MarmotApp {
         })
     }
 
+    /// Outbox routing for account-scoped events. Prefers the account's own
+    /// declared NIP-65 write relays (read from the local relay-list cache, no
+    /// network), so e.g. republishing your relay lists / profile goes to *your*
+    /// relays rather than whatever defaults the caller passed. Falls back to
+    /// `fallback` only when the account has no NIP-65 list yet (cold start).
+    fn outbox_endpoints(
+        &self,
+        account_id_hex: &str,
+        fallback: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let nip65 = self
+            .account_relay_list_status_for_account_id(account_id_hex)
+            .map(|status| status.nip65.relays)
+            .unwrap_or_default();
+        if nip65.is_empty() {
+            fallback
+        } else {
+            nip65.into_iter().map(TransportEndpoint).collect()
+        }
+    }
+
     pub async fn publish_user_profile(
         &self,
         label: &str,
@@ -2609,7 +2635,10 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        let endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints = self.outbox_endpoints(
+            &keys.public_key().to_hex(),
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
         let content = serde_json::to_string(&profile_content_json(&profile))?;
         let event = NostrTransportEvent::new_unsigned(
             keys.public_key().to_hex(),
@@ -2630,7 +2659,10 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        let endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints = self.outbox_endpoints(
+            &keys.public_key().to_hex(),
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
         let tags = follows
             .iter()
             .map(|follow| {
