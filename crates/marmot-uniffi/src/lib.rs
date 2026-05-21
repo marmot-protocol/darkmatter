@@ -343,7 +343,13 @@ impl Marmot {
     }
 
     /// Per-account chats list. Emits whenever a group's projection changes.
-    pub fn subscribe_chats(
+    ///
+    /// `async` is required even though the body is synchronous: marmot-app's
+    /// `subscribe_chats` spawns a background filter task via `tokio::spawn`,
+    /// which panics ("no reactor running") if invoked outside a tokio
+    /// runtime. UniFFI only enters the tokio runtime for `async` exports, so
+    /// the subscribe methods that spawn must be async.
+    pub async fn subscribe_chats(
         &self,
         account_ref: String,
         include_archived: bool,
@@ -355,8 +361,9 @@ impl Marmot {
     }
 
     /// Messages for a specific group (when `group_id_hex` is `Some`) or
-    /// every message across the account (when `None`).
-    pub fn subscribe_messages(
+    /// every message across the account (when `None`). Async for the same
+    /// tokio-runtime reason as [`Marmot::subscribe_chats`].
+    pub async fn subscribe_messages(
         &self,
         account_ref: String,
         group_id_hex: Option<String>,
@@ -369,8 +376,9 @@ impl Marmot {
         Ok(MessagesSubscription::new(inner))
     }
 
-    /// Member/profile/roster changes for one group.
-    pub fn subscribe_group_state(
+    /// Member/profile/roster changes for one group. Async for the same
+    /// tokio-runtime reason as [`Marmot::subscribe_chats`].
+    pub async fn subscribe_group_state(
         &self,
         account_ref: String,
         group_id_hex: String,
