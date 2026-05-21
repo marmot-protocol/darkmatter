@@ -9,9 +9,10 @@
 use cgka_traits::GroupId;
 use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
-    AppGroupMemberRecord, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
-    AppMessageRecord, MarmotAppEvent, ReceivedMessage, RelayPlaneHealth, RuntimeMessageReceived,
-    RuntimeMessageUpdate, SendSummary, UserProfileMetadata,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent, ReceivedMessage,
+    RelayPlaneHealth, RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary,
+    UserProfileMetadata,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -111,6 +112,27 @@ impl From<AppGroupMemberRecord> for AppGroupMemberRecordFfi {
             member_id_hex: value.member_id_hex,
             account: value.account,
             local: value.local,
+        }
+    }
+}
+
+/// MLS-level group state for the conversation's developer/debug view: the
+/// current epoch, live member count, and the app components the group requires.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AppGroupMlsStateFfi {
+    pub group_id_hex: String,
+    pub epoch: u64,
+    pub member_count: u32,
+    pub required_app_components: Vec<u16>,
+}
+
+impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
+    fn from(value: AppGroupMlsState) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            epoch: value.epoch,
+            member_count: value.member_count as u32,
+            required_app_components: value.required_app_components,
         }
     }
 }

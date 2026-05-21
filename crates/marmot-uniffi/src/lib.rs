@@ -27,8 +27,8 @@ mod errors;
 mod subscriptions;
 
 use conversions::{
-    AccountSummaryFfi, AppGroupMemberRecordFfi, AppMessageRecordFfi, SendSummaryFfi,
-    UserProfileMetadataFfi, group_id_from_hex,
+    AccountSummaryFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
+    AppMessageRecordFfi, SendSummaryFfi, UserProfileMetadataFfi, group_id_from_hex,
 };
 use errors::MarmotKitError;
 use subscriptions::{
@@ -271,6 +271,84 @@ impl Marmot {
             .update_group_profile(&account_ref, &group_id, name, description)
             .await?;
         Ok(summary.into())
+    }
+
+    /// Grant admin rights to `member_ref` (npub or hex). Requires the caller
+    /// to be an admin; publishes a group state update.
+    pub async fn promote_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_ref: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .promote_admin(&account_ref, &group_id, &member_ref)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Revoke `member_ref`'s admin rights.
+    pub async fn demote_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_ref: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .demote_admin(&account_ref, &group_id, &member_ref)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Step down as an admin of `group_id_hex` (demote the active account).
+    pub async fn self_demote_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .self_demote_admin(&account_ref, &group_id)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Current MLS state (epoch, member count, required components) for the
+    /// conversation developer/debug view.
+    pub async fn group_mls_state(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<AppGroupMlsStateFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let state = self
+            .runtime
+            .group_mls_state(&account_ref, &group_id)
+            .await?;
+        Ok(state.into())
+    }
+
+    /// Flag a group archived (or restore it). Local-only projection state —
+    /// it does not change membership or publish anything. The chats list
+    /// filters archived groups unless `include_archived` is set.
+    pub fn set_group_archived(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        archived: bool,
+    ) -> Result<AppGroupRecordFfi, MarmotKitError> {
+        let account = self.runtime.accounts().resolve(&account_ref)?;
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group = self
+            .app
+            .set_group_archived(&account.label, &group_id_hex, archived)?;
+        Ok(group.into())
     }
 
     // -----------------------------------------------------------------------
