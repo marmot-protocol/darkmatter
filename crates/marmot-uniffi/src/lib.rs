@@ -305,6 +305,13 @@ impl Marmot {
         marmot_app::npub_for_account_id(&account_id_hex).ok()
     }
 
+    /// Normalize a public-key reference (npub or hex) to canonical hex.
+    /// `None` if it isn't a valid public key. Used to resolve a scanned or
+    /// deep-linked npub back to the account id the rest of the API expects.
+    pub fn account_id_hex(&self, reference: String) -> Option<String> {
+        marmot_app::account_id_hex_from_ref(&reference).ok()
+    }
+
     /// Per-account relay lists: the NIP-65, inbox, and key-package lists the
     /// account has published, plus the configured default/bootstrap sets.
     pub fn account_relay_lists(

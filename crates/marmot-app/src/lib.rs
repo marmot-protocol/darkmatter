@@ -5099,6 +5099,14 @@ pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::InvalidPublicKey)
 }
 
+/// Normalize any public-key reference (npub bech32 or hex) into canonical
+/// hex account id. Public so embedders can resolve scanned/typed npubs.
+pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
+    Ok(PublicKey::parse(reference)
+        .map_err(|_| AppError::InvalidPublicKey)?
+        .to_hex())
+}
+
 fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
     npub_for_account_id(account_id_hex).unwrap_or_else(|_| account_id_hex.to_owned())
 }
