@@ -33,6 +33,11 @@ CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"
 FRAMEWORK_NAME="MarmotKit"
 
+# Run from the workspace root so cargo resolves the right Cargo.toml no
+# matter where this script was invoked from (e.g. the iOS repo's
+# sync-bindings.sh).
+cd "$WORKSPACE_DIR"
+
 echo "==> Cleaning previous build artifacts"
 rm -rf "$BUILD_DIR" "$OUT_DIR"
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
