@@ -4923,13 +4923,21 @@ fn profile_from_record(record: RelayEventRecord) -> Option<(String, UserProfileM
     ))
 }
 
+/// Defensive cap on any single ingested profile field. Nostr kind:0 content
+/// is attacker-controlled (anyone can publish any metadata to a relay), so we
+/// bound each field to keep a malicious multi-megabyte value from bloating the
+/// directory cache and downstream consumers. 4096 chars is generous for any
+/// legitimate name/about/url. Char-based (not byte) truncation keeps the
+/// result valid UTF-8.
+const MAX_PROFILE_FIELD_CHARS: usize = 4096;
+
 fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
     value
         .get(field)
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .map(|value| value.chars().take(MAX_PROFILE_FIELD_CHARS).collect())
 }
 
 fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
