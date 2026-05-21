@@ -299,6 +299,30 @@ impl Marmot {
         self.runtime.display_name_for_account_id(&account_id_hex)
     }
 
+    /// Convert a hex account id (Nostr public key) into its `npub…` bech32
+    /// form for display. `None` if the hex isn't a valid public key.
+    pub fn npub(&self, account_id_hex: String) -> Option<String> {
+        marmot_app::npub_for_account_id(&account_id_hex).ok()
+    }
+
+    /// Per-account relay lists: the NIP-65, inbox, and key-package lists the
+    /// account has published, plus the configured default/bootstrap sets.
+    pub fn account_relay_lists(
+        &self,
+        account_ref: String,
+    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
+        let account = self.runtime.accounts().resolve(&account_ref)?;
+        let status = self.app.account_relay_list_status(&account.label)?;
+        Ok(status.into())
+    }
+
+    /// Live relay-plane connection health (connected / connecting /
+    /// disconnected counts, etc.) for the relay diagnostics view.
+    pub async fn relay_health(&self) -> conversions::RelayHealthFfi {
+        let shared = self.runtime.shared_services();
+        shared.relay_plane().relay_health().await.into()
+    }
+
     /// Full cached Nostr kind:0 profile for an account id (name, display
     /// name, about, picture, nip05, lud16), if the runtime has one
     /// projected. The local account's own profile is cached immediately

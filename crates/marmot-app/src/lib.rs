@@ -5086,7 +5086,9 @@ fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, AppError> {
     Ok(values)
 }
 
-fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
+/// Convert a hex Nostr public key (account id) into its `npub…` bech32 form.
+/// Public so embedders (FFI/UI) can render npubs instead of raw hex.
+pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
     PublicKey::parse(account_id_hex)
         .map_err(|_| AppError::InvalidPublicKey)?
         .to_bech32()

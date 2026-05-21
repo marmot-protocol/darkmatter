@@ -8,9 +8,10 @@
 
 use cgka_traits::GroupId;
 use marmot_app::{
-    AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupNostrRoutingComponent,
-    AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent, ReceivedMessage,
-    RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary, UserProfileMetadata,
+    AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
+    AppGroupMemberRecord, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppMessageRecord, MarmotAppEvent, ReceivedMessage, RelayPlaneHealth, RuntimeMessageReceived,
+    RuntimeMessageUpdate, SendSummary, UserProfileMetadata,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -295,6 +296,82 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex: m.account_id_hex,
                 account_label: m.account_label,
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayListFfi {
+    pub kind: u64,
+    pub relays: Vec<String>,
+}
+
+impl From<AccountRelayListState> for RelayListFfi {
+    fn from(value: AccountRelayListState) -> Self {
+        Self {
+            kind: value.kind,
+            relays: value.relays,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AccountRelayListsFfi {
+    pub complete: bool,
+    pub missing: Vec<String>,
+    pub default_relays: Vec<String>,
+    pub bootstrap_relays: Vec<String>,
+    pub nip65: RelayListFfi,
+    pub inbox: RelayListFfi,
+    pub key_package: RelayListFfi,
+}
+
+impl From<AccountRelayListStatus> for AccountRelayListsFfi {
+    fn from(value: AccountRelayListStatus) -> Self {
+        Self {
+            complete: value.complete,
+            missing: value.missing,
+            default_relays: value.default_relays,
+            bootstrap_relays: value.bootstrap_relays,
+            nip65: value.nip65.into(),
+            inbox: value.inbox.into(),
+            key_package: value.key_package.into(),
+        }
+    }
+}
+
+/// Live relay-plane connection health for the diagnostics view.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayHealthFfi {
+    pub sdk_backed: bool,
+    pub total_relays: u32,
+    pub initialized: u32,
+    pub pending: u32,
+    pub connecting: u32,
+    pub connected: u32,
+    pub disconnected: u32,
+    pub terminated: u32,
+    pub banned: u32,
+    pub sleeping: u32,
+    pub connection_attempts: u32,
+    pub connection_successes: u32,
+}
+
+impl From<RelayPlaneHealth> for RelayHealthFfi {
+    fn from(value: RelayPlaneHealth) -> Self {
+        Self {
+            sdk_backed: value.sdk_backed,
+            total_relays: value.total_relays as u32,
+            initialized: value.initialized as u32,
+            pending: value.pending as u32,
+            connecting: value.connecting as u32,
+            connected: value.connected as u32,
+            disconnected: value.disconnected as u32,
+            terminated: value.terminated as u32,
+            banned: value.banned as u32,
+            sleeping: value.sleeping as u32,
+            connection_attempts: value.connection_attempts as u32,
+            connection_successes: value.connection_successes as u32,
         }
     }
 }
