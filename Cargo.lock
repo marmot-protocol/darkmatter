@@ -2453,6 +2453,7 @@ dependencies = [
  "hex",
  "marmot-account",
  "marmot-app",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uniffi",
