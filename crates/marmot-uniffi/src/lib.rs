@@ -32,7 +32,8 @@ use conversions::{
 };
 use errors::MarmotKitError;
 use subscriptions::{
-    ChatsSubscription, EventsSubscription, GroupStateSubscription, MessagesSubscription,
+    AgentStreamSubscription, ChatsSubscription, EventsSubscription, GroupStateSubscription,
+    MessagesSubscription,
 };
 
 uniffi::setup_scaffolding!();
@@ -433,6 +434,33 @@ impl Marmot {
             .delete_message(&account_ref, &group_id, &target_message_id)
             .await?;
         Ok(summary.into())
+    }
+
+    /// Watch a live agent text stream over the brokered QUIC channel. Pass
+    /// `stream_id_hex = None` to follow the latest stream in the group (the
+    /// common case when reacting to an AgentStreamStarted event). The returned
+    /// subscription yields incremental `Chunk`s then a terminal `Finished` /
+    /// `Failed`. `server_cert_der` pins a self-signed broker cert (else platform
+    /// trust); `insecure_local` is loopback-only for testing.
+    pub async fn watch_agent_text_stream(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        stream_id_hex: Option<String>,
+        server_cert_der: Option<Vec<u8>>,
+        insecure_local: bool,
+    ) -> Result<Arc<AgentStreamSubscription>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let watch = self.runtime.watch_agent_text_stream(
+            &account_ref,
+            &group_id,
+            marmot_app::AgentStreamWatchOptions {
+                stream_id_hex,
+                server_cert_der,
+                insecure_local,
+            },
+        )?;
+        Ok(AgentStreamSubscription::new(watch))
     }
 
     /// Best-effort cached display name for an account id. Returns the Nostr

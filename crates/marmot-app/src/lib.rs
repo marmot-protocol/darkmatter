@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +23,7 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
     AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC, AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC,
     AgentTextStreamAppPayloadEnvelopeV1, AgentTextStreamAppPayloadV1, AgentTextStreamQuicPolicyV1,
+    AgentTextStreamRouteV1, AgentTextStreamStartPayloadV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
@@ -44,7 +46,7 @@ use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent
 use cgka_traits::group::Group;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    GroupId, MemberId, TransportAdapter, TransportAdapterError, TransportEndpoint,
+    GroupId, MemberId, MessageId, TransportAdapter, TransportAdapterError, TransportEndpoint,
     TransportGroupSubscription, TransportPublishTarget,
 };
 use marmot_account::{
@@ -69,6 +71,9 @@ use transport_nostr_adapter::{
     NostrRelayClient, NostrSdkRelayClient,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
+use transport_quic_broker::{
+    BrokerServerTrust, SubscribeTextFromBroker, subscribe_text_from_broker_with_updates,
+};
 
 mod agent_streams;
 mod directory_cache;
@@ -486,6 +491,44 @@ impl RuntimeGroupStateSubscription {
     }
 }
 
+/// One update from watching a live agent text stream over QUIC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeAgentStreamUpdate {
+    /// An incremental text delta. `text` is the new fragment, not the full text.
+    Chunk { seq: u64, text: String },
+    /// The stream closed cleanly; `text` is the complete transcript.
+    Finished {
+        text: String,
+        transcript_hash_hex: String,
+        chunk_count: u64,
+    },
+    /// The watch failed (connection/broker error).
+    Failed { message: String },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentStreamWatchOptions {
+    /// Watch a specific stream id; `None` watches the latest stream in the group.
+    pub stream_id_hex: Option<String>,
+    /// DER cert for a self-signed broker; `None` uses platform trust.
+    pub server_cert_der: Option<Vec<u8>>,
+    /// Loopback-only insecure trust, for local testing.
+    pub insecure_local: bool,
+}
+
+/// A live agent-text-stream watch. Drains chunk/finished/failed updates from a
+/// background QUIC subscription task.
+pub struct RuntimeAgentStreamWatch {
+    pub stream_id_hex: String,
+    updates: mpsc::Receiver<RuntimeAgentStreamUpdate>,
+}
+
+impl RuntimeAgentStreamWatch {
+    pub async fn recv(&mut self) -> Option<RuntimeAgentStreamUpdate> {
+        self.updates.recv().await
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarmotAppEvent {
     GroupJoined {
@@ -694,6 +737,84 @@ impl MarmotAppRuntime {
         });
         Ok(RuntimeGroupStateSubscription {
             snapshot,
+            updates: updates_rx,
+        })
+    }
+
+    /// Watch a live agent text stream over the brokered QUIC channel. Resolves
+    /// the latest `Start` payload for the group (or a specific `stream_id`),
+    /// connects to the broker named in its `quic://` candidate, and streams
+    /// incremental text chunks until the stream finishes. Must be called from
+    /// within a tokio runtime (it spawns the QUIC subscriber task).
+    pub fn watch_agent_text_stream(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        options: AgentStreamWatchOptions,
+    ) -> Result<RuntimeAgentStreamWatch, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let messages = self.messages_with_query(
+            account_ref,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: None,
+            },
+        )?;
+        let (start_message_id_hex, start) =
+            latest_agent_stream_start(messages, options.stream_id_hex.as_deref())?;
+        if start.route != AgentTextStreamRouteV1::BrokeredQuic {
+            return Err(AppError::AgentStreamUnsupportedRoute);
+        }
+        let candidate = start
+            .quic_candidates
+            .iter()
+            .find(|candidate| candidate.trim().starts_with("quic://"))
+            .ok_or(AppError::AgentStreamMissingCandidate)?;
+        let parsed = parse_quic_candidate(candidate)?;
+        let trust = if options.insecure_local {
+            BrokerServerTrust::InsecureLocal
+        } else if let Some(der) = options.server_cert_der {
+            BrokerServerTrust::CertificateDer(der)
+        } else {
+            BrokerServerTrust::Platform
+        };
+        let stream_id = hex::decode(&start.stream_id)?;
+        let stream_id_hex = start.stream_id.clone();
+        let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+
+        let (updates_tx, updates_rx) = mpsc::channel(1024);
+        let config = SubscribeTextFromBroker {
+            broker_addr: parsed.addr,
+            server_name: parsed.server_name,
+            trust,
+            stream_id,
+            start_event_id,
+        };
+        tokio::spawn(async move {
+            let chunk_tx = updates_tx.clone();
+            let result = subscribe_text_from_broker_with_updates(config, |chunk| {
+                // Non-blocking: if the consumer falls behind we drop a delta;
+                // the Finished update carries the full transcript for reconcile.
+                let _ = chunk_tx.try_send(RuntimeAgentStreamUpdate::Chunk {
+                    seq: chunk.seq,
+                    text: chunk.text.clone(),
+                });
+            })
+            .await;
+            let final_update = match result {
+                Ok(received) => RuntimeAgentStreamUpdate::Finished {
+                    text: received.text,
+                    transcript_hash_hex: hex::encode(received.transcript_hash),
+                    chunk_count: received.chunk_count,
+                },
+                Err(err) => RuntimeAgentStreamUpdate::Failed {
+                    message: err.to_string(),
+                },
+            };
+            let _ = updates_tx.send(final_update).await;
+        });
+        Ok(RuntimeAgentStreamWatch {
+            stream_id_hex,
             updates: updates_rx,
         })
     }
@@ -2204,6 +2325,14 @@ pub enum AppError {
     MissingKeyPackage(String),
     #[error("unknown local group: {0}")]
     UnknownGroup(String),
+    #[error("no agent text stream start found for this group")]
+    AgentStreamMissingStart,
+    #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
+    AgentStreamUnsupportedRoute,
+    #[error("agent text stream start has no usable quic:// candidate")]
+    AgentStreamMissingCandidate,
+    #[error("invalid quic candidate: {0}")]
+    AgentStreamInvalidCandidate(String),
     #[error("publish failed: {0}")]
     Publish(String),
     #[error("default relays are required to publish account relay lists")]
@@ -3735,6 +3864,67 @@ fn agent_stream_runtime_event(
             Some(MarmotAppEvent::AgentStreamFinalized(stream_message))
         }
     }
+}
+
+struct ParsedQuicCandidate {
+    addr: SocketAddr,
+    server_name: String,
+}
+
+/// Find the most recent `Start` agent-text-stream payload in a group's message
+/// history, optionally constrained to a specific `stream_id`.
+fn latest_agent_stream_start(
+    messages: Vec<AppMessageRecord>,
+    stream_id_hex: Option<&str>,
+) -> Result<(String, AgentTextStreamStartPayloadV1), AppError> {
+    messages
+        .into_iter()
+        .rev()
+        .find_map(|message| {
+            let payload = AgentTextStreamAppPayloadEnvelopeV1::decode(message.plaintext.as_bytes())
+                .ok()
+                .flatten()?;
+            match payload.payload {
+                AgentTextStreamAppPayloadV1::Start(start)
+                    if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id) =>
+                {
+                    Some((message.message_id_hex, start))
+                }
+                _ => None,
+            }
+        })
+        .ok_or(AppError::AgentStreamMissingStart)
+}
+
+fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, AppError> {
+    let trimmed = candidate.trim();
+    let Some(rest) = trimmed.strip_prefix("quic://") else {
+        return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
+    }
+    let server_name = candidate_server_name(authority)?;
+    let addr = authority
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(trimmed.to_owned()))?;
+    Ok(ParsedQuicCandidate { addr, server_name })
+}
+
+fn candidate_server_name(authority: &str) -> Result<String, AppError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, _)) = rest.split_once(']') else {
+            return Err(AppError::AgentStreamInvalidCandidate(authority.to_owned()));
+        };
+        return Ok(host.to_owned());
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(host, _)| host.to_owned())
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))
 }
 
 fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMessageUpdate> {

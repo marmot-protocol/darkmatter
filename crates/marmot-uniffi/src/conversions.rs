@@ -11,8 +11,8 @@ use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent, ReceivedMessage,
-    RelayPlaneHealth, RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary,
-    UserProfileMetadata,
+    RelayPlaneHealth, RuntimeAgentStreamUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
+    SendSummary, UserProfileMetadata,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -34,6 +34,42 @@ impl From<SendSummary> for SendSummaryFfi {
         Self {
             published: value.published as u32,
             message_ids: value.message_ids,
+        }
+    }
+}
+
+/// One update from a live agent-text-stream watch. `Chunk.text` is an
+/// incremental fragment; `Finished.text` is the complete transcript.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum AgentStreamUpdateFfi {
+    Chunk {
+        seq: u64,
+        text: String,
+    },
+    Finished {
+        text: String,
+        transcript_hash_hex: String,
+        chunk_count: u64,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
+    fn from(value: RuntimeAgentStreamUpdate) -> Self {
+        match value {
+            RuntimeAgentStreamUpdate::Chunk { seq, text } => Self::Chunk { seq, text },
+            RuntimeAgentStreamUpdate::Finished {
+                text,
+                transcript_hash_hex,
+                chunk_count,
+            } => Self::Finished {
+                text,
+                transcript_hash_hex,
+                chunk_count,
+            },
+            RuntimeAgentStreamUpdate::Failed { message } => Self::Failed { message },
         }
     }
 }
