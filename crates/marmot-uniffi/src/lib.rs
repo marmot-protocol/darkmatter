@@ -346,17 +346,16 @@ impl Marmot {
         Ok(entry.and_then(|record| record.profile).map(Into::into))
     }
 
-    /// Refresh the user-directory entry for `account_id_hex` from the given
-    /// relays. After this resolves successfully, `display_name` will return
-    /// the freshly-projected name (if any was published).
-    pub async fn refresh_directory(
+    /// Fetch and cache an account's own Nostr kind:0 profile from `relays`.
+    /// After this resolves, `user_profile` / `display_name` return the
+    /// freshly-fetched metadata (name, picture, etc.) for that account.
+    pub async fn refresh_profile(
         &self,
         account_id_hex: String,
-        bootstrap_relays: Vec<String>,
+        relays: Vec<String>,
     ) -> Result<(), MarmotKitError> {
-        let _ = self
-            .runtime
-            .refresh_user_directory_for_account_id(&account_id_hex, endpoints(&bootstrap_relays))
+        self.app
+            .refresh_profile_for_account_id(&account_id_hex, endpoints(&relays))
             .await?;
         Ok(())
     }

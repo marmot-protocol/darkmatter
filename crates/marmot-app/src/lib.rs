@@ -2845,6 +2845,20 @@ impl MarmotApp {
         Ok(profiles.len())
     }
 
+    /// Fetch and cache a single account's own Nostr kind:0 profile from
+    /// relays. Unlike `refresh_user_directory_for_account_id` (which refreshes
+    /// the account's *follows'* profiles), this targets the account itself, so
+    /// its display name / avatar become locally available right away.
+    pub async fn refresh_profile_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<(), AppError> {
+        self.refresh_directory_profiles(&[account_id_hex.to_owned()], &source_relays)
+            .await?;
+        Ok(())
+    }
+
     async fn fetch_events_for_account_ids(
         &self,
         account_ids: &[String],
