@@ -204,9 +204,7 @@ pub enum MessageUpdateFfi {
 impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
     fn from(value: RuntimeMessageUpdate) -> Self {
         match value {
-            RuntimeMessageUpdate::Message(m) => Self::Message {
-                received: m.into(),
-            },
+            RuntimeMessageUpdate::Message(m) => Self::Message { received: m.into() },
             RuntimeMessageUpdate::AgentStreamStarted(m) => Self::AgentStreamStarted {
                 received: RuntimeMessageReceivedFfi {
                     account_id_hex: m.account_id_hex,
@@ -279,9 +277,7 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_label,
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
-            MarmotAppEvent::MessageReceived(m) => Self::MessageReceived {
-                received: m.into(),
-            },
+            MarmotAppEvent::MessageReceived(m) => Self::MessageReceived { received: m.into() },
             MarmotAppEvent::GroupEvent(e) => Self::GroupEvent {
                 account_id_hex: e.account_id_hex,
                 account_label: e.account_label,
@@ -291,11 +287,12 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_label: e.account_label,
                 message: e.message,
             },
-            MarmotAppEvent::AgentStreamStarted(m)
-            | MarmotAppEvent::AgentStreamFinalized(m) => Self::AgentStreamActivity {
-                account_id_hex: m.account_id_hex,
-                account_label: m.account_label,
-            },
+            MarmotAppEvent::AgentStreamStarted(m) | MarmotAppEvent::AgentStreamFinalized(m) => {
+                Self::AgentStreamActivity {
+                    account_id_hex: m.account_id_hex,
+                    account_label: m.account_label,
+                }
+            }
         }
     }
 }
@@ -378,8 +375,9 @@ impl From<RelayPlaneHealth> for RelayHealthFfi {
 
 /// Decode a hex-encoded group id back into the engine's byte newtype.
 pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::MarmotKitError> {
-    let bytes = hex::decode(group_id_hex).map_err(|err| crate::errors::MarmotKitError::InvalidHex {
-        message: err.to_string(),
-    })?;
+    let bytes =
+        hex::decode(group_id_hex).map_err(|err| crate::errors::MarmotKitError::InvalidHex {
+            message: err.to_string(),
+        })?;
     Ok(GroupId::new(bytes))
 }

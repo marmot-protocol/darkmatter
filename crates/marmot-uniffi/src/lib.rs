@@ -19,8 +19,7 @@ use std::sync::Arc;
 
 use cgka_traits::TransportEndpoint;
 use marmot_app::{
-    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppRuntime,
-    UserProfileMetadata,
+    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppRuntime, UserProfileMetadata,
 };
 
 mod conversions;

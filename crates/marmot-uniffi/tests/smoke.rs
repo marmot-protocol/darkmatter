@@ -44,8 +44,11 @@ fn display_name_is_none_for_unknown_account() {
     .expect("open marmot kit");
 
     // A hex string that doesn't match any known account should produce None.
-    let name = kit.display_name(
-        "0000000000000000000000000000000000000000000000000000000000000000".into(),
+    let name =
+        kit.display_name("0000000000000000000000000000000000000000000000000000000000000000".into());
+    assert!(
+        name.is_none(),
+        "expected None for unknown account, got {:?}",
+        name
     );
-    assert!(name.is_none(), "expected None for unknown account, got {:?}", name);
 }

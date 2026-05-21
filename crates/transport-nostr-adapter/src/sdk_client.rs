@@ -342,8 +342,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
                     break;
                 }
                 Ok(Err(e)) => {
-                    last_error =
-                        Some(TransportAdapterError::Publish(format!("send event: {e}")));
+                    last_error = Some(TransportAdapterError::Publish(format!("send event: {e}")));
                 }
                 Err(_) => {
                     last_error = Some(TransportAdapterError::Publish(
