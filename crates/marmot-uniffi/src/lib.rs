@@ -299,6 +299,19 @@ impl Marmot {
         self.runtime.display_name_for_account_id(&account_id_hex)
     }
 
+    /// Full cached Nostr kind:0 profile for an account id (name, display
+    /// name, about, picture, nip05, lud16), if the runtime has one
+    /// projected. The local account's own profile is cached immediately
+    /// after `publish_user_profile`; other accounts' profiles populate via
+    /// `refresh_directory`. Returns `None` when nothing is cached yet.
+    pub fn user_profile(
+        &self,
+        account_id_hex: String,
+    ) -> Result<Option<UserProfileMetadataFfi>, MarmotKitError> {
+        let entry = self.app.directory_entry_for_account_id(&account_id_hex)?;
+        Ok(entry.and_then(|record| record.profile).map(Into::into))
+    }
+
     /// Refresh the user-directory entry for `account_id_hex` from the given
     /// relays. After this resolves successfully, `display_name` will return
     /// the freshly-projected name (if any was published).
