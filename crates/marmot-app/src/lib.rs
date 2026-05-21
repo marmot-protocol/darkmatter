@@ -3008,8 +3008,12 @@ impl MarmotApp {
     }
 
     async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
-        if self.account_home().account(member_ref).is_ok() {
-            return self.latest_key_package(member_ref);
+        // Local accounts: cache files are keyed by the account's canonical
+        // label, so resolve the ref (which may be an npub or hex pubkey)
+        // before looking up the cached key package. Using the raw ref here
+        // would miss the file when inviting a local account by npub.
+        if let Ok(account) = self.account_home().account(member_ref) {
+            return self.latest_key_package(&account.label);
         }
         let account_id = PublicKey::parse(member_ref)
             .map_err(|_| AppError::MissingKeyPackage(member_ref.to_owned()))?
