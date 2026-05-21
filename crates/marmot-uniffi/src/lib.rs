@@ -56,14 +56,17 @@ pub struct Marmot {
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
     /// Open the Marmot app at `root_path`, configured with the given default
-    /// relay URLs. The on-disk layout is created lazily — no I/O happens here
-    /// beyond opening the account-home directory. Call [`Marmot::start`]
-    /// before subscribing to events.
+    /// relay URLs. Account secrets (Nostr private keys) are stored in the
+    /// platform **Keychain** via the default keychain-backed account home —
+    /// not in a plaintext file. Fallible because initializing the keychain
+    /// store can fail. Call [`Marmot::start`] before subscribing to events.
     #[uniffi::constructor]
-    pub fn new(root_path: String, relay_urls: Vec<String>) -> Arc<Self> {
-        let app = MarmotApp::with_relays(&root_path, relay_urls);
+    pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
+        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
+            .map_err(marmot_app::AppError::from)?;
+        let app = MarmotApp::with_relays_and_account_home(&root_path, relay_urls, account_home);
         let runtime = app.runtime();
-        Arc::new(Self { app, runtime })
+        Ok(Arc::new(Self { app, runtime }))
     }
 
     /// Bring the runtime online: reconcile known accounts, start workers,

@@ -18,7 +18,8 @@ async fn empty_kit_lifecycle() {
     let kit: Arc<Marmot> = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
-    );
+    )
+    .expect("open marmot kit");
 
     // Fresh kit should be openable and report no accounts.
     let accounts = kit.list_accounts().expect("list_accounts on empty kit");
@@ -39,7 +40,8 @@ fn display_name_is_none_for_unknown_account() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
-    );
+    )
+    .expect("open marmot kit");
 
     // A hex string that doesn't match any known account should produce None.
     let name = kit.display_name(
