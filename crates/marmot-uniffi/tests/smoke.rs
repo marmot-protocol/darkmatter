@@ -8,12 +8,29 @@
 //! integration tests against a built-in nostr-relay-builder relay. The job
 //! here is just to prove the FFI boundary itself is alive.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use marmot_uniffi::Marmot;
 
+/// `Marmot::new` opens a Keychain-backed secret store, which on the real
+/// targets (iOS/macOS) is always present but in headless CI (Linux Secret
+/// Service, no D-Bus daemon) is not. Install an in-memory mock as the default
+/// keyring store before constructing; `AccountHome` short-circuits its own
+/// platform init when a default store already exists, so this exercises the
+/// real constructor path on every platform without touching a real keychain.
+fn install_mock_keyring() {
+    static KEYRING_INIT: Once = Once::new();
+    KEYRING_INIT.call_once(|| {
+        if keyring_core::get_default_store().is_none() {
+            let store = keyring_core::mock::Store::new().expect("create mock keyring store");
+            keyring_core::set_default_store(store);
+        }
+    });
+}
+
 #[tokio::test]
 async fn empty_kit_lifecycle() {
+    install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit: Arc<Marmot> = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
@@ -36,6 +53,7 @@ async fn empty_kit_lifecycle() {
 
 #[test]
 fn display_name_is_none_for_unknown_account() {
+    install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),

@@ -2451,6 +2451,7 @@ version = "0.1.0"
 dependencies = [
  "cgka-traits",
  "hex",
+ "keyring-core",
  "marmot-account",
  "marmot-app",
  "tempfile",

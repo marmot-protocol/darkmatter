@@ -25,6 +25,7 @@ uniffi = { version = "0.28", features = ["tokio"] }
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+keyring-core.workspace = true
 
 [[bin]]
 name = "uniffi-bindgen"
