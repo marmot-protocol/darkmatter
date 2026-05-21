@@ -6,7 +6,7 @@
 //! (Rust → FFI). When the iOS side needs to round-trip data back into
 //! marmot-app we'll add the reverse direction explicitly.
 
-use cgka_traits::GroupId;
+use cgka_traits::{GroupId, MarmotAppMessagePayloadV1, MarmotReactionActionV1};
 use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
@@ -38,6 +38,68 @@ impl From<SendSummary> for SendSummaryFfi {
     }
 }
 
+/// Structured chat payloads (reactions, replies, deletes, …) carried inside a
+/// message. Flattened from `MarmotAppMessagePayloadV1` for the Swift side.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum AppMessagePayloadFfi {
+    Reaction {
+        target_message_id: String,
+        emoji: String,
+        removed: bool,
+    },
+    Delete {
+        target_message_id: String,
+    },
+    Retry {
+        target_message_id: String,
+    },
+    Media {
+        file_name: String,
+        media_type: String,
+        size_bytes: u64,
+        caption: Option<String>,
+    },
+    Reply {
+        target_message_id: String,
+        text: String,
+    },
+}
+
+impl From<MarmotAppMessagePayloadV1> for AppMessagePayloadFfi {
+    fn from(value: MarmotAppMessagePayloadV1) -> Self {
+        match value {
+            MarmotAppMessagePayloadV1::Reaction {
+                target_message_id,
+                emoji,
+                action,
+            } => Self::Reaction {
+                target_message_id,
+                emoji,
+                removed: matches!(action, MarmotReactionActionV1::Remove),
+            },
+            MarmotAppMessagePayloadV1::Delete { target_message_id } => {
+                Self::Delete { target_message_id }
+            }
+            MarmotAppMessagePayloadV1::Retry {
+                target_message_id, ..
+            } => Self::Retry { target_message_id },
+            MarmotAppMessagePayloadV1::Media { reference, caption } => Self::Media {
+                file_name: reference.file_name,
+                media_type: reference.media_type,
+                size_bytes: reference.size_bytes,
+                caption,
+            },
+            MarmotAppMessagePayloadV1::Reply {
+                target_message_id,
+                text,
+            } => Self::Reply {
+                target_message_id,
+                text,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppMessageRecordFfi {
     pub message_id_hex: String,
@@ -45,6 +107,7 @@ pub struct AppMessageRecordFfi {
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
+    pub app_message: Option<AppMessagePayloadFfi>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -57,6 +120,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             group_id_hex: value.group_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
+            app_message: value.app_message.map(Into::into),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -182,6 +246,7 @@ pub struct ReceivedMessageFfi {
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub plaintext: String,
+    pub app_message: Option<AppMessagePayloadFfi>,
 }
 
 impl From<&ReceivedMessage> for ReceivedMessageFfi {
@@ -192,6 +257,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             sender: value.sender.clone(),
             sender_display_name: value.sender_display_name.clone(),
             plaintext: value.plaintext.clone(),
+            app_message: value.app_message.clone().map(Into::into),
         }
     }
 }
