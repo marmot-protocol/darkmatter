@@ -1,9 +1,8 @@
-//! Swift / UniFFI bindings for the Marmot app runtime.
+//! UniFFI bindings for the Marmot app runtime.
 //!
 //! This crate is a thin FFI adapter over [`marmot_app::MarmotApp`] and
-//! [`marmot_app::MarmotAppRuntime`]. It is consumed by `darkmatter-ios` (and
-//! anything else that wants a UniFFI-shaped surface) via the generated Swift
-//! package and the accompanying `MarmotKit.xcframework`.
+//! [`marmot_app::MarmotAppRuntime`]. It is consumed by generated Swift and
+//! Kotlin bindings, plus anything else that wants a UniFFI-shaped surface.
 //!
 //! Design notes:
 //! - One process-wide [`Marmot`] handle owns the [`MarmotApp`] + runtime pair.
@@ -13,7 +12,7 @@
 //!   re-exposed as FFI-friendly records (e.g. byte ids → hex strings,
 //!   variant-with-payload enums → flattened variants).
 //! - Subscriptions are returned as long-lived `uniffi::Object` instances;
-//!   the iOS side drives them with `while let Some(update) = sub.next().await`.
+//!   host apps drive them by awaiting `next()` until it returns `None`.
 
 use std::sync::Arc;
 
@@ -57,9 +56,11 @@ pub struct Marmot {
 impl Marmot {
     /// Open the Marmot app at `root_path`, configured with the given default
     /// relay URLs. Account secrets (Nostr private keys) are stored in the
-    /// platform **Keychain** via the default keychain-backed account home —
-    /// not in a plaintext file. Fallible because initializing the keychain
-    /// store can fail. Call [`Marmot::start`] before subscribing to events.
+    /// platform keyring (Keychain on Apple platforms, Android's native
+    /// keyring on Android) via the default keychain-backed account home —
+    /// not in a plaintext file. Fallible because initializing the platform
+    /// secret store can fail. Call [`Marmot::start`] before subscribing to
+    /// events.
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
         let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
@@ -78,7 +79,7 @@ impl Marmot {
 
     /// Tear the runtime down. Drops all subscriptions; long-lived
     /// [`EventsSubscription`] / [`ChatsSubscription`] / etc. instances on the
-    /// Swift side will see their `next()` return `None` shortly after.
+    /// host side will see their `next()` return `None` shortly after.
     pub async fn shutdown(&self) {
         self.runtime.shutdown().await;
     }

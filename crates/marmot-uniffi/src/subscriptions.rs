@@ -2,11 +2,11 @@
 //!
 //! Each subscription wraps one of marmot-app's `Runtime*Subscription` types
 //! (or a `broadcast::Receiver` for the top-level event firehose) and exposes
-//! Swift-friendly methods:
+//! host-friendly methods:
 //!
 //! - `snapshot()` returns the initial state exactly once (subsequent calls
 //!   yield the empty case).
-//! - `next()` is an async fn the Swift side can drive in a `while let` loop
+//! - `next()` is an async fn host apps can drive in a loop
 //!   to receive subsequent updates; it returns `None` when the underlying
 //!   sender drops.
 //!

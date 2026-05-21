@@ -75,7 +75,7 @@ impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
 }
 
 /// Structured chat payloads (reactions, replies, deletes, …) carried inside a
-/// message. Flattened from `MarmotAppMessagePayloadV1` for the Swift side.
+/// message. Flattened from `MarmotAppMessagePayloadV1` for host bindings.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum AppMessagePayloadFfi {
     Reaction {
@@ -316,7 +316,7 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 }
 
 /// A unified update from a messages subscription. Each variant carries enough
-/// context for the iOS side to update its in-memory timeline without holding
+/// context for host apps to update an in-memory timeline without holding
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
@@ -348,8 +348,8 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
 }
 
 /// Top-level event firehose, FFI-shaped. Agent streams collapse to a single
-/// "agent stream activity" variant — the iOS app doesn't differentiate them
-/// at the surface level for v1.
+/// "agent stream activity" variant — host apps do not differentiate them at
+/// the surface level for v1.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MarmotEventFfi {
     GroupJoined {
