@@ -18,8 +18,14 @@ Prerequisites:
 
 ```sh
 rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+# macOS Android Studio default:
 export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/<version>"
+# Linux / common CI default:
+# export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/<version>"
 ```
+
+CI jobs can also set `ANDROID_SDK_ROOT` or `ANDROID_HOME`; the build script will discover the newest NDK under
+`$ANDROID_SDK_ROOT/ndk` or `$ANDROID_HOME/ndk` when `ANDROID_NDK_HOME` is not set.
 
 Build all Android ABIs:
 

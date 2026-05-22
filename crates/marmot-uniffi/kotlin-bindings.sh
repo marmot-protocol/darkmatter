@@ -16,7 +16,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
-TARGET_DIR="$WORKSPACE_DIR/target"
+TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+  TARGET_DIR="$WORKSPACE_DIR/$TARGET_DIR"
+fi
 OUT_DIR="$CRATE_DIR/output/android"
 KOTLIN_OUT_DIR="$OUT_DIR/kotlin"
 JNI_OUT_DIR="$OUT_DIR/jniLibs"
@@ -67,7 +70,14 @@ find_android_ndk() {
     fi
   done
 
-  local sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+  local sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+  if [[ -z "$sdk_root" ]]; then
+    case "$(uname -s)" in
+      Darwin) sdk_root="$HOME/Library/Android/sdk" ;;
+      Linux) sdk_root="$HOME/Android/Sdk" ;;
+      *) sdk_root="$HOME/Library/Android/sdk" ;;
+    esac
+  fi
   if [[ -d "$sdk_root/ndk" ]]; then
     local ndk_dir
     ndk_dir="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"

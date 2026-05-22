@@ -38,6 +38,23 @@ impl From<SendSummary> for SendSummaryFfi {
     }
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AgentStreamStartFfi {
+    pub stream_id_hex: String,
+    pub published: u32,
+    pub message_ids: Vec<String>,
+}
+
+impl AgentStreamStartFfi {
+    pub(crate) fn new(stream_id_hex: String, summary: SendSummary) -> Self {
+        Self {
+            stream_id_hex,
+            published: summary.published as u32,
+            message_ids: summary.message_ids,
+        }
+    }
+}
+
 /// One update from a live agent-text-stream watch. `Chunk.text` is an
 /// incremental fragment; `Finished.text` is the complete transcript.
 #[derive(Clone, Debug, uniffi::Enum)]

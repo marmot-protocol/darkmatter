@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -98,6 +98,7 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(3);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
+const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
 
@@ -521,11 +522,20 @@ pub struct AgentStreamWatchOptions {
 pub struct RuntimeAgentStreamWatch {
     pub stream_id_hex: String,
     updates: mpsc::Receiver<RuntimeAgentStreamUpdate>,
+    abort: tokio::task::AbortHandle,
 }
 
 impl RuntimeAgentStreamWatch {
     pub async fn recv(&mut self) -> Option<RuntimeAgentStreamUpdate> {
         self.updates.recv().await
+    }
+}
+
+impl Drop for RuntimeAgentStreamWatch {
+    fn drop(&mut self) {
+        // Cancel the background QUIC subscriber so dropping the watch handle
+        // doesn't leak a task driving a (possibly hung) broker connection.
+        self.abort.abort();
     }
 }
 
@@ -757,65 +767,44 @@ impl MarmotAppRuntime {
             account_ref,
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex),
-                limit: None,
+                limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
             },
         )?;
         let (start_message_id_hex, start) =
             latest_agent_stream_start(messages, options.stream_id_hex.as_deref())?;
+        if start_message_id_hex.is_empty() {
+            // The latest start hasn't been echoed back with a message id yet, so
+            // we can't reference it to the broker; surface that rather than
+            // forwarding a zero-length MessageId.
+            return Err(AppError::AgentStreamStartNotConfirmed);
+        }
         if start.route != AgentTextStreamRouteV1::BrokeredQuic {
             return Err(AppError::AgentStreamUnsupportedRoute);
         }
-        let candidate = start
-            .quic_candidates
-            .iter()
-            .find(|candidate| candidate.trim().starts_with("quic://"))
-            .ok_or(AppError::AgentStreamMissingCandidate)?;
-        let parsed = parse_quic_candidate(candidate)?;
-        let trust = if options.insecure_local {
-            BrokerServerTrust::InsecureLocal
-        } else if let Some(der) = options.server_cert_der {
-            BrokerServerTrust::CertificateDer(der)
-        } else {
-            BrokerServerTrust::Platform
-        };
+        let candidates = parse_quic_candidates(&start.quic_candidates)?;
+        let server_cert_der = options.server_cert_der;
+        let insecure_local = options.insecure_local;
         let stream_id = hex::decode(&start.stream_id)?;
         let stream_id_hex = start.stream_id.clone();
         let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
-        let config = SubscribeTextFromBroker {
-            broker_addr: parsed.addr,
-            server_name: parsed.server_name,
-            trust,
-            stream_id,
-            start_event_id,
-        };
-        tokio::spawn(async move {
-            let chunk_tx = updates_tx.clone();
-            let result = subscribe_text_from_broker_with_updates(config, |chunk| {
-                // Non-blocking: if the consumer falls behind we drop a delta;
-                // the Finished update carries the full transcript for reconcile.
-                let _ = chunk_tx.try_send(RuntimeAgentStreamUpdate::Chunk {
-                    seq: chunk.seq,
-                    text: chunk.text.clone(),
-                });
-            })
+        let handle = tokio::spawn(async move {
+            let final_update = watch_broker_candidates(
+                candidates,
+                server_cert_der,
+                insecure_local,
+                stream_id,
+                start_event_id,
+                updates_tx.clone(),
+            )
             .await;
-            let final_update = match result {
-                Ok(received) => RuntimeAgentStreamUpdate::Finished {
-                    text: received.text,
-                    transcript_hash_hex: hex::encode(received.transcript_hash),
-                    chunk_count: received.chunk_count,
-                },
-                Err(err) => RuntimeAgentStreamUpdate::Failed {
-                    message: err.to_string(),
-                },
-            };
             let _ = updates_tx.send(final_update).await;
         });
         Ok(RuntimeAgentStreamWatch {
             stream_id_hex,
             updates: updates_rx,
+            abort: handle.abort_handle(),
         })
     }
 
@@ -2327,6 +2316,8 @@ pub enum AppError {
     UnknownGroup(String),
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
+    #[error("agent text stream start has no confirmed message id yet")]
+    AgentStreamStartNotConfirmed,
     #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
     AgentStreamUnsupportedRoute,
     #[error("agent text stream start has no usable quic:// candidate")]
@@ -3867,7 +3858,12 @@ fn agent_stream_runtime_event(
 }
 
 struct ParsedQuicCandidate {
-    addr: SocketAddr,
+    authority: String,
+    server_name: String,
+}
+
+struct ResolvedQuicCandidate {
+    broker_addr: SocketAddr,
     server_name: String,
 }
 
@@ -3906,11 +3902,22 @@ fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, AppError
         return Err(AppError::AgentStreamInvalidCandidate(trimmed.to_owned()));
     }
     let server_name = candidate_server_name(authority)?;
-    let addr = authority
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(trimmed.to_owned()))?;
-    Ok(ParsedQuicCandidate { addr, server_name })
+    Ok(ParsedQuicCandidate {
+        authority: authority.to_owned(),
+        server_name,
+    })
+}
+
+fn parse_quic_candidates(candidates: &[String]) -> Result<Vec<ParsedQuicCandidate>, AppError> {
+    let parsed = candidates
+        .iter()
+        .filter(|candidate| candidate.trim().starts_with("quic://"))
+        .filter_map(|candidate| parse_quic_candidate(candidate).ok())
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        return Err(AppError::AgentStreamMissingCandidate);
+    }
+    Ok(parsed)
 }
 
 fn candidate_server_name(authority: &str) -> Result<String, AppError> {
@@ -3925,6 +3932,94 @@ fn candidate_server_name(authority: &str) -> Result<String, AppError> {
         .map(|(host, _)| host.to_owned())
         .filter(|host| !host.is_empty())
         .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))
+}
+
+async fn watch_broker_candidates(
+    candidates: Vec<ParsedQuicCandidate>,
+    server_cert_der: Option<Vec<u8>>,
+    insecure_local: bool,
+    stream_id: Vec<u8>,
+    start_event_id: MessageId,
+    updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
+) -> RuntimeAgentStreamUpdate {
+    let mut last_error = None;
+    for candidate in candidates {
+        match resolve_broker_addr(&candidate.authority).await {
+            Ok(broker_addr) => {
+                let resolved = ResolvedQuicCandidate {
+                    broker_addr,
+                    server_name: candidate.server_name,
+                };
+                let trust = broker_trust_for_addr(
+                    resolved.broker_addr,
+                    server_cert_der.clone(),
+                    insecure_local,
+                );
+                let config = SubscribeTextFromBroker {
+                    broker_addr: resolved.broker_addr,
+                    server_name: resolved.server_name,
+                    trust,
+                    stream_id: stream_id.clone(),
+                    start_event_id: start_event_id.clone(),
+                };
+                let chunk_tx = updates_tx.clone();
+                match subscribe_text_from_broker_with_updates(config, |chunk| {
+                    // Non-blocking: if the consumer falls behind we drop a
+                    // delta; the Finished update carries the full transcript
+                    // for reconcile.
+                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                        chunk_tx.try_send(RuntimeAgentStreamUpdate::Chunk {
+                            seq: chunk.seq,
+                            text: chunk.text.clone(),
+                        })
+                    {
+                        tracing::warn!(
+                            target: "marmot_app::agent_stream",
+                            method = "watch_agent_text_stream",
+                            "dropping live agent text stream delta; consumer is behind",
+                        );
+                    }
+                })
+                .await
+                {
+                    Ok(received) => {
+                        return RuntimeAgentStreamUpdate::Finished {
+                            text: received.text,
+                            transcript_hash_hex: hex::encode(received.transcript_hash),
+                            chunk_count: received.chunk_count,
+                        };
+                    }
+                    Err(err) => last_error = Some(err.to_string()),
+                }
+            }
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+    RuntimeAgentStreamUpdate::Failed {
+        message: last_error.unwrap_or_else(|| AppError::AgentStreamMissingCandidate.to_string()),
+    }
+}
+
+async fn resolve_broker_addr(authority: &str) -> Result<SocketAddr, AppError> {
+    let mut addrs = tokio::net::lookup_host(authority)
+        .await
+        .map_err(|_| AppError::AgentStreamInvalidCandidate(authority.to_owned()))?;
+    addrs
+        .next()
+        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))
+}
+
+fn broker_trust_for_addr(
+    broker_addr: SocketAddr,
+    server_cert_der: Option<Vec<u8>>,
+    insecure_local: bool,
+) -> BrokerServerTrust {
+    if insecure_local && broker_addr.ip().is_loopback() {
+        return BrokerServerTrust::InsecureLocal;
+    }
+    server_cert_der
+        .map(BrokerServerTrust::CertificateDer)
+        .unwrap_or(BrokerServerTrust::Platform)
 }
 
 fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMessageUpdate> {
@@ -5699,5 +5794,39 @@ mod tests {
             MarmotRelayPlane::full_history().subscription_rebuild_since(Some(1_700_000_000)),
             None
         );
+    }
+
+    #[test]
+    fn agent_stream_candidate_parser_skips_malformed_quic_candidates() {
+        let candidates = vec![
+            "quic://".to_owned(),
+            "https://127.0.0.1:4450".to_owned(),
+            "quic://127.0.0.1:4450".to_owned(),
+        ];
+
+        let parsed = parse_quic_candidates(&candidates).expect("valid fallback candidate");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].authority, "127.0.0.1:4450");
+        assert_eq!(parsed[0].server_name, "127.0.0.1");
+    }
+
+    #[test]
+    fn agent_stream_insecure_local_only_applies_to_loopback_brokers() {
+        let loopback = "127.0.0.1:4450".parse().unwrap();
+        let remote = "203.0.113.10:4450".parse().unwrap();
+
+        assert!(matches!(
+            broker_trust_for_addr(loopback, None, true),
+            BrokerServerTrust::InsecureLocal
+        ));
+        assert!(matches!(
+            broker_trust_for_addr(remote, None, true),
+            BrokerServerTrust::Platform
+        ));
+        assert!(matches!(
+            broker_trust_for_addr(remote, Some(vec![1, 2, 3]), true),
+            BrokerServerTrust::CertificateDer(der) if der == vec![1, 2, 3]
+        ));
     }
 }
