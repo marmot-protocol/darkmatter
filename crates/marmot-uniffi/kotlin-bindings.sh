@@ -2,7 +2,7 @@
 # Build Kotlin bindings and Android JNI libraries for MarmotKit.
 #
 # Outputs:
-#   <crate>/output/android/kotlin/org/marmotprotocol/marmotkit/marmot_uniffi.kt
+#   <crate>/output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt
 #   <crate>/output/android/jniLibs/<abi>/libmarmot_uniffi.so
 #
 # The Kotlin file is generated from the same UniFFI metadata as the Swift
@@ -184,5 +184,5 @@ done
 
 echo ""
 echo "Done."
-echo "  Kotlin binding: $KOTLIN_OUT_DIR/org/marmotprotocol/marmotkit/${LIB_BASENAME}.kt"
+echo "  Kotlin binding: $KOTLIN_OUT_DIR/dev/ipf/marmotkit/${LIB_BASENAME}.kt"
 echo "  JNI libraries:  $JNI_OUT_DIR"

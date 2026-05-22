@@ -33,7 +33,7 @@ To build a subset:
 ANDROID_ABIS="arm64-v8a x86_64" ./crates/marmot-uniffi/kotlin-bindings.sh
 ```
 
-Generated Kotlin uses package `org.marmotprotocol.marmotkit`, loads `libmarmot_uniffi.so`, and requires the normal
+Generated Kotlin uses package `dev.ipf.marmotkit`, loads `libmarmot_uniffi.so`, and requires the normal
 UniFFI Kotlin runtime dependencies used by the generated file: JNA, Kotlin coroutines, and AndroidX annotations.
 
 The output directories are ignored because generated bindings and packaged native libraries are derived artifacts.
