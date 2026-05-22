@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "org.marmotprotocol.marmotkit"
+cdylib_name = "marmot_uniffi"
+android = true
+kotlin_target_version = "1.9.0"
+
