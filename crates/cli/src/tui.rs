@@ -963,10 +963,10 @@ impl TuiApp {
                 let by = self.messages_page();
                 self.scroll_messages_down(by);
             }
-            KeyCode::Home if self.focus != Focus::Composer => {
+            KeyCode::Home => {
                 self.messages_scroll = u16::MAX;
             }
-            KeyCode::End if self.focus != Focus::Composer => {
+            KeyCode::End => {
                 self.messages_scroll = 0;
             }
             KeyCode::Enter => {
