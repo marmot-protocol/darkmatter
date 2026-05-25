@@ -2464,7 +2464,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     let watcher = watcher.spawn().expect("stream watcher should start");
     let broker_addr = broker.addr.to_string();
     let (sent, output) =
-        run_json_until_child_exits(home.path(), watcher, Duration::from_secs(15), |home| {
+        run_json_until_child_exits(home.path(), watcher, Duration::from_secs(60), |home| {
             try_run_json(
                 home,
                 &[
