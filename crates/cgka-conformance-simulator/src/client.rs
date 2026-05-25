@@ -218,6 +218,7 @@ impl HarnessClient {
                 keys: self.signer.clone(),
             }))
             .feature_registry(self.registry.clone())
+            .supported_app_components(harness_supported_app_components())
             .peeler(Box::new(peeler))
             .build()
             .expect("engine rebuilds");
