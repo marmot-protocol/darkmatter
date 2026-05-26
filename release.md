@@ -229,7 +229,7 @@ assets on the same GitHub Release.
 ## Current Limits
 
 - The workspace is not published to crates.io.
-- The whole-workspace release is tag and source-archive based.
+- The whole-workspace release is tag- and source-archive-based.
 - MarmotKit releases are zipped generated files, not SwiftPM or Maven packages.
 - Android consumers still need the UniFFI Kotlin runtime dependencies required by the generated Kotlin file.
 - The QUIC broker image has its own GHCR flow in `.github/workflows/quic-broker-image.yml`; it is not part of the

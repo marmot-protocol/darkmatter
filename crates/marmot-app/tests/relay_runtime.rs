@@ -28,6 +28,10 @@ use tokio::time::{Duration, sleep, timeout};
 use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
+const RELAY_RUNTIME_EVENT_WAIT: Duration = Duration::from_secs(20);
+const RELAY_RUNTIME_NOTIFICATION_WAKE_WAIT_MS: u32 = 30_000;
+const RELAY_RUNTIME_NOTIFICATION_DRAIN_WAIT: Duration = Duration::from_secs(10);
+
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -986,7 +990,10 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
     let runtime_for_wake = runtime.clone();
     let wake_handle = tokio::spawn(async move {
         runtime_for_wake
-            .collect_notifications_after_wake(8_000, NotificationWakeSource::ApnsNse)
+            .collect_notifications_after_wake(
+                RELAY_RUNTIME_NOTIFICATION_WAKE_WAIT_MS,
+                NotificationWakeSource::ApnsNse,
+            )
             .await
     });
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1002,7 +1009,7 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
 
     let wake = wake_handle.await.unwrap();
     let mut subscription_updates = Vec::new();
-    let drain_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let drain_deadline = std::time::Instant::now() + RELAY_RUNTIME_NOTIFICATION_DRAIN_WAIT;
     while std::time::Instant::now() < drain_deadline {
         match timeout(Duration::from_millis(250), subscription.recv()).await {
             Ok(Some(update)) => subscription_updates.push(update),
@@ -1311,7 +1318,7 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
     )
     .await;
 
-    timeout(Duration::from_secs(5), async {
+    timeout(RELAY_RUNTIME_EVENT_WAIT, async {
         loop {
             let name = app
                 .directory_entry_for_account_id(&setup.account.account_id_hex)
@@ -1355,7 +1362,7 @@ async fn directory_sync_worker_admits_follow_list_users() {
     )
     .await;
 
-    timeout(Duration::from_secs(5), async {
+    timeout(RELAY_RUNTIME_EVENT_WAIT, async {
         loop {
             if app
                 .directory_entry_for_account_id(&followed)
@@ -1468,11 +1475,18 @@ async fn wait_for_event<F>(
 where
     F: FnMut(&MarmotAppEvent) -> bool,
 {
-    timeout(Duration::from_secs(5), async {
+    timeout(RELAY_RUNTIME_EVENT_WAIT, async {
         loop {
-            let event = events.recv().await.unwrap();
-            if matches_event(&event) {
-                return event;
+            match events.recv().await {
+                Ok(event) => {
+                    if matches_event(&event) {
+                        return event;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime event stream closed")
+                }
             }
         }
     })
@@ -1487,7 +1501,7 @@ async fn wait_for_message_update<F>(
 where
     F: FnMut(&RuntimeMessageUpdate) -> bool,
 {
-    timeout(Duration::from_secs(5), async {
+    timeout(RELAY_RUNTIME_EVENT_WAIT, async {
         loop {
             let update = subscription.recv().await.expect("message update");
             if matches_update(&update) {

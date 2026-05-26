@@ -1,0 +1,6 @@
+[test-groups]
+relay-runtime = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(marmot-app) & binary(relay_runtime)'
+test-group = 'relay-runtime'
