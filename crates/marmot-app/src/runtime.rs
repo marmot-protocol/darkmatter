@@ -917,18 +917,26 @@ impl MarmotAppRuntime {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let app_for_lookup = app.clone();
                 let account_label_for_lookup = account_label.clone();
+                let group_id_hex_for_lookup = group_id_hex.clone();
                 if runtime_shutdown_requested(&stopping) {
                     return;
                 }
                 let group = match blocking_app_task(move || {
-                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex)
+                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex_for_lookup)
                 })
                 .await
                 {
                     Ok(Some(group)) => group,
-                    Ok(None) | Err(_) => continue,
+                    Ok(None) | Err(_) => {
+                        group_fingerprints.remove(&group_id_hex);
+                        continue;
+                    }
                 };
                 if !include_archived && group.archived {
+                    group_fingerprints.remove(&group_id_hex);
+                    if updates_tx.send(group).await.is_err() {
+                        return;
+                    }
                     continue;
                 }
                 let fingerprint = app_group_record_fingerprint(&group);
