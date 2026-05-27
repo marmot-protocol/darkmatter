@@ -828,6 +828,10 @@ impl From<RuntimeProjectionUpdate> for RuntimeProjectionUpdateFfi {
     }
 }
 
+// FFI enum: variants carry rich payloads by value because UniFFI doesn't
+// support `Box` in the wire format — boxing here would not satisfy the lint
+// in practice and would force every host language to dereference.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum TimelineSubscriptionUpdateFfi {
     Page { page: TimelinePageFfi },
@@ -1283,6 +1287,9 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
 /// Top-level event firehose, FFI-shaped. Agent streams collapse to a single
 /// "agent stream activity" variant — host apps do not differentiate them at
 /// the surface level for v1.
+// FFI enum: see `TimelineSubscriptionUpdateFfi` — UniFFI lowers each variant
+// by value, so boxing wouldn't change the wire size.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MarmotEventFfi {
     GroupJoined {
