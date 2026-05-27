@@ -1,0 +1,53 @@
+name: Nightly conformance
+
+# Runs the slow proptest path (`conformance-slow` feature: 1000 cases instead of
+# 128) plus the full simulator suite on a daily schedule. This is the version
+# that exercises the engine more thoroughly than the per-PR conformance job and
+# is not on the PR-blocking path.
+
+on:
+  schedule:
+    # 07:00 UTC daily (after most US/EU contributors are offline).
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  conformance-slow:
+    name: Conformance (slow proptest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+
+      - name: Run simulator tests with conformance-slow
+        run: cargo nextest run -p cgka-conformance-simulator --features conformance-slow --locked
+
+      - name: Run vector report
+        run: |
+          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
+            --vectors crates/cgka-conformance-simulator/vectors \
+            --out target/cgka-conformance-simulator-reports
+
+      - name: Upload vector report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cgka-conformance-simulator-reports-nightly
+          path: target/cgka-conformance-simulator-reports
+          if-no-files-found: error

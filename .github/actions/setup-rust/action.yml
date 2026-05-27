@@ -1,0 +1,37 @@
+name: Setup Rust toolchain
+description: Install the workspace-pinned Rust toolchain and restore Cargo cache.
+inputs:
+  components:
+    description: Comma-separated rustup components to install in addition to the default profile.
+    required: false
+    default: ""
+  cache:
+    description: Whether to enable the Swatinem/rust-cache step.
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+        components_arg=()
+        if [[ -n "${{ inputs.components }}" ]]; then
+          IFS=',' read -ra parts <<< "${{ inputs.components }}"
+          for part in "${parts[@]}"; do
+            trimmed="${part// /}"
+            if [[ -n "$trimmed" ]]; then
+              components_arg+=("--component" "$trimmed")
+            fi
+          done
+        fi
+        rustup toolchain install "$toolchain" --profile minimal "${components_arg[@]}"
+        rustup default "$toolchain"
+        rustc --version
+        cargo --version
+
+    - name: Cache Cargo artifacts
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
