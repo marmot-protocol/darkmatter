@@ -2638,7 +2638,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Message { command } | crate::Command::Messages { command } => {
-            crate::message_command_with_runtime(
+            crate::commands::message::with_runtime(
                 &account_home,
                 &app,
                 runtime,

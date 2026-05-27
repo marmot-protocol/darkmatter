@@ -12,6 +12,7 @@ pub mod group;
 pub mod groups;
 pub mod key_package;
 pub mod media;
+pub mod message;
 pub mod notifications;
 pub mod profile;
 pub mod relays;
