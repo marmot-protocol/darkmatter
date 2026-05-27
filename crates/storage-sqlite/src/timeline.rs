@@ -1118,6 +1118,14 @@ mod tests {
                 .and_then(Value::as_str),
             Some("aa".repeat(32).as_str())
         );
+        assert_eq!(
+            start
+                .agent_text_stream
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("started")
+        );
 
         let final_message = &messages[1];
         assert_eq!(final_message.message_id_hex, "final");
@@ -1128,6 +1136,14 @@ mod tests {
                 .and_then(|value| value.get("start_event_id"))
                 .and_then(Value::as_str),
             Some("start")
+        );
+        assert_eq!(
+            final_message
+                .agent_text_stream
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("finalized")
         );
     }
 
