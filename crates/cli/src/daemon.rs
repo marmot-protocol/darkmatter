@@ -364,17 +364,9 @@ impl DaemonEventHub {
     }
 }
 
-pub fn default_socket_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dmd.sock")
-}
+mod paths;
 
-pub fn default_pid_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dmd.pid")
-}
-
-pub fn default_log_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dmd.log")
-}
+pub use paths::{default_log_path, default_pid_path, default_socket_path};
 
 pub async fn run_server_from<I, T>(args: I) -> CliOutput
 where
