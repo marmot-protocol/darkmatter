@@ -9,6 +9,7 @@ pub mod chats;
 pub mod debug;
 pub mod follows;
 pub mod group;
+pub mod groups;
 pub mod key_package;
 pub mod media;
 pub mod notifications;

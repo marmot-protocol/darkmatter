@@ -1404,7 +1404,7 @@ async fn handle_group_state_subscription(
         .group_mls_state(&account_ref, &group_id_value)
         .await
         .ok()
-        .map(crate::group_mls_state_json);
+        .map(crate::commands::groups::group_mls_state_json);
     if !write_stream_response(
         stream,
         &group_state_stream_response(
@@ -1422,7 +1422,7 @@ async fn handle_group_state_subscription(
             .group_mls_state(&account_ref, &group_id_value)
             .await
             .ok()
-            .map(crate::group_mls_state_json);
+            .map(crate::commands::groups::group_mls_state_json);
         if !write_stream_response(
             stream,
             &group_state_stream_response(group, "GroupStateUpdated", mls),
@@ -2628,7 +2628,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Groups { command } => {
-            crate::groups_command_with_runtime(
+            crate::commands::groups::with_runtime(
                 &account_home,
                 &app,
                 runtime,
