@@ -57,7 +57,7 @@ fn analyze_warnings(bundles: &[ForensicsBundle]) -> Vec<String> {
     let public_salts = bundles
         .iter()
         .filter(|bundle| !bundle.mode.is_sensitive())
-        .filter_map(|bundle| bundle.redaction_salt_id.as_deref())
+        .map(|bundle| bundle.redaction_salt_id.as_deref().unwrap_or("<missing>"))
         .collect::<BTreeSet<_>>();
     if public_salts.len() > 1 {
         vec![
@@ -212,6 +212,20 @@ mod tests {
         let mut bob = bundle("bob", 7, commit("commit-b", 6, "bb"));
         bob.mode = ForensicsDumpMode::Public;
         bob.redaction_salt_id = Some("salt-b".to_owned());
+
+        let report = analyze_bundles(&[alice, bob]);
+
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("different redaction salt ids"));
+    }
+
+    #[test]
+    fn analyzer_warns_when_public_dump_redaction_salt_is_missing() {
+        let mut alice = bundle("alice", 7, commit("commit-a", 6, "aa"));
+        alice.mode = ForensicsDumpMode::Public;
+        alice.redaction_salt_id = Some("salt-a".to_owned());
+        let mut bob = bundle("bob", 7, commit("commit-b", 6, "bb"));
+        bob.mode = ForensicsDumpMode::Public;
 
         let report = analyze_bundles(&[alice, bob]);
 

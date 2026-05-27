@@ -2950,8 +2950,20 @@ async fn run_app_runtime_account_worker(
                         options,
                         respond,
                     }) => {
-                        let result = client.group_forensics_bundle(&group_id, &options);
-                        let _ = respond.send(result);
+                        let task = tokio::task::spawn_blocking(move || {
+                            let result = client.group_forensics_bundle(&group_id, &options);
+                            (client, result)
+                        });
+                        match task.await {
+                            Ok((restored_client, result)) => {
+                                client = restored_client;
+                                let _ = respond.send(result);
+                            }
+                            Err(err) => {
+                                let _ = respond.send(Err(AppError::BlockingTask(err.to_string())));
+                                return;
+                            }
+                        }
                     }
                     Some(AccountWorkerCommand::UpdateMessageRetention {
                         group_id,

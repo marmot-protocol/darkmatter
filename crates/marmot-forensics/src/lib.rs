@@ -24,9 +24,14 @@ pub struct ForensicsExportOptions {
 
 impl ForensicsExportOptions {
     pub fn public(redaction_salt: impl Into<Vec<u8>>) -> Self {
+        let redaction_salt = redaction_salt.into();
+        assert!(
+            !redaction_salt.is_empty(),
+            "public forensics exports require a non-empty redaction salt"
+        );
         Self {
             mode: ForensicsDumpMode::Public,
-            redaction_salt: redaction_salt.into(),
+            redaction_salt,
         }
     }
 
@@ -199,6 +204,12 @@ mod tests {
         assert!(payload_digest.starts_with("salted_sha256:"));
         assert_eq!(payload_hex, None);
         assert!(options.redaction_salt_id().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "public forensics exports require a non-empty redaction salt")]
+    fn public_options_reject_empty_salt() {
+        let _ = ForensicsExportOptions::public(Vec::new());
     }
 
     #[test]
