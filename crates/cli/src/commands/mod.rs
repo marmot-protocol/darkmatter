@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod chats;
+pub mod daemon;
 pub mod debug;
 pub mod follows;
 pub mod group;

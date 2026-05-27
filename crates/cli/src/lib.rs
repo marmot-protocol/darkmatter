@@ -38,6 +38,7 @@ pub mod tui;
 
 pub(crate) use commands::account::AccountCommand;
 pub(crate) use commands::chats::ChatsCommand;
+pub(crate) use commands::daemon::DaemonCommand;
 pub(crate) use commands::debug::DebugCommand;
 pub(crate) use commands::follows::FollowsCommand;
 pub(crate) use commands::group::GroupCommand;
@@ -469,31 +470,6 @@ enum StreamCommand {
         #[arg(long, help = "Expected streamed chunk count")]
         chunk_count: Option<u64>,
     },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum DaemonCommand {
-    #[command(about = "Start dmd in the background")]
-    Start {
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated discovery relays for profiles, relay lists, and KeyPackages"
-        )]
-        discovery_relays: Vec<String>,
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated default account relays used when creating identities"
-        )]
-        default_account_relays: Vec<String>,
-    },
-    #[command(about = "Stop the background dmd daemon")]
-    Stop,
-    #[command(about = "Show daemon status, relay health, and stream watches")]
-    Status,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1807,14 +1783,16 @@ where
     })
 }
 
-fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, bool), DmError> {
+pub(crate) fn stream_start_event_id(
+    start_event_id: Option<String>,
+) -> Result<(MessageId, bool), DmError> {
     match start_event_id {
         Some(value) => Ok((MessageId::new(hex::decode(value)?), true)),
         None => Ok((MessageId::new(vec![0; 32]), false)),
     }
 }
 
-fn latest_stream_start(
+pub(crate) fn latest_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
 ) -> Result<(String, StreamStartView, String), DmError> {
@@ -1919,7 +1897,7 @@ struct ParsedQuicCandidate {
     server_name: String,
 }
 
-fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError> {
+pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError> {
     let trimmed = candidate.trim();
     let Some(rest) = trimmed.strip_prefix("quic://") else {
         return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
@@ -1936,7 +1914,7 @@ fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError>
     })
 }
 
-async fn resolve_quic_candidate_addr(
+pub(crate) async fn resolve_quic_candidate_addr(
     candidate: &ParsedQuicCandidate,
 ) -> Result<SocketAddr, DmError> {
     let mut addrs = tokio::net::lookup_host(&candidate.authority)
@@ -1950,7 +1928,7 @@ async fn resolve_quic_candidate_addr(
         .ok_or_else(|| DmError::InvalidQuicCandidate(candidate.original.clone()))
 }
 
-fn candidate_server_name(authority: &str) -> Result<String, DmError> {
+pub(crate) fn candidate_server_name(authority: &str) -> Result<String, DmError> {
     if let Some(rest) = authority.strip_prefix('[') {
         let Some((host, _)) = rest.split_once(']') else {
             return Err(DmError::InvalidQuicCandidate(authority.to_owned()));
@@ -1972,7 +1950,7 @@ pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
         .is_some_and(|host| quic_host_is_loopback(&host))
 }
 
-fn quic_candidate_host(candidate: &str) -> Option<String> {
+pub(crate) fn quic_candidate_host(candidate: &str) -> Option<String> {
     let rest = candidate.trim().strip_prefix("quic://")?;
     let authority = rest.split('/').next().unwrap_or(rest);
     if let Some(rest) = authority.strip_prefix('[') {
@@ -1984,7 +1962,7 @@ fn quic_candidate_host(candidate: &str) -> Option<String> {
         .filter(|host| !host.is_empty())
 }
 
-fn quic_host_is_loopback(host: &str) -> bool {
+pub(crate) fn quic_host_is_loopback(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -1993,7 +1971,7 @@ fn quic_host_is_loopback(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], DmError> {
+pub(crate) fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], DmError> {
     let bytes = hex::decode(value)?;
     let actual = bytes.len();
     bytes
@@ -2001,7 +1979,7 @@ fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], DmError> {
         .map_err(|_| DmError::InvalidTranscriptHashLength(actual))
 }
 
-fn normalize_hex(value: &str) -> Result<String, DmError> {
+pub(crate) fn normalize_hex(value: &str) -> Result<String, DmError> {
     Ok(hex::encode(hex::decode(value)?))
 }
 
@@ -2045,14 +2023,14 @@ pub(crate) fn agent_text_stream_payload_value(
 }
 
 /// Map the inner-event `route` tag value to the historical JSON route label.
-fn stream_route_label(route: &str) -> &str {
+pub(crate) fn stream_route_label(route: &str) -> &str {
     match route {
         "quic" => "brokered_quic",
         other => other,
     }
 }
 
-fn broker_trust(
+pub(crate) fn broker_trust(
     server_addr: SocketAddr,
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
@@ -2071,7 +2049,7 @@ fn broker_trust(
         .map_err(Into::into)
 }
 
-fn broker_trust_name(trust: &BrokerServerTrust) -> &'static str {
+pub(crate) fn broker_trust_name(trust: &BrokerServerTrust) -> &'static str {
     match trust {
         BrokerServerTrust::Platform => "platform",
         BrokerServerTrust::CertificateDer(_) => "certificate_der",
@@ -2079,7 +2057,7 @@ fn broker_trust_name(trust: &BrokerServerTrust) -> &'static str {
     }
 }
 
-fn stream_trust(
+pub(crate) fn stream_trust(
     server_addr: SocketAddr,
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
@@ -2098,14 +2076,14 @@ fn stream_trust(
         .map_err(Into::into)
 }
 
-fn ensure_insecure_local_endpoint(server_addr: SocketAddr) -> Result<(), DmError> {
+pub(crate) fn ensure_insecure_local_endpoint(server_addr: SocketAddr) -> Result<(), DmError> {
     if server_addr.ip().is_loopback() {
         return Ok(());
     }
     Err(DmError::InsecureLocalRequiresLoopback(server_addr))
 }
 
-fn stream_trust_name(trust: &ServerTrust) -> &'static str {
+pub(crate) fn stream_trust_name(trust: &ServerTrust) -> &'static str {
     match trust {
         ServerTrust::Platform => "platform",
         ServerTrust::CertificateDer(_) => "certificate_der",
