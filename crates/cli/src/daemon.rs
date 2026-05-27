@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
 use clap::Parser;
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::{
