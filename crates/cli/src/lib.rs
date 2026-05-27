@@ -39,6 +39,7 @@ pub(crate) mod commands;
 pub mod daemon;
 pub mod tui;
 
+pub(crate) use commands::chats::ChatsCommand;
 pub(crate) use commands::debug::DebugCommand;
 pub(crate) use commands::follows::FollowsCommand;
 pub(crate) use commands::key_package::KeyPackageCommand;
@@ -366,43 +367,6 @@ enum AccountCommand {
         )]
         bootstrap_relays: Vec<String>,
     },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum ChatsCommand {
-    #[command(about = "List current chats")]
-    List {
-        #[arg(long, help = "Include archived chats")]
-        include_archived: bool,
-    },
-    #[command(about = "Show one chat")]
-    Show {
-        #[arg(help = "Group id to show")]
-        group: String,
-    },
-    #[command(about = "Subscribe to live chat-list updates through the daemon")]
-    Subscribe,
-    #[command(about = "Archive a chat locally")]
-    Archive {
-        #[arg(help = "Group id to archive")]
-        group: String,
-    },
-    #[command(about = "Unarchive a chat locally")]
-    Unarchive {
-        #[arg(help = "Group id to unarchive")]
-        group: String,
-    },
-    #[command(name = "list-archived", about = "List archived chats")]
-    ListArchived,
-    #[command(
-        name = "subscribe-archived",
-        about = "Subscribe to live archived-chat updates through the daemon"
-    )]
-    SubscribeArchived,
-    #[command(hide = true)]
-    Mute { group: String, duration: String },
-    #[command(hide = true)]
-    Unmute { group: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -1282,7 +1246,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             commands::key_package::run(&account_home, &app, command, account_flag).await
         }
         Command::Chats { command } => {
-            chats_command(&account_home, &app, command, account_flag).await
+            commands::chats::run(&account_home, &app, command, account_flag).await
         }
         Command::Media { command } => {
             media_command(&account_home, &app, command, account_flag).await
@@ -1715,78 +1679,6 @@ async fn account_command(
                 }),
             })
         }
-    }
-}
-
-async fn chats_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: ChatsCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        ChatsCommand::List { include_archived } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let chats = if include_archived {
-                app.groups(&account.label)?
-            } else {
-                app.visible_groups(&account.label)?
-            };
-            Ok(CommandOutput {
-                plain: group_list_plain(&chats),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "include_archived": include_archived,
-                    "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
-                }),
-            })
-        }
-        ChatsCommand::Show { group } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            group_show_output(app, account, group, None)
-        }
-        ChatsCommand::Subscribe => Err(DmError::MessagesSubscribeRequiresDaemon),
-        ChatsCommand::Archive { group } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            group_archive_output(app, account, group, true)
-        }
-        ChatsCommand::Unarchive { group } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            group_archive_output(app, account, group, false)
-        }
-        ChatsCommand::ListArchived => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let chats = app
-                .groups(&account.label)?
-                .into_iter()
-                .filter(|group| group.archived)
-                .collect::<Vec<_>>();
-            Ok(CommandOutput {
-                plain: group_list_plain(&chats),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
-                }),
-            })
-        }
-        ChatsCommand::SubscribeArchived => Err(DmError::MessagesSubscribeRequiresDaemon),
-        ChatsCommand::Mute { .. } => unsupported_command(
-            "chats mute",
-            "chat notification mute state is not modeled in marmot-app yet",
-        ),
-        ChatsCommand::Unmute { .. } => unsupported_command(
-            "chats unmute",
-            "chat notification mute state is not modeled in marmot-app yet",
-        ),
     }
 }
 
@@ -2366,7 +2258,7 @@ async fn group_admin_policy_output(
     })
 }
 
-fn group_show_output(
+pub(crate) fn group_show_output(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
     group: String,
@@ -2395,7 +2287,7 @@ fn group_show_output(
     Ok(CommandOutput { plain, json })
 }
 
-fn group_archive_output(
+pub(crate) fn group_archive_output(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
     group: String,
@@ -3688,7 +3580,7 @@ fn profile_display_name(profile: Option<&UserProfileMetadata>) -> Option<String>
         .map(str::to_owned)
 }
 
-fn group_list_plain(groups: &[AppGroupRecord]) -> String {
+pub(crate) fn group_list_plain(groups: &[AppGroupRecord]) -> String {
     if groups.is_empty() {
         return "no groups".to_owned();
     }
@@ -3706,7 +3598,7 @@ fn group_plain(group: &AppGroupRecord) -> String {
     )
 }
 
-fn group_json(group: AppGroupRecord) -> Value {
+pub(crate) fn group_json(group: AppGroupRecord) -> Value {
     json!({
         "group_id": group.group_id_hex,
         "endpoint": group.endpoint,
@@ -4192,7 +4084,7 @@ pub(crate) fn npub_for_account_id(account_id: &str) -> String {
         .expect("stored account ids can be encoded as npub")
 }
 
-fn normalize_group_id_hex(value: &str) -> Result<String, DmError> {
+pub(crate) fn normalize_group_id_hex(value: &str) -> Result<String, DmError> {
     Ok(hex::encode(hex::decode(value)?))
 }
 
