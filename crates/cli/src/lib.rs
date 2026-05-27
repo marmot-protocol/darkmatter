@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
