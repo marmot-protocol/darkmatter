@@ -1776,7 +1776,7 @@ fn spawn_stream_watch(
         };
         let output = crate::command_output_result(
             json,
-            crate::stream_watch_command_app_with_runtime(
+            crate::commands::stream::watch_with_runtime(
                 &account_home,
                 &app,
                 &runtime,
@@ -2648,7 +2648,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Stream { command } => {
-            crate::stream_command_app_with_runtime(
+            crate::commands::stream::with_runtime(
                 &account_home,
                 &app,
                 runtime,

@@ -19,4 +19,5 @@ pub mod notifications;
 pub mod profile;
 pub mod relays;
 pub mod settings;
+pub mod stream;
 pub mod users;
