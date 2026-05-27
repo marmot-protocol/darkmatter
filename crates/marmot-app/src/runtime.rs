@@ -44,7 +44,8 @@ use crate::{
     MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, SendSummary, SyncSummary,
-    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -535,6 +536,24 @@ impl RuntimeMessagesSubscription {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeTimelineMessageUpdate {
+    pub account_id_hex: String,
+    pub account_label: String,
+    pub page: TimelinePage,
+}
+
+pub struct RuntimeTimelineMessagesSubscription {
+    pub snapshot: TimelinePage,
+    updates: mpsc::Receiver<RuntimeTimelineMessageUpdate>,
+}
+
+impl RuntimeTimelineMessagesSubscription {
+    pub async fn recv(&mut self) -> Option<RuntimeTimelineMessageUpdate> {
+        self.updates.recv().await
+    }
+}
+
 pub struct RuntimeChatsSubscription {
     pub snapshot: Vec<AppGroupRecord>,
     updates: mpsc::Receiver<AppGroupRecord>,
@@ -766,6 +785,67 @@ impl MarmotAppRuntime {
             snapshot,
             updates: updates_rx,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
+        })
+    }
+
+    pub fn subscribe_timeline_messages(
+        &self,
+        account_ref: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<RuntimeTimelineMessagesSubscription, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let account_id_hex = account.account_id_hex.clone();
+        let account_label = account.label.clone();
+        let group_id_hex = query.group_id_hex.clone();
+        let app = self.accounts.app.clone();
+        let mut events = self.events.subscribe();
+        let snapshot = app.timeline_messages_with_query(&account_label, query.clone())?;
+        let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                let Some(update) = runtime_message_update_from_event(event) else {
+                    continue;
+                };
+                if update.account_id_hex() != account_id_hex {
+                    continue;
+                }
+                let message = update.message();
+                let message_group_id_hex = hex::encode(message.group_id.as_slice());
+                if group_id_hex.as_deref() != Some(message_group_id_hex.as_str())
+                    && group_id_hex.is_some()
+                {
+                    continue;
+                }
+                let app_for_lookup = app.clone();
+                let account_label_for_lookup = account_label.clone();
+                let query_for_lookup = query.clone();
+                let page = match blocking_app_task(move || {
+                    app_for_lookup
+                        .timeline_messages_with_query(&account_label_for_lookup, query_for_lookup)
+                })
+                .await
+                {
+                    Ok(page) => page,
+                    Err(_) => continue,
+                };
+                let update = RuntimeTimelineMessageUpdate {
+                    account_id_hex: account_id_hex.clone(),
+                    account_label: account_label.clone(),
+                    page,
+                };
+                if updates_tx.send(update).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(RuntimeTimelineMessagesSubscription {
+            snapshot,
+            updates: updates_rx,
         })
     }
 
@@ -1735,6 +1815,17 @@ impl MarmotAppRuntime {
     ) -> Result<Vec<AppMessageRecord>, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts.app.messages_with_query(&account.label, query)
+    }
+
+    pub fn timeline_messages_with_query(
+        &self,
+        account_ref: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .timeline_messages_with_query(&account.label, query)
     }
 
     pub async fn create_identity(

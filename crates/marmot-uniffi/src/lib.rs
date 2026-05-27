@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::{
     AccountSetupRequest, AppMessageQuery, ForensicsExportOptions, MarmotApp, MarmotAppRuntime,
-    UserProfileMetadata,
+    TimelineMessageQuery, TimelinePagination, UserProfileMetadata,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -39,7 +39,7 @@ use conversions::{
 pub use errors::MarmotKitError;
 use subscriptions::{
     AgentStreamSubscription, ChatsSubscription, EventsSubscription, GroupStateSubscription,
-    MessagesSubscription, NotificationsSubscription,
+    MessagesSubscription, NotificationsSubscription, TimelineMessagesSubscription,
 };
 
 uniffi::setup_scaffolding!();
@@ -50,7 +50,8 @@ pub use conversions::{
     MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
     NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
     NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
-    PushRegistrationFfi,
+    PushRegistrationFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -89,6 +90,34 @@ fn forensics_public_salt(
         });
     }
     Ok(salt)
+}
+
+fn optional_group_id_hex(group_id_hex: Option<String>) -> Result<Option<String>, MarmotKitError> {
+    match group_id_hex {
+        Some(value) if !value.trim().is_empty() => Ok(Some(hex::encode(
+            group_id_from_hex(value.trim())?.as_slice(),
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn timeline_query_from_ffi(
+    query: TimelineMessageQueryFfi,
+) -> Result<TimelineMessageQuery, MarmotKitError> {
+    Ok(TimelineMessageQuery {
+        group_id_hex: optional_group_id_hex(query.group_id_hex)?,
+        search: query.search.and_then(|value| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        }),
+        pagination: TimelinePagination {
+            before: query.before,
+            before_message_id: query.before_message_id,
+            after: query.after,
+            after_message_id: query.after_message_id,
+            limit: query.limit.map(|value| value as usize),
+        },
+    })
 }
 
 fn unix_now_seconds() -> u64 {
@@ -1314,6 +1343,23 @@ impl Marmot {
         Ok(records.into_iter().map(Into::into).collect())
     }
 
+    /// Materialized conversation timeline for a group or account-wide tail.
+    ///
+    /// This is the app-facing aggregated view: kind-9 chat/reply/media rows,
+    /// reaction summaries, delete tombstones, stream-final metadata, and
+    /// pagination flags. Raw kind-7/kind-5 events remain available through
+    /// `messages(...)` for diagnostics.
+    pub fn timeline_messages(
+        &self,
+        account_ref: String,
+        query: TimelineMessageQueryFfi,
+    ) -> Result<TimelinePageFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .timeline_messages_with_query(&account_ref, timeline_query_from_ffi(query)?)?
+            .into())
+    }
+
     // -----------------------------------------------------------------------
     // Subscriptions
     // -----------------------------------------------------------------------
@@ -1364,6 +1410,28 @@ impl Marmot {
         };
         let inner = self.runtime.subscribe_messages(&account_ref, query)?;
         Ok(MessagesSubscription::new(inner))
+    }
+
+    /// Live materialized timeline updates for a group or account-wide tail.
+    /// The snapshot and each update are full pages for the supplied query.
+    pub async fn subscribe_timeline_messages(
+        &self,
+        account_ref: String,
+        group_id_hex: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Arc<TimelineMessagesSubscription>, MarmotKitError> {
+        let query = TimelineMessageQuery {
+            group_id_hex: optional_group_id_hex(group_id_hex)?,
+            search: None,
+            pagination: TimelinePagination {
+                limit: limit.map(|value| value as usize),
+                ..TimelinePagination::default()
+            },
+        };
+        let inner = self
+            .runtime
+            .subscribe_timeline_messages(&account_ref, query)?;
+        Ok(TimelineMessagesSubscription::new(inner))
     }
 
     /// Member/profile/roster changes for one group. Async for the same
