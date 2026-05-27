@@ -1,0 +1,28 @@
+# Nextest configuration.
+#
+# Heavy integration tests (CLI subprocess flows, relay runtime) are bucketed into
+# test groups with bounded concurrency so they do not contend with each other for
+# kernel resources (sockets, daemon startup, relay listeners, account workers).
+#
+# Each CLI test binary boots `dm`/`dmd` subprocesses, mock relays, and account
+# workers. Running multiple in parallel under CI exhausted the 45s account
+# worker ready timeout (see `APP_RUNTIME_ACCOUNT_READY_WAIT` in
+# `crates/marmot-app/src/lib.rs`). Capping concurrency to 2 keeps throughput up
+# while removing the contention that triggered intermittent failures.
+
+[profile.default]
+fail-fast = false
+
+[[profile.default.overrides]]
+filter = "package(darkmatter-cli) & kind(test)"
+test-group = "cli-integration"
+
+[[profile.default.overrides]]
+filter = "package(marmot-app) & binary(relay_runtime)"
+test-group = "relay-runtime"
+
+[test-groups.cli-integration]
+max-threads = 2
+
+[test-groups.relay-runtime]
+max-threads = 1
