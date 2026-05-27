@@ -9,7 +9,8 @@ use cgka_traits::app_components::{
     NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+    MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::{GroupId, SecretBytes, TransportAdapter, TransportEndpoint};
@@ -503,6 +504,13 @@ impl AppClient {
             };
             self.app
                 .record_account_app_event(&self.state.label, &message_projection)?;
+            if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+                self.app.mark_timeline_message_read(
+                    &self.state.label,
+                    &group_id_hex,
+                    &app_event_id,
+                )?;
+            }
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;
