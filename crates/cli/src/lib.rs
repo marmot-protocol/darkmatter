@@ -19,9 +19,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
     AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AgentTextStreamFinishRequest,
-    AppError, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus,
-    FetchedKeyPackage, MarmotApp, MarmotAppRuntime, StreamStartView, SyncSummary,
-    UserProfileMetadata, tag_value,
+    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage,
+    MarmotApp, MarmotAppRuntime, StreamStartView, SyncSummary, UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
