@@ -552,11 +552,7 @@ impl RuntimeMessagesSubscription {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeTimelineMessageUpdate {
-    Page {
-        account_id_hex: String,
-        account_label: String,
-        page: TimelinePage,
-    },
+    Page { page: TimelinePage },
     Projection(RuntimeProjectionUpdate),
 }
 
@@ -893,11 +889,7 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         if updates_tx
-                            .send(RuntimeTimelineMessageUpdate::Page {
-                                account_id_hex: account_id_hex.clone(),
-                                account_label: account_label.clone(),
-                                page,
-                            })
+                            .send(RuntimeTimelineMessageUpdate::Page { page })
                             .await
                             .is_err()
                         {
@@ -1071,7 +1063,7 @@ impl MarmotAppRuntime {
                 }
                 let row = match blocking_app_task(move || {
                     app_for_lookup
-                        .chat_list_row(&account_label_for_lookup, &group_id_hex)
+                        .refresh_chat_list_row(&account_label_for_lookup, &group_id_hex)
                         .map(|row| row.filter(|row| include_archived_for_lookup || !row.archived))
                 })
                 .await

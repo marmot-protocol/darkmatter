@@ -841,7 +841,7 @@ pub enum TimelineSubscriptionUpdateFfi {
 impl From<RuntimeTimelineMessageUpdate> for TimelineSubscriptionUpdateFfi {
     fn from(value: RuntimeTimelineMessageUpdate) -> Self {
         match value {
-            RuntimeTimelineMessageUpdate::Page { page, .. } => Self::Page { page: page.into() },
+            RuntimeTimelineMessageUpdate::Page { page } => Self::Page { page: page.into() },
             RuntimeTimelineMessageUpdate::Projection(update) => Self::Projection {
                 update: update.into(),
             },

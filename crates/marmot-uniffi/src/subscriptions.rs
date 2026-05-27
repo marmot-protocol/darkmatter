@@ -151,7 +151,7 @@ impl TimelineMessagesSubscription {
     pub async fn next(&self) -> Option<TimelinePageFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(|update| match update {
-            marmot_app::RuntimeTimelineMessageUpdate::Page { page, .. } => page.into(),
+            marmot_app::RuntimeTimelineMessageUpdate::Page { page } => page.into(),
             marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => TimelinePageFfi {
                 messages: update
                     .update

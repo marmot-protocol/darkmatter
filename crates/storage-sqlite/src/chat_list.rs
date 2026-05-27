@@ -63,27 +63,46 @@ struct ConversationReadState {
 }
 
 impl SqliteAccountStorage {
-    pub fn chat_list_rows(
-        &self,
-        local_account_id_hex: &str,
-        query: ChatListQuery,
-    ) -> StorageResult<Vec<ChatListRow>> {
+    pub fn chat_list_rows(&self, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex)?;
         let rows = chat_list_rows_tx(&tx, query)?;
         tx.commit().storage()?;
         Ok(rows)
     }
 
-    pub fn chat_list_row(
+    pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let row = chat_list_row_tx(&tx, group_id_hex)?;
+        tx.commit().storage()?;
+        Ok(row)
+    }
+
+    pub fn ensure_chat_list_rows(&self, local_account_id_hex: &str) -> StorageResult<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        if !chat_list_projection_complete_tx(&tx)? {
+            rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex)?;
+        }
+        tx.commit().storage()
+    }
+
+    pub fn refresh_chat_list_rows(&self, local_account_id_hex: &str) -> StorageResult<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex)?;
+        tx.commit().storage()
+    }
+
+    pub fn refresh_chat_list_row(
         &self,
         local_account_id_hex: &str,
         group_id_hex: &str,
     ) -> StorageResult<Option<ChatListRow>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let row = rebuild_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
+        let row = refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
         tx.commit().storage()?;
         Ok(row)
     }
@@ -169,7 +188,7 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
         }
-        let row = rebuild_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
+        let row = refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
         tx.commit().storage()?;
         Ok(row)
     }
@@ -179,6 +198,7 @@ fn rebuild_all_chat_list_rows_tx(
     tx: &Transaction<'_>,
     local_account_id_hex: &str,
 ) -> StorageResult<()> {
+    tx.execute("DELETE FROM chat_list_rows", []).storage()?;
     let groups = account_groups_tx(tx)?;
     for group in groups {
         rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group)?;
@@ -186,16 +206,54 @@ fn rebuild_all_chat_list_rows_tx(
     Ok(())
 }
 
-fn rebuild_chat_list_row_tx(
+fn refresh_chat_list_row_tx(
     tx: &Transaction<'_>,
     local_account_id_hex: &str,
     group_id_hex: &str,
 ) -> StorageResult<Option<ChatListRow>> {
     let Some(group) = account_group_tx(tx, group_id_hex)? else {
+        tx.execute(
+            "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
+            params![group_id_hex],
+        )
+        .storage()?;
         return Ok(None);
     };
     rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group)?;
     chat_list_row_tx(tx, group_id_hex)
+}
+
+fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool> {
+    let missing: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM account_groups AS ag
+                LEFT JOIN chat_list_rows AS row
+                    ON row.group_id_hex = ag.group_id_hex
+                WHERE row.group_id_hex IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if missing != 0 {
+        return Ok(false);
+    }
+    let stale: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM chat_list_rows AS row
+                LEFT JOIN account_groups AS ag
+                    ON ag.group_id_hex = row.group_id_hex
+                WHERE ag.group_id_hex IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    Ok(stale == 0)
 }
 
 fn rebuild_chat_list_row_for_group_tx(
@@ -760,14 +818,14 @@ mod tests {
     }
 
     #[test]
-    fn chat_list_row_returns_refreshed_single_group_projection() {
+    fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
         let store = setup_store();
         store
             .record_app_event(&chat("latest", REMOTE, 10, "single row"))
             .unwrap();
 
         let row = store
-            .chat_list_row(LOCAL, GROUP)
+            .refresh_chat_list_row(LOCAL, GROUP)
             .unwrap()
             .expect("chat row");
 
@@ -778,7 +836,69 @@ mod tests {
                 .map(|message| message.message_id_hex.as_str()),
             Some("latest")
         );
-        assert_eq!(store.chat_list_row(LOCAL, "missing-group").unwrap(), None);
+        assert_eq!(
+            store.refresh_chat_list_row(LOCAL, "missing-group").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn chat_list_reads_cached_projection_without_rebuilding() {
+        let store = setup_store();
+        store
+            .record_app_event(&chat("old", REMOTE, 10, "cached"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .chat_list_rows(crate::ChatListQuery::default())
+                .unwrap(),
+            Vec::new()
+        );
+
+        store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+        assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "old");
+
+        store
+            .record_app_event(&chat("new", REMOTE, 11, "not refreshed yet"))
+            .unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+        assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "old");
+
+        store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+        assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "new");
+    }
+
+    #[test]
+    fn ensure_chat_list_rows_backfills_missing_projection_rows() {
+        let store = setup_store();
+        store
+            .record_app_event(&chat("latest", REMOTE, 10, "backfilled"))
+            .unwrap();
+
+        store.ensure_chat_list_rows(LOCAL).unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+
+        assert_eq!(row.group_id_hex, GROUP);
+        assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "latest");
     }
 
     #[test]
@@ -789,9 +909,8 @@ mod tests {
             .unwrap();
 
         let row = store
-            .chat_list_rows(LOCAL, crate::ChatListQuery::default())
+            .refresh_chat_list_row(LOCAL, GROUP)
             .unwrap()
-            .pop()
             .expect("chat row");
         assert_eq!(row.group_id_hex, GROUP);
         assert_eq!(row.title, "Marmot Lab");
@@ -807,9 +926,8 @@ mod tests {
             .unwrap();
 
         let row = store
-            .chat_list_rows(LOCAL, crate::ChatListQuery::default())
+            .refresh_chat_list_row(LOCAL, GROUP)
             .unwrap()
-            .pop()
             .expect("chat row");
         assert_eq!(row.unread_count, 1);
         assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("new"));
@@ -818,7 +936,7 @@ mod tests {
             .mark_timeline_message_read(LOCAL, GROUP, "new")
             .unwrap();
         let row = store
-            .chat_list_rows(LOCAL, crate::ChatListQuery::default())
+            .chat_list_rows(crate::ChatListQuery::default())
             .unwrap()
             .pop()
             .expect("chat row");
@@ -835,8 +953,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .chat_list_rows(LOCAL, crate::ChatListQuery::default())
-                .unwrap()[0]
+                .refresh_chat_list_row(LOCAL, GROUP)
+                .unwrap()
+                .expect("chat row")
                 .unread_count,
             1
         );
@@ -848,7 +967,7 @@ mod tests {
             .mark_timeline_message_read(LOCAL, GROUP, "own")
             .unwrap();
         let row = store
-            .chat_list_rows(LOCAL, crate::ChatListQuery::default())
+            .chat_list_rows(crate::ChatListQuery::default())
             .unwrap()
             .pop()
             .expect("chat row");
