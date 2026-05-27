@@ -1211,6 +1211,11 @@ pub struct ReceivedMessageFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    /// Source-event timestamp (seconds since epoch) for the MLS-delivered
+    /// message. Clients should sort the timeline by this value so chronology
+    /// reflects send time, not delivery time. Zero means the timestamp was
+    /// unavailable at decode time.
+    pub recorded_at: u64,
 }
 
 impl From<&ReceivedMessage> for ReceivedMessageFfi {
@@ -1223,6 +1228,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             plaintext: value.plaintext.clone(),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
+            recorded_at: value.recorded_at,
         }
     }
 }

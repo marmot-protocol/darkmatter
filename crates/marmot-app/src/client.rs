@@ -1089,6 +1089,7 @@ impl AppClient {
                 event,
                 group_projection.as_ref(),
                 &source_message_id_hex,
+                source_recorded_at,
             ) {
                 if notifications::is_push_gossip_kind(message.kind) {
                     if let Err(err) = self
