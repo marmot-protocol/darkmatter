@@ -59,6 +59,13 @@ jobs:
           formal=false
           conformance=false
           relay=false
+          # Infra/config-only PRs (workflow, composite actions, nextest config)
+          # must still exercise the heavy gates so CI changes are validated end-to-end.
+          if echo "$files" | grep -qE '^(\.github/workflows/|\.github/actions/|\.config/nextest\.toml)'; then
+            formal=true
+            conformance=true
+            relay=true
+          fi
           if echo "$files" | grep -qE '^(formal/|spec/|rust-toolchain\.toml)'; then
             formal=true
           fi
