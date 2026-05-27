@@ -22,7 +22,7 @@ use marmot_app::{
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppMessageQuery, AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL, FetchedKeyPackage,
     MarmotApp, MarmotAppRuntime, MediaReference, MediaUploadRequest, StreamStartView, SyncSummary,
-    UserDirectorySearch, UserProfileMetadata, tag_value,
+    UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,9 @@ pub(crate) mod commands;
 pub mod daemon;
 pub mod tui;
 
+use commands::notifications::NotificationsCommand;
 use commands::settings::SettingsCommand;
+use commands::users::UsersCommand;
 
 pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
@@ -789,33 +791,6 @@ enum RelaysCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum UsersCommand {
-    #[command(about = "Show a known user from the local directory")]
-    Show {
-        #[arg(value_name = "NPUB_OR_HEX", help = "User to show")]
-        pubkey: String,
-    },
-    #[command(about = "Search known users in the local directory")]
-    Search {
-        #[arg(help = "Search query")]
-        query: String,
-        #[arg(
-            long,
-            default_value = "0..2",
-            value_parser = parse_radius,
-            help = "Directory graph radius as START..END"
-        )]
-        radius: (u8, u8),
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum NotificationsCommand {
-    #[command(about = "Subscribe to notification updates")]
-    Subscribe,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum StreamCommand {
     #[command(about = "Anchor a durable agent text stream start over the MLS message path")]
     Start {
@@ -1457,8 +1432,10 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             relays_command(&account_home, &app, command, account_flag, relay).await
         }
         Command::Settings { command } => commands::settings::run(&home, command),
-        Command::Users { command } => users_command(&account_home, &app, command, account_flag),
-        Command::Notifications { command } => notifications_command(command),
+        Command::Users { command } => {
+            commands::users::run(&account_home, &app, command, account_flag)
+        }
+        Command::Notifications { command } => commands::notifications::run(command),
         Command::Stream { command } => {
             stream_command_app(&account_home, &app, command, account_flag).await
         }
@@ -1699,7 +1676,10 @@ fn export_nsec_command(_pubkey: String) -> Result<CommandOutput, DmError> {
     )
 }
 
-fn unsupported_command<T>(command: &'static str, reason: &'static str) -> Result<T, DmError> {
+pub(crate) fn unsupported_command<T>(
+    command: &'static str,
+    reason: &'static str,
+) -> Result<T, DmError> {
     Err(DmError::UnsupportedCommand { command, reason })
 }
 
@@ -3346,63 +3326,6 @@ fn normalize_relay_type(value: &str) -> Result<String, DmError> {
     }
 }
 
-fn users_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: UsersCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        UsersCommand::Show { pubkey } => {
-            let account_id = parse_public_key(&pubkey)?;
-            let entry = app
-                .directory_entry_for_account_id(&account_id)?
-                .ok_or_else(|| AppError::MissingDirectoryEntry(account_id.clone()))?;
-            Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&entry)
-                    .expect("JSON response serialization cannot fail"),
-                json: json!({ "user": entry }),
-            })
-        }
-        UsersCommand::Search { query, radius } => {
-            let account = resolve_account(account_home, account_flag)?;
-            let results = app.search_user_directory(UserDirectorySearch {
-                searcher_account_id_hex: account.account_id_hex.clone(),
-                query: query.clone(),
-                radius_start: radius.0,
-                radius_end: radius.1,
-                limit: None,
-            })?;
-            Ok(CommandOutput {
-                plain: if results.is_empty() {
-                    "no users".to_owned()
-                } else {
-                    results
-                        .iter()
-                        .map(|result| result.npub.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                },
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "query": query,
-                    "users": results,
-                }),
-            })
-        }
-    }
-}
-
-fn notifications_command(command: NotificationsCommand) -> Result<CommandOutput, DmError> {
-    match command {
-        NotificationsCommand::Subscribe => unsupported_command(
-            "notifications subscribe",
-            "notification derivation and delivery are not exposed by the daemon yet",
-        ),
-    }
-}
-
 fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, DmError> {
     if !confirm {
         return unsupported_command(
@@ -3422,22 +3345,6 @@ fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, DmError> {
             "home": home,
         }),
     })
-}
-
-fn parse_radius(s: &str) -> Result<(u8, u8), String> {
-    let Some((start, end)) = s.split_once("..") else {
-        return Err("expected format START..END".to_owned());
-    };
-    let start = start
-        .parse::<u8>()
-        .map_err(|_| format!("invalid radius start: {start}"))?;
-    let end = end
-        .parse::<u8>()
-        .map_err(|_| format!("invalid radius end: {end}"))?;
-    if start > end {
-        return Err(format!("radius start ({start}) must be <= end ({end})"));
-    }
-    Ok((start, end))
 }
 
 async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, DmError> {
@@ -4870,7 +4777,7 @@ fn account_selector_or_default(
     Ok(resolve_account(account_home, default_account)?.account_id_hex)
 }
 
-fn resolve_account(
+pub(crate) fn resolve_account(
     account_home: &AccountHome,
     explicit: Option<String>,
 ) -> Result<marmot_account::AccountSummary, DmError> {
@@ -4911,13 +4818,13 @@ fn ensure_local_signing(account: &marmot_account::AccountSummary) -> Result<(), 
     }
 }
 
-fn parse_public_key(value: &str) -> Result<String, DmError> {
+pub(crate) fn parse_public_key(value: &str) -> Result<String, DmError> {
     nostr::PublicKey::parse(value)
         .map(|pubkey| pubkey.to_hex())
         .map_err(|_| DmError::InvalidPublicKey)
 }
 
-fn npub_for_account_id(account_id: &str) -> String {
+pub(crate) fn npub_for_account_id(account_id: &str) -> String {
     nostr::PublicKey::parse(account_id)
         .expect("stored account ids are valid Nostr public keys")
         .to_bech32()
