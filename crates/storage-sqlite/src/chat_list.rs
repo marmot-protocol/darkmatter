@@ -83,6 +83,10 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<ChatListRow>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
+        let Some(group) = account_group_tx(&tx, group_id_hex)? else {
+            tx.commit().storage()?;
+            return Ok(None);
+        };
         if read_state_tx(&tx, group_id_hex)?.is_none() {
             let latest = latest_kind9_message_tx(&tx, group_id_hex)?;
             let (last_read_message_id_hex, last_read_timeline_at) = latest
@@ -105,7 +109,8 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         }
-        let row = rebuild_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
+        rebuild_chat_list_row_for_group_tx(&tx, local_account_id_hex, group)?;
+        let row = chat_list_row_tx(&tx, group_id_hex)?;
         tx.commit().storage()?;
         Ok(row)
     }
@@ -729,6 +734,17 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    #[test]
+    fn initialize_chat_read_state_returns_none_for_unknown_group() {
+        let store = setup_store();
+
+        let row = store
+            .initialize_chat_read_state(LOCAL, "missing-group")
+            .unwrap();
+
+        assert_eq!(row, None);
     }
 
     #[test]

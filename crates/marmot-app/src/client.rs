@@ -505,11 +505,19 @@ impl AppClient {
             self.app
                 .record_account_app_event(&self.state.label, &message_projection)?;
             if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
-                self.app.mark_timeline_message_read(
+                let read_marker = self.app.mark_timeline_message_read(
                     &self.state.label,
                     &group_id_hex,
                     &app_event_id,
-                )?;
+                );
+                if let Err(err) = read_marker {
+                    tracing::warn!(
+                        target: "marmot_app::messages",
+                        method = "send_app_event",
+                        error = %err,
+                        "local read marker update skipped after successful send",
+                    );
+                }
             }
             self.prune_plaintext_retention_for_group(group_id)?;
         }

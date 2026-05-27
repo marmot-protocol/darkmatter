@@ -887,10 +887,15 @@ impl MarmotAppRuntime {
         } else {
             app.visible_groups(&account_label)?
         };
-        let mut seen_groups = snapshot
+        let mut group_fingerprints = snapshot
             .iter()
-            .map(app_group_record_fingerprint)
-            .collect::<HashSet<_>>();
+            .map(|group| {
+                (
+                    group.group_id_hex.clone(),
+                    app_group_record_fingerprint(group),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -926,9 +931,11 @@ impl MarmotAppRuntime {
                 if !include_archived && group.archived {
                     continue;
                 }
-                if !seen_groups.insert(app_group_record_fingerprint(&group)) {
+                let fingerprint = app_group_record_fingerprint(&group);
+                if group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint) {
                     continue;
                 }
+                group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
                 if updates_tx.send(group).await.is_err() {
                     return;
                 }
@@ -954,10 +961,10 @@ impl MarmotAppRuntime {
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot = app.chat_list(&account_label, include_archived)?;
-        let mut seen_rows = snapshot
+        let mut row_fingerprints = snapshot
             .iter()
-            .map(chat_list_row_fingerprint)
-            .collect::<HashSet<_>>();
+            .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row)))
+            .collect::<HashMap<_, _>>();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -978,12 +985,13 @@ impl MarmotAppRuntime {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let app_for_lookup = app.clone();
                 let account_label_for_lookup = account_label.clone();
+                let include_archived_for_lookup = include_archived;
                 if runtime_shutdown_requested(&stopping) {
                     return;
                 }
                 let row = match blocking_app_task(move || {
                     app_for_lookup
-                        .chat_list(&account_label_for_lookup, true)
+                        .chat_list(&account_label_for_lookup, include_archived_for_lookup)
                         .map(|rows| {
                             rows.into_iter()
                                 .find(|candidate| candidate.group_id_hex == group_id_hex)
@@ -995,9 +1003,10 @@ impl MarmotAppRuntime {
                     Ok(None) | Err(_) => continue,
                 };
                 let fingerprint = chat_list_row_fingerprint(&row);
-                if !seen_rows.insert(fingerprint) {
+                if row_fingerprints.get(&row.group_id_hex) == Some(&fingerprint) {
                     continue;
                 }
+                row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
                 if updates_tx.send(row).await.is_err() {
                     return;
                 }

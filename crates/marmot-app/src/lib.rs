@@ -2462,25 +2462,39 @@ impl MarmotApp {
 
     fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
         let mut names = HashMap::new();
+        let senders = rows
+            .iter()
+            .filter_map(|row| {
+                row.last_message
+                    .as_ref()
+                    .map(|message| message.sender.clone())
+            })
+            .collect::<HashSet<_>>();
+        for sender in senders {
+            if let Some(name) = self.display_name_for_account_id(&sender)? {
+                names.insert(sender, name);
+            }
+        }
         for row in rows {
             let Some(message) = row.last_message.as_mut() else {
                 continue;
             };
-            if let Some(name) = names.get(&message.sender).cloned() {
-                message.sender_display_name = Some(name);
-                continue;
-            }
-            if let Some(name) = self.display_name_for_account_id(&message.sender)? {
-                names.insert(message.sender.clone(), name.clone());
-                message.sender_display_name = Some(name);
+            if let Some(name) = names.get(&message.sender) {
+                message.sender_display_name = Some(name.clone());
             }
         }
         Ok(())
     }
 
     fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) -> Result<(), AppError> {
-        if let Some(row) = row {
-            self.hydrate_chat_list_rows(std::slice::from_mut(row))?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let Some(message) = row.last_message.as_mut() else {
+            return Ok(());
+        };
+        if let Some(name) = self.display_name_for_account_id(&message.sender)? {
+            message.sender_display_name = Some(name);
         }
         Ok(())
     }
