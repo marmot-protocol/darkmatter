@@ -2577,8 +2577,8 @@ async fn handle_app_runtime_account_setup_request(
     let output = runtime
         .create_or_import_account(request)
         .await
-        .map_err(crate::map_account_setup_error)
-        .and_then(crate::account_setup_command_output);
+        .map_err(crate::commands::account::map_setup_error)
+        .and_then(crate::commands::account::setup_command_output);
     Some(crate::command_output_result(cli.json, output))
 }
 

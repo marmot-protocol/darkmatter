@@ -5,6 +5,7 @@
 //! `crate::execute_inner` dispatches to. New command families should follow
 //! the same pattern so `lib.rs` stays focused on top-level dispatch.
 
+pub mod account;
 pub mod chats;
 pub mod debug;
 pub mod follows;

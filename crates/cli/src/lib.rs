@@ -17,9 +17,9 @@ use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
-    AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AgentTextStreamFinishRequest,
-    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage,
-    MarmotApp, MarmotAppRuntime, StreamStartView, SyncSummary, UserProfileMetadata, tag_value,
+    AccountRelayListStatus, AgentTextStreamFinishRequest, AppError, AppGroupRecord,
+    AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp, MarmotAppRuntime,
+    StreamStartView, SyncSummary, UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ pub(crate) mod commands;
 pub mod daemon;
 pub mod tui;
 
+pub(crate) use commands::account::AccountCommand;
 pub(crate) use commands::chats::ChatsCommand;
 pub(crate) use commands::debug::DebugCommand;
 pub(crate) use commands::follows::FollowsCommand;
@@ -308,65 +309,6 @@ enum Command {
     Reset {
         #[arg(long, help = "Required safety flag before deleting local data")]
         confirm: bool,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum AccountCommand {
-    #[command(about = "Create a local account and publish its bootstrap records")]
-    Create {
-        #[arg(
-            value_name = "NPUB_OR_HEX",
-            help = "Optional npub or hex pubkey to track"
-        )]
-        identity: Option<String>,
-        #[serde(default)]
-        #[arg(long, help = "Read an nsec private key from stdin instead of argv")]
-        nsec_stdin: bool,
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated account relay list to publish"
-        )]
-        default_relays: Vec<String>,
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated bootstrap relays used to find account records"
-        )]
-        bootstrap_relays: Vec<String>,
-        #[arg(
-            long,
-            help = "Publish missing relay-list records during account creation"
-        )]
-        publish_missing_relay_lists: bool,
-    },
-    #[command(about = "List local accounts")]
-    List,
-    #[command(about = "Show account readiness, relay-list, and KeyPackage status")]
-    Status {
-        #[arg(help = "Optional account label, npub, or hex pubkey")]
-        account: Option<String>,
-    },
-    #[command(
-        name = "relay-lists",
-        about = "Fetch and inspect published relay lists"
-    )]
-    RelayLists {
-        #[arg(
-            value_name = "NPUB_OR_HEX",
-            help = "Account to inspect; defaults to selected account"
-        )]
-        account: Option<String>,
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated relays to use for relay-list discovery"
-        )]
-        bootstrap_relays: Vec<String>,
     },
 }
 
@@ -962,7 +904,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
         Command::Logout { pubkey } => logout_command(&account_home, pubkey),
         Command::ExportNsec { pubkey } => export_nsec_command(pubkey),
         Command::Account { command } => {
-            account_command(
+            commands::account::run(
                 &account_home,
                 &app,
                 command,
@@ -973,7 +915,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             .await
         }
         Command::Accounts { command } => {
-            account_command(
+            commands::account::run(
                 &account_home,
                 &app,
                 command,
@@ -1087,7 +1029,7 @@ async fn identity_create_command(
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
 ) -> Result<CommandOutput, DmError> {
-    create_or_import_account_command(
+    commands::account::create_or_import(
         app,
         None,
         default_relays,
@@ -1114,7 +1056,7 @@ async fn identity_login_command(
     let Some(identity) = identity else {
         return Err(DmError::MissingLoginIdentity);
     };
-    create_or_import_account_command(
+    commands::account::create_or_import(
         app,
         Some(identity),
         default_relays,
@@ -1211,93 +1153,6 @@ pub(crate) fn unsupported_command<T>(
     Err(DmError::UnsupportedCommand { command, reason })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn create_or_import_account_command(
-    app: &MarmotApp,
-    identity: Option<String>,
-    mut default_relays: Vec<String>,
-    mut bootstrap_relays: Vec<String>,
-    publish_missing_relay_lists: bool,
-    publish_initial_key_package: bool,
-    nsec_stdin: bool,
-    _runtime_info: CliRuntimeInfo,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    validate_materialized_secret_identity("account create", &identity, nsec_stdin)?;
-    let global_relay_defaults =
-        apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
-    let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
-    let creates_new_private_key = identity.is_none();
-    let adds_public_account = identity
-        .as_deref()
-        .is_some_and(|value| !is_nostr_secret(value));
-    if creates_new_private_key && default_relays.is_empty() {
-        return Err(DmError::MissingRelay);
-    }
-    if imports_private_key && default_relays.is_empty() && bootstrap_relays.is_empty() {
-        return Err(DmError::MissingRelay);
-    }
-    if adds_public_account && bootstrap_relays.is_empty() && default_relays.is_empty() {
-        return Err(DmError::MissingRelay);
-    }
-    if adds_public_account && !default_relays.is_empty() && !global_relay_defaults.default_relays {
-        return Err(DmError::PublicAccountCannotSign);
-    }
-
-    let default_relays = relay_endpoints(default_relays)?;
-    let bootstrap_relays = relay_endpoints(bootstrap_relays)?;
-    let setup = app
-        .runtime()
-        .create_or_import_account(AccountSetupRequest {
-            identity,
-            default_relays,
-            bootstrap_relays,
-            publish_missing_relay_lists,
-            publish_initial_key_package,
-        })
-        .await
-        .map_err(map_account_setup_error)?;
-
-    account_setup_command_output(setup)
-}
-
-pub(crate) fn account_setup_command_output(
-    setup: AccountSetupResult,
-) -> Result<CommandOutput, DmError> {
-    let key_package_plain = setup
-        .key_package_bytes
-        .map(|bytes| format!(" key-package-bytes={bytes}"))
-        .unwrap_or_default();
-    Ok(CommandOutput {
-        plain: format!(
-            "created identity {} local-signing={} relay-lists={}{}",
-            npub_for_account_id(&setup.account.account_id_hex),
-            setup.account.local_signing,
-            relay_setup_plain(&setup.relay_lists),
-            key_package_plain
-        ),
-        json: json!({
-            "account_id": setup.account.account_id_hex,
-            "npub": npub_for_account_id(&setup.account.account_id_hex),
-            "local_signing": setup.account.local_signing,
-            "relay_lists": relay_lists_json(setup.relay_lists),
-            "key_package": setup.key_package_bytes.map(|bytes| json!({
-                "published": true,
-                "bytes": bytes,
-            })),
-            "profile": setup.profile,
-        }),
-    })
-}
-
-pub(crate) fn map_account_setup_error(err: AppError) -> DmError {
-    if let AppError::MissingRelayLists(missing) = &err {
-        let status = missing_relay_list_status(missing.clone());
-        return DmError::MissingRelayLists(missing.clone(), Box::new(status));
-    }
-    err.into()
-}
-
 pub(crate) fn missing_relay_list_status(missing: Vec<String>) -> AccountRelayListStatus {
     AccountRelayListStatus {
         complete: false,
@@ -1316,110 +1171,6 @@ pub(crate) fn missing_relay_list_status(missing: Vec<String>) -> AccountRelayLis
             kind: 10051,
             relays: Vec::new(),
         },
-    }
-}
-
-async fn account_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: AccountCommand,
-    runtime_info: CliRuntimeInfo,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        AccountCommand::Create {
-            identity,
-            nsec_stdin,
-            default_relays,
-            bootstrap_relays,
-            publish_missing_relay_lists,
-        } => {
-            create_or_import_account_command(
-                app,
-                identity,
-                default_relays,
-                bootstrap_relays,
-                publish_missing_relay_lists,
-                false,
-                nsec_stdin,
-                runtime_info,
-                relay,
-            )
-            .await
-        }
-        AccountCommand::List => {
-            let accounts = account_home.accounts()?;
-            let accounts_json = accounts
-                .into_iter()
-                .map(|account| account_summary_json(app, account))
-                .collect::<Vec<_>>();
-            let plain = if accounts_json.is_empty() {
-                "no accounts".to_owned()
-            } else {
-                accounts_json
-                    .iter()
-                    .map(|account| {
-                        format!(
-                            "{} {} local-signing={}",
-                            account_display_name_or_npub(account),
-                            account
-                                .get("account_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            account
-                                .get("local_signing")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok(CommandOutput {
-                plain,
-                json: json!({ "accounts": accounts_json }),
-            })
-        }
-        AccountCommand::Status { account } => {
-            let account = resolve_account(account_home, account.or(account_flag))?;
-            if !account.local_signing {
-                let relay_lists =
-                    app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
-                let json = public_account_status_json(&account, relay_lists);
-                return Ok(CommandOutput {
-                    plain: serde_json::to_string_pretty(&json)
-                        .expect("JSON response serialization cannot fail"),
-                    json,
-                });
-            }
-            let status = app.status(&account.label)?;
-            Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&dm_status_json(status.clone(), &runtime_info))
-                    .expect("JSON response serialization cannot fail"),
-                json: dm_status_json(status, &runtime_info),
-            })
-        }
-        AccountCommand::RelayLists {
-            account,
-            bootstrap_relays,
-        } => {
-            let account_id = account_selector_or_default(account_home, account, account_flag)?;
-            let relay_lists = relay_list_status_for_account_id(
-                app,
-                &account_id,
-                relay_endpoints(bootstrap_relays)?,
-            )
-            .await?;
-            Ok(CommandOutput {
-                plain: relay_setup_plain(&relay_lists),
-                json: json!({
-                    "account_id": account_id,
-                    "npub": npub_for_account_id(&account_id),
-                    "relay_lists": relay_lists_json(relay_lists),
-                }),
-            })
-        }
     }
 }
 
@@ -2439,7 +2190,10 @@ fn sync_json(
     })
 }
 
-fn account_summary_json(app: &MarmotApp, account: marmot_account::AccountSummary) -> Value {
+pub(crate) fn account_summary_json(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+) -> Value {
     let profile = app
         .directory_entry_for_account_id(&account.account_id_hex)
         .ok()
@@ -2455,7 +2209,7 @@ fn account_summary_json(app: &MarmotApp, account: marmot_account::AccountSummary
     })
 }
 
-fn account_display_name_or_npub(account: &Value) -> &str {
+pub(crate) fn account_display_name_or_npub(account: &Value) -> &str {
     account
         .get("display_name")
         .and_then(Value::as_str)
@@ -2588,7 +2342,7 @@ pub(crate) fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
     })
 }
 
-fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Value {
+pub(crate) fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Value {
     json!({
         "account_id": status.account_id_hex,
         "npub": npub_for_account_id(&status.account_id_hex),
@@ -2619,11 +2373,11 @@ fn secret_store_json(runtime_info: &CliRuntimeInfo) -> Value {
     }
 }
 
-fn is_nostr_secret(value: &str) -> bool {
+pub(crate) fn is_nostr_secret(value: &str) -> bool {
     value.starts_with("nsec")
 }
 
-fn public_account_status_json(
+pub(crate) fn public_account_status_json(
     account: &marmot_account::AccountSummary,
     relay_lists: AccountRelayListStatus,
 ) -> Value {
@@ -2641,7 +2395,7 @@ struct GlobalRelayDefaults {
     bootstrap_relays: bool,
 }
 
-fn apply_global_relay_defaults(
+pub(crate) fn apply_global_relay_defaults(
     default_relays: &mut Vec<String>,
     bootstrap_relays: &mut Vec<String>,
     relay: Option<String>,
@@ -2694,7 +2448,7 @@ pub(crate) fn relay_endpoints(values: Vec<String>) -> Result<Vec<TransportEndpoi
     Ok(endpoints)
 }
 
-async fn relay_list_status_for_account_id(
+pub(crate) async fn relay_list_status_for_account_id(
     app: &MarmotApp,
     account_id: &str,
     bootstrap_relays: Vec<TransportEndpoint>,
@@ -2779,7 +2533,7 @@ pub(crate) fn normalize_group_id_hex(value: &str) -> Result<String, DmError> {
     Ok(hex::encode(hex::decode(value)?))
 }
 
-fn relay_setup_plain(status: &AccountRelayListStatus) -> String {
+pub(crate) fn relay_setup_plain(status: &AccountRelayListStatus) -> String {
     if status.complete {
         "complete".to_owned()
     } else {
