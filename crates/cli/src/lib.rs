@@ -39,13 +39,14 @@ pub(crate) mod commands;
 pub mod daemon;
 pub mod tui;
 
-use commands::debug::DebugCommand;
-use commands::follows::FollowsCommand;
-use commands::notifications::NotificationsCommand;
-use commands::profile::ProfileCommand;
-use commands::relays::RelaysCommand;
-use commands::settings::SettingsCommand;
-use commands::users::UsersCommand;
+pub(crate) use commands::debug::DebugCommand;
+pub(crate) use commands::follows::FollowsCommand;
+pub(crate) use commands::key_package::KeyPackageCommand;
+pub(crate) use commands::notifications::NotificationsCommand;
+pub(crate) use commands::profile::ProfileCommand;
+pub(crate) use commands::relays::RelaysCommand;
+pub(crate) use commands::settings::SettingsCommand;
+pub(crate) use commands::users::UsersCommand;
 
 pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
@@ -355,46 +356,6 @@ enum AccountCommand {
         #[arg(
             value_name = "NPUB_OR_HEX",
             help = "Account to inspect; defaults to selected account"
-        )]
-        account: Option<String>,
-        #[arg(
-            long,
-            value_name = "URLS",
-            value_delimiter = ',',
-            help = "Comma-separated relays to use for relay-list discovery"
-        )]
-        bootstrap_relays: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum KeyPackageCommand {
-    #[command(about = "List local KeyPackage publication records")]
-    List,
-    #[command(about = "Republish the currently cached KeyPackage")]
-    Publish,
-    #[command(
-        about = "Force mint and publish a fresh replacement KeyPackage",
-        alias = "force-publish"
-    )]
-    Rotate,
-    #[command(hide = true)]
-    Delete { event_id: String },
-    #[command(name = "delete-all", hide = true)]
-    DeleteAll {
-        #[arg(long)]
-        confirm: bool,
-    },
-    #[command(about = "Check whether a user has relay lists and a fetchable KeyPackage")]
-    Check {
-        #[arg(value_name = "NPUB_OR_HEX", help = "User to check")]
-        pubkey: String,
-    },
-    #[command(about = "Fetch and cache another user's KeyPackage")]
-    Fetch {
-        #[arg(
-            value_name = "NPUB_OR_HEX",
-            help = "User to fetch; defaults to selected account"
         )]
         account: Option<String>,
         #[arg(
@@ -1318,7 +1279,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             .await
         }
         Command::Keys { command } => {
-            key_package_command(&account_home, &app, command, account_flag).await
+            commands::key_package::run(&account_home, &app, command, account_flag).await
         }
         Command::Chats { command } => {
             chats_command(&account_home, &app, command, account_flag).await
@@ -1753,146 +1714,6 @@ async fn account_command(
                     "relay_lists": relay_lists_json(relay_lists),
                 }),
             })
-        }
-    }
-}
-
-async fn key_package_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: KeyPackageCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let runtime = app.runtime();
-    key_package_command_with_runtime(account_home, app, &runtime, command, account_flag).await
-}
-
-pub(crate) async fn key_package_command_with_runtime(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    command: KeyPackageCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        KeyPackageCommand::List => {
-            let account = resolve_account(account_home, account_flag)?;
-            let relay_lists =
-                app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
-            let fetched = if relay_lists.key_package.relays.is_empty() {
-                None
-            } else {
-                app.fetch_latest_key_package_for_account_id(
-                    &account.account_id_hex,
-                    relay_endpoints(relay_lists.key_package.relays.clone())?,
-                )
-                .await
-                .ok()
-            };
-            let keys = fetched
-                .into_iter()
-                .map(key_package_fetch_json)
-                .collect::<Vec<_>>();
-            Ok(CommandOutput {
-                plain: if keys.is_empty() {
-                    "no key packages".to_owned()
-                } else {
-                    format!("{} key package(s)", keys.len())
-                },
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "keys": keys,
-                }),
-            })
-        }
-        KeyPackageCommand::Publish => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let key_package_bytes = runtime.publish_key_package(&account.label).await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "published key package for {} bytes={}",
-                    npub_for_account_id(&account.account_id_hex),
-                    key_package_bytes
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "key_package_bytes": key_package_bytes,
-                }),
-            })
-        }
-        KeyPackageCommand::Rotate => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let key_package_bytes = runtime.rotate_key_package(&account.label).await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "rotated key package for {} bytes={}",
-                    npub_for_account_id(&account.account_id_hex),
-                    key_package_bytes
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "key_package_bytes": key_package_bytes,
-                    "rotated": true,
-                }),
-            })
-        }
-        KeyPackageCommand::Fetch {
-            account,
-            bootstrap_relays,
-        } => {
-            let account_id = account_selector_or_default(account_home, account, account_flag)?;
-            let fetched = app
-                .fetch_latest_key_package_for_account_id(
-                    &account_id,
-                    relay_endpoints(bootstrap_relays)?,
-                )
-                .await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "fetched key package for {account_id} bytes={} relays={}",
-                    fetched.key_package.bytes().len(),
-                    fetched.source_relays.join(",")
-                ),
-                json: key_package_fetch_json(fetched),
-            })
-        }
-        KeyPackageCommand::Check { pubkey } => {
-            let account_id = parse_public_key(&pubkey)?;
-            let fetched = app
-                .fetch_latest_key_package_for_account_id(&account_id, Vec::new())
-                .await?;
-            Ok(CommandOutput {
-                plain: format!("key package available for {account_id}"),
-                json: json!({
-                    "account_id": account_id,
-                    "npub": npub_for_account_id(&account_id),
-                    "available": true,
-                    "key_package": key_package_fetch_json(fetched),
-                }),
-            })
-        }
-        KeyPackageCommand::Delete { .. } => unsupported_command(
-            "keys delete",
-            "relay deletion for KeyPackage events is not implemented yet",
-        ),
-        KeyPackageCommand::DeleteAll { confirm } => {
-            if !confirm {
-                return unsupported_command(
-                    "keys delete-all",
-                    "pass --confirm once relay deletion is implemented",
-                );
-            }
-            unsupported_command(
-                "keys delete-all",
-                "relay deletion for KeyPackage events is not implemented yet",
-            )
         }
     }
 }
@@ -4172,7 +3993,7 @@ fn imeta_fields(tags: &[Vec<String>]) -> Option<HashMap<String, String>> {
     Some(fields)
 }
 
-fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
+pub(crate) fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
     json!({
         "account_id": fetched.account_id_hex,
         "key_package_id": fetched.key_package_id,
@@ -4304,7 +4125,7 @@ async fn relay_list_status_for_account_id(
     }
 }
 
-fn account_selector_or_default(
+pub(crate) fn account_selector_or_default(
     account_home: &AccountHome,
     account_ref: Option<String>,
     default_account: Option<String>,

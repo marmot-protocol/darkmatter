@@ -2658,7 +2658,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Keys { command } => {
-            crate::key_package_command_with_runtime(
+            crate::commands::key_package::with_runtime(
                 &account_home,
                 &app,
                 runtime,

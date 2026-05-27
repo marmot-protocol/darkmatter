@@ -7,6 +7,7 @@
 
 pub mod debug;
 pub mod follows;
+pub mod key_package;
 pub mod notifications;
 pub mod profile;
 pub mod relays;
