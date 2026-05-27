@@ -7,7 +7,7 @@ use cgka_traits::app_event::{
     STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -149,8 +149,9 @@ struct ValidatedPagination {
 
 impl SqliteAccountStorage {
     pub fn record_app_event(&self, event: &StoredAppEvent) -> StorageResult<()> {
-        let conn = self.lock()?;
-        conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        tx.execute(
             "INSERT INTO app_events (
                 group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
                 plaintext, kind, tags_json, recorded_at, received_at
@@ -181,8 +182,8 @@ impl SqliteAccountStorage {
             ],
         )
         .storage()?;
-        drop(conn);
-        self.rebuild_message_timeline_for_group(&event.group_id_hex)
+        rebuild_message_timeline_for_group_tx(&tx, &event.group_id_hex)?;
+        tx.commit().storage()
     }
 
     pub fn invalidate_app_event_by_source(
@@ -190,8 +191,9 @@ impl SqliteAccountStorage {
         source_message_id_hex: &str,
         reason: &str,
     ) -> StorageResult<bool> {
-        let conn = self.lock()?;
-        let group_id_hex: Option<String> = conn
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let group_id_hex: Option<String> = tx
             .query_row(
                 "SELECT group_id_hex FROM app_events WHERE source_message_id_hex = ?1",
                 params![source_message_id_hex],
@@ -202,83 +204,22 @@ impl SqliteAccountStorage {
         let Some(group_id_hex) = group_id_hex else {
             return Ok(false);
         };
-        conn.execute(
+        tx.execute(
             "UPDATE app_events
              SET invalidated = 1, invalidation_reason = ?2
              WHERE source_message_id_hex = ?1",
             params![source_message_id_hex, reason],
         )
         .storage()?;
-        drop(conn);
-        self.rebuild_message_timeline_for_group(&group_id_hex)?;
+        rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
+        tx.commit().storage()?;
         Ok(true)
     }
 
     pub fn rebuild_message_timeline_for_group(&self, group_id_hex: &str) -> StorageResult<()> {
-        let events = self.app_events_for_rebuild(group_id_hex)?;
-        let (rows, stream_starts) = project_group_events(events);
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        tx.execute(
-            "DELETE FROM message_timeline WHERE group_id_hex = ?1",
-            params![group_id_hex],
-        )
-        .storage()?;
-        tx.execute(
-            "DELETE FROM agent_stream_starts WHERE group_id_hex = ?1",
-            params![group_id_hex],
-        )
-        .storage()?;
-        for row in rows {
-            tx.execute(
-                "INSERT INTO message_timeline (
-                    group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
-                    plaintext, kind, tags_json, timeline_at, received_at,
-                    reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-                    deleted, deleted_by_message_id_hex
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                params![
-                    &row.group_id_hex,
-                    &row.message_id_hex,
-                    &row.source_message_id_hex,
-                    &row.direction,
-                    &row.sender,
-                    &row.plaintext,
-                    u64_to_i64(row.kind)?,
-                    tags_json(&row.tags)?,
-                    u64_to_i64(row.timeline_at)?,
-                    u64_to_i64(row.received_at)?,
-                    &row.reply_to_message_id_hex,
-                    optional_value_json(&row.media)?,
-                    optional_value_json(&row.agent_text_stream)?,
-                    reaction_summary_json(&row.reactions)?,
-                    if row.deleted { 1_i64 } else { 0_i64 },
-                    &row.deleted_by_message_id_hex,
-                ],
-            )
-            .storage()?;
-        }
-        for start in stream_starts {
-            tx.execute(
-                "INSERT INTO agent_stream_starts (
-                    group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
-                    tags_json, started_at, received_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    &start.group_id_hex,
-                    &start.message_id_hex,
-                    &start.source_message_id_hex,
-                    &start.sender,
-                    &start.stream_id_hex,
-                    tags_json(&start.tags)?,
-                    u64_to_i64(start.started_at)?,
-                    u64_to_i64(start.received_at)?,
-                ],
-            )
-            .storage()?;
-        }
+        rebuild_message_timeline_for_group_tx(&tx, group_id_hex)?;
         tx.commit().storage()
     }
 
@@ -314,24 +255,95 @@ impl SqliteAccountStorage {
             has_more_after,
         })
     }
+}
 
-    fn app_events_for_rebuild(&self, group_id_hex: &str) -> StorageResult<Vec<RawAppEvent>> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
-                        plaintext, kind, tags_json, recorded_at, received_at
-                 FROM app_events
-                 WHERE group_id_hex = ?1
-                   AND invalidated = 0
-                 ORDER BY recorded_at, message_id_hex, insert_order",
-            )
-            .storage()?;
-        stmt.query_map(params![group_id_hex], raw_event_from_row)
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()
+pub(crate) fn rebuild_message_timeline_for_group_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+) -> StorageResult<()> {
+    let events = app_events_for_rebuild_tx(tx, group_id_hex)?;
+    let (rows, stream_starts) = project_group_events(events);
+    tx.execute(
+        "DELETE FROM message_timeline WHERE group_id_hex = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
+    tx.execute(
+        "DELETE FROM agent_stream_starts WHERE group_id_hex = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
+    for row in rows {
+        tx.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                plaintext, kind, tags_json, timeline_at, received_at,
+                reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
+                deleted, deleted_by_message_id_hex
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                &row.group_id_hex,
+                &row.message_id_hex,
+                &row.source_message_id_hex,
+                &row.direction,
+                &row.sender,
+                &row.plaintext,
+                u64_to_i64(row.kind)?,
+                tags_json(&row.tags)?,
+                u64_to_i64(row.timeline_at)?,
+                u64_to_i64(row.received_at)?,
+                &row.reply_to_message_id_hex,
+                optional_value_json(&row.media)?,
+                optional_value_json(&row.agent_text_stream)?,
+                reaction_summary_json(&row.reactions)?,
+                if row.deleted { 1_i64 } else { 0_i64 },
+                &row.deleted_by_message_id_hex,
+            ],
+        )
+        .storage()?;
     }
+    for start in stream_starts {
+        tx.execute(
+            "INSERT INTO agent_stream_starts (
+                group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
+                tags_json, started_at, received_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                &start.group_id_hex,
+                &start.message_id_hex,
+                &start.source_message_id_hex,
+                &start.sender,
+                &start.stream_id_hex,
+                tags_json(&start.tags)?,
+                u64_to_i64(start.started_at)?,
+                u64_to_i64(start.received_at)?,
+            ],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+fn app_events_for_rebuild_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+) -> StorageResult<Vec<RawAppEvent>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                    plaintext, kind, tags_json, recorded_at, received_at
+             FROM app_events
+             WHERE group_id_hex = ?1
+               AND invalidated = 0
+             ORDER BY recorded_at, message_id_hex, insert_order",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex], raw_event_from_row)
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
 }
 
 fn validate_pagination(pagination: &TimelinePagination) -> StorageResult<ValidatedPagination> {
@@ -390,7 +402,7 @@ fn timeline_query_sql(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        clauses.push("LOWER(plaintext) LIKE LOWER(?)".to_owned());
+        clauses.push("plaintext LIKE ? COLLATE NOCASE".to_owned());
         params.push(rusqlite::types::Value::Text(format!("%{search}%")));
     }
     match pagination.direction {
@@ -924,6 +936,25 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id_hex, "final");
         assert!(messages[0].agent_text_stream.is_some());
+    }
+
+    #[test]
+    fn timeline_search_matches_plaintext_case_insensitively() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "Hello There"))
+            .unwrap();
+
+        let page = store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some("11".repeat(32)),
+                search: Some("hello".to_owned()),
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].message_id_hex, "target");
     }
 
     #[test]

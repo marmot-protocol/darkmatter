@@ -1008,7 +1008,7 @@ async fn handle_messages_subscription(
     runtime: Option<marmot_app::MarmotAppRuntime>,
     cli: Cli,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if timeline_messages_subscribe_args(&cli).is_ok() {
+    if is_timeline_messages_subscribe(&cli) {
         return handle_timeline_messages_subscription(stream, defaults, runtime, cli).await;
     }
     let (group_id, limit) = match messages_subscribe_args(&cli) {
@@ -1556,6 +1556,21 @@ fn messages_subscribe_args(cli: &Cli) -> Result<(Option<String>, Option<usize>),
         .transpose()
         .map_err(|err| err.to_string())?;
     Ok((group_id, Some(limit.unwrap_or(50).min(200))))
+}
+
+fn is_timeline_messages_subscribe(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        crate::Command::Message {
+            command: crate::MessageCommand::Timeline {
+                command: crate::MessageTimelineCommand::Subscribe { .. },
+            },
+        } | crate::Command::Messages {
+            command: crate::MessageCommand::Timeline {
+                command: crate::MessageTimelineCommand::Subscribe { .. },
+            },
+        }
+    )
 }
 
 fn timeline_messages_subscribe_args(cli: &Cli) -> Result<(Option<String>, Option<usize>), String> {
@@ -3841,8 +3856,78 @@ fn stream_result_plain(result: &serde_json::Value) -> String {
                     .unwrap_or("")
             )
         }
+        Some("timeline_subscription_ready") => {
+            let group_id = result
+                .get("group_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<all>");
+            format!("timeline subscription ready group={group_id}")
+        }
+        Some("initial_timeline_page") | Some("timeline_updated") => {
+            timeline_stream_page_plain(result)
+        }
         _ => result.to_string(),
     }
+}
+
+fn timeline_stream_page_plain(result: &serde_json::Value) -> String {
+    let label = match result.get("type").and_then(serde_json::Value::as_str) {
+        Some("initial_timeline_page") => "initial timeline page",
+        Some("timeline_updated") => "timeline updated",
+        _ => "timeline",
+    };
+    let has_more_before = result
+        .get("has_more_before")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let has_more_after = result
+        .get("has_more_after")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let messages = result
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if messages.is_empty() {
+        return format!(
+            "{label} has_more_before={has_more_before} has_more_after={has_more_after}: no timeline messages"
+        );
+    }
+    let body = messages
+        .iter()
+        .map(timeline_stream_message_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{label} has_more_before={has_more_before} has_more_after={has_more_after}\n{body}")
+}
+
+fn timeline_stream_message_plain(message: &serde_json::Value) -> String {
+    let deleted = if message
+        .get("deleted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        " deleted=true"
+    } else {
+        ""
+    };
+    format!(
+        "group={} from={}: {}{}",
+        message
+            .get("group_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>"),
+        message
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>"),
+        message
+            .get("plaintext")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        deleted
+    )
 }
 
 fn write_pid_file(pid_path: &Path) -> std::io::Result<()> {
@@ -4529,6 +4614,63 @@ mod tests {
         };
 
         assert_eq!(messages_subscribe_args(&cli), Ok((None, Some(200))));
+    }
+
+    #[test]
+    fn timeline_messages_subscribe_is_routed_by_command_shape() {
+        let cli = Cli {
+            home: None,
+            socket: None,
+            relay: None,
+            daemon_discovery_relays: Vec::new(),
+            daemon_default_account_relays: Vec::new(),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command: crate::Command::Messages {
+                command: crate::MessageCommand::Timeline {
+                    command: crate::MessageTimelineCommand::Subscribe {
+                        group: Some("not-hex".to_owned()),
+                        limit: Some(25),
+                    },
+                },
+            },
+        };
+
+        assert!(is_timeline_messages_subscribe(&cli));
+        assert!(timeline_messages_subscribe_args(&cli).is_err());
+    }
+
+    #[test]
+    fn timeline_stream_plain_output_is_human_readable() {
+        let ready = serde_json::json!({
+            "type": "timeline_subscription_ready",
+            "group_id": "aa"
+        });
+        assert_eq!(
+            stream_result_plain(&ready),
+            "timeline subscription ready group=aa"
+        );
+
+        let page = serde_json::json!({
+            "type": "initial_timeline_page",
+            "has_more_before": true,
+            "has_more_after": false,
+            "messages": [
+                {
+                    "group_id": "aa",
+                    "from": "alice",
+                    "plaintext": "hello",
+                    "deleted": false
+                }
+            ]
+        });
+
+        assert_eq!(
+            stream_result_plain(&page),
+            "initial timeline page has_more_before=true has_more_after=false\ngroup=aa from=alice: hello"
+        );
     }
 
     #[test]

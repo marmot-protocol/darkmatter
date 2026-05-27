@@ -273,6 +273,25 @@ impl SqliteAccountStorage {
         )
         .storage()?;
 
+        if state.groups.is_empty() {
+            tx.execute("DELETE FROM account_groups", []).storage()?;
+        } else {
+            let retained_group_ids = state
+                .groups
+                .iter()
+                .map(|group| Value::Text(group.group_id_hex.clone()))
+                .collect::<Vec<_>>();
+            let placeholders = (0..retained_group_ids.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.execute(
+                &format!("DELETE FROM account_groups WHERE group_id_hex NOT IN ({placeholders})"),
+                params_from_iter(retained_group_ids),
+            )
+            .storage()?;
+        }
+
         for group in &state.groups {
             tx.execute(
                 "INSERT INTO account_groups (
@@ -428,9 +447,8 @@ impl SqliteAccountStorage {
                 params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
             )
             .storage()?;
+        crate::timeline::rebuild_message_timeline_for_group_tx(&tx, group_id_hex)?;
         tx.commit().storage()?;
-        drop(conn);
-        self.rebuild_message_timeline_for_group(group_id_hex)?;
         Ok(pruned)
     }
 
@@ -1034,6 +1052,38 @@ mod tests {
         assert_eq!(restored.groups[0].profile_name, "alpha");
         assert_eq!(restored.groups[0].components.len(), 2);
         assert_eq!(restored.groups[0].components[1].component_id, 0x8004);
+    }
+
+    #[test]
+    fn account_projection_state_deletes_groups_removed_from_snapshot() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let state = StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha"), group("bb", "beta")],
+        };
+        store.save_account_projection_state(&state, 16).unwrap();
+
+        let updated = StoredAccountState {
+            groups: vec![group("bb", "beta")],
+            ..state
+        };
+        store.save_account_projection_state(&updated, 16).unwrap();
+
+        let restored = store.load_account_projection_state("alice", 16).unwrap();
+        assert_eq!(restored.groups.len(), 1);
+        assert_eq!(restored.groups[0].group_id_hex, "bb");
+        let stale_components: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM account_group_app_components WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_components, 0);
     }
 
     #[test]

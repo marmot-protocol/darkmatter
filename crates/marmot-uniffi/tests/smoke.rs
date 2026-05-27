@@ -273,6 +273,19 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
         .expect_err("invalid group hex should fail before account lookup");
     assert!(format!("{invalid_group}").contains("invalid hex"));
 
+    let invalid_cursor = kit
+        .timeline_messages(
+            "missing".into(),
+            TimelineMessageQueryFfi {
+                before: Some(1),
+                before_message_id: Some("not-hex".into()),
+                limit: Some(25),
+                ..TimelineMessageQueryFfi::default()
+            },
+        )
+        .expect_err("invalid cursor hex should fail before account lookup");
+    assert!(format!("{invalid_cursor}").contains("invalid hex"));
+
     let subscribe_error = match kit
         .subscribe_timeline_messages("missing".into(), None, Some(25))
         .await

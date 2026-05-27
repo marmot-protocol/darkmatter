@@ -49,7 +49,7 @@ CREATE TABLE message_timeline (
 CREATE INDEX idx_message_timeline_order
     ON message_timeline (group_id_hex, timeline_at, message_id_hex);
 CREATE INDEX idx_message_timeline_search
-    ON message_timeline (group_id_hex, plaintext);
+    ON message_timeline (group_id_hex, plaintext COLLATE NOCASE);
 
 CREATE TABLE agent_stream_starts (
     group_id_hex TEXT NOT NULL,

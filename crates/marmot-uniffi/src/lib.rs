@@ -101,6 +101,27 @@ fn optional_group_id_hex(group_id_hex: Option<String>) -> Result<Option<String>,
     }
 }
 
+fn optional_message_id_hex(
+    message_id_hex: Option<String>,
+) -> Result<Option<String>, MarmotKitError> {
+    let Some(value) = message_id_hex else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let bytes = hex::decode(value).map_err(|err| MarmotKitError::InvalidHex {
+        details: err.to_string(),
+    })?;
+    if bytes.len() != 32 {
+        return Err(MarmotKitError::InvalidHex {
+            details: format!("expected 32-byte message id, got {} bytes", bytes.len()),
+        });
+    }
+    Ok(Some(hex::encode(bytes)))
+}
+
 fn timeline_query_from_ffi(
     query: TimelineMessageQueryFfi,
 ) -> Result<TimelineMessageQuery, MarmotKitError> {
@@ -112,9 +133,9 @@ fn timeline_query_from_ffi(
         }),
         pagination: TimelinePagination {
             before: query.before,
-            before_message_id: query.before_message_id,
+            before_message_id: optional_message_id_hex(query.before_message_id)?,
             after: query.after,
-            after_message_id: query.after_message_id,
+            after_message_id: optional_message_id_hex(query.after_message_id)?,
             limit: query.limit.map(|value| value as usize),
         },
     })
@@ -1481,6 +1502,17 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn optional_message_id_hex_trims_and_canonicalizes() {
+        assert_eq!(optional_message_id_hex(None).unwrap(), None);
+        assert_eq!(optional_message_id_hex(Some("  ".into())).unwrap(), None);
+        assert_eq!(
+            optional_message_id_hex(Some(format!(" {} ", "AB".repeat(32)))).unwrap(),
+            Some("ab".repeat(32))
+        );
+        assert!(optional_message_id_hex(Some("abcd".into())).is_err());
     }
 
     #[test]
