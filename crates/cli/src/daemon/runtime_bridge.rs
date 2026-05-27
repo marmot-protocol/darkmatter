@@ -490,6 +490,7 @@ pub(super) async fn handle_app_runtime_event(
             );
         }
         marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
+        marmot_app::MarmotAppEvent::ProjectionUpdated(_) => {}
         marmot_app::MarmotAppEvent::MessageReceived(message) => {
             // Raw message updates keep kind-1200 starts separate as
             // `AgentStreamStarted`; materialized timeline subscriptions include
