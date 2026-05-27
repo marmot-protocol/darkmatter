@@ -2668,7 +2668,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Follows { command } => {
-            crate::follows_command_with_runtime(
+            crate::commands::follows::with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2679,7 +2679,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Profile { command } => {
-            crate::profile_command_with_runtime(
+            crate::commands::profile::with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2690,7 +2690,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Relays { command } => {
-            crate::relays_command_with_runtime(
+            crate::commands::relays::with_runtime(
                 &account_home,
                 &app,
                 runtime,

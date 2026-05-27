@@ -18,10 +18,10 @@ use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
-    AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
-    AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL, FetchedKeyPackage,
-    MarmotApp, MarmotAppRuntime, MediaReference, MediaUploadRequest, StreamStartView, SyncSummary,
+    AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AgentTextStreamFinishRequest,
+    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery,
+    AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL, FetchedKeyPackage, MarmotApp,
+    MarmotAppRuntime, MediaReference, MediaUploadRequest, StreamStartView, SyncSummary,
     UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
@@ -39,7 +39,11 @@ pub(crate) mod commands;
 pub mod daemon;
 pub mod tui;
 
+use commands::debug::DebugCommand;
+use commands::follows::FollowsCommand;
 use commands::notifications::NotificationsCommand;
+use commands::profile::ProfileCommand;
+use commands::relays::RelaysCommand;
 use commands::settings::SettingsCommand;
 use commands::users::UsersCommand;
 
@@ -302,19 +306,6 @@ enum Command {
         #[arg(long, help = "Required safety flag before deleting local data")]
         confirm: bool,
     },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum DebugCommand {
-    #[command(
-        name = "relay-control-state",
-        about = "Show the relay-plane subscription and control-state snapshot"
-    )]
-    RelayControlState,
-    #[command(about = "Run a local runtime health check for the selected account")]
-    Health,
-    #[command(name = "ratchet-tree", hide = true)]
-    RatchetTree { group_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -710,83 +701,6 @@ enum MessageCommand {
         group: Option<String>,
         #[arg(long, help = "Initial replay limit")]
         limit: Option<usize>,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum FollowsCommand {
-    #[command(about = "List followed users")]
-    List,
-    #[command(about = "Follow a user")]
-    Add {
-        #[arg(value_name = "NPUB_OR_HEX", help = "User to follow")]
-        pubkey: String,
-    },
-    #[command(about = "Unfollow a user")]
-    Remove {
-        #[arg(value_name = "NPUB_OR_HEX", help = "User to unfollow")]
-        pubkey: String,
-    },
-    #[command(about = "Check whether a user is followed")]
-    Check {
-        #[arg(value_name = "NPUB_OR_HEX", help = "User to check")]
-        pubkey: String,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum ProfileCommand {
-    #[command(about = "Show the selected account Nostr profile")]
-    Show,
-    #[command(about = "Update and publish the selected account Nostr profile")]
-    Update {
-        #[arg(long, help = "Set the short profile name")]
-        name: Option<String>,
-        #[arg(long, help = "Set the display name")]
-        display_name: Option<String>,
-        #[arg(long, help = "Set the profile bio")]
-        about: Option<String>,
-        #[arg(long, help = "Set the profile picture URL")]
-        picture: Option<String>,
-        #[arg(long, help = "Set the NIP-05 identifier")]
-        nip05: Option<String>,
-        #[arg(long, help = "Set the Lightning address")]
-        lud16: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum RelaysCommand {
-    #[command(about = "List account relay URLs")]
-    List {
-        #[arg(
-            long = "type",
-            value_name = "TYPE",
-            help = "Relay list type: nip65, inbox, or key_package"
-        )]
-        relay_type: Option<String>,
-    },
-    #[command(about = "Add a relay URL to an account relay list")]
-    Add {
-        #[arg(help = "Relay URL to add")]
-        url: String,
-        #[arg(
-            long = "type",
-            value_name = "TYPE",
-            help = "Relay list type: nip65, inbox, or key_package"
-        )]
-        relay_type: String,
-    },
-    #[command(about = "Remove a relay URL from an account relay list")]
-    Remove {
-        #[arg(help = "Relay URL to remove")]
-        url: String,
-        #[arg(
-            long = "type",
-            value_name = "TYPE",
-            help = "Relay list type: nip65, inbox, or key_package"
-        )]
-        relay_type: String,
     },
 }
 
@@ -1349,7 +1263,9 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
         account_home.clone(),
     );
     match command {
-        Command::Debug { command } => debug_command(&account_home, &app, command, account_flag),
+        Command::Debug { command } => {
+            commands::debug::run(&account_home, &app, command, account_flag)
+        }
         Command::CreateIdentity => {
             identity_create_command(
                 &app,
@@ -1423,13 +1339,13 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             message_command(&account_home, &app, command, account_flag).await
         }
         Command::Follows { command } => {
-            follows_command(&account_home, &app, command, account_flag, relay).await
+            commands::follows::run(&account_home, &app, command, account_flag, relay).await
         }
         Command::Profile { command } => {
-            profile_command(&account_home, &app, command, account_flag, relay).await
+            commands::profile::run(&account_home, &app, command, account_flag, relay).await
         }
         Command::Relays { command } => {
-            relays_command(&account_home, &app, command, account_flag, relay).await
+            commands::relays::run(&account_home, &app, command, account_flag, relay).await
         }
         Command::Settings { command } => commands::settings::run(&home, command),
         Command::Users { command } => {
@@ -1602,60 +1518,6 @@ fn whoami_command(
     })
 }
 
-fn debug_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: DebugCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        DebugCommand::RelayControlState => {
-            let accounts = account_home.accounts()?;
-            let statuses = accounts
-                .into_iter()
-                .map(|account| {
-                    let relay_lists = app
-                        .account_relay_list_status_for_account_id(&account.account_id_hex)
-                        .map(relay_lists_json)
-                        .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                    json!({
-                        "account_id": account.account_id_hex,
-                        "npub": npub_for_account_id(&account.account_id_hex),
-                        "relay_lists": relay_lists,
-                    })
-                })
-                .collect::<Vec<_>>();
-            Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&statuses)
-                    .expect("JSON response serialization cannot fail"),
-                json: json!({ "accounts": statuses }),
-            })
-        }
-        DebugCommand::Health => {
-            let account = resolve_account(account_home, account_flag)?;
-            let status = app.status(&account.label)?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "healthy account={} groups={} messages={}",
-                    account.account_id_hex, status.group_count, status.message_count
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "healthy": true,
-                    "groups": status.group_count,
-                    "messages": status.message_count,
-                    "seen_events": status.seen_events,
-                }),
-            })
-        }
-        DebugCommand::RatchetTree { .. } => unsupported_command(
-            "debug ratchet-tree",
-            "ratchet-tree diagnostics are not exposed by marmot-app yet",
-        ),
-    }
-}
-
 fn logout_command(account_home: &AccountHome, pubkey: String) -> Result<CommandOutput, DmError> {
     let account_id = parse_public_key(&pubkey)?;
     account_home.remove_account(&account_id)?;
@@ -1770,7 +1632,7 @@ pub(crate) fn map_account_setup_error(err: AppError) -> DmError {
     err.into()
 }
 
-fn missing_relay_list_status(missing: Vec<String>) -> AccountRelayListStatus {
+pub(crate) fn missing_relay_list_status(missing: Vec<String>) -> AccountRelayListStatus {
     AccountRelayListStatus {
         complete: false,
         missing,
@@ -3002,330 +2864,6 @@ fn search_messages(
     Ok(matches)
 }
 
-async fn follows_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: FollowsCommand,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let runtime = app.runtime();
-    follows_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
-}
-
-pub(crate) async fn follows_command_with_runtime(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    command: FollowsCommand,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
-    match command {
-        FollowsCommand::List => {
-            let follows = app
-                .directory_entry_for_account_id(&account.account_id_hex)?
-                .map(|entry| entry.follows)
-                .unwrap_or_default();
-            follows_output(account.account_id_hex, follows)
-        }
-        FollowsCommand::Check { pubkey } => {
-            let target = parse_public_key(&pubkey)?;
-            let follows = app
-                .directory_entry_for_account_id(&account.account_id_hex)?
-                .map(|entry| entry.follows)
-                .unwrap_or_default();
-            let follows_target = follows.iter().any(|follow| follow == &target);
-            Ok(CommandOutput {
-                plain: format!("follows {}: {follows_target}", npub_for_account_id(&target)),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "pubkey": target,
-                    "user": npub_for_account_id(&target),
-                    "follows": follows_target,
-                }),
-            })
-        }
-        FollowsCommand::Add { pubkey } => {
-            update_follows_command(app, runtime, account, relay, pubkey, true).await
-        }
-        FollowsCommand::Remove { pubkey } => {
-            update_follows_command(app, runtime, account, relay, pubkey, false).await
-        }
-    }
-}
-
-async fn update_follows_command(
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    account: marmot_account::AccountSummary,
-    relay: Option<String>,
-    pubkey: String,
-    add: bool,
-) -> Result<CommandOutput, DmError> {
-    let target = parse_public_key(&pubkey)?;
-    let relay = relay.ok_or(DmError::MissingRelay)?;
-    let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
-    let mut follows = app
-        .directory_entry_for_account_id(&account.account_id_hex)?
-        .map(|entry| entry.follows)
-        .unwrap_or_default();
-    if add {
-        if !follows.contains(&target) {
-            follows.push(target);
-        }
-    } else {
-        follows.retain(|follow| follow != &target);
-    }
-    follows.sort();
-    follows.dedup();
-    runtime
-        .publish_account_follow_list(
-            &account.label,
-            &follows,
-            AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint.clone()]),
-        )
-        .await?;
-    let _ = runtime
-        .refresh_user_directory_for_account_id(&account.account_id_hex, vec![endpoint])
-        .await;
-    follows_output(account.account_id_hex, follows)
-}
-
-fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOutput, DmError> {
-    let follows_json = follows
-        .iter()
-        .map(|follow| {
-            json!({
-                "account_id": follow,
-                "npub": npub_for_account_id(follow),
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(CommandOutput {
-        plain: if follows_json.is_empty() {
-            "no follows".to_owned()
-        } else {
-            follows_json
-                .iter()
-                .filter_map(|follow| follow.get("npub").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        json: json!({
-            "account_id": account_id,
-            "npub": npub_for_account_id(&account_id),
-            "follows": follows_json,
-        }),
-    })
-}
-
-async fn profile_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: ProfileCommand,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let runtime = app.runtime();
-    profile_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
-}
-
-pub(crate) async fn profile_command_with_runtime(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    command: ProfileCommand,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
-    match command {
-        ProfileCommand::Show => {
-            let entry = app.directory_entry_for_account_id(&account.account_id_hex)?;
-            Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&entry)
-                    .expect("JSON response serialization cannot fail"),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "profile": entry.and_then(|entry| entry.profile),
-                }),
-            })
-        }
-        ProfileCommand::Update {
-            name,
-            display_name,
-            about,
-            picture,
-            nip05,
-            lud16,
-        } => {
-            let relay = relay.ok_or(DmError::MissingRelay)?;
-            let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
-            let profile = UserProfileMetadata {
-                name,
-                display_name,
-                about,
-                picture,
-                nip05,
-                lud16,
-                created_at: unix_now_seconds(),
-                source_relays: Vec::new(),
-            };
-            runtime
-                .publish_user_profile(
-                    &account.label,
-                    profile.clone(),
-                    AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint]),
-                )
-                .await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "updated profile {}",
-                    npub_for_account_id(&account.account_id_hex)
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "profile": profile,
-                }),
-            })
-        }
-    }
-}
-
-async fn relays_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: RelaysCommand,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let runtime = app.runtime();
-    relays_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
-}
-
-pub(crate) async fn relays_command_with_runtime(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    command: RelaysCommand,
-    account_flag: Option<String>,
-    relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
-    match command {
-        RelaysCommand::List { relay_type } => {
-            let status = app.account_relay_list_status(&account.label)?;
-            let relays = relays_for_type(&status, relay_type.as_deref())?;
-            Ok(CommandOutput {
-                plain: if relays.is_empty() {
-                    "no relays".to_owned()
-                } else {
-                    relays.join("\n")
-                },
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "relay_type": relay_type,
-                    "relays": relays,
-                    "relay_lists": relay_lists_json(status),
-                }),
-            })
-        }
-        RelaysCommand::Add { url, relay_type } => {
-            update_relay_list(app, runtime, account, relay, relay_type, url, true).await
-        }
-        RelaysCommand::Remove { url, relay_type } => {
-            update_relay_list(app, runtime, account, relay, relay_type, url, false).await
-        }
-    }
-}
-
-async fn update_relay_list(
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    account: marmot_account::AccountSummary,
-    relay: Option<String>,
-    relay_type: String,
-    url: String,
-    add: bool,
-) -> Result<CommandOutput, DmError> {
-    let relay_type = normalize_relay_type(&relay_type)?;
-    let url = validate_relay_url(&url)?;
-    let status = app.account_relay_list_status(&account.label)?;
-    let mut relays = relays_for_type(&status, Some(&relay_type))?;
-    if add {
-        if !relays.contains(&url) {
-            relays.push(url.clone());
-        }
-    } else {
-        relays.retain(|relay| relay != &url);
-    }
-    relays.sort();
-    relays.dedup();
-    let publish_relays = relay_endpoints(relays.clone())?;
-    let bootstrap = relay
-        .map(validate_relay_url)
-        .transpose()?
-        .or_else(|| relays.first().cloned())
-        .ok_or(DmError::MissingRelay)?;
-    let bootstrap_relays = vec![TransportEndpoint(bootstrap)];
-    let status = runtime
-        .publish_account_relay_list_kind(
-            &account.label,
-            &relay_type,
-            publish_relays,
-            bootstrap_relays,
-        )
-        .await?;
-    Ok(CommandOutput {
-        plain: relays.join("\n"),
-        json: json!({
-            "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex),
-            "relay_type": relay_type,
-            "relays": relays,
-            "relay_lists": relay_lists_json(status),
-        }),
-    })
-}
-
-fn relays_for_type(
-    status: &AccountRelayListStatus,
-    relay_type: Option<&str>,
-) -> Result<Vec<String>, DmError> {
-    match relay_type.map(normalize_relay_type).transpose()?.as_deref() {
-        Some("nip65") => Ok(status.nip65.relays.clone()),
-        Some("inbox") => Ok(status.inbox.relays.clone()),
-        Some("key_package") => Ok(status.key_package.relays.clone()),
-        None => {
-            let mut relays = status.default_relays.clone();
-            relays.extend(status.inbox.relays.clone());
-            relays.extend(status.key_package.relays.clone());
-            relays.sort();
-            relays.dedup();
-            Ok(relays)
-        }
-        Some(_) => unreachable!("normalize_relay_type constrains values"),
-    }
-}
-
-fn normalize_relay_type(value: &str) -> Result<String, DmError> {
-    match value {
-        "nip65" => Ok("nip65".to_owned()),
-        "inbox" => Ok("inbox".to_owned()),
-        "key_package" | "key-package" => Ok("key_package".to_owned()),
-        _ => unsupported_command("relays", "relay type must be nip65, inbox, or key_package"),
-    }
-}
-
 fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, DmError> {
     if !confirm {
         return unsupported_command(
@@ -4108,7 +3646,7 @@ fn normalize_hex(value: &str) -> Result<String, DmError> {
     Ok(hex::encode(hex::decode(value)?))
 }
 
-fn unix_now_seconds() -> u64 {
+pub(crate) fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4729,7 +4267,7 @@ fn resolve_relay(relay: Option<String>) -> Result<Option<String>, DmError> {
     }
 }
 
-fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, DmError> {
+pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, DmError> {
     let relay = relay.as_ref().trim();
     if relay.is_empty() {
         return Err(DmError::EmptyRelayUrl);
@@ -4741,7 +4279,7 @@ fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, DmError> {
     Ok(relay.to_owned())
 }
 
-fn relay_endpoints(values: Vec<String>) -> Result<Vec<TransportEndpoint>, DmError> {
+pub(crate) fn relay_endpoints(values: Vec<String>) -> Result<Vec<TransportEndpoint>, DmError> {
     let mut endpoints = Vec::new();
     for value in values {
         let endpoint = TransportEndpoint(validate_relay_url(value)?);
@@ -4810,7 +4348,9 @@ fn resolve_account_ref(
     Err(DmError::UnknownLocalAccount(value.to_owned()))
 }
 
-fn ensure_local_signing(account: &marmot_account::AccountSummary) -> Result<(), DmError> {
+pub(crate) fn ensure_local_signing(
+    account: &marmot_account::AccountSummary,
+) -> Result<(), DmError> {
     if account.local_signing {
         Ok(())
     } else {
@@ -4843,7 +4383,7 @@ fn relay_setup_plain(status: &AccountRelayListStatus) -> String {
     }
 }
 
-fn relay_lists_json(status: AccountRelayListStatus) -> Value {
+pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
     json!({
         "complete": status.complete,
         "missing": status.missing,
