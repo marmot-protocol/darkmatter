@@ -2701,7 +2701,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Media { command } => {
-            crate::media_command_with_runtime(
+            crate::commands::media::with_runtime(
                 &account_home,
                 &app,
                 runtime,
