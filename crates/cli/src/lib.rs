@@ -20,9 +20,8 @@ use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHA
 use marmot_app::{
     AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AgentTextStreamFinishRequest,
     AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery,
-    AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL, FetchedKeyPackage, MarmotApp,
-    MarmotAppRuntime, MediaReference, MediaUploadRequest, StreamStartView, SyncSummary,
-    UserProfileMetadata, tag_value,
+    AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp, MarmotAppRuntime, StreamStartView,
+    SyncSummary, UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
