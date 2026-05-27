@@ -30,7 +30,6 @@ use crate::{
     open_private_append_file, resolve_home, write_private_file,
 };
 
-const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
 const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
@@ -97,168 +96,15 @@ struct DaemonDefaults {
     keychain_service: Option<String>,
 }
 
-#[derive(Debug)]
-struct DaemonState {
-    pid: u32,
-    started_at: u64,
-    last_runtime_activity: Option<DaemonRuntimeActivityReport>,
-}
-
-#[derive(Default)]
-struct AppRuntimeHost {
-    runtime: Option<marmot_app::MarmotAppRuntime>,
-    bridge: Option<JoinHandle<()>>,
-    stream_watch: StreamWatchWorkers,
-}
-
-impl AppRuntimeHost {
-    async fn abort_all(&mut self) {
-        if let Some(runtime) = &self.runtime {
-            runtime.shutdown().await;
-        }
-        if let Some(handle) = self.bridge.take() {
-            handle.abort();
-        }
-        self.stream_watch.abort_all();
-        self.runtime = None;
-    }
-}
-
-#[derive(Clone, Default)]
-struct StreamWatchWorkers {
-    handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-}
-
-impl StreamWatchWorkers {
-    fn replace(&self, watch_id: String, handle: JoinHandle<()>) {
-        match self.handles.lock() {
-            Ok(mut handles) => {
-                Self::reap_finished_locked(&mut handles);
-                if let Some(previous) = handles.insert(watch_id, handle) {
-                    previous.abort();
-                }
-            }
-            Err(_) => handle.abort(),
-        }
-    }
-
-    fn reap_finished(&self) {
-        if let Ok(mut handles) = self.handles.lock() {
-            Self::reap_finished_locked(&mut handles);
-        }
-    }
-
-    fn reap_finished_locked(handles: &mut HashMap<String, JoinHandle<()>>) {
-        handles.retain(|_, handle| !handle.is_finished());
-    }
-
-    fn abort_all(&self) {
-        if let Ok(mut handles) = self.handles.lock() {
-            for (_, handle) in handles.drain() {
-                handle.abort();
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct StreamComposeWorkers {
-    sessions: HashMap<String, StreamComposeSession>,
-}
-
-impl StreamComposeWorkers {
-    fn insert(&mut self, key: String, session: StreamComposeSession) {
-        if let Some(previous) = self.sessions.insert(key, session) {
-            let _ = previous.tx.try_send(StreamComposeCommand::Cancel);
-            previous.handle.abort();
-        }
-    }
-
-    fn remove(&mut self, key: &str) -> Option<StreamComposeSession> {
-        self.sessions.remove(key)
-    }
-
-    fn get(&self, key: &str) -> Option<&StreamComposeSession> {
-        self.sessions.get(key)
-    }
-
-    fn abort_all(&mut self) {
-        for (_, session) in self.sessions.drain() {
-            let _ = session.tx.try_send(StreamComposeCommand::Cancel);
-            session.handle.abort();
-        }
-    }
-}
-
-#[derive(Default)]
-struct DaemonWorkers {
-    runtime: AppRuntimeHost,
-    stream_compose: StreamComposeWorkers,
-}
-
-impl DaemonWorkers {
-    async fn abort_all(&mut self) {
-        self.runtime.abort_all().await;
-        self.stream_compose.abort_all();
-    }
-}
-
-struct StreamComposeSession {
-    tx: mpsc::Sender<StreamComposeCommand>,
-    handle: JoinHandle<()>,
-}
-
-enum StreamComposeCommand {
-    Append {
-        text: String,
-        respond: oneshot::Sender<Result<DaemonOutgoingStreamReport, String>>,
-    },
-    Finish {
-        respond: oneshot::Sender<Result<DaemonOutgoingStreamReport, String>>,
-    },
-    Cancel,
-}
-
-#[derive(Clone)]
-struct DaemonEventHub {
-    messages: broadcast::Sender<DaemonStreamResponse>,
-    recent_messages: Arc<Mutex<VecDeque<DaemonStreamResponse>>>,
-}
-
-impl DaemonEventHub {
-    fn new() -> Self {
-        let (messages, _) = broadcast::channel(1024);
-        Self {
-            messages,
-            recent_messages: Arc::new(Mutex::new(VecDeque::new())),
-        }
-    }
-
-    fn subscribe_messages(&self) -> broadcast::Receiver<DaemonStreamResponse> {
-        self.messages.subscribe()
-    }
-
-    fn publish_message(&self, response: DaemonStreamResponse) {
-        if let Ok(mut recent) = self.recent_messages.lock() {
-            recent.push_back(response.clone());
-            while recent.len() > DAEMON_EVENT_REPLAY_LIMIT {
-                recent.pop_front();
-            }
-        }
-        let _ = self.messages.send(response);
-    }
-
-    fn recent_messages(&self) -> Vec<DaemonStreamResponse> {
-        self.recent_messages
-            .lock()
-            .map(|recent| recent.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-}
-
 mod client;
 mod paths;
+mod state;
 mod wire;
+
+use state::{
+    AppRuntimeHost, DaemonEventHub, DaemonState, DaemonWorkers, StreamComposeCommand,
+    StreamComposeSession, StreamComposeWorkers, StreamWatchWorkers,
+};
 
 pub use client::{DaemonClient, DaemonClientError};
 pub(crate) use client::{
