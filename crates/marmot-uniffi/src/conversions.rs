@@ -13,12 +13,14 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    ForensicsDumpMode, GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
+    ChatListAvatar, ChatListMessagePreview, ChatListRow, ForensicsDumpMode,
+    GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
     LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult, MediaReference,
     MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate,
-    RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary, UserProfileMetadata,
+    RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary, TimelineMessageRecord, TimelinePage,
+    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction, UserProfileMetadata,
     account_id_hex_from_ref, npub_for_account_id,
 };
 
@@ -560,6 +562,233 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
     }
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatListAvatarFfi {
+    pub image_hash_hex: String,
+    pub image_key_hex: String,
+    pub image_nonce_hex: String,
+    pub image_upload_key_hex: String,
+    pub media_type: Option<String>,
+}
+
+impl From<ChatListAvatar> for ChatListAvatarFfi {
+    fn from(value: ChatListAvatar) -> Self {
+        Self {
+            image_hash_hex: value.image_hash_hex,
+            image_key_hex: value.image_key_hex,
+            image_nonce_hex: value.image_nonce_hex,
+            image_upload_key_hex: value.image_upload_key_hex,
+            media_type: value.media_type,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatListMessagePreviewFfi {
+    pub message_id_hex: String,
+    pub sender: String,
+    pub sender_display_name: Option<String>,
+    pub plaintext: String,
+    pub kind: u64,
+    pub timeline_at: u64,
+    pub deleted: bool,
+}
+
+impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
+    fn from(value: ChatListMessagePreview) -> Self {
+        Self {
+            message_id_hex: value.message_id_hex,
+            sender: value.sender,
+            sender_display_name: value.sender_display_name,
+            plaintext: value.plaintext,
+            kind: value.kind,
+            timeline_at: value.timeline_at,
+            deleted: value.deleted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatListRowFfi {
+    pub group_id_hex: String,
+    pub archived: bool,
+    pub pending_confirmation: bool,
+    pub title: String,
+    pub group_name: String,
+    pub avatar: Option<ChatListAvatarFfi>,
+    pub last_message: Option<ChatListMessagePreviewFfi>,
+    pub unread_count: u64,
+    pub has_unread: bool,
+    pub first_unread_message_id_hex: Option<String>,
+    pub last_read_message_id_hex: Option<String>,
+    pub last_read_timeline_at: Option<u64>,
+    pub updated_at: u64,
+}
+
+impl From<ChatListRow> for ChatListRowFfi {
+    fn from(value: ChatListRow) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            archived: value.archived,
+            pending_confirmation: value.pending_confirmation,
+            title: value.title,
+            group_name: value.group_name,
+            avatar: value.avatar.map(Into::into),
+            last_message: value.last_message.map(Into::into),
+            unread_count: value.unread_count,
+            has_unread: value.has_unread,
+            first_unread_message_id_hex: value.first_unread_message_id_hex,
+            last_read_message_id_hex: value.last_read_message_id_hex,
+            last_read_timeline_at: value.last_read_timeline_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineReactionEmojiFfi {
+    pub emoji: String,
+    pub senders: Vec<String>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineUserReactionFfi {
+    pub reaction_message_id_hex: String,
+    pub target_message_id_hex: String,
+    pub sender: String,
+    pub emoji: String,
+    pub reacted_at: u64,
+}
+
+impl From<TimelineUserReaction> for TimelineUserReactionFfi {
+    fn from(value: TimelineUserReaction) -> Self {
+        Self {
+            reaction_message_id_hex: value.reaction_message_id_hex,
+            target_message_id_hex: value.target_message_id_hex,
+            sender: value.sender,
+            emoji: value.emoji,
+            reacted_at: value.reacted_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineReactionSummaryFfi {
+    pub by_emoji: Vec<TimelineReactionEmojiFfi>,
+    pub user_reactions: Vec<TimelineUserReactionFfi>,
+}
+
+impl From<TimelineReactionSummary> for TimelineReactionSummaryFfi {
+    fn from(value: TimelineReactionSummary) -> Self {
+        Self {
+            by_emoji: value
+                .by_emoji
+                .into_iter()
+                .map(|(emoji, senders)| TimelineReactionEmojiFfi { emoji, senders })
+                .collect(),
+            user_reactions: value.user_reactions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct TimelineMessageQueryFfi {
+    pub group_id_hex: Option<String>,
+    pub search: Option<String>,
+    pub before: Option<u64>,
+    pub before_message_id: Option<String>,
+    pub after: Option<u64>,
+    pub after_message_id: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineReplyPreviewFfi {
+    pub message_id_hex: String,
+    pub sender: String,
+    pub plaintext: String,
+    pub kind: u64,
+    pub media_json: Option<String>,
+    pub agent_text_stream_json: Option<String>,
+    pub deleted: bool,
+}
+
+impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
+    fn from(value: TimelineReplyPreview) -> Self {
+        Self {
+            message_id_hex: value.message_id_hex,
+            sender: value.sender,
+            plaintext: value.plaintext,
+            kind: value.kind,
+            media_json: value.media.map(|media| media.to_string()),
+            agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
+            deleted: value.deleted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineMessageRecordFfi {
+    pub message_id_hex: String,
+    pub source_message_id_hex: Option<String>,
+    pub direction: String,
+    pub group_id_hex: String,
+    pub sender: String,
+    pub plaintext: String,
+    pub kind: u64,
+    pub tags: Vec<MessageTagFfi>,
+    pub timeline_at: u64,
+    pub received_at: u64,
+    pub reply_to_message_id_hex: Option<String>,
+    pub reply_preview: Option<TimelineReplyPreviewFfi>,
+    pub media_json: Option<String>,
+    pub agent_text_stream_json: Option<String>,
+    pub reactions: TimelineReactionSummaryFfi,
+    pub deleted: bool,
+    pub deleted_by_message_id_hex: Option<String>,
+}
+
+impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
+    fn from(value: TimelineMessageRecord) -> Self {
+        Self {
+            message_id_hex: value.message_id_hex,
+            source_message_id_hex: value.source_message_id_hex,
+            direction: value.direction,
+            group_id_hex: value.group_id_hex,
+            sender: value.sender,
+            plaintext: value.plaintext,
+            kind: value.kind,
+            tags: message_tags_ffi(value.tags),
+            timeline_at: value.timeline_at,
+            received_at: value.received_at,
+            reply_to_message_id_hex: value.reply_to_message_id_hex,
+            reply_preview: value.reply_preview.map(Into::into),
+            media_json: value.media.map(|media| media.to_string()),
+            agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
+            reactions: value.reactions.into(),
+            deleted: value.deleted,
+            deleted_by_message_id_hex: value.deleted_by_message_id_hex,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelinePageFfi {
+    pub messages: Vec<TimelineMessageRecordFfi>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+}
+
+impl From<TimelinePage> for TimelinePageFfi {
+    fn from(value: TimelinePage) -> Self {
+        Self {
+            messages: value.messages.into_iter().map(Into::into).collect(),
+            has_more_before: value.has_more_before,
+            has_more_after: value.has_more_after,
+        }
+    }
+}
+
 pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRecordFfi> {
     messages
         .into_iter()
@@ -964,13 +1193,13 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
-    /// A timeline message: chat, reply, media, reaction, delete, or the kind-9
-    /// stream-final. Host apps branch on `received.message.kind` and `tags`; a
-    /// kind-9 carrying a `stream` tag is the stream-final that replaces the
-    /// ephemeral preview.
+    /// A raw message update: chat, reply, media, reaction, delete, or the kind-9
+    /// stream-final. Materialized timeline pages also include kind-1200 stream
+    /// starts as `TimelineMessageRecordFfi` rows.
     Message { received: RuntimeMessageReceivedFfi },
     /// A kind-1200 agent text stream start — the signal to open the QUIC
-    /// preview. Its stream id, route, and brokers live on `message.tags`.
+    /// preview for raw message subscribers. Its stream id, route, and brokers
+    /// live on `message.tags`.
     AgentStreamStarted { received: RuntimeMessageReceivedFfi },
 }
 
@@ -1149,6 +1378,7 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn group(admins: Vec<&str>) -> AppGroupRecordFfi {
         AppGroupRecordFfi {
@@ -1209,6 +1439,88 @@ mod tests {
         assert!(bob_action.can_remove);
         assert!(bob_action.can_promote);
         assert!(!bob_action.can_demote);
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_preserves_materialized_metadata() {
+        let record = TimelineMessageRecord {
+            message_id_hex: "message-1".to_owned(),
+            source_message_id_hex: Some("source-1".to_owned()),
+            direction: "received".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "aa".repeat(32),
+            plaintext: "hello".to_owned(),
+            kind: 9,
+            tags: vec![vec!["q".to_owned(), "parent".to_owned()]],
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: Some("parent".to_owned()),
+            reply_preview: Some(TimelineReplyPreview {
+                message_id_hex: "parent".to_owned(),
+                sender: "bb".repeat(32),
+                plaintext: "parent text".to_owned(),
+                kind: 9,
+                media: None,
+                agent_text_stream: None,
+                deleted: false,
+            }),
+            media: Some(serde_json::json!({
+                "imeta": [["imeta", "url https://blob.example/file"]]
+            })),
+            agent_text_stream: Some(serde_json::json!({
+                "stream_id_hex": "22"
+            })),
+            reactions: TimelineReactionSummary {
+                by_emoji: BTreeMap::from([("+".to_owned(), vec!["bob".to_owned()])]),
+                user_reactions: vec![TimelineUserReaction {
+                    reaction_message_id_hex: "reaction-1".to_owned(),
+                    target_message_id_hex: "message-1".to_owned(),
+                    sender: "bob".to_owned(),
+                    emoji: "+".to_owned(),
+                    reacted_at: 12,
+                }],
+            },
+            deleted: true,
+            deleted_by_message_id_hex: Some("delete-1".to_owned()),
+        };
+
+        let page = TimelinePageFfi::from(TimelinePage {
+            messages: vec![record],
+            has_more_before: true,
+            has_more_after: false,
+        });
+
+        assert!(page.has_more_before);
+        assert!(!page.has_more_after);
+        let message = &page.messages[0];
+        assert_eq!(message.message_id_hex, "message-1");
+        assert_eq!(message.source_message_id_hex.as_deref(), Some("source-1"));
+        assert_eq!(message.reply_to_message_id_hex.as_deref(), Some("parent"));
+        let preview = message.reply_preview.as_ref().expect("reply preview");
+        assert_eq!(preview.message_id_hex, "parent");
+        assert_eq!(preview.sender, "bb".repeat(32));
+        assert_eq!(preview.plaintext, "parent text");
+        assert!(!preview.deleted);
+        assert_eq!(message.tags[0].values, vec!["q", "parent"]);
+        assert_eq!(
+            message.media_json.as_deref(),
+            Some(r#"{"imeta":[["imeta","url https://blob.example/file"]]}"#)
+        );
+        assert_eq!(
+            message.agent_text_stream_json.as_deref(),
+            Some(r#"{"stream_id_hex":"22"}"#)
+        );
+        assert_eq!(message.reactions.by_emoji[0].emoji, "+");
+        assert_eq!(message.reactions.by_emoji[0].senders, vec!["bob"]);
+        assert_eq!(
+            message.reactions.user_reactions[0].reaction_message_id_hex,
+            "reaction-1"
+        );
+        assert!(message.deleted);
+        assert_eq!(
+            message.deleted_by_message_id_hex.as_deref(),
+            Some("delete-1")
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@ use cgka_traits::app_components::{
     NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+    MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::{GroupId, SecretBytes, TransportAdapter, TransportEndpoint};
@@ -485,10 +486,14 @@ impl AppClient {
         self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
+        let source_message_id_hex = effects
+            .reports
+            .first()
+            .map(|report| hex::encode(report.message_id.as_slice()));
         if !notifications::is_push_gossip_kind(event.kind) {
-            let projection = self.app.account_projection(&self.state.label)?;
-            projection.record_message(&AppMessageProjection {
+            let message_projection = AppMessageProjection {
                 message_id_hex: app_event_id.clone(),
+                source_message_id_hex,
                 direction: "sent".to_owned(),
                 group_id_hex: group_id_hex.clone(),
                 sender: sender.clone(),
@@ -496,7 +501,25 @@ impl AppClient {
                 kind: event.kind,
                 tags: event.tags.clone(),
                 recorded_at: None,
-            })?;
+            };
+            self.app
+                .record_account_app_event(&self.state.label, &message_projection)?;
+            if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+                let read_marker = self.app.mark_timeline_message_read(
+                    &self.state.label,
+                    &group_id_hex,
+                    &app_event_id,
+                );
+                if let Err(err) = read_marker {
+                    let error_code = read_marker_error_code(&err);
+                    tracing::warn!(
+                        target: "marmot_app::messages",
+                        method = "send_app_event",
+                        error_code = %error_code,
+                        "local read marker update skipped after successful send",
+                    );
+                }
+            }
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;
@@ -699,13 +722,13 @@ impl AppClient {
         target_message_id: &str,
     ) -> Result<String, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let messages =
-            self.app
-                .account_projection(&self.state.label)?
-                .messages(AppMessageQuery {
-                    group_id_hex: Some(group_id_hex),
-                    limit: None,
-                })?;
+        let messages = self.app.messages_with_query(
+            &self.state.label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: None,
+            },
+        )?;
         messages
             .into_iter()
             .rev()
@@ -1084,19 +1107,32 @@ impl AppClient {
                     continue;
                 }
                 self.app.remember_directory_message_sender(&message)?;
+                let message_projection = AppMessageProjection {
+                    message_id_hex: message.message_id_hex.clone(),
+                    source_message_id_hex: Some(message.source_message_id_hex.clone()),
+                    direction: "received".to_owned(),
+                    group_id_hex: hex::encode(message.group_id.as_slice()),
+                    sender: message.sender.clone(),
+                    plaintext: message.plaintext.clone(),
+                    kind: message.kind,
+                    tags: message.tags.clone(),
+                    recorded_at: Some(source_recorded_at),
+                };
                 self.app
-                    .account_projection(&self.state.label)?
-                    .record_message(&AppMessageProjection {
-                        message_id_hex: message.message_id_hex.clone(),
-                        direction: "received".to_owned(),
-                        group_id_hex: hex::encode(message.group_id.as_slice()),
-                        sender: message.sender.clone(),
-                        plaintext: message.plaintext.clone(),
-                        kind: message.kind,
-                        tags: message.tags.clone(),
-                        recorded_at: Some(source_recorded_at),
-                    })?;
+                    .record_account_app_event(&self.state.label, &message_projection)?;
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
+            }
+            if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                message_id,
+                reason,
+                ..
+            } = event
+            {
+                self.app.invalidate_timeline_source_message(
+                    &self.state.label,
+                    &hex::encode(message_id.as_slice()),
+                    &format!("{reason:?}"),
+                )?;
             }
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;
@@ -1212,9 +1248,11 @@ impl AppClient {
             return Ok(());
         }
         let cutoff = unix_now_seconds().saturating_sub(retention.disappearing_message_secs);
-        self.app
-            .account_projection(&self.state.label)?
-            .prune_group_messages_before(&hex::encode(group_id.as_slice()), cutoff)?;
+        self.app.prune_account_app_events_before(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            cutoff,
+        )?;
         Ok(())
     }
 
@@ -1271,6 +1309,60 @@ impl AppClient {
                 )
             })?;
         AppGroupNostrRoutingComponent::from_bytes(&bytes)
+    }
+}
+
+fn read_marker_error_code(error: &AppError) -> &'static str {
+    match error {
+        AppError::Account(_) => "read_marker_failed:account",
+        AppError::AccountHome(_) => "read_marker_failed:account_home",
+        AppError::Session(_) => "read_marker_failed:session",
+        AppError::Storage(_) => "read_marker_failed:storage",
+        AppError::Transport(_) => "read_marker_failed:transport",
+        AppError::Io(_) => "read_marker_failed:io",
+        AppError::Json(_) => "read_marker_failed:json",
+        AppError::Sqlite(_) => "read_marker_failed:sqlite",
+        AppError::Hex(_) => "read_marker_failed:hex",
+        AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
+        AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
+        AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
+        AppError::AgentStreamStartNotConfirmed => {
+            "read_marker_failed:agent_stream_start_not_confirmed"
+        }
+        AppError::AgentStreamUnsupportedRoute => {
+            "read_marker_failed:agent_stream_unsupported_route"
+        }
+        AppError::AgentStreamMissingCandidate => {
+            "read_marker_failed:agent_stream_missing_candidate"
+        }
+        AppError::AgentStreamInvalidCandidate(_) => {
+            "read_marker_failed:agent_stream_invalid_candidate"
+        }
+        AppError::Publish(_) => "read_marker_failed:publish",
+        AppError::MissingDefaultRelays => "read_marker_failed:missing_default_relays",
+        AppError::MissingRelayLists(_) => "read_marker_failed:missing_relay_lists",
+        AppError::RelayDirectory(_) => "read_marker_failed:relay_directory",
+        AppError::InvalidPublicKey => "read_marker_failed:invalid_public_key",
+        AppError::InvalidKeyPackageEvent(_) => "read_marker_failed:invalid_key_package_event",
+        AppError::MissingDirectoryEntry(_) => "read_marker_failed:missing_directory_entry",
+        AppError::InvalidDirectorySearch(_) => "read_marker_failed:invalid_directory_search",
+        AppError::InvalidGroupProfile(_) => "read_marker_failed:invalid_group_profile",
+        AppError::InvalidNostrRouting(_) => "read_marker_failed:invalid_nostr_routing",
+        AppError::InvalidAgentTextStreamPolicy(_) => {
+            "read_marker_failed:invalid_agent_text_stream_policy"
+        }
+        AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
+        AppError::BlobStore(_) => "read_marker_failed:blob_store",
+        AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
+        AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
+        AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",
+        AppError::InvalidPushGossip(_) => "read_marker_failed:invalid_push_gossip",
+        AppError::NotificationsDisabled => "read_marker_failed:notifications_disabled",
+        AppError::SqlcipherKeyDerivation(_) => "read_marker_failed:sqlcipher_key_derivation",
+        AppError::BlockingTask(_) => "read_marker_failed:blocking_task",
+        AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
+        AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
+        AppError::TransportClosed => "read_marker_failed:transport_closed",
     }
 }
 

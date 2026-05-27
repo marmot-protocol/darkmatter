@@ -98,6 +98,50 @@ pub enum MessageCommand {
         #[arg(long, help = "Initial replay limit")]
         limit: Option<usize>,
     },
+    #[command(about = "List, search, and subscribe to the materialized message timeline")]
+    Timeline {
+        #[command(subcommand)]
+        command: MessageTimelineCommand,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+pub enum MessageTimelineCommand {
+    #[command(about = "List materialized timeline messages")]
+    List {
+        #[arg(value_name = "GROUP", help = "Group id to list")]
+        group_id: Option<String>,
+        #[arg(long, help = "Group id to list")]
+        group: Option<String>,
+        #[arg(long, help = "Only include timeline rows before this unix timestamp")]
+        before: Option<u64>,
+        #[arg(long, help = "Only include timeline rows before this message id")]
+        before_message_id: Option<String>,
+        #[arg(long, help = "Only include timeline rows after this unix timestamp")]
+        after: Option<u64>,
+        #[arg(long, help = "Only include timeline rows after this message id")]
+        after_message_id: Option<String>,
+        #[arg(long, help = "Maximum number of timeline rows to return")]
+        limit: Option<usize>,
+    },
+    #[command(about = "Search materialized timeline messages")]
+    Search {
+        #[arg(help = "Search query")]
+        query: String,
+        #[arg(value_name = "GROUP", help = "Optional group id to search")]
+        group_id: Option<String>,
+        #[arg(long, help = "Group id to search")]
+        group: Option<String>,
+        #[arg(long, help = "Maximum number of results to return")]
+        limit: Option<usize>,
+    },
+    #[command(about = "Subscribe to live materialized timeline updates through the daemon")]
+    Subscribe {
+        #[arg(help = "Group id to watch; omit to watch all local groups")]
+        group: Option<String>,
+        #[arg(long, help = "Initial replay limit")]
+        limit: Option<usize>,
+    },
 }
 
 pub(crate) async fn run(
@@ -326,6 +370,17 @@ pub(crate) async fn with_runtime(
             })
         }
         MessageCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
+        MessageCommand::Timeline { command } => match command {
+            MessageTimelineCommand::Subscribe { .. } => {
+                Err(DmError::MessagesSubscribeRequiresDaemon)
+            }
+            MessageTimelineCommand::List { .. } | MessageTimelineCommand::Search { .. } => {
+                crate::unsupported_command(
+                    "messages timeline",
+                    "timeline list/search ports are pending integration of the upstream timeline feature into the decomposed command modules",
+                )
+            }
+        },
     }
 }
 

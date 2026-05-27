@@ -40,7 +40,7 @@ pub(crate) use commands::group::GroupCommand;
 pub(crate) use commands::groups::GroupsCommand;
 pub(crate) use commands::key_package::KeyPackageCommand;
 pub(crate) use commands::media::MediaCommand;
-pub(crate) use commands::message::MessageCommand;
+pub(crate) use commands::message::{MessageCommand, MessageTimelineCommand};
 pub(crate) use commands::notifications::NotificationsCommand;
 pub(crate) use commands::profile::ProfileCommand;
 pub(crate) use commands::relays::RelaysCommand;
@@ -569,6 +569,53 @@ fn is_background_stream_watch(cli: &Cli) -> bool {
     )
 }
 
+#[allow(dead_code)]
+pub(crate) fn is_timeline_messages_subscribe(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Message {
+            command: MessageCommand::Timeline {
+                command: MessageTimelineCommand::Subscribe { .. },
+            },
+        } | Command::Messages {
+            command: MessageCommand::Timeline {
+                command: MessageTimelineCommand::Subscribe { .. },
+            },
+        }
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn timeline_messages_subscribe_args(
+    cli: &Cli,
+) -> Result<(Option<String>, Option<usize>), String> {
+    let (group, limit) = match &cli.command {
+        Command::Message {
+            command:
+                MessageCommand::Timeline {
+                    command: MessageTimelineCommand::Subscribe { group, limit },
+                },
+        }
+        | Command::Messages {
+            command:
+                MessageCommand::Timeline {
+                    command: MessageTimelineCommand::Subscribe { group, limit },
+                },
+        } => (group, *limit),
+        _ => {
+            return Err(
+                "timeline messages subscribe requires dm messages timeline subscribe".to_owned(),
+            );
+        }
+    };
+    let group_id = group
+        .as_deref()
+        .map(normalize_group_id_hex)
+        .transpose()
+        .map_err(|err| err.to_string())?;
+    Ok((group_id, Some(limit.unwrap_or(50).min(200))))
+}
+
 fn is_messages_subscribe(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -576,6 +623,14 @@ fn is_messages_subscribe(cli: &Cli) -> bool {
             command: MessageCommand::Subscribe { .. },
         } | Command::Messages {
             command: MessageCommand::Subscribe { .. },
+        } | Command::Message {
+            command: MessageCommand::Timeline {
+                command: MessageTimelineCommand::Subscribe { .. },
+            },
+        } | Command::Messages {
+            command: MessageCommand::Timeline {
+                command: MessageTimelineCommand::Subscribe { .. },
+            },
         }
     )
 }

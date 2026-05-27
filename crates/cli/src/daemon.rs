@@ -17,6 +17,8 @@ use crate::{
     Cli, CliOutput, DaemonCommand, SecretStoreKind, create_private_dir_all,
     open_private_append_file, resolve_home, write_private_file,
 };
+#[cfg(test)]
+use crate::{is_timeline_messages_subscribe, timeline_messages_subscribe_args};
 
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
@@ -142,6 +144,8 @@ use subscriptions::{
 
 use state::{DaemonEventHub, DaemonState, DaemonWorkers, StreamWatchWorkers};
 
+#[cfg(test)]
+use client::stream_result_plain;
 pub use client::{DaemonClient, DaemonClientError};
 pub(crate) use client::{
     send_chats_subscribe, send_execute, send_group_state_subscribe, send_messages_subscribe,
@@ -1253,6 +1257,7 @@ mod tests {
     fn runtime_message_json_marks_account_label_sender_as_me() {
         let message = marmot_app::ReceivedMessage {
             message_id_hex: "01".to_owned(),
+            source_message_id_hex: "source-01".to_owned(),
             sender: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             sender_display_name: Some("Alice Example".to_owned()),
             group_id: GroupId::new(vec![0xab; 32]),
@@ -1312,6 +1317,7 @@ mod tests {
     fn runtime_message_json_carries_named_peer_display_name() {
         let message = marmot_app::ReceivedMessage {
             message_id_hex: "02".to_owned(),
+            source_message_id_hex: "source-02".to_owned(),
             sender: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             sender_display_name: Some("Bob Example".to_owned()),
             group_id: GroupId::new(vec![0xcd; 32]),
@@ -1388,6 +1394,63 @@ mod tests {
         };
 
         assert_eq!(messages_subscribe_args(&cli), Ok((None, Some(200))));
+    }
+
+    #[test]
+    fn timeline_messages_subscribe_is_routed_by_command_shape() {
+        let cli = Cli {
+            home: None,
+            socket: None,
+            relay: None,
+            daemon_discovery_relays: Vec::new(),
+            daemon_default_account_relays: Vec::new(),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command: crate::Command::Messages {
+                command: crate::MessageCommand::Timeline {
+                    command: crate::MessageTimelineCommand::Subscribe {
+                        group: Some("not-hex".to_owned()),
+                        limit: Some(25),
+                    },
+                },
+            },
+        };
+
+        assert!(is_timeline_messages_subscribe(&cli));
+        assert!(timeline_messages_subscribe_args(&cli).is_err());
+    }
+
+    #[test]
+    fn timeline_stream_plain_output_is_human_readable() {
+        let ready = serde_json::json!({
+            "type": "timeline_subscription_ready",
+            "group_id": "aa"
+        });
+        assert_eq!(
+            stream_result_plain(&ready),
+            "timeline subscription ready group=aa"
+        );
+
+        let page = serde_json::json!({
+            "type": "initial_timeline_page",
+            "has_more_before": true,
+            "has_more_after": false,
+            "messages": [
+                {
+                    "group_id": "aa",
+                    "from": "alice",
+                    "plaintext": "hello",
+                    "deleted": false
+                }
+            ]
+        });
+
+        assert_eq!(
+            stream_result_plain(&page),
+            "initial timeline page has_more_before=true has_more_after=false\ngroup=aa from=alice: hello"
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::{
     AccountSetupRequest, AppMessageQuery, ForensicsExportOptions, MarmotApp, MarmotAppRuntime,
-    UserProfileMetadata,
+    TimelineMessageQuery, TimelinePagination, UserProfileMetadata,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -38,19 +38,22 @@ use conversions::{
 };
 pub use errors::MarmotKitError;
 use subscriptions::{
-    AgentStreamSubscription, ChatsSubscription, EventsSubscription, GroupStateSubscription,
-    MessagesSubscription, NotificationsSubscription,
+    AgentStreamSubscription, ChatListSubscription, ChatsSubscription, EventsSubscription,
+    GroupStateSubscription, MessagesSubscription, NotificationsSubscription,
+    TimelineMessagesSubscription,
 };
 
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    BackgroundNotificationCollectionFfi, ForensicsDumpModeFfi, GroupPushDebugInfoFfi,
-    GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi, MediaDownloadResultFfi,
-    MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
-    PushRegistrationFfi,
+    BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
+    ChatListRowFfi, ForensicsDumpModeFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
+    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
+    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
+    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, TimelineMessageQueryFfi,
+    TimelineMessageRecordFfi, TimelinePageFfi, TimelineReactionEmojiFfi,
+    TimelineReactionSummaryFfi, TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -89,6 +92,55 @@ fn forensics_public_salt(
         });
     }
     Ok(salt)
+}
+
+fn optional_group_id_hex(group_id_hex: Option<String>) -> Result<Option<String>, MarmotKitError> {
+    match group_id_hex {
+        Some(value) if !value.trim().is_empty() => Ok(Some(hex::encode(
+            group_id_from_hex(value.trim())?.as_slice(),
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn optional_message_id_hex(
+    message_id_hex: Option<String>,
+) -> Result<Option<String>, MarmotKitError> {
+    let Some(value) = message_id_hex else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let bytes = hex::decode(value).map_err(|err| MarmotKitError::InvalidHex {
+        details: err.to_string(),
+    })?;
+    if bytes.len() != 32 {
+        return Err(MarmotKitError::InvalidHex {
+            details: format!("expected 32-byte message id, got {} bytes", bytes.len()),
+        });
+    }
+    Ok(Some(hex::encode(bytes)))
+}
+
+fn timeline_query_from_ffi(
+    query: TimelineMessageQueryFfi,
+) -> Result<TimelineMessageQuery, MarmotKitError> {
+    Ok(TimelineMessageQuery {
+        group_id_hex: optional_group_id_hex(query.group_id_hex)?,
+        search: query.search.and_then(|value| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        }),
+        pagination: TimelinePagination {
+            before: query.before,
+            before_message_id: optional_message_id_hex(query.before_message_id)?,
+            after: query.after,
+            after_message_id: optional_message_id_hex(query.after_message_id)?,
+            limit: query.limit.map(|value| value as usize),
+        },
+    })
 }
 
 fn unix_now_seconds() -> u64 {
@@ -1314,6 +1366,74 @@ impl Marmot {
         Ok(records.into_iter().map(Into::into).collect())
     }
 
+    /// Materialized conversation timeline for a group or account-wide tail.
+    ///
+    /// This is the app-facing aggregated view: kind-9 chat/reply/media rows,
+    /// kind-1200 stream-start rows, stream-final metadata pointing back to the
+    /// start, reaction summaries, delete tombstones, and pagination flags. Raw
+    /// kind-7/kind-5 events remain available through `messages(...)` for
+    /// diagnostics.
+    pub fn timeline_messages(
+        &self,
+        account_ref: String,
+        query: TimelineMessageQueryFfi,
+    ) -> Result<TimelinePageFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .timeline_messages_with_query(&account_ref, timeline_query_from_ffi(query)?)?
+            .into())
+    }
+
+    /// Durable chat-list rows for fast app launch. Rows include the group
+    /// title/avatar, last kind-9 preview, unread count, and read anchors.
+    pub fn chat_list(
+        &self,
+        account_ref: String,
+        include_archived: bool,
+    ) -> Result<Vec<ChatListRowFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .chat_list(&account_ref, include_archived)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Establish the unread baseline the first time a user opens a group.
+    /// Existing kind-9 history remains read; later remote kind-9 messages count
+    /// until marked visible via `mark_timeline_message_read`.
+    pub fn initialize_chat_read_state(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Option<ChatListRowFfi>, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        Ok(self
+            .runtime
+            .initialize_chat_read_state(&account_ref, &group_id_hex)?
+            .map(Into::into))
+    }
+
+    /// Mark a kind-9 timeline message visible/read. Own kind-9 messages can
+    /// advance the marker too, which clears any earlier unread messages.
+    pub fn mark_timeline_message_read(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    ) -> Result<Option<ChatListRowFfi>, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        let message_id_hex = optional_message_id_hex(Some(message_id_hex))?.ok_or_else(|| {
+            MarmotKitError::InvalidHex {
+                details: "message id is required".to_owned(),
+            }
+        })?;
+        Ok(self
+            .runtime
+            .mark_timeline_message_read(&account_ref, &group_id_hex, &message_id_hex)?
+            .map(Into::into))
+    }
+
     // -----------------------------------------------------------------------
     // Subscriptions
     // -----------------------------------------------------------------------
@@ -1350,6 +1470,19 @@ impl Marmot {
         Ok(ChatsSubscription::new(inner))
     }
 
+    /// Per-account durable chat-list projection. Async for the same
+    /// tokio-runtime reason as [`Marmot::subscribe_chats`].
+    pub async fn subscribe_chat_list(
+        &self,
+        account_ref: String,
+        include_archived: bool,
+    ) -> Result<Arc<ChatListSubscription>, MarmotKitError> {
+        let inner = self
+            .runtime
+            .subscribe_chat_list(&account_ref, include_archived)?;
+        Ok(ChatListSubscription::new(inner))
+    }
+
     /// Messages for a specific group (when `group_id_hex` is `Some`) or
     /// every message across the account (when `None`). Async for the same
     /// tokio-runtime reason as [`Marmot::subscribe_chats`].
@@ -1364,6 +1497,28 @@ impl Marmot {
         };
         let inner = self.runtime.subscribe_messages(&account_ref, query)?;
         Ok(MessagesSubscription::new(inner))
+    }
+
+    /// Live materialized timeline updates for a group or account-wide tail.
+    /// The snapshot and each update are full pages for the supplied query.
+    pub async fn subscribe_timeline_messages(
+        &self,
+        account_ref: String,
+        group_id_hex: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Arc<TimelineMessagesSubscription>, MarmotKitError> {
+        let query = TimelineMessageQuery {
+            group_id_hex: optional_group_id_hex(group_id_hex)?,
+            search: None,
+            pagination: TimelinePagination {
+                limit: limit.map(|value| value as usize),
+                ..TimelinePagination::default()
+            },
+        };
+        let inner = self
+            .runtime
+            .subscribe_timeline_messages(&account_ref, query)?;
+        Ok(TimelineMessagesSubscription::new(inner))
     }
 
     /// Member/profile/roster changes for one group. Async for the same
@@ -1413,6 +1568,17 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn optional_message_id_hex_trims_and_canonicalizes() {
+        assert_eq!(optional_message_id_hex(None).unwrap(), None);
+        assert_eq!(optional_message_id_hex(Some("  ".into())).unwrap(), None);
+        assert_eq!(
+            optional_message_id_hex(Some(format!(" {} ", "AB".repeat(32)))).unwrap(),
+            Some("ab".repeat(32))
+        );
+        assert!(optional_message_id_hex(Some("abcd".into())).is_err());
     }
 
     #[test]

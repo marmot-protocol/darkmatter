@@ -12,7 +12,7 @@ use std::sync::{Arc, Once};
 
 use marmot_uniffi::{
     Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi,
+    PushPlatformFfi, TimelineMessageQueryFfi,
 };
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
@@ -238,4 +238,92 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
         .subscribe_notifications()
         .await
         .expect("empty notification subscription should be valid");
+}
+
+#[tokio::test]
+async fn timeline_binding_methods_are_public_and_validate_inputs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let missing_account = kit
+        .timeline_messages(
+            "missing".into(),
+            TimelineMessageQueryFfi {
+                limit: Some(25),
+                ..TimelineMessageQueryFfi::default()
+            },
+        )
+        .expect_err("missing account should fail");
+    assert!(format!("{missing_account}").contains("missing"));
+
+    let invalid_group = kit
+        .timeline_messages(
+            "missing".into(),
+            TimelineMessageQueryFfi {
+                group_id_hex: Some("not-hex".into()),
+                limit: Some(25),
+                ..TimelineMessageQueryFfi::default()
+            },
+        )
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_group}").contains("invalid hex"));
+
+    let invalid_cursor = kit
+        .timeline_messages(
+            "missing".into(),
+            TimelineMessageQueryFfi {
+                before: Some(1),
+                before_message_id: Some("not-hex".into()),
+                limit: Some(25),
+                ..TimelineMessageQueryFfi::default()
+            },
+        )
+        .expect_err("invalid cursor hex should fail before account lookup");
+    assert!(format!("{invalid_cursor}").contains("invalid hex"));
+
+    let subscribe_error = match kit
+        .subscribe_timeline_messages("missing".into(), None, Some(25))
+        .await
+    {
+        Ok(_) => panic!("missing account subscription should fail"),
+        Err(err) => err,
+    };
+    assert!(format!("{subscribe_error}").contains("missing"));
+}
+
+#[tokio::test]
+async fn chat_list_binding_methods_are_public_and_validate_inputs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let missing_account = kit
+        .chat_list("missing".into(), false)
+        .expect_err("missing account should fail");
+    assert!(format!("{missing_account}").contains("missing"));
+
+    let invalid_group = kit
+        .initialize_chat_read_state("missing".into(), "not-hex".into())
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_group}").contains("invalid hex"));
+
+    let invalid_message = kit
+        .mark_timeline_message_read("missing".into(), "00".repeat(32), "not-hex".into())
+        .expect_err("invalid message hex should fail before account lookup");
+    assert!(format!("{invalid_message}").contains("invalid hex"));
+
+    let subscribe_error = match kit.subscribe_chat_list("missing".into(), false).await {
+        Ok(_) => panic!("missing account subscription should fail"),
+        Err(err) => err,
+    };
+    assert!(format!("{subscribe_error}").contains("missing"));
 }

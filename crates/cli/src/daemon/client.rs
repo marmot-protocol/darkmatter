@@ -227,7 +227,7 @@ fn write_client_stream_response(
     Ok(())
 }
 
-fn stream_result_plain(result: &serde_json::Value) -> String {
+pub(super) fn stream_result_plain(result: &serde_json::Value) -> String {
     match result.get("type").and_then(serde_json::Value::as_str) {
         Some("message")
         | Some("reaction")
