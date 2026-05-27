@@ -1193,13 +1193,13 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
-    /// A timeline message: chat, reply, media, reaction, delete, or the kind-9
-    /// stream-final. Host apps branch on `received.message.kind` and `tags`; a
-    /// kind-9 carrying a `stream` tag is the stream-final that replaces the
-    /// ephemeral preview.
+    /// A raw message update: chat, reply, media, reaction, delete, or the kind-9
+    /// stream-final. Materialized timeline pages also include kind-1200 stream
+    /// starts as `TimelineMessageRecordFfi` rows.
     Message { received: RuntimeMessageReceivedFfi },
     /// A kind-1200 agent text stream start — the signal to open the QUIC
-    /// preview. Its stream id, route, and brokers live on `message.tags`.
+    /// preview for raw message subscribers. Its stream id, route, and brokers
+    /// live on `message.tags`.
     AgentStreamStarted { received: RuntimeMessageReceivedFfi },
 }
 

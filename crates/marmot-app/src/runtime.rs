@@ -490,8 +490,11 @@ pub struct RuntimeAccountError {
 
 /// A kind-1200 agent-text-stream **start** observed in a group. The inner
 /// event's stream metadata lives on `message.tags`; clients use it to open the
-/// ephemeral QUIC preview. The eventual kind-9 stream-final flows as a normal
-/// [`RuntimeMessageUpdate::Message`] carrying `stream`/`stream-start` tags.
+/// ephemeral QUIC preview. Raw message subscribers receive this as
+/// [`RuntimeMessageUpdate::AgentStreamStarted`]; materialized timeline
+/// subscribers see the same kind-1200 as a timeline row. The eventual kind-9
+/// stream-final flows as a normal [`RuntimeMessageUpdate::Message`] carrying
+/// `stream`/`stream-start` tags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeAgentStreamMessage {
     pub account_id_hex: String,
@@ -3490,9 +3493,10 @@ fn publish_app_runtime_summary(
         });
     }
     for message in &summary.messages {
-        // A kind-1200 start is an open-preview signal, not a timeline message,
-        // so it is emitted only as `AgentStreamStarted`. Everything else
-        // (chat/reply/media/reaction/delete/stream-final) is a timeline message.
+        // Raw message subscribers get kind-1200 starts as a typed open-preview
+        // signal. The storage timeline still materializes the same start as a
+        // kind-1200 timeline row so timeline-only subscribers can discover and
+        // watch the live stream.
         if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
             let _ = events.send(event);
         } else {
@@ -3741,9 +3745,9 @@ pub(crate) fn broker_trust_for_addr(
 
 fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMessageUpdate> {
     match event {
-        // Every delivered timeline message (chat, reply, media, reaction,
-        // delete, stream-final) flows as a `Message`. The kind-1200 stream start
-        // arrives as its own `AgentStreamStarted` event below, never here.
+        // Raw message updates keep kind-1200 stream starts distinct from
+        // message rows. The materialized storage timeline still includes those
+        // starts when clients call `timeline_messages`.
         MarmotAppEvent::MessageReceived(message) => Some(RuntimeMessageUpdate::Message(message)),
         MarmotAppEvent::AgentStreamStarted(message) => {
             Some(RuntimeMessageUpdate::AgentStreamStarted(message))
