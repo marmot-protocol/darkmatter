@@ -1313,13 +1313,15 @@ impl MarmotApp {
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let caches = self.directory_caches()?;
-        if let Some(entry) = Self::directory_entry_from_caches(&caches, &account_id_hex)? {
-            return self.hydrate_directory_record(entry).map(Some);
-        }
-        self.shared_storage()?
+        let cached_entry = Self::directory_entry_from_caches(&caches, &account_id_hex)?
+            .map(|entry| self.hydrate_directory_record(entry))
+            .transpose()?;
+        let shared_entry = self
+            .shared_storage()?
             .public_directory_user(&account_id_hex)?
             .map(|record| self.hydrate_public_directory_record(record))
-            .transpose()
+            .transpose()?;
+        Ok(select_newer_directory_entry(cached_entry, shared_entry))
     }
 
     pub async fn refresh_user_directory_for_account_id(
@@ -2275,16 +2277,15 @@ impl MarmotApp {
         let mut entries_by_id = BTreeMap::new();
         for cache in self.directory_caches()? {
             for entry in cache.entries()? {
-                entries_by_id
-                    .entry(entry.account_id_hex.clone())
-                    .or_insert(entry);
+                upsert_newer_directory_entry(
+                    &mut entries_by_id,
+                    self.hydrate_directory_record(entry)?,
+                );
             }
         }
         for record in self.shared_storage()?.public_directory_users()? {
             let entry = self.hydrate_public_directory_record(record)?;
-            entries_by_id
-                .entry(entry.account_id_hex.clone())
-                .or_insert(entry);
+            upsert_newer_directory_entry(&mut entries_by_id, entry);
         }
         Ok(entries_by_id.into_values().collect())
     }
@@ -2848,9 +2849,15 @@ impl MarmotApp {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
-        let entry = self.hydrate_directory_record(entry.clone())?;
-        self.shared_storage()?
-            .put_public_directory_user(&public_directory_user_record(&entry)?)?;
+        let proposed_entry = self.hydrate_directory_record(entry.clone())?;
+        let mut shared_storage = self.shared_storage()?;
+        let shared_entry = shared_storage
+            .public_directory_user(&proposed_entry.account_id_hex)?
+            .map(|record| self.hydrate_public_directory_record(record))
+            .transpose()?;
+        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry)
+            .expect("proposed directory entry should be present");
+        shared_storage.put_public_directory_user(&public_directory_user_record(&entry)?)?;
         for cache in self.directory_caches()? {
             cache.put_with_reason(&entry, reason)?;
         }
@@ -3114,6 +3121,55 @@ fn user_directory_record_from_public(
             .map(|json| serde_json::from_str(&json))
             .transpose()?,
     })
+}
+
+fn directory_record_recency(entry: &UserDirectoryRecord) -> u64 {
+    entry
+        .profile
+        .as_ref()
+        .map(|profile| profile.created_at)
+        .into_iter()
+        .chain(
+            entry
+                .key_package
+                .as_ref()
+                .map(|key_package| key_package.created_at),
+        )
+        .max()
+        .unwrap_or_default()
+}
+
+fn select_newer_directory_entry(
+    cached: Option<UserDirectoryRecord>,
+    shared: Option<UserDirectoryRecord>,
+) -> Option<UserDirectoryRecord> {
+    match (cached, shared) {
+        (Some(cached), Some(shared)) => {
+            if directory_record_recency(&shared) > directory_record_recency(&cached) {
+                Some(shared)
+            } else {
+                Some(cached)
+            }
+        }
+        (Some(entry), None) | (None, Some(entry)) => Some(entry),
+        (None, None) => None,
+    }
+}
+
+fn upsert_newer_directory_entry(
+    entries_by_id: &mut BTreeMap<String, UserDirectoryRecord>,
+    entry: UserDirectoryRecord,
+) {
+    match entries_by_id.entry(entry.account_id_hex.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(entry);
+        }
+        std::collections::btree_map::Entry::Occupied(mut slot) => {
+            if directory_record_recency(&entry) > directory_record_recency(slot.get()) {
+                *slot.get_mut() = entry;
+            }
+        }
+    }
 }
 
 fn app_feature_registry() -> FeatureRegistry {
@@ -4411,6 +4467,105 @@ mod tests {
             app.directory_entry_for_account_id(&graph_user)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    fn test_directory_record(
+        account_id_hex: &str,
+        name: &str,
+        created_at: u64,
+    ) -> UserDirectoryRecord {
+        UserDirectoryRecord {
+            account_id_hex: account_id_hex.to_owned(),
+            npub: npub_for_account_id_lossy(account_id_hex),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some(name.to_owned()),
+                display_name: None,
+                about: None,
+                picture: None,
+                nip05: None,
+                lud16: None,
+                created_at,
+                source_relays: Vec::new(),
+            }),
+            follows: Vec::new(),
+            follow_source_relays: Vec::new(),
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        }
+    }
+
+    #[test]
+    fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let contact = format!("{:064x}", 42);
+
+        cache
+            .put(&test_directory_record(&contact, "old-cache", 1))
+            .unwrap();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(
+                &public_directory_user_record(&test_directory_record(&contact, "new-shared", 2))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let entry = app
+            .directory_entry_for_account_id(&contact)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("new-shared".to_owned())
+        );
+    }
+
+    #[test]
+    fn directory_entries_and_save_keep_newer_shared_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let contact = format!("{:064x}", 43);
+        let stale = test_directory_record(&contact, "old-cache", 1);
+        let fresh = test_directory_record(&contact, "new-shared", 2);
+
+        cache.put(&stale).unwrap();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&public_directory_user_record(&fresh).unwrap())
+            .unwrap();
+
+        let listed = app.directory_entries().unwrap();
+        let listed_entry = listed
+            .iter()
+            .find(|entry| entry.account_id_hex == contact)
+            .unwrap();
+        assert_eq!(
+            listed_entry
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.name.as_deref()),
+            Some("new-shared")
+        );
+
+        app.save_directory_entry_with_reason(&stale, "stale-cache")
+            .unwrap();
+        let entry = app
+            .directory_entry_for_account_id(&contact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("new-shared".to_owned())
         );
     }
 
