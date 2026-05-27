@@ -16,6 +16,7 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, MemberId, MessageId, SecretBytes, TransportEndpoint};
 use marmot_account::{AccountHomeError, AccountSummary};
+use marmot_forensics::{ForensicsBundle, ForensicsExportOptions};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -326,6 +327,11 @@ enum AccountWorkerCommand {
     GroupMlsState {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
+    },
+    GroupForensicsBundle {
+        group_id: GroupId,
+        options: ForensicsExportOptions,
+        respond: oneshot::Sender<Result<ForensicsBundle, AppError>>,
     },
     SafeExportSecret {
         group_id: GroupId,
@@ -1191,6 +1197,17 @@ impl MarmotAppRuntime {
         self.accounts.group_mls_state(account_ref, group_id).await
     }
 
+    pub async fn group_forensics_bundle(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        options: ForensicsExportOptions,
+    ) -> Result<ForensicsBundle, AppError> {
+        self.accounts
+            .group_forensics_bundle(account_ref, group_id, options)
+            .await
+    }
+
     pub async fn safe_export_secret(
         &self,
         account_ref: &str,
@@ -1988,6 +2005,25 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::GroupMlsState {
                 group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn group_forensics_bundle(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        options: ForensicsExportOptions,
+    ) -> Result<ForensicsBundle, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupForensicsBundle {
+                group_id: group_id.clone(),
+                options,
                 respond,
             })
             .await
@@ -2907,6 +2943,14 @@ async fn run_app_runtime_account_worker(
                     }
                     Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
                         let result = client.group_mls_state(&group_id);
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::GroupForensicsBundle {
+                        group_id,
+                        options,
+                        respond,
+                    }) => {
+                        let result = client.group_forensics_bundle(&group_id, &options);
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::UpdateMessageRetention {
