@@ -300,6 +300,76 @@ pub(super) fn stream_result_plain(result: &serde_json::Value) -> String {
                     .unwrap_or("")
             )
         }
+        Some("timeline_subscription_ready") => {
+            let group_id = result
+                .get("group_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<all>");
+            format!("timeline subscription ready group={group_id}")
+        }
+        Some("initial_timeline_page") | Some("timeline_updated") => {
+            timeline_stream_page_plain(result)
+        }
         _ => result.to_string(),
     }
+}
+
+fn timeline_stream_page_plain(result: &serde_json::Value) -> String {
+    let label = match result.get("type").and_then(serde_json::Value::as_str) {
+        Some("initial_timeline_page") => "initial timeline page",
+        Some("timeline_updated") => "timeline updated",
+        _ => "timeline",
+    };
+    let has_more_before = result
+        .get("has_more_before")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let has_more_after = result
+        .get("has_more_after")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let messages = result
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if messages.is_empty() {
+        return format!(
+            "{label} has_more_before={has_more_before} has_more_after={has_more_after}: no timeline messages"
+        );
+    }
+    let body = messages
+        .iter()
+        .map(timeline_stream_message_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{label} has_more_before={has_more_before} has_more_after={has_more_after}\n{body}")
+}
+
+fn timeline_stream_message_plain(message: &serde_json::Value) -> String {
+    let deleted = if message
+        .get("deleted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        " deleted=true"
+    } else {
+        ""
+    };
+    format!(
+        "group={} from={}: {}{}",
+        message
+            .get("group_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>"),
+        message
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>"),
+        message
+            .get("plaintext")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        deleted
+    )
 }

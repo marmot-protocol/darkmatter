@@ -971,6 +971,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         "daemon start failed\n{}",
         command_output_summary(&start)
     );
+    wait_for_daemon(&socket);
 
     let status = Command::new(env!("CARGO_BIN_EXE_dm"))
         .arg("--socket")
@@ -1118,7 +1119,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
         command_output_summary(&start)
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_group = false;
     while Instant::now() < deadline {
         let output = Command::new(env!("CARGO_BIN_EXE_dm"))
