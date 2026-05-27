@@ -2618,7 +2618,7 @@ async fn handle_app_runtime_command_request(
 
     let output = match cli.command.clone() {
         crate::Command::Group { command } => {
-            crate::group_command_with_runtime(
+            crate::commands::group::with_runtime(
                 &account_home,
                 &app,
                 runtime,

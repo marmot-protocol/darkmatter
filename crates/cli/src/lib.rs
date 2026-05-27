@@ -19,9 +19,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
     AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AgentTextStreamFinishRequest,
-    AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery,
-    AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp, MarmotAppRuntime, StreamStartView,
-    SyncSummary, UserProfileMetadata, tag_value,
+    AppError, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus,
+    FetchedKeyPackage, MarmotApp, MarmotAppRuntime, StreamStartView, SyncSummary,
+    UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ pub mod tui;
 pub(crate) use commands::chats::ChatsCommand;
 pub(crate) use commands::debug::DebugCommand;
 pub(crate) use commands::follows::FollowsCommand;
+pub(crate) use commands::group::GroupCommand;
 pub(crate) use commands::key_package::KeyPackageCommand;
 pub(crate) use commands::media::MediaCommand;
 pub(crate) use commands::notifications::NotificationsCommand;
@@ -366,37 +367,6 @@ enum AccountCommand {
             help = "Comma-separated relays to use for relay-list discovery"
         )]
         bootstrap_relays: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
-enum GroupCommand {
-    Create {
-        name: String,
-        #[arg(value_name = "MEMBER")]
-        members: Vec<String>,
-        #[arg(long)]
-        description: Option<String>,
-    },
-    Members {
-        group: String,
-    },
-    Invite {
-        group: String,
-        #[arg(value_name = "MEMBER", required = true)]
-        members: Vec<String>,
-    },
-    Remove {
-        group: String,
-        #[arg(value_name = "MEMBER", required = true)]
-        members: Vec<String>,
-    },
-    Update {
-        group: String,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        description: Option<String>,
     },
 }
 
@@ -1210,7 +1180,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             commands::media::run(&account_home, &app, command, account_flag).await
         }
         Command::Group { command } => {
-            group_command(&account_home, &app, command, account_flag).await
+            commands::group::run(&account_home, &app, command, account_flag).await
         }
         Command::Groups { command } => {
             groups_command(&account_home, &app, command, account_flag).await
@@ -1640,151 +1610,6 @@ async fn account_command(
     }
 }
 
-async fn group_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: GroupCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    let runtime = app.runtime();
-    group_command_with_runtime(account_home, app, &runtime, command, account_flag).await
-}
-
-pub(crate) async fn group_command_with_runtime(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    runtime: &MarmotAppRuntime,
-    command: GroupCommand,
-    account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        GroupCommand::Create {
-            name,
-            members,
-            description,
-        } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let group_id = runtime
-                .create_group(&account.label, &name, &members, description.clone())
-                .await?;
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let group = app
-                .group(&account.label, &group_id_hex)?
-                .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
-            Ok(CommandOutput {
-                plain: format!("created group {group_id_hex}"),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "group_id": group.group_id_hex,
-                    "name": group.profile.name.clone(),
-                    "profile": group.profile,
-                    "image": group.image,
-                    "admin_policy": group.admin_policy,
-                    "agent_text_stream": group.agent_text_stream,
-                    "members": members,
-                }),
-            })
-        }
-        GroupCommand::Members { group } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let members = runtime.group_members(&account.label, &group_id).await?;
-            Ok(CommandOutput {
-                plain: group_members_plain(&members),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "group_id": hex::encode(group_id.as_slice()),
-                    "members": group_members_json(members),
-                }),
-            })
-        }
-        GroupCommand::Invite { group, members } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let summary = runtime
-                .invite_members(&account.label, &group_id, &members)
-                .await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "invited {} member(s) published={}",
-                    members.len(),
-                    summary.published
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "group_id": hex::encode(group_id.as_slice()),
-                    "members": members,
-                    "published": summary.published,
-                    "message_ids": summary.message_ids,
-                }),
-            })
-        }
-        GroupCommand::Remove { group, members } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let summary = runtime
-                .remove_members(&account.label, &group_id, &members)
-                .await?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "removed {} member(s) published={}",
-                    members.len(),
-                    summary.published
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "group_id": hex::encode(group_id.as_slice()),
-                    "members": members,
-                    "published": summary.published,
-                    "message_ids": summary.message_ids,
-                }),
-            })
-        }
-        GroupCommand::Update {
-            group,
-            name,
-            description,
-        } => {
-            let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
-            app.status(&account.label)?;
-            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let summary = runtime
-                .update_group_profile(&account.label, &group_id, name, description)
-                .await?;
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let group = app
-                .group(&account.label, &group_id_hex)?
-                .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
-            Ok(CommandOutput {
-                plain: format!(
-                    "updated group {group_id_hex} published={}",
-                    summary.published
-                ),
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
-                    "group": group_json(group),
-                    "published": summary.published,
-                    "message_ids": summary.message_ids,
-                }),
-            })
-        }
-    }
-}
-
 async fn groups_command(
     account_home: &AccountHome,
     app: &MarmotApp,
@@ -1822,7 +1647,7 @@ pub(crate) async fn groups_command_with_runtime(
             members,
             description,
         } => {
-            group_command_with_runtime(
+            commands::group::with_runtime(
                 account_home,
                 app,
                 runtime,
@@ -1847,7 +1672,7 @@ pub(crate) async fn groups_command_with_runtime(
             group_show_output(app, account, group_id_hex, Some(mls))
         }
         GroupsCommand::AddMembers { group_id, members } => {
-            group_command_with_runtime(
+            commands::group::with_runtime(
                 account_home,
                 app,
                 runtime,
@@ -1860,7 +1685,7 @@ pub(crate) async fn groups_command_with_runtime(
             .await
         }
         GroupsCommand::RemoveMembers { group_id, members } => {
-            group_command_with_runtime(
+            commands::group::with_runtime(
                 account_home,
                 app,
                 runtime,
@@ -1873,7 +1698,7 @@ pub(crate) async fn groups_command_with_runtime(
             .await
         }
         GroupsCommand::Members { group_id } => {
-            group_command_with_runtime(
+            commands::group::with_runtime(
                 account_home,
                 app,
                 runtime,
@@ -1959,7 +1784,7 @@ pub(crate) async fn groups_command_with_runtime(
             })
         }
         GroupsCommand::Rename { group_id, name } => {
-            group_command_with_runtime(
+            commands::group::with_runtime(
                 account_home,
                 app,
                 runtime,
@@ -3440,30 +3265,6 @@ fn group_mls_state_json(state: AppGroupMlsState) -> Value {
         "member_count": state.member_count,
         "required_app_components": state.required_app_components,
     })
-}
-
-fn group_members_plain(members: &[AppGroupMemberRecord]) -> String {
-    if members.is_empty() {
-        return "no members".to_owned();
-    }
-    members
-        .iter()
-        .map(|member| npub_for_account_id(&member.member_id_hex))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Vec<Value> {
-    members
-        .into_iter()
-        .map(|member| {
-            json!({
-                "member_id": member.member_id_hex,
-                "npub": npub_for_account_id(&member.member_id_hex),
-                "local": member.local,
-            })
-        })
-        .collect()
 }
 
 fn apply_message_cursors(
