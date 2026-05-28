@@ -1,7 +1,7 @@
 use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Params, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,36 +224,147 @@ fn refresh_chat_list_row_tx(
 }
 
 fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool> {
-    let missing: i64 = tx
-        .query_row(
-            "SELECT EXISTS(
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
                 SELECT 1
                 FROM account_groups AS ag
                 LEFT JOIN chat_list_rows AS row
                     ON row.group_id_hex = ag.group_id_hex
                 WHERE row.group_id_hex IS NULL
              )",
-            [],
-            |row| row.get(0),
-        )
-        .storage()?;
-    if missing != 0 {
+        [],
+    )? {
         return Ok(false);
     }
-    let stale: i64 = tx
-        .query_row(
-            "SELECT EXISTS(
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
                 SELECT 1
                 FROM chat_list_rows AS row
                 LEFT JOIN account_groups AS ag
                     ON ag.group_id_hex = row.group_id_hex
                 WHERE ag.group_id_hex IS NULL
              )",
-            [],
-            |row| row.get(0),
-        )
-        .storage()?;
-    Ok(stale == 0)
+        [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM account_groups AS ag
+                JOIN chat_list_rows AS row
+                    ON row.group_id_hex = ag.group_id_hex
+                WHERE row.archived IS NOT ag.archived
+                   OR row.pending_confirmation IS NOT ag.pending_confirmation
+                   OR row.title IS NOT CASE
+                        WHEN trim(ag.profile_name) = '' THEN ag.group_id_hex
+                        ELSE ag.profile_name
+                      END
+                   OR row.group_name IS NOT ag.profile_name
+                   OR row.avatar_image_hash_hex IS NOT ag.image_hash_hex
+                   OR row.avatar_image_key_hex IS NOT ag.image_key_hex
+                   OR row.avatar_image_nonce_hex IS NOT ag.image_nonce_hex
+                   OR row.avatar_image_upload_key_hex IS NOT ag.image_upload_key_hex
+                   OR row.avatar_media_type IS NOT ag.image_media_type
+                   OR row.updated_at < ag.updated_at
+             )",
+        [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM conversation_read_state AS read_state
+                JOIN chat_list_rows AS row
+                    ON row.group_id_hex = read_state.group_id_hex
+                WHERE row.last_read_message_id_hex IS NOT read_state.last_read_message_id_hex
+                   OR row.last_read_timeline_at IS NOT read_state.last_read_timeline_at
+                   OR row.updated_at < read_state.updated_at
+             )",
+        [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM account_groups AS ag
+                JOIN chat_list_rows AS row
+                    ON row.group_id_hex = ag.group_id_hex
+                WHERE row.updated_at < COALESCE((
+                        SELECT MAX(mt.received_at)
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                     ), 0)
+                   OR row.last_message_id_hex IS NOT (
+                        SELECT mt.message_id_hex
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
+                   OR row.last_message_sender IS NOT (
+                        SELECT mt.sender
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
+                   OR row.last_message_preview IS NOT (
+                        SELECT mt.plaintext
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
+                   OR row.last_message_kind IS NOT (
+                        SELECT mt.kind
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
+                   OR row.last_message_timeline_at IS NOT (
+                        SELECT mt.timeline_at
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
+                   OR row.last_message_deleted IS NOT COALESCE((
+                        SELECT mt.deleted
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     ), 0)
+             )",
+        params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
+    )? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn projection_has_rows_tx<P: Params>(
+    tx: &Transaction<'_>,
+    sql: &str,
+    params: P,
+) -> StorageResult<bool> {
+    let exists: i64 = tx.query_row(sql, params, |row| row.get(0)).storage()?;
+    Ok(exists != 0)
 }
 
 fn rebuild_chat_list_row_for_group_tx(
@@ -899,6 +1010,91 @@ mod tests {
 
         assert_eq!(row.group_id_hex, GROUP);
         assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "latest");
+    }
+
+    #[test]
+    fn ensure_chat_list_rows_rebuilds_stale_account_group_rows() {
+        let store = setup_store();
+        store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE account_groups
+                 SET profile_name = ?1
+                 WHERE group_id_hex = ?2",
+                params!["Renamed Lab", GROUP],
+            )
+            .unwrap();
+        }
+
+        store.ensure_chat_list_rows(LOCAL).unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+
+        assert_eq!(row.title, "Renamed Lab");
+        assert_eq!(row.group_name, "Renamed Lab");
+    }
+
+    #[test]
+    fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
+        let store = setup_store();
+        store
+            .record_app_event(&chat("old", REMOTE, 10, "old preview"))
+            .unwrap();
+        store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+        store
+            .record_app_event(&chat("new", REMOTE, 11, "new preview"))
+            .unwrap();
+
+        store.ensure_chat_list_rows(LOCAL).unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+
+        let last_message = row.last_message.expect("last message");
+        assert_eq!(last_message.message_id_hex, "new");
+        assert_eq!(last_message.plaintext, "new preview");
+    }
+
+    #[test]
+    fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
+        let store = setup_store();
+        store
+            .record_app_event(&chat("unread", REMOTE, 10, "needs read state"))
+            .unwrap();
+        store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversation_read_state (
+                    group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                    initialized_at, updated_at
+                 )
+                 VALUES (?1, NULL, NULL, 0, 1)",
+                params![GROUP],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE chat_list_rows SET updated_at = 0 WHERE group_id_hex = ?1",
+                params![GROUP],
+            )
+            .unwrap();
+        }
+
+        store.ensure_chat_list_rows(LOCAL).unwrap();
+        let row = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap()
+            .pop()
+            .expect("chat row");
+
+        assert_eq!(row.unread_count, 1);
+        assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("unread"));
     }
 
     #[test]

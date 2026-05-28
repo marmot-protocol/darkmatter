@@ -89,11 +89,11 @@ pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
     ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatsSubscription, RuntimeEventsSubscription,
-    RuntimeGroupEvent, RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
-    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
-    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    StreamStartView,
+    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
+    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
 };
 
 pub use agent_streams::{
@@ -2592,21 +2592,17 @@ impl MarmotApp {
         )
         .entered();
         self.account_home().account(label)?;
-        if self
+        let mut ready = self
             .account_state_ready
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(label)
-        {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ready.contains(label) {
             return Ok(());
         }
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?
             .ensure_account_projection(label)?;
-        self.account_state_ready
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(label.to_owned());
+        ready.insert(label.to_owned());
         Ok(())
     }
 

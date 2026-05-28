@@ -19,7 +19,7 @@ use marmot_app::{
     MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
+    RuntimeChatListUpdate, RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageRecord, TimelinePage,
     TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction, UserProfileMetadata,
     account_id_hex_from_ref, npub_for_account_id,
@@ -642,6 +642,21 @@ impl From<ChatListRow> for ChatListRowFfi {
             last_read_message_id_hex: value.last_read_message_id_hex,
             last_read_timeline_at: value.last_read_timeline_at,
             updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum ChatListSubscriptionUpdateFfi {
+    Row { row: ChatListRowFfi },
+    RemoveRow { group_id_hex: String },
+}
+
+impl From<RuntimeChatListUpdate> for ChatListSubscriptionUpdateFfi {
+    fn from(value: RuntimeChatListUpdate) -> Self {
+        match value {
+            RuntimeChatListUpdate::Row(row) => Self::Row { row: row.into() },
+            RuntimeChatListUpdate::RemoveRow { group_id_hex } => Self::RemoveRow { group_id_hex },
         }
     }
 }
