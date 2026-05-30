@@ -87,7 +87,7 @@ pub(crate) use groups::AppGroupImageInput;
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
-    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
+    ChatListUpdateTrigger, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
     RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
@@ -95,6 +95,7 @@ pub use runtime::{
     RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
     RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
 };
+pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};
 
 pub use agent_streams::{
     AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
@@ -352,7 +353,9 @@ pub struct ReceivedMessage {
 pub struct AppProjectionUpdate {
     pub group_id_hex: String,
     pub timeline_messages: Vec<TimelineMessageRecord>,
+    pub timeline_changes: Vec<TimelineMessageChange>,
     pub chat_list_row: Option<ChatListRow>,
+    pub chat_list_trigger: ChatListUpdateTrigger,
 }
 
 fn remember_seen_event(state: &mut AccountState, event_id: String) {
@@ -2812,10 +2815,14 @@ impl MarmotApp {
         storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
         let chat_list_row = self.refresh_chat_list_row(label, &storage_update.group_id_hex)?;
+        let chat_list_trigger =
+            ChatListUpdateTrigger::from_timeline_changes(&storage_update.changes);
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,
+            timeline_changes: storage_update.changes,
             chat_list_row,
+            chat_list_trigger,
         })
     }
 

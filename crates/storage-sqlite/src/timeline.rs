@@ -102,6 +102,42 @@ pub struct TimelinePage {
 pub struct TimelineProjectionUpdate {
     pub group_id_hex: String,
     pub messages: Vec<TimelineMessageRecord>,
+    pub changes: Vec<TimelineMessageChange>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TimelineMessageChange {
+    Upsert {
+        trigger: TimelineUpdateTrigger,
+        message: TimelineMessageRecord,
+    },
+    Remove {
+        message_id_hex: String,
+        reason: TimelineRemoveReason,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TimelineUpdateTrigger {
+    NewMessage,
+    MessageEditedOrReprojected,
+    ReactionAdded,
+    ReactionRemoved,
+    MessageDeleted,
+    ReplyPreviewChanged,
+    AgentStreamStarted,
+    AgentStreamFinished,
+    DeliveryOrSendStateChanged,
+    ReceiptChanged,
+    SnapshotRefresh,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TimelineRemoveReason {
+    Invalidated,
+    Cleared,
+    Pruned,
+    NoLongerMatchesQuery,
 }
 
 #[derive(Clone, Debug)]
@@ -205,10 +241,14 @@ impl SqliteAccountStorage {
         )
         .storage()?;
         rebuild_message_timeline_for_group_tx(&tx, &event.group_id_hex)?;
-        let messages = timeline_records_by_ids_tx(&tx, &event.group_id_hex, affected_message_ids)?;
+        let messages =
+            timeline_records_by_ids_tx(&tx, &event.group_id_hex, affected_message_ids.clone())?;
+        let changes =
+            timeline_changes_for_event(&event.message_id_hex, event.kind, &event.tags, &messages);
         tx.commit().storage().map(|()| TimelineProjectionUpdate {
             group_id_hex: event.group_id_hex.clone(),
             messages,
+            changes,
         })
     }
 
@@ -257,11 +297,20 @@ impl SqliteAccountStorage {
         )
         .storage()?;
         rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
-        let messages = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids)?;
+        let messages =
+            timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
+        let changes = timeline_changes_for_invalidation(
+            &message_id_hex,
+            kind,
+            &tags,
+            affected_message_ids,
+            &messages,
+        );
         tx.commit().storage()?;
         Ok(Some(TimelineProjectionUpdate {
             group_id_hex,
             messages,
+            changes,
         }))
     }
 
@@ -451,7 +500,134 @@ fn affected_timeline_message_ids_for_parts_tx(
         }
         _ => {}
     }
+    let reply_targets = ids.iter().cloned().collect::<Vec<_>>();
+    ids.extend(reply_message_ids_for_targets_tx(
+        tx,
+        group_id_hex,
+        &reply_targets,
+    )?);
     Ok(ids)
+}
+
+fn timeline_changes_for_event(
+    event_message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+    messages: &[TimelineMessageRecord],
+) -> Vec<TimelineMessageChange> {
+    messages
+        .iter()
+        .cloned()
+        .map(|message| TimelineMessageChange::Upsert {
+            trigger: timeline_trigger_for_event_row(event_message_id_hex, kind, tags, &message),
+            message,
+        })
+        .collect()
+}
+
+fn timeline_changes_for_invalidation(
+    event_message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+    affected_message_ids: BTreeSet<String>,
+    messages: &[TimelineMessageRecord],
+) -> Vec<TimelineMessageChange> {
+    let present = messages
+        .iter()
+        .map(|message| message.message_id_hex.clone())
+        .collect::<HashSet<_>>();
+    let mut changes = timeline_changes_for_event(event_message_id_hex, kind, tags, messages);
+    changes.extend(
+        affected_message_ids
+            .into_iter()
+            .filter(|message_id_hex| !present.contains(message_id_hex))
+            .map(|message_id_hex| TimelineMessageChange::Remove {
+                message_id_hex,
+                reason: TimelineRemoveReason::Invalidated,
+            }),
+    );
+    changes
+}
+
+fn timeline_trigger_for_event_row(
+    event_message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+    row: &TimelineMessageRecord,
+) -> TimelineUpdateTrigger {
+    let event_targets = tag_values(tags, EVENT_REF_TAG).collect::<Vec<_>>();
+    if row.message_id_hex != event_message_id_hex
+        && row
+            .reply_to_message_id_hex
+            .as_deref()
+            .is_some_and(|reply_target| {
+                reply_target == event_message_id_hex
+                    || event_targets.iter().any(|target| target == &reply_target)
+            })
+        && matches!(
+            kind,
+            MARMOT_APP_EVENT_KIND_CHAT
+                | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+                | MARMOT_APP_EVENT_KIND_DELETE
+        )
+    {
+        return TimelineUpdateTrigger::ReplyPreviewChanged;
+    }
+    match kind {
+        MARMOT_APP_EVENT_KIND_CHAT => {
+            if tag_value(tags, STREAM_TAG).is_some() && tag_value(tags, STREAM_START_TAG).is_some()
+            {
+                TimelineUpdateTrigger::AgentStreamFinished
+            } else {
+                TimelineUpdateTrigger::NewMessage
+            }
+        }
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => TimelineUpdateTrigger::AgentStreamStarted,
+        MARMOT_APP_EVENT_KIND_REACTION => TimelineUpdateTrigger::ReactionAdded,
+        MARMOT_APP_EVENT_KIND_DELETE => {
+            if event_targets
+                .iter()
+                .any(|target| *target == row.message_id_hex)
+            {
+                TimelineUpdateTrigger::MessageDeleted
+            } else {
+                TimelineUpdateTrigger::ReactionRemoved
+            }
+        }
+        _ => TimelineUpdateTrigger::MessageEditedOrReprojected,
+    }
+}
+
+fn reply_message_ids_for_targets_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    target_message_ids: &[String],
+) -> StorageResult<Vec<String>> {
+    if target_message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", target_message_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT message_id_hex
+         FROM message_timeline
+         WHERE group_id_hex = ?
+           AND reply_to_message_id_hex IN ({placeholders})"
+    );
+    let mut values = Vec::<rusqlite::types::Value>::with_capacity(target_message_ids.len() + 1);
+    values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+    values.extend(
+        target_message_ids
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text),
+    );
+    let mut stmt = tx.prepare(&sql).storage()?;
+    stmt.query_map(params_from_iter(values.iter()), |row| row.get(0))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
 }
 
 fn reaction_target_message_id_tx(
@@ -1236,6 +1412,122 @@ mod tests {
     }
 
     #[test]
+    fn chat_event_returns_new_message_change() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+
+        let update = store
+            .record_app_event(&chat("message", "alice", 1, "hello"))
+            .unwrap();
+
+        assert!(matches!(
+            update.changes.as_slice(),
+            [TimelineMessageChange::Upsert {
+                trigger: TimelineUpdateTrigger::NewMessage,
+                message,
+            }] if message.message_id_hex == "message"
+        ));
+    }
+
+    #[test]
+    fn reaction_event_returns_reaction_added_change_for_target() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+
+        let update = store
+            .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+            .unwrap();
+
+        assert!(matches!(
+            update.changes.as_slice(),
+            [TimelineMessageChange::Upsert {
+                trigger: TimelineUpdateTrigger::ReactionAdded,
+                message,
+            }] if message.message_id_hex == "target"
+        ));
+    }
+
+    #[test]
+    fn deleting_reaction_returns_reaction_removed_change_for_target() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+        store
+            .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+            .unwrap();
+
+        let update = store
+            .record_app_event(&delete("delete-reaction", "bob", "reaction-1", 3))
+            .unwrap();
+
+        assert!(update.changes.iter().any(|change| {
+            matches!(
+                change,
+                TimelineMessageChange::Upsert {
+                    trigger: TimelineUpdateTrigger::ReactionRemoved,
+                    message,
+                } if message.message_id_hex == "target"
+            )
+        }));
+    }
+
+    #[test]
+    fn deleting_message_returns_message_deleted_change_for_target() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+
+        let update = store
+            .record_app_event(&delete("delete-message", "alice", "target", 2))
+            .unwrap();
+
+        assert!(matches!(
+            update.changes.as_slice(),
+            [TimelineMessageChange::Upsert {
+                trigger: TimelineUpdateTrigger::MessageDeleted,
+                message,
+            }] if message.message_id_hex == "target" && message.deleted
+        ));
+    }
+
+    #[test]
+    fn parent_arrival_updates_existing_reply_preview_delta() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&reply("reply", "bob", "parent", 1, "answer"))
+            .unwrap();
+
+        let update = store
+            .record_app_event(&chat("parent", "alice", 2, "the original"))
+            .unwrap();
+
+        let reply_change = update
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                TimelineMessageChange::Upsert { trigger, message }
+                    if message.message_id_hex == "reply" =>
+                {
+                    Some((trigger, message))
+                }
+                _ => None,
+            })
+            .expect("reply preview change");
+        assert_eq!(reply_change.0, &TimelineUpdateTrigger::ReplyPreviewChanged);
+        assert_eq!(
+            reply_change
+                .1
+                .reply_preview
+                .as_ref()
+                .map(|preview| preview.message_id_hex.as_str()),
+            Some("parent")
+        );
+    }
+
+    #[test]
     fn delete_requires_target_author_and_keeps_tombstone() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
@@ -1385,7 +1677,56 @@ mod tests {
             .unwrap();
         assert!(update.is_some());
 
+        assert!(update.unwrap().changes.iter().any(|change| {
+            matches!(
+                change,
+                TimelineMessageChange::Remove {
+                    message_id_hex,
+                    reason: TimelineRemoveReason::Invalidated,
+                } if message_id_hex == "target"
+            )
+        }));
         assert!(list(&store).is_empty());
+    }
+
+    #[test]
+    fn parent_invalidation_removes_parent_and_updates_reply_preview_delta() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("parent", "alice", 1, "the original"))
+            .unwrap();
+        store
+            .record_app_event(&reply("reply", "bob", "parent", 2, "answer"))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_source("source-parent", "losing_branch")
+            .unwrap()
+            .expect("projection update");
+
+        assert!(update.changes.iter().any(|change| {
+            matches!(
+                change,
+                TimelineMessageChange::Remove {
+                    message_id_hex,
+                    reason: TimelineRemoveReason::Invalidated,
+                } if message_id_hex == "parent"
+            )
+        }));
+        let reply_change = update
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                TimelineMessageChange::Upsert { trigger, message }
+                    if message.message_id_hex == "reply" =>
+                {
+                    Some((trigger, message))
+                }
+                _ => None,
+            })
+            .expect("reply preview change");
+        assert_eq!(reply_change.0, &TimelineUpdateTrigger::ReplyPreviewChanged);
+        assert!(reply_change.1.reply_preview.is_none());
     }
 
     #[test]
