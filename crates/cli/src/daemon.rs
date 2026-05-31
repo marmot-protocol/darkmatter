@@ -1771,7 +1771,7 @@ fn timeline_message_change_json(
             serde_json::json!({
                 "type": "upsert",
                 "trigger": trigger,
-                "message": crate::timeline_message_record_json(message, display_name),
+                "message": crate::timeline_message_record_json(*message, display_name),
             })
         }
         marmot_app::TimelineMessageChange::Remove {

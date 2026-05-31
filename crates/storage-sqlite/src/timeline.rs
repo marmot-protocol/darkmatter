@@ -109,7 +109,7 @@ pub struct TimelineProjectionUpdate {
 pub enum TimelineMessageChange {
     Upsert {
         trigger: TimelineUpdateTrigger,
-        message: TimelineMessageRecord,
+        message: Box<TimelineMessageRecord>,
     },
     Remove {
         message_id_hex: String,
@@ -481,9 +481,11 @@ fn affected_timeline_message_ids_for_parts_tx(
     tags: &[Vec<String>],
 ) -> StorageResult<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
+    let mut reply_preview_targets = BTreeSet::new();
     match kind {
         MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
             ids.insert(message_id_hex.to_owned());
+            reply_preview_targets.insert(message_id_hex.to_owned());
         }
         MARMOT_APP_EVENT_KIND_REACTION => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
@@ -491,6 +493,7 @@ fn affected_timeline_message_ids_for_parts_tx(
         MARMOT_APP_EVENT_KIND_DELETE => {
             for target in tag_values(tags, EVENT_REF_TAG) {
                 ids.insert(target.to_owned());
+                reply_preview_targets.insert(target.to_owned());
                 if let Some(reaction_target) =
                     reaction_target_message_id_tx(tx, group_id_hex, target)?
                 {
@@ -500,7 +503,7 @@ fn affected_timeline_message_ids_for_parts_tx(
         }
         _ => {}
     }
-    let reply_targets = ids.iter().cloned().collect::<Vec<_>>();
+    let reply_targets = reply_preview_targets.into_iter().collect::<Vec<_>>();
     ids.extend(reply_message_ids_for_targets_tx(
         tx,
         group_id_hex,
@@ -520,7 +523,7 @@ fn timeline_changes_for_event(
         .cloned()
         .map(|message| TimelineMessageChange::Upsert {
             trigger: timeline_trigger_for_event_row(event_message_id_hex, kind, tags, &message),
-            message,
+            message: Box::new(message),
         })
         .collect()
 }
@@ -536,7 +539,19 @@ fn timeline_changes_for_invalidation(
         .iter()
         .map(|message| message.message_id_hex.clone())
         .collect::<HashSet<_>>();
-    let mut changes = timeline_changes_for_event(event_message_id_hex, kind, tags, messages);
+    let mut changes = messages
+        .iter()
+        .cloned()
+        .map(|message| TimelineMessageChange::Upsert {
+            trigger: timeline_trigger_for_invalidation_row(
+                event_message_id_hex,
+                kind,
+                tags,
+                &message,
+            ),
+            message: Box::new(message),
+        })
+        .collect::<Vec<_>>();
     changes.extend(
         affected_message_ids
             .into_iter()
@@ -547,6 +562,46 @@ fn timeline_changes_for_invalidation(
             }),
     );
     changes
+}
+
+fn timeline_trigger_for_invalidation_row(
+    event_message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+    row: &TimelineMessageRecord,
+) -> TimelineUpdateTrigger {
+    let event_targets = tag_values(tags, EVENT_REF_TAG).collect::<Vec<_>>();
+    if row.message_id_hex != event_message_id_hex
+        && row
+            .reply_to_message_id_hex
+            .as_deref()
+            .is_some_and(|reply_target| {
+                reply_target == event_message_id_hex
+                    || event_targets.iter().any(|target| target == &reply_target)
+            })
+        && matches!(
+            kind,
+            MARMOT_APP_EVENT_KIND_CHAT
+                | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+                | MARMOT_APP_EVENT_KIND_DELETE
+        )
+    {
+        return TimelineUpdateTrigger::ReplyPreviewChanged;
+    }
+    match kind {
+        MARMOT_APP_EVENT_KIND_REACTION => TimelineUpdateTrigger::ReactionRemoved,
+        MARMOT_APP_EVENT_KIND_DELETE => {
+            if event_targets
+                .iter()
+                .any(|target| *target == row.message_id_hex)
+            {
+                TimelineUpdateTrigger::MessageEditedOrReprojected
+            } else {
+                TimelineUpdateTrigger::ReactionAdded
+            }
+        }
+        _ => TimelineUpdateTrigger::MessageEditedOrReprojected,
+    }
 }
 
 fn timeline_trigger_for_event_row(
@@ -1746,6 +1801,15 @@ mod tests {
 
         assert_eq!(update.messages.len(), 1);
         assert_eq!(update.messages[0].message_id_hex, "target");
+        assert!(update.changes.iter().any(|change| {
+            matches!(
+                change,
+                TimelineMessageChange::Upsert {
+                    trigger: TimelineUpdateTrigger::ReactionRemoved,
+                    message,
+                } if message.message_id_hex == "target"
+            )
+        }));
         assert!(
             update.messages[0]
                 .reactions

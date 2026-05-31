@@ -647,6 +647,7 @@ impl From<ChatListRow> for ChatListRowFfi {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum ChatListSubscriptionUpdateFfi {
     Row {
@@ -664,7 +665,7 @@ impl From<RuntimeChatListUpdate> for ChatListSubscriptionUpdateFfi {
         match value {
             RuntimeChatListUpdate::Row { trigger, row } => Self::Row {
                 trigger: trigger.into(),
-                row: row.into(),
+                row: (*row).into(),
             },
             RuntimeChatListUpdate::RemoveRow {
                 trigger,
@@ -852,6 +853,7 @@ impl From<TimelinePage> for TimelinePageFfi {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum TimelineMessageChangeFfi {
     Upsert {
@@ -869,7 +871,7 @@ impl From<TimelineMessageChange> for TimelineMessageChangeFfi {
         match value {
             TimelineMessageChange::Upsert { trigger, message } => Self::Upsert {
                 trigger: trigger.into(),
-                message: message.into(),
+                message: (*message).into(),
             },
             TimelineMessageChange::Remove {
                 message_id_hex,

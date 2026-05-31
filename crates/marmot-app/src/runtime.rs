@@ -597,7 +597,7 @@ pub struct RuntimeChatListSubscription {
 pub enum RuntimeChatListUpdate {
     Row {
         trigger: ChatListUpdateTrigger,
-        row: ChatListRow,
+        row: Box<ChatListRow>,
     },
     RemoveRow {
         trigger: ChatListUpdateTrigger,
@@ -1473,17 +1473,9 @@ impl MarmotAppRuntime {
         let drain_until = Instant::now() + remaining;
         loop {
             match events.try_recv() {
-                Ok(event) => match notifications::notification_update_from_event(&app, &event) {
-                    Ok(Some(update)) => notifications.push(update),
-                    Ok(None) | Err(AppError::NotificationsDisabled) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "marmot_app::notifications",
-                            method = "collect_notifications_after_wake",
-                            "notification projection skipped: {err}",
-                        );
-                    }
-                },
+                Ok(event) => {
+                    collect_notification_update_from_event(&app, &event, &mut notifications);
+                }
                 Err(broadcast::error::TryRecvError::Empty) => {
                     if Instant::now() >= drain_until {
                         break;
@@ -1495,11 +1487,11 @@ impl MarmotAppRuntime {
                     .await
                     {
                         Ok(Ok(event)) => {
-                            if let Ok(Some(update)) =
-                                notifications::notification_update_from_event(&app, &event)
-                            {
-                                notifications.push(update);
-                            }
+                            collect_notification_update_from_event(
+                                &app,
+                                &event,
+                                &mut notifications,
+                            );
                         }
                         Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                         Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
@@ -2161,27 +2153,29 @@ impl MarmotAppRuntime {
         archived: bool,
     ) -> Result<AppGroupRecord, AppError> {
         let account = self.accounts.resolve(account_ref)?;
-        let group = self
-            .accounts
-            .app
-            .set_group_archived(&account.label, group_id_hex, archived)?;
+        let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let group =
+            self.accounts
+                .app
+                .set_group_archived(&account.label, &group_id_hex, archived)?;
         let chat_list_row = self
             .accounts
             .app
-            .refresh_chat_list_row(&account.label, group_id_hex)?;
-        let _ = self
-            .events
-            .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
-                account_id_hex: account.account_id_hex,
-                account_label: account.label,
-                update: AppProjectionUpdate {
-                    group_id_hex: group_id_hex.to_owned(),
-                    timeline_messages: Vec::new(),
-                    timeline_changes: Vec::new(),
-                    chat_list_row,
-                    chat_list_trigger: ChatListUpdateTrigger::ArchiveChanged,
-                },
-            }));
+            .refresh_chat_list_row(&account.label, &group_id_hex)?;
+        self.publish_chat_list_projection_update(
+            account.account_id_hex.clone(),
+            account.label.clone(),
+            group_id_hex,
+            chat_list_row,
+            ChatListUpdateTrigger::ArchiveChanged,
+        );
+        publish_app_runtime_group_state_updated(
+            &self.events,
+            &account.account_id_hex,
+            &account.label,
+            &group_id,
+        );
         Ok(group)
     }
 
@@ -2462,12 +2456,16 @@ impl AccountManager {
                 .map(|worker| worker.commands.clone())
                 .collect::<Vec<_>>()
         };
+        let mut responses = Vec::with_capacity(commands.len());
         for command in commands {
             let (respond, response) = oneshot::channel();
             command
                 .send(AccountWorkerCommand::CatchUp { respond })
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
+            responses.push(response);
+        }
+        for response in responses {
             match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(message))) => return Err(AppError::RelayDirectory(message)),
@@ -3807,6 +3805,24 @@ fn account_worker_reconnect_jitter() -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
+fn collect_notification_update_from_event(
+    app: &MarmotApp,
+    event: &MarmotAppEvent,
+    notifications: &mut Vec<NotificationUpdate>,
+) {
+    match notifications::notification_update_from_event(app, event) {
+        Ok(Some(update)) => notifications.push(update),
+        Ok(None) | Err(AppError::NotificationsDisabled) => {}
+        Err(err) => {
+            tracing::warn!(
+                target: "marmot_app::notifications",
+                method = "collect_notifications_after_wake",
+                "notification projection skipped: {err}",
+            );
+        }
+    }
+}
+
 fn publish_app_runtime_summary(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -4248,7 +4264,10 @@ async fn send_chat_list_row_update(
     }
     row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
     updates_tx
-        .send(RuntimeChatListUpdate::Row { trigger, row })
+        .send(RuntimeChatListUpdate::Row {
+            trigger,
+            row: Box::new(row),
+        })
         .await
         .is_ok()
 }
