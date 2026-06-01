@@ -537,10 +537,11 @@ impl AppClient {
                     ) {
                         Ok(Some(update)) => on_local_projection(update),
                         Ok(None) => {}
-                        Err(rollback_err) => {
+                        Err(_) => {
                             tracing::warn!(
-                                app_event_id,
-                                error = %rollback_err,
+                                target: "marmot_app::messages",
+                                method = "send_app_event_with_local_projection",
+                                error_code = "local_projection_retract_failed",
                                 "failed to retract local projection after publish failure"
                             );
                         }
@@ -555,12 +556,13 @@ impl AppClient {
             .first()
             .map(|report| hex::encode(report.message_id.as_slice()));
         if should_project_locally {
-            self.record_local_app_event_projection(
+            let update = self.record_local_app_event_projection(
                 &group_id_hex,
                 &sender,
                 &event,
                 source_message_id_hex,
             )?;
+            on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;

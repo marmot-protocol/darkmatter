@@ -618,6 +618,12 @@ pub enum ChatListUpdateTrigger {
     Removed,
 }
 
+impl Default for ChatListUpdateTrigger {
+    fn default() -> Self {
+        Self::SnapshotRefresh
+    }
+}
+
 impl ChatListUpdateTrigger {
     pub(crate) fn from_timeline_changes(changes: &[TimelineMessageChange]) -> Self {
         if changes.iter().any(|change| {
@@ -1329,11 +1335,12 @@ impl MarmotAppRuntime {
                                 }
                             }
                             Ok(None) | Err(AppError::NotificationsDisabled) => {}
-                            Err(err) => {
+                            Err(_) => {
                                 tracing::warn!(
                                     target: "marmot_app::notifications",
                                     method = "subscribe_notifications",
-                                    "notification projection skipped: {err}",
+                                    error_code = "notification_projection_skipped",
+                                    "notification projection skipped",
                                 );
                             }
                         }
@@ -1682,12 +1689,19 @@ impl MarmotAppRuntime {
             .accounts
             .update_group_profile(account_ref, group_id, name, description)
             .await?;
-        let account = self.accounts.resolve(account_ref)?;
+        let account = match self.accounts.resolve(account_ref) {
+            Ok(account) => account,
+            Err(_) => return Ok(summary),
+        };
         let group_id_hex = hex::encode(group_id.as_slice());
-        let chat_list_row = self
+        let chat_list_row = match self
             .accounts
             .app
-            .refresh_chat_list_row(&account.label, &group_id_hex)?;
+            .refresh_chat_list_row(&account.label, &group_id_hex)
+        {
+            Ok(row) => row,
+            Err(_) => return Ok(summary),
+        };
         let _ = self
             .events
             .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
@@ -1755,11 +1769,11 @@ impl MarmotAppRuntime {
             .accounts
             .send_message(account_ref, group_id, payload)
             .await?;
-        self.publish_chat_list_projection_refresh(
+        let _ = self.publish_chat_list_projection_refresh(
             account_ref,
             &hex::encode(group_id.as_slice()),
             ChatListUpdateTrigger::NewLastMessage,
-        )?;
+        );
         Ok(summary)
     }
 
@@ -1908,11 +1922,11 @@ impl MarmotAppRuntime {
                 },
             )
             .await?;
-        self.publish_chat_list_projection_refresh(
+        let _ = self.publish_chat_list_projection_refresh(
             account_ref,
             &hex::encode(group_id.as_slice()),
             ChatListUpdateTrigger::NewLastMessage,
-        )?;
+        );
         Ok(summary)
     }
 
@@ -1949,11 +1963,11 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Media { reference, caption },
             )
             .await?;
-        self.publish_chat_list_projection_refresh(
+        let _ = self.publish_chat_list_projection_refresh(
             account_ref,
             &hex::encode(group_id.as_slice()),
             ChatListUpdateTrigger::NewLastMessage,
-        )?;
+        );
         Ok(summary)
     }
 
@@ -3885,11 +3899,12 @@ fn collect_notification_update_from_event(
     match notifications::notification_update_from_event(app, event) {
         Ok(Some(update)) => notifications.push(update),
         Ok(None) | Err(AppError::NotificationsDisabled) => {}
-        Err(err) => {
+        Err(_) => {
             tracing::warn!(
                 target: "marmot_app::notifications",
                 method = "collect_notifications_after_wake",
-                "notification projection skipped: {err}",
+                error_code = "notification_projection_skipped",
+                "notification projection skipped",
             );
         }
     }

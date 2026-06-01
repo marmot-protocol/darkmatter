@@ -319,18 +319,14 @@ impl SqliteAccountStorage {
             kind,
             &tags,
         )?;
+        let before = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
         tx.execute(update_sql, params![lookup_id_hex, reason])
             .storage()?;
         rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
         let messages =
             timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
-        let changes = timeline_changes_for_invalidation(
-            &message_id_hex,
-            kind,
-            &tags,
-            affected_message_ids,
-            &messages,
-        );
+        let changes =
+            timeline_changes_for_invalidation(&message_id_hex, kind, &tags, &before, &messages);
         tx.commit().storage()?;
         Ok(Some(TimelineProjectionUpdate {
             group_id_hex,
@@ -557,15 +553,20 @@ fn timeline_changes_for_invalidation(
     event_message_id_hex: &str,
     kind: u64,
     tags: &[Vec<String>],
-    affected_message_ids: BTreeSet<String>,
+    before: &[TimelineMessageRecord],
     messages: &[TimelineMessageRecord],
 ) -> Vec<TimelineMessageChange> {
-    let present = messages
+    let before_by_id = before
         .iter()
-        .map(|message| message.message_id_hex.clone())
-        .collect::<HashSet<_>>();
+        .map(|message| (message.message_id_hex.as_str(), message))
+        .collect::<HashMap<_, _>>();
+    let after_by_id = messages
+        .iter()
+        .map(|message| (message.message_id_hex.as_str(), message))
+        .collect::<HashMap<_, _>>();
     let mut changes = messages
         .iter()
+        .filter(|message| before_by_id.get(message.message_id_hex.as_str()) != Some(message))
         .cloned()
         .map(|message| TimelineMessageChange::Upsert {
             trigger: timeline_trigger_for_invalidation_row(
@@ -578,11 +579,11 @@ fn timeline_changes_for_invalidation(
         })
         .collect::<Vec<_>>();
     changes.extend(
-        affected_message_ids
-            .into_iter()
-            .filter(|message_id_hex| !present.contains(message_id_hex))
+        before
+            .iter()
+            .filter(|message| !after_by_id.contains_key(message.message_id_hex.as_str()))
             .map(|message_id_hex| TimelineMessageChange::Remove {
-                message_id_hex,
+                message_id_hex: message_id_hex.message_id_hex.clone(),
                 reason: TimelineRemoveReason::Invalidated,
             }),
     );
@@ -1867,5 +1868,39 @@ mod tests {
                 .is_none_or(Vec::is_empty)
         );
         assert!(update.messages[0].reactions.user_reactions.is_empty());
+    }
+
+    #[test]
+    fn orphan_reaction_invalidation_does_not_remove_missing_target() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&reaction("reaction-1", "bob", "target", 1, "+"))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_source("source-reaction-1", "losing_branch")
+            .unwrap()
+            .expect("projection update");
+
+        assert!(update.messages.is_empty());
+        assert!(update.changes.is_empty());
+    }
+
+    #[test]
+    fn no_op_delete_invalidation_does_not_emit_unchanged_target() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+        store
+            .record_app_event(&delete("delete-1", "bob", "target", 2))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_source("source-delete-1", "losing_branch")
+            .unwrap()
+            .expect("projection update");
+
+        assert!(update.changes.is_empty());
     }
 }

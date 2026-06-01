@@ -353,8 +353,10 @@ pub struct ReceivedMessage {
 pub struct AppProjectionUpdate {
     pub group_id_hex: String,
     pub timeline_messages: Vec<TimelineMessageRecord>,
+    #[serde(default)]
     pub timeline_changes: Vec<TimelineMessageChange>,
     pub chat_list_row: Option<ChatListRow>,
+    #[serde(default)]
     pub chat_list_trigger: ChatListUpdateTrigger,
 }
 
@@ -4571,6 +4573,20 @@ mod tests {
 
     use crate::messages::STREAM_ROUTE_QUIC;
     use crate::messages::{AppMessageIntent, build_inner_event};
+
+    #[test]
+    fn legacy_projection_update_json_defaults_new_streaming_fields() {
+        let update: AppProjectionUpdate = serde_json::from_str(
+            r#"{"group_id_hex":"group","timeline_messages":[],"chat_list_row":null}"#,
+        )
+        .unwrap();
+
+        assert!(update.timeline_changes.is_empty());
+        assert_eq!(
+            update.chat_list_trigger,
+            ChatListUpdateTrigger::SnapshotRefresh
+        );
+    }
 
     fn relay_delivery(event_id: String, pubkey: String) -> cgka_traits::TransportDelivery {
         let event = NostrTransportEvent {
