@@ -257,26 +257,56 @@ impl SqliteAccountStorage {
         source_message_id_hex: &str,
         reason: &str,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.invalidate_app_event(
+            "SELECT group_id_hex, message_id_hex, kind, tags_json
+             FROM app_events
+             WHERE source_message_id_hex = ?1",
+            "UPDATE app_events
+             SET invalidated = 1, invalidation_reason = ?2
+             WHERE source_message_id_hex = ?1",
+            source_message_id_hex,
+            reason,
+        )
+    }
+
+    pub fn invalidate_app_event_by_message_id(
+        &self,
+        message_id_hex: &str,
+        reason: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.invalidate_app_event(
+            "SELECT group_id_hex, message_id_hex, kind, tags_json
+             FROM app_events
+             WHERE message_id_hex = ?1",
+            "UPDATE app_events
+             SET invalidated = 1, invalidation_reason = ?2
+             WHERE message_id_hex = ?1",
+            message_id_hex,
+            reason,
+        )
+    }
+
+    fn invalidate_app_event(
+        &self,
+        select_sql: &str,
+        update_sql: &str,
+        lookup_id_hex: &str,
+        reason: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let row: Option<(String, String, u64, Vec<Vec<String>>)> = tx
-            .query_row(
-                "SELECT group_id_hex, message_id_hex, kind, tags_json
-                 FROM app_events
-                 WHERE source_message_id_hex = ?1",
-                params![source_message_id_hex],
-                |row| {
-                    let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                    let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?;
-                    Ok((row.get(0)?, row.get(1)?, kind, tags))
-                },
-            )
+            .query_row(select_sql, params![lookup_id_hex], |row| {
+                let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?;
+                Ok((row.get(0)?, row.get(1)?, kind, tags))
+            })
             .optional()
             .storage()?;
         let Some((group_id_hex, message_id_hex, kind, tags)) = row else {
@@ -289,13 +319,8 @@ impl SqliteAccountStorage {
             kind,
             &tags,
         )?;
-        tx.execute(
-            "UPDATE app_events
-             SET invalidated = 1, invalidation_reason = ?2
-             WHERE source_message_id_hex = ?1",
-            params![source_message_id_hex, reason],
-        )
-        .storage()?;
+        tx.execute(update_sql, params![lookup_id_hex, reason])
+            .storage()?;
         rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
         let messages =
             timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
@@ -1733,6 +1758,30 @@ mod tests {
         assert!(update.is_some());
 
         assert!(update.unwrap().changes.iter().any(|change| {
+            matches!(
+                change,
+                TimelineMessageChange::Remove {
+                    message_id_hex,
+                    reason: TimelineRemoveReason::Invalidated,
+                } if message_id_hex == "target"
+            )
+        }));
+        assert!(list(&store).is_empty());
+    }
+
+    #[test]
+    fn message_id_invalidation_retracts_projected_effects() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("target", "alice", 1, "hello"))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_event_by_message_id("target", "local_publish_failed")
+            .unwrap()
+            .expect("projection update");
+
+        assert!(update.changes.iter().any(|change| {
             matches!(
                 change,
                 TimelineMessageChange::Remove {

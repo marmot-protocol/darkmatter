@@ -443,7 +443,7 @@ impl AppClient {
         on_local_projection: F,
     ) -> Result<SendSummary, AppError>
     where
-        F: FnOnce(crate::AppProjectionUpdate),
+        F: FnMut(crate::AppProjectionUpdate),
     {
         // The transport-facing `send` carries plain UTF-8 chat text; structured
         // payloads use `send_app_event` with a typed intent.
@@ -477,10 +477,10 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         intent: AppMessageIntent,
-        on_local_projection: F,
+        mut on_local_projection: F,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
-        F: FnOnce(crate::AppProjectionUpdate),
+        F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group(group_id)?;
         let sender = self
@@ -513,15 +513,42 @@ impl AppClient {
             on_local_projection(update);
         }
 
-        self.sync_runtime_groups().await?;
-        let effects = self
-            .runtime
-            .send(SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload,
-            })
-            .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        let effects = match async {
+            self.sync_runtime_groups().await?;
+            let effects = self
+                .runtime
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await?;
+            fail_if_publish_failed(&effects.failures)?;
+            Ok::<_, AppError>(effects)
+        }
+        .await
+        {
+            Ok(effects) => effects,
+            Err(err) => {
+                if should_project_locally {
+                    match self.app.invalidate_timeline_app_event(
+                        &self.state.label,
+                        &app_event_id,
+                        "local_publish_failed",
+                    ) {
+                        Ok(Some(update)) => on_local_projection(update),
+                        Ok(None) => {}
+                        Err(rollback_err) => {
+                            tracing::warn!(
+                                app_event_id,
+                                error = %rollback_err,
+                                "failed to retract local projection after publish failure"
+                            );
+                        }
+                    }
+                }
+                return Err(err);
+            }
+        };
         self.remember_published_reports(&effects);
         let source_message_id_hex = effects
             .reports
@@ -915,12 +942,32 @@ impl AppClient {
         stream_id: &[u8],
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.send_app_event(
+        self.start_agent_text_stream_with_local_projection(
+            group_id,
+            stream_id,
+            quic_candidates,
+            |_| {},
+        )
+        .await
+    }
+
+    pub(crate) async fn start_agent_text_stream_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        stream_id: &[u8],
+        quic_candidates: Vec<String>,
+        on_local_projection: F,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        self.send_app_event_with_local_projection(
             group_id,
             AppMessageIntent::StreamStart {
                 stream_id: stream_id.to_vec(),
                 quic_candidates,
             },
+            on_local_projection,
         )
         .await
     }
@@ -930,8 +977,25 @@ impl AppClient {
         group_id: &GroupId,
         request: AgentTextStreamFinishRequest,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.send_app_event(group_id, AppMessageIntent::StreamFinal { request })
+        self.finish_agent_text_stream_with_local_projection(group_id, request, |_| {})
             .await
+    }
+
+    pub(crate) async fn finish_agent_text_stream_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        request: AgentTextStreamFinishRequest,
+        on_local_projection: F,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        self.send_app_event_with_local_projection(
+            group_id,
+            AppMessageIntent::StreamFinal { request },
+            on_local_projection,
+        )
+        .await
     }
 
     pub async fn retry_group_convergence(

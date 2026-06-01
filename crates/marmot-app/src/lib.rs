@@ -2809,6 +2809,20 @@ impl MarmotApp {
             .transpose()
     }
 
+    pub(crate) fn invalidate_timeline_app_event(
+        &self,
+        label: &str,
+        message_id_hex: &str,
+        reason: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .invalidate_app_event_by_message_id(message_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
     fn app_projection_update(
         &self,
         label: &str,
