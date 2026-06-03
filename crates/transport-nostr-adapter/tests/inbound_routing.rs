@@ -209,6 +209,48 @@ async fn subscribed_group_event_becomes_account_scoped_delivery() {
 }
 
 #[tokio::test]
+async fn same_message_from_two_relays_records_cross_relay_corroboration() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint_a = TransportEndpoint("wss://group-a.example".into());
+    let endpoint_b = TransportEndpoint("wss://group-b.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id,
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id,
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    // Same logical message delivered by two distinct relay endpoints.
+    for endpoint in [&endpoint_a, &endpoint_b] {
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("group-sub".into()),
+                event: group_event("11", &transport_group_id),
+            })
+            .await
+            .expect("relay event handled");
+    }
+
+    let spread = adapter.delivery_spread().await;
+    assert_eq!(spread.observed, 1, "one logical message observed");
+    assert_eq!(spread.corroborated, 1, "corroborated by a second endpoint");
+    assert_eq!(spread.sample_count(), 1, "one spread sample recorded");
+}
+
+#[tokio::test]
 async fn synced_group_subscriptions_replace_old_routes() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());

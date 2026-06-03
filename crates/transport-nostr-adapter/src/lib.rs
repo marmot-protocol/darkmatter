@@ -30,6 +30,7 @@ mod key_package;
 mod relay_list;
 #[cfg(feature = "sdk")]
 mod sdk_client;
+mod telemetry;
 
 pub use key_package::{
     KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST, NostrKeyPackagePublication,
@@ -41,6 +42,7 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan};
+pub use telemetry::{RelayDeliverySpread, RelayDeliveryTelemetry, SpreadBucket};
 
 const DELIVERY_BUFFER: usize = 1024;
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
@@ -214,6 +216,8 @@ pub struct NostrTransportAdapter {
     state: Arc<RwLock<AdapterState>>,
     delivery_tx: mpsc::Sender<TransportDelivery>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<TransportDelivery>>>,
+    /// Local monotonic origin for delivery telemetry. Never `created_at`.
+    monotonic_start: std::time::Instant,
 }
 
 impl NostrTransportAdapter {
@@ -224,6 +228,7 @@ impl NostrTransportAdapter {
             state: Arc::new(RwLock::new(AdapterState::default())),
             delivery_tx,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
+            monotonic_start: std::time::Instant::now(),
         }
     }
 
@@ -242,6 +247,17 @@ impl NostrTransportAdapter {
             .map(|account| account.groups.len())
             .sum();
         metrics
+    }
+
+    /// Aggregate cross-relay arrival-spread snapshot for diagnostics and
+    /// quiescence tuning. Privacy-safe: counts and millisecond buckets only.
+    pub async fn delivery_spread(&self) -> RelayDeliverySpread {
+        tracing::trace!(
+            target: "transport_nostr_adapter::adapter",
+            method = "delivery_spread",
+            "snapshotting delivery spread"
+        );
+        self.state.read().await.telemetry.snapshot()
     }
 
     /// Convert a relay event into zero or more account-scoped deliveries.
@@ -282,7 +298,14 @@ impl NostrTransportAdapter {
             delivered += 1;
         }
 
-        self.state.write().await.record_inbound_event(delivered);
+        // Local-time sighting for cross-relay arrival spread. Uses the adapter's
+        // monotonic clock, never the publisher-controlled `created_at`.
+        let now_ms = self.monotonic_start.elapsed().as_millis() as u64;
+        {
+            let mut state = self.state.write().await;
+            state.record_inbound_event(delivered);
+            state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
+        }
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "handle_relay_event",
@@ -540,6 +563,7 @@ struct AccountRoutes {
 struct AdapterState {
     accounts: HashMap<MemberId, AccountRoutes>,
     metrics: NostrAdapterMetrics,
+    telemetry: RelayDeliveryTelemetry,
 }
 
 impl AdapterState {
@@ -574,6 +598,15 @@ impl AdapterState {
         if delivered == 0 {
             self.metrics.inbound_events_dropped += 1;
         }
+    }
+
+    fn record_delivery_timing(
+        &mut self,
+        message_id: &MessageId,
+        endpoint: &TransportEndpoint,
+        now_ms: u64,
+    ) {
+        self.telemetry.record_sighting(message_id, endpoint, now_ms);
     }
 
     fn record_publish_attempt(&mut self) {
