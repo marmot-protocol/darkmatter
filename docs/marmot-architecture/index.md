@@ -49,6 +49,11 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** Working note on Nostr user directory, account bootstrap, relay plane, group routing, and relay
     safety policy.
 
+- **Doc:** [`overview/http-server-transport.md`](./overview/http-server-transport.md)
+  - **What it covers:** Design note for a hypothetical single-server HTTP transport (ordering, durable queues,
+    KeyPackage directory) as a reduced-assurance profile, with the adapter/peeler/server split and the privacy
+    trade-off.
+
 - **Doc:** [`overview/app-core-boundary.md`](./overview/app-core-boundary.md)
   - **What it covers:** The boundary between `dm`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
     bindings.
