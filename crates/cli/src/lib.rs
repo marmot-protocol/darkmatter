@@ -4534,26 +4534,27 @@ async fn sync_command(
 }
 
 async fn relay_stats_command(app: &MarmotApp) -> Result<CommandOutput, DmError> {
-    Ok(relay_stats_output(app.relay_telemetry().await))
+    relay_stats_output(app.relay_telemetry().await)
 }
 
 pub(crate) async fn relay_stats_command_with_runtime(
     runtime: &MarmotAppRuntime,
 ) -> Result<CommandOutput, DmError> {
-    Ok(relay_stats_output(
+    relay_stats_output(
         runtime
             .shared_services()
             .relay_plane()
             .relay_telemetry()
             .await,
-    ))
+    )
 }
 
-fn relay_stats_output(snapshot: RelayTelemetrySnapshot) -> CommandOutput {
-    CommandOutput {
+fn relay_stats_output(snapshot: RelayTelemetrySnapshot) -> Result<CommandOutput, DmError> {
+    let json = serde_json::to_value(&snapshot)?;
+    Ok(CommandOutput {
         plain: relay_stats_plain(&snapshot),
-        json: serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
-    }
+        json,
+    })
 }
 
 /// Render a percentile of a duration histogram for the human view.
@@ -5971,7 +5972,7 @@ mod tests {
 
     #[test]
     fn relay_stats_output_json_preserves_snapshot_shape() {
-        let output = relay_stats_output(sample_relay_telemetry());
+        let output = relay_stats_output(sample_relay_telemetry()).expect("snapshot serializes");
         assert_eq!(output.json["metrics"]["inbound_events_delivered"], 7);
         assert_eq!(
             output.json["delivery_spread"]["per_relay"][0]["relay_index"],

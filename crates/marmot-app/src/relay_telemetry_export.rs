@@ -287,14 +287,25 @@ pub enum RelayExportError {
 impl MarmotRelayPlane {
     /// Build an opt-in relay-telemetry exporter — the single construction gate.
     ///
-    /// Returns `None` unless export is enabled and an endpoint is configured, so
-    /// off-by-default opt-in is structurally enforced: with no exporter there is
-    /// no resolution and no push.
+    /// Returns `None` unless [`RelayTelemetryExportConfig::export_allowed`]
+    /// holds — opted in, an endpoint is configured, and that endpoint is TLS
+    /// (`https`, or loopback `http` for local testing). Off-by-default opt-in is
+    /// structurally enforced: with no exporter there is no resolution and no
+    /// push, and relay identities are never sent over a non-TLS transport.
     pub fn telemetry_exporter(
         &self,
         config: RelayTelemetryExportConfig,
     ) -> Option<RelayTelemetryExporter> {
-        if !config.enabled || config.endpoint.is_none() {
+        if !config.export_allowed() {
+            if config.enabled {
+                // Opted in but the endpoint is missing or not TLS: fail closed
+                // (no exporter) rather than push relay identities in the clear.
+                tracing::warn!(
+                    target: "marmot_app::relay_telemetry_export",
+                    method = "telemetry_exporter",
+                    "relay telemetry export disabled: endpoint missing or not https",
+                );
+            }
             return None;
         }
         Some(RelayTelemetryExporter {
@@ -347,7 +358,7 @@ impl RelayTelemetryExporter {
 
 #[cfg(feature = "otlp-export")]
 mod otlp {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{
@@ -476,7 +487,12 @@ mod otlp {
         let request = to_request(batch, unix_nano(started_at), unix_nano(SystemTime::now()));
         let body = request.encode_to_vec();
         let url = format!("{}/v1/metrics", endpoint.trim_end_matches('/'));
+        // Bound both connect and overall request time so a stuck collector
+        // cannot hang an export indefinitely (both stay well under the default
+        // poll interval).
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|_| RelayExportError::Request)?;
         let response = client
@@ -609,8 +625,11 @@ impl RelayTelemetryExporter {
                         );
                     }
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                result = shutdown.changed() => {
+                    // `changed()` errors when the sender is dropped; treat that
+                    // as a shutdown too, otherwise the branch would resolve
+                    // immediately every iteration and spin the loop.
+                    if result.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }

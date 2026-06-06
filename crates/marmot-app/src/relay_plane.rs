@@ -484,16 +484,19 @@ impl MarmotRelayPlane {
     /// Resolve opaque relay indices to relay endpoints — the export label
     /// boundary.
     ///
-    /// This is the single opt-in gate for relay-identity resolution. It returns
-    /// `None` unless `config.enabled`; only when opted in does it mint a
-    /// [`RelayExportConsent`] and ask the adapter to reverse-map indices to
+    /// Crate-private and reachable only through the exporter. It returns `None`
+    /// unless [`RelayTelemetryExportConfig::export_allowed`] holds (the same
+    /// gate as [`MarmotRelayPlane::telemetry_exporter`]); only then does it mint
+    /// a [`RelayExportConsent`] and ask the adapter to reverse-map indices to
     /// relay URLs. No other code path turns a device-local index into a relay
     /// URL. See the privacy contract in `relay-observability.md`.
-    pub async fn resolve_relay_labels(
+    pub(crate) async fn resolve_relay_labels(
         &self,
         config: &RelayTelemetryExportConfig,
     ) -> Option<RelayLabelResolution> {
-        if !config.enabled {
+        // Same gate as `telemetry_exporter`: resolution cannot happen unless
+        // export is opted in, has an endpoint, and that endpoint is TLS.
+        if !config.export_allowed() {
             return None;
         }
         let consent = RelayExportConsent::affirm();
@@ -1676,12 +1679,22 @@ mod tests {
         let disabled = RelayTelemetryExportConfig::disabled();
         assert!(relay_plane.resolve_relay_labels(&disabled).await.is_none());
 
-        // Opted in: the export boundary resolves the opaque index for the
-        // activated inbox endpoint back to its relay URL.
-        let enabled = RelayTelemetryExportConfig {
+        // Opted in but no endpoint: still no resolution (same gate as the
+        // exporter).
+        let no_endpoint = RelayTelemetryExportConfig {
             enabled: true,
             ..Default::default()
         };
+        assert!(
+            relay_plane
+                .resolve_relay_labels(&no_endpoint)
+                .await
+                .is_none()
+        );
+
+        // Opted in with a TLS endpoint: the export boundary resolves the opaque
+        // index for the activated inbox endpoint back to its relay URL.
+        let enabled = RelayTelemetryExportConfig::enabled("https://otlp.example");
         let resolution = relay_plane
             .resolve_relay_labels(&enabled)
             .await
