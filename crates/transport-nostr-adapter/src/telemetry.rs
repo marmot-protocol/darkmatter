@@ -35,7 +35,16 @@ use cgka_traits::TransportEndpoint;
 ///
 /// A delta is counted in the first bucket whose bound it does not exceed.
 /// Deltas above the last bound fall in a dedicated overflow bucket.
-const BUCKET_BOUNDS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+///
+/// Deliberately fine-grained: the collected data is only as precise as the
+/// bucket edges, and we want high-resolution percentiles for both relay ranking
+/// and quiescence tuning, with the densest resolution across the 10ms-2s
+/// delivery-jitter range that matters most. Memory is a handful of `u64`
+/// counters per histogram, so finer buckets are cheap.
+const BUCKET_BOUNDS_MS: [u64; 24] = [
+    1, 2, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 7500,
+    10000, 15000, 20000, 30000,
+];
 
 /// Default retention window for the per-message first-sighting table.
 ///
@@ -642,8 +651,9 @@ mod tests {
 
         let snap = telem.snapshot();
         assert_eq!(snap.spread.sample_count(), 10);
-        assert_eq!(snap.spread.approx_percentile_ms(0.5), Some(10));
-        assert_eq!(snap.spread.approx_percentile_ms(1.0), Some(2500));
+        // p50 sits among the fast 5ms samples; p100 reaches the 2000ms laggard.
+        assert_eq!(snap.spread.approx_percentile_ms(0.5), Some(5));
+        assert_eq!(snap.spread.approx_percentile_ms(1.0), Some(2000));
     }
 
     #[test]
@@ -656,7 +666,7 @@ mod tests {
     fn spread_beyond_largest_bucket_counts_as_overflow() {
         let mut telem = RelayDeliveryTelemetry::default();
         telem.record_sighting(&msg(1), A, 0);
-        telem.record_sighting(&msg(1), B, 20_000);
+        telem.record_sighting(&msg(1), B, 40_000);
 
         let snap = telem.snapshot();
         assert_eq!(snap.spread.overflow_count, 1);
@@ -696,7 +706,7 @@ mod tests {
     fn first_event_latency_recorded_once_per_relay() {
         let mut telem = RelaySyncTelemetry::default();
         telem.record_subscription_start("sub", &[A], 100);
-        telem.record_first_event("sub", A, 130);
+        telem.record_first_event("sub", A, 140);
         telem.record_first_event("sub", A, 900);
 
         let snap = telem.snapshot();

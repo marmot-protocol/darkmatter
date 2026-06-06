@@ -1,14 +1,14 @@
 # Relay Observability and Telemetry Export
 
-**Status:** design draft. This specifies the *export contract* for client-side relay performance telemetry: which
-signals leave the device, under what privacy guarantees, and how they reach a first-party metrics stack. It is the
-broad-observability counterpart to [`relay-delivery-telemetry.md`](./relay-delivery-telemetry.md), which is scoped to
-device-local convergence tuning and exports nothing.
+**Status:** design draft; privacy carve-out **accepted**, `observability.md` amendment applied. This specifies the
+*export contract* for client-side relay performance telemetry: which signals leave the device, under what privacy
+guarantees, and how they reach a first-party metrics stack. It is the broad-observability counterpart to
+[`relay-delivery-telemetry.md`](./relay-delivery-telemetry.md), which is scoped to device-local convergence tuning and
+exports nothing.
 
-This document is a contract, not yet an implementation. The normative privacy rules in
-[`overview/observability.md`](./overview/observability.md) are unchanged until the amendment in
-[Proposed observability.md amendment](#proposed-observabilitymd-amendment) is accepted; no telemetry leaves the device
-before then.
+The privacy carve-out below is accepted and the matching amendment is now in
+[`overview/observability.md`](./overview/observability.md). Implementation (relay-plane rollup, opt-in exporter,
+dashboards) is still pending; no telemetry leaves the device until those land.
 
 ## Purpose
 
@@ -49,12 +49,15 @@ Each is a hard requirement.
    group id, transport group id, subscription id, pubkey, message id, event id, IP-derived field, or any user- or
    membership-derived value. Relay identity is the sole exception to the device-local rule, and only because it is the
    thing being measured, not an identifier of the reporter.
-4. **Aggregate only.** Exported series are counts and fixed-bucket histograms accumulated over a coarse window. No
-   per-event, per-message, or per-timestamp rows. This is the same shape the device-local snapshots already produce
-   (`RelayDeliverySpread`, `RelaySyncSnapshot`, `NostrAdapterMetrics`).
+4. **Aggregate only.** Exported series are counts and fixed-bucket histograms (fine-grained for collection resolution —
+   see [Histogram resolution](#histogram-resolution)) accumulated over a window. No per-event, per-message, or
+   per-timestamp rows. This is the same shape the device-local snapshots already produce (`RelayDeliverySpread`,
+   `RelaySyncSnapshot`, `NostrAdapterMetrics`).
 5. **k-anonymity at the dashboard.** A relay's experienced-quality series is shown only when at least `k` distinct
-   reporters have contributed to it, enforced at aggregation/query time in the metrics stack. A relay seen by one client
-   is not individually distinguishable. `k` is a deployment parameter (see open questions).
+   reporters have contributed to it, enforced at aggregation/query time in the metrics stack. `k` is a deployment
+   parameter. **During internal testing `k = 1`**, to gather as much data as possible while the only reporters are our
+   own builds. `k` MUST be raised to a conservative value — and the IP-stripping proxy of requirement 6 stood up —
+   before any non-internal rollout.
 6. **No source attribution at rest.** The receiving endpoint MUST NOT persist source IPs joined to series, and SHOULD
    terminate behind a proxy that strips them, so the stored data cannot re-link a series to a reporter after the fact.
 
@@ -109,6 +112,22 @@ to a first-party receiver, or OTLP to a collector, behind an IP-stripping proxy.
 distinct relays (hundreds), which is fine as a single label dimension. The metrics stack applies the k-anonymity gate at
 query time.
 
+**Backend — decided: Grafana.** Relay data goes to Grafana (Prometheus/TSDB behind it), which is the right home for
+latency histograms and percentile/ranking dashboards, and where the server-side strfry fleet metrics already live — so
+client-experienced and server-side relay views sit side by side. **Aptabase is reserved for future product analytics**
+(usage, retention, feature events); its anonymous event-count model is a poor fit for latency distributions and has no
+native histogram/percentile story, so relay telemetry does not go there. During internal testing (`k = 1`), clients push
+directly to the first-party Grafana/OTLP endpoint; the IP-stripping proxy and dashboard k-anonymity gate are stood up
+before any external reporters are added.
+
+### Histogram resolution
+
+Buckets are deliberately fine-grained, since the collected data is only as precise as the bucket edges and we want
+high-resolution percentiles for both relay ranking and quiescence tuning. The device-local histograms in
+[`telemetry::DurationHistogram`](../../crates/transport-nostr-adapter/src/telemetry.rs) define the bucket edges (ms);
+the exporter forwards those same edges. Memory is bounded — a handful of `u64` counters per relay per metric — so finer
+buckets are cheap.
+
 ## Proposed observability.md amendment
 
 `observability.md` currently states relay URLs must never appear in telemetry and that Marmot exposes only
@@ -124,7 +143,7 @@ aggregate/redacted relay-health summaries. Add a bounded carve-out:
 > source IPs are not persisted against series. Relay identity is the sole identifier permitted to leave the device, and
 > only as the subject being measured. This carve-out applies to the export channel alone and never to logs or traces.
 
-The amendment is applied to `observability.md` when this spec is accepted, not before.
+This amendment is **accepted and now applied** in [`overview/observability.md`](./overview/observability.md).
 
 ## Phasing
 
@@ -138,12 +157,18 @@ The amendment is applied to `observability.md` when this spec is accepted, not b
 
 Server-side strfry fleet telemetry is independent and can proceed in parallel at any time.
 
+## Decided
+
+- **k value: `k = 1` for now.** During internal testing we want as much data as possible; the only reporters are our own
+  builds. Raise to a conservative value (and stand up the IP-stripping proxy) before any external rollout.
+- **Backend: Grafana** for relay data; Aptabase reserved for future product analytics (see
+  [Collection and export architecture](#collection-and-export-architecture)).
+- **Histogram buckets: fine-grained** (see [Histogram resolution](#histogram-resolution)).
+
 ## Open questions
 
-- **k value.** What anonymity threshold balances useful coverage against re-identification risk? Too high hides
-  long-tail relays; too low weakens the guarantee. Likely a deployment parameter with a conservative default.
-- **Push transport.** `remote_write` vs OTLP vs a thin custom receiver — which best supports the IP-stripping and
-  no-client-label requirements without bespoke infrastructure?
+- **Push transport.** `remote_write` vs OTLP vs a thin custom receiver into Grafana — which best supports the
+  IP-stripping and no-client-label requirements without bespoke infrastructure?
 - **Consent granularity.** One toggle for all relay telemetry, or separate consent for ranking vs quiescence-tuning
   data? The latter is population-level and arguably lower-risk.
 - **Mobile cost.** Export window and batching that respect battery and metered-network constraints.
