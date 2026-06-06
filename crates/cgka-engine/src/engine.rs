@@ -72,6 +72,11 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
     pub(crate) convergence_clock_started_at: Instant,
+
+    /// Diagnostic post-settle reorg telemetry. Recorded at the convergence
+    /// apply site and exposed via [`Engine::engine_metrics`]. Never an input to
+    /// convergence or branch selection.
+    pub(crate) engine_metrics: crate::engine_metrics::EngineMetrics,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -191,6 +196,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
+            engine_metrics: crate::engine_metrics::EngineMetrics::default(),
         })
     }
 }
@@ -233,6 +239,22 @@ impl<S: StorageProvider> Engine<S> {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Aggregate, privacy-safe snapshot of engine diagnostic telemetry.
+    ///
+    /// Currently the post-settle reorg counters and histograms used for
+    /// quiescence tuning (`docs/marmot-architecture/relay-delivery-telemetry.md`
+    /// §"Validation: post-settle reorg rate"). Carries only counts and
+    /// millisecond/commit buckets — no group ids, epochs, or branch ids. Like
+    /// `drain_events`, it is read-only and never feeds convergence.
+    pub fn engine_metrics(&self) -> crate::engine_metrics::EngineMetricsSnapshot {
+        tracing::trace!(
+            target: "cgka_engine::engine_metrics",
+            method = "engine_metrics",
+            "snapshotting engine metrics"
+        );
+        self.engine_metrics.snapshot()
     }
 
     /// Return the Marmot group metadata mirrored from signed MLS group state.

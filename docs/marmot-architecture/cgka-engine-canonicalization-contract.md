@@ -376,6 +376,7 @@ removes each queued intent after regeneration succeeds. If regeneration creates 
 CanonicalizationResult {
   previous_tip,
   selected_tip,
+  selected_fork_epoch,
   selected_branch_id,
   convergence_status,
   accepted_commits,
