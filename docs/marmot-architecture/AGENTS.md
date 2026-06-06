@@ -14,7 +14,8 @@ Agent map for the Marmot architecture docs.
 8. `cgka-engine-canonicalization-contract.md`
 9. `distributed-convergence.md`
 10. `relay-delivery-telemetry.md`
-11. `../../spec/README.md` when the task touches the Marmot v2 protocol draft.
+11. `relay-observability.md`
+12. `../../spec/README.md` when the task touches the Marmot v2 protocol draft.
 
 ## Document roles
 
@@ -44,6 +45,9 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `relay-delivery-telemetry.md`
   - **Role:** Relay delivery measurement and quiescence tuning; companion to `distributed-convergence.md`.
+
+- **Path:** `relay-observability.md`
+  - **Role:** Export contract for client-side relay telemetry: privacy contract, metric catalogue, and observability.md amendment.
 
 - **Path:** `../../spec/`
   - **Role:** Marmot v2 protocol draft by stable surface and app component.

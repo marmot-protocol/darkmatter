@@ -204,8 +204,9 @@ device-local, and carries no relay identity. A separate, larger workstream wants
 (latency, EOSE timing, delivery success, kind acceptance, negentropy sync health) exported to an operator metrics stack
 so relays can be ranked good-vs-bad, including a self-hosted strfry fleet that reconciles internally over negentropy.
 
-That workstream is distinct and gets its own design doc, because ranking relays requires relay identity in exported
-metrics, which the current [`observability.md`](./overview/observability.md) rule forbids. The agreed direction is:
+That workstream is distinct and has its own design doc — [`relay-observability.md`](./relay-observability.md) — because
+ranking relays requires relay identity in exported metrics, which the current
+[`observability.md`](./overview/observability.md) rule forbids. The agreed direction is:
 **relay-identified metrics MAY leave the device to a first-party metrics stack, but only aggregated, opt-in, and behind
 k-anonymity thresholds**; that decision will be carried into an `observability.md` amendment when the broad-telemetry
 workstream starts. Until then, the per-relay timing in phase 2 keeps relays as opaque device-local indices and exports

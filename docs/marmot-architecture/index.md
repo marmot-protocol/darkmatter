@@ -101,6 +101,10 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Measuring relay delivery behavior to tune convergence quiescence; cross-relay arrival spread,
     quiescence regimes, and the backfill/reconciliation backstop.
 
+- **Doc:** [`relay-observability.md`](./relay-observability.md)
+  - **What it covers:** Export contract for client-side relay performance telemetry: the opt-in/aggregate/k-anonymous
+    privacy contract, metric catalogue, collection architecture, and the proposed observability.md amendment.
+
 - **Doc:** [`../../spec/README.md`](../../spec/README.md)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.
 
