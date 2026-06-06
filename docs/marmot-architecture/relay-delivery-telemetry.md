@@ -112,7 +112,8 @@ values in any emitted form.
 
 `cross_relay_spread` is the foundational one and is self-contained in the transport adapter. The first-event and EOSE
 timing land via the raw per-relay event/EOSE stream (phase 2; see [Instrumentation interface](#instrumentation-interface)).
-`observed_reorg_rate` is owned by the engine, not the adapter, and is recorded against settle outcomes.
+`observed_reorg_rate` is owned by the engine, not the adapter, and is recorded against settle outcomes — specified in
+[Validation: post-settle reorg rate](#validation-post-settle-reorg-rate).
 
 ## Choosing the static value
 
@@ -131,6 +132,67 @@ constant from real data, once, and set it in group policy. The procedure is offl
 The existing policy already treats `settlement_quiescence_ms` as a floor a client MAY exceed, but only as a deliberate
 static configuration choice — never derived from a client's own live measurements. The measurement-to-value step is a
 human decision fed by dashboards, not a runtime controller.
+
+## Validation: post-settle reorg rate
+
+`observed_reorg_rate` is the engine-side half of the [loss function](#the-loss-function): it measures how often settling
+turned out to be premature, which is the only direct evidence that a chosen `settlement_quiescence_ms` is *too low*. The
+spread distribution tells you what value *might* be safe; the reorg rate tells you whether it *was*.
+
+### What a reorg is, in engine terms
+
+The engine reaches `Settled` when quiescence has elapsed and every pending input has a disposition
+(`ConvergenceStatus::Settled`, `crates/cgka-engine/src/canonicalization.rs`). It then applies the selected canonical
+branch (`set_stable`) and emits `GroupEvent::EpochChanged { from, to }`. A **post-settle reorg** is the case where, after
+a group has applied a canonical branch while `Settled`, a later canonicalization pass — triggered by a commit that
+arrived *after* that settle, with a `fork_epoch` at or above the retained anchor (i.e. within `max_rewind_commits`) —
+selects a *different* canonical branch that diverges at or below the previously-applied tip. This is the engine's
+existing fork-recovery path (`GroupEvent::ForkRecovered { source_epoch, recovered_epoch, winner, invalidated }`,
+`crates/cgka-engine/src/fork_recovery.rs`); losing-branch app messages are re-dispositioned
+`InvalidatedAppMessageReason::LosingBranch`.
+
+A normal forward advance — where the selected branch extends the previously-applied one — is **not** a reorg. The engine
+does not distinguish these today; both surface as `EpochChanged`. So the metric requires a small addition: a per-group
+record of the last branch applied while `Settled` (its tip, branch id, and the local settle time), against which the
+next applied selection is classified.
+
+### What to record
+
+Engine-side, aggregate across groups, local-monotonic timing, never `created_at`:
+
+| Signal | Shape | Why |
+| --- | --- | --- |
+| `settles` | counter | denominator: settle episodes, summed across groups |
+| `post_settle_reorgs` | counter | numerator: settles later superseded by a diverging branch |
+| `reorg_rewind_depth` | histogram (commits) | `previous_applied_tip - new_fork_epoch`; how deep the rewind was, vs. `max_rewind_commits` |
+| `reorg_lateness_ms` | histogram (ms) | local time from the superseded settle to the reorg — **how much more quiescence would have prevented it** |
+
+`observed_reorg_rate = post_settle_reorgs / settles` is derived. `reorg_lateness_ms` is the most directly actionable
+signal of all: its distribution is exactly the extra wait that would have avoided each reorg, so a high percentile of it
+is the empirical correction to add on top of the cross-relay-spread floor when
+[choosing the static value](#choosing-the-static-value).
+
+### Where it lives
+
+The engine has no metrics struct today (unlike the adapter's `NostrAdapterMetrics`). The natural home is a counters
+struct on `Engine<S>`, incremented at the apply/settle site (`crates/cgka-engine/src/distributed_convergence.rs`, where
+`set_stable` runs and `EpochChanged` / `ForkRecovered` are emitted), with a per-group in-memory last-applied record for
+reorg classification, exposed by a new `engine_metrics()`-style accessor alongside the existing `drain_events()`.
+
+Like all telemetry here it is **diagnostic only and must never feed convergence or branch selection**, and the snapshot
+carries only counts and millisecond buckets — no group ids, epochs, branch ids, or member ids in any emitted form.
+Because it is engine-side it is not an adapter metric; it joins the export path through the relay-plane rollup and ships
+to Grafana over the same OTLP exporter as the relay metrics.
+
+### Open questions
+
+- **Reorgs during `Resolving`.** Only *post-`Settled`* reorgs reflect premature settling; a re-selection while still
+  `Resolving` (before the app was told anything) is normal convergence, not a tuning signal. The classifier gates on
+  "the superseded branch was observed in a `Settled` pass," which the per-group record tracks.
+- **Denominator choice.** `reorgs / settles` is the natural rate, but `reorgs / canonical-advances` or a per-unit-time
+  rate may read better on a dashboard; the raw counters are exported so the operating choice stays open.
+- **Restart semantics.** The per-group last-applied record is in-memory; after a restart the first settle re-establishes
+  it and is not classified as a reorg. That under-counts slightly across restarts and is acceptable for a tuning signal.
 
 ## Backfill and reconciliation
 
@@ -190,7 +252,8 @@ the engine against settle outcomes and is out of scope for the adapter.
    ([`telemetry::RelaySyncTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)). *Resolving* those opaque
    indices to relay identity for export is the broad-observability workstream
    ([`relay-observability.md`](./relay-observability.md)).
-3. **Engine-side reorg-rate telemetry.** Closes the quiescence loss function by measuring post-settle reorgs.
+3. **Engine-side reorg-rate telemetry.** *Specified*, implementation pending. Closes the quiescence loss function by
+   measuring post-settle reorgs; see [Validation: post-settle reorg rate](#validation-post-settle-reorg-rate).
 4. **Set the static value from data.** Aggregate (1) and (3) over real relays and groups, read the distributions, and
    choose the negotiated `settlement_quiescence_ms`. An offline operator/analysis step, not a runtime controller.
 5. **Set reconciliation (NIP-77).** Fetch-completeness backstop for backdated late commits.
