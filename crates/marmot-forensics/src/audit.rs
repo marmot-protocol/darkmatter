@@ -233,6 +233,13 @@ impl JsonlRecorder {
 
 impl ForensicRecorder for JsonlRecorder {
     fn record(&self, record: AuditRecord) {
+        // Poisoning means a prior `record()` panicked while holding the lock.
+        // The inner state (writer + seq + engine_id) is plain data — no
+        // partially-mutated invariant survives across the panic boundary that
+        // would make it unsafe to read here. We recover and continue rather
+        // than propagate the panic: the forensic recorder must NEVER crash the
+        // engine's hot path, since the audit log is a debug aid layered on top
+        // of normal operation.
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
