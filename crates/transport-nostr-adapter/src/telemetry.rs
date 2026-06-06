@@ -83,6 +83,88 @@ impl RelayIndexRegistry {
         self.indices.insert(endpoint.clone(), index);
         index
     }
+
+    /// Resolve an opaque index back to its relay endpoint, if one is assigned.
+    ///
+    /// This is the only reverse mapping in the module. It exists solely for the
+    /// opt-in export label boundary; the adapter gates access behind
+    /// [`RelayExportConsent`], so callers cannot reach a populated registry
+    /// without one.
+    pub fn resolve(&self, index: RelayIndex) -> Option<&TransportEndpoint> {
+        self.indices
+            .iter()
+            .find_map(|(endpoint, candidate)| (*candidate == index).then_some(endpoint))
+    }
+
+    /// Every assigned `(index, endpoint)` pair, ascending by index.
+    pub fn resolutions(&self) -> Vec<(RelayIndex, TransportEndpoint)> {
+        let mut pairs: Vec<(RelayIndex, TransportEndpoint)> = self
+            .indices
+            .iter()
+            .map(|(endpoint, index)| (*index, endpoint.clone()))
+            .collect();
+        pairs.sort_by_key(|(index, _)| index.0);
+        pairs
+    }
+}
+
+/// Capability that authorizes resolving opaque [`RelayIndex`] values back to
+/// relay endpoints for the opt-in telemetry export boundary.
+///
+/// Relay identity is the sole identifier permitted to leave the device, and
+/// only as the subject being measured (see
+/// `docs/marmot-architecture/relay-observability.md`). Turning a device-local
+/// index into a relay URL therefore requires one of these tokens, and a token
+/// MUST be minted only where the user has explicitly opted in to export. There
+/// is deliberately no other path from an index to a relay URL.
+#[derive(Clone, Copy, Debug)]
+pub struct RelayExportConsent {
+    _seal: (),
+}
+
+impl RelayExportConsent {
+    /// Affirm the relay-telemetry export opt-in.
+    ///
+    /// Call ONLY from the opt-in export boundary, after confirming the user has
+    /// enabled export. Minting a consent token anywhere else violates the
+    /// privacy contract in `relay-observability.md`.
+    pub fn affirm() -> Self {
+        Self { _seal: () }
+    }
+}
+
+/// Resolved relay-identity labels for the export boundary.
+///
+/// Maps opaque device-local [`RelayIndex`] values to their relay endpoints.
+/// Produced only behind [`RelayExportConsent`]; this is the one place a relay
+/// URL is attached to telemetry, and only for first-party export.
+#[derive(Clone, Debug, Default)]
+pub struct RelayLabelResolution {
+    labels: HashMap<RelayIndex, TransportEndpoint>,
+}
+
+impl RelayLabelResolution {
+    /// Build a resolution from `(index, endpoint)` pairs.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (RelayIndex, TransportEndpoint)>) -> Self {
+        Self {
+            labels: pairs.into_iter().collect(),
+        }
+    }
+
+    /// Relay endpoint label for an index, if known.
+    pub fn label_for(&self, index: RelayIndex) -> Option<&TransportEndpoint> {
+        self.labels.get(&index)
+    }
+
+    /// Number of resolved relay labels.
+    pub fn len(&self) -> usize {
+        self.labels.len()
+    }
+
+    /// Whether no relay labels are resolved.
+    pub fn is_empty(&self) -> bool {
+        self.labels.is_empty()
+    }
 }
 
 /// Internal fixed-bucket duration histogram in milliseconds.
@@ -550,6 +632,36 @@ mod tests {
         let first = registry.index_for(&a);
         assert_eq!(registry.index_for(&b), RelayIndex(1));
         assert_eq!(registry.index_for(&a), first, "stable across calls");
+    }
+
+    #[test]
+    fn registry_resolves_indices_back_to_endpoints() {
+        let mut registry = RelayIndexRegistry::default();
+        let a = TransportEndpoint("wss://a".into());
+        let b = TransportEndpoint("wss://b".into());
+        let ia = registry.index_for(&a);
+        let ib = registry.index_for(&b);
+
+        assert_eq!(registry.resolve(ia), Some(&a));
+        assert_eq!(registry.resolve(ib), Some(&b));
+        assert_eq!(registry.resolve(RelayIndex(99)), None);
+        assert_eq!(registry.resolutions(), vec![(ia, a), (ib, b)]);
+    }
+
+    #[test]
+    fn relay_label_resolution_maps_indices_to_endpoints() {
+        let resolution = RelayLabelResolution::from_pairs([
+            (RelayIndex(0), TransportEndpoint("wss://a".into())),
+            (RelayIndex(1), TransportEndpoint("wss://b".into())),
+        ]);
+        assert_eq!(resolution.len(), 2);
+        assert!(!resolution.is_empty());
+        assert_eq!(
+            resolution.label_for(RelayIndex(1)),
+            Some(&TransportEndpoint("wss://b".into()))
+        );
+        assert_eq!(resolution.label_for(RelayIndex(2)), None);
+        assert!(RelayLabelResolution::default().is_empty());
     }
 
     #[test]

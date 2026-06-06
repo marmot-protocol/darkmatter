@@ -102,7 +102,7 @@ pub use agent_streams::{
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
 pub use client::AppClient;
-pub use config::MarmotAppConfig;
+pub use config::{MarmotAppConfig, RelayTelemetryExportConfig};
 pub use error::AppError;
 pub use groups::{
     AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupImageComponent,
@@ -140,7 +140,7 @@ pub use storage_sqlite::{
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
-    RelayDeliveryStats, RelayLatencyStats, RelaySyncSnapshot,
+    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
 };
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};

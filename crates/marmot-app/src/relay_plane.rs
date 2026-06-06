@@ -19,8 +19,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     NostrAdapterMetrics, NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient,
-    NostrSdkRelayHealth, NostrTransportAdapter, RelayDeliverySpread, RelaySyncSnapshot,
+    NostrSdkRelayHealth, NostrTransportAdapter, RelayDeliverySpread, RelayExportConsent,
+    RelayLabelResolution, RelaySyncSnapshot,
 };
+
+use crate::config::RelayTelemetryExportConfig;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
@@ -314,6 +317,31 @@ impl MarmotRelayPlane {
             sync: adapter.relay_sync().await,
             health: self.relay_health().await,
         }
+    }
+
+    /// Resolve opaque relay indices to relay endpoints — the export label
+    /// boundary.
+    ///
+    /// This is the single opt-in gate for relay-identity resolution. It returns
+    /// `None` unless `config.enabled`; only when opted in does it mint a
+    /// [`RelayExportConsent`] and ask the adapter to reverse-map indices to
+    /// relay URLs. No other code path turns a device-local index into a relay
+    /// URL. See the privacy contract in `relay-observability.md`.
+    pub async fn resolve_relay_labels(
+        &self,
+        config: &RelayTelemetryExportConfig,
+    ) -> Option<RelayLabelResolution> {
+        if !config.enabled {
+            return None;
+        }
+        let consent = RelayExportConsent::affirm();
+        Some(
+            self.inner
+                .transport
+                .adapter
+                .resolve_relay_labels(consent)
+                .await,
+        )
     }
 
     pub(crate) async fn fetch_directory_events(
@@ -1311,6 +1339,43 @@ mod tests {
         assert!(!telemetry.health.sdk_backed);
         // No relay copies were observed, so spread stays empty (no URLs leak).
         assert_eq!(telemetry.delivery_spread.spread.sample_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_label_resolution_is_gated_behind_opt_in() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let endpoint = TransportEndpoint("wss://relay.example".into());
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+
+        alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice,
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        // Off by default: no opt-in means no relay-identity resolution at all.
+        let disabled = RelayTelemetryExportConfig::disabled();
+        assert!(relay_plane.resolve_relay_labels(&disabled).await.is_none());
+
+        // Opted in: the export boundary resolves the opaque index for the
+        // activated inbox endpoint back to its relay URL.
+        let enabled = RelayTelemetryExportConfig { enabled: true };
+        let resolution = relay_plane
+            .resolve_relay_labels(&enabled)
+            .await
+            .expect("opt-in resolves labels");
+        assert!(!resolution.is_empty());
+        assert!(
+            resolution
+                .label_for(transport_nostr_adapter::RelayIndex(0))
+                .is_some()
+        );
     }
 
     #[tokio::test]

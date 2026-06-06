@@ -21,3 +21,22 @@ impl MarmotAppConfig {
         self
     }
 }
+
+/// Opt-in configuration for relay-telemetry export.
+///
+/// Off by default. While `enabled` is `false` nothing is resolved or exported
+/// and the app behaves exactly as today. This is the single opt-in switch that
+/// gates relay-identity resolution and, later, the OTLP exporter — see the
+/// privacy contract in `docs/marmot-architecture/relay-observability.md`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayTelemetryExportConfig {
+    /// Whether the user has opted in to relay-telemetry export. Off by default.
+    pub enabled: bool,
+}
+
+impl RelayTelemetryExportConfig {
+    /// A disabled (opt-out) configuration. This is also [`Default`].
+    pub fn disabled() -> Self {
+        Self { enabled: false }
+    }
+}
