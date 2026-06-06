@@ -126,6 +126,34 @@ impl NostrSdkRelayClient {
                             }
                             RelayPoolNotification::Message {
                                 relay_url,
+                                message:
+                                    RelayMessage::Event {
+                                        subscription_id,
+                                        event,
+                                    },
+                            } => {
+                                // Raw per-relay copy (not deduplicated): telemetry
+                                // only, so cross-relay spread sees every relay's
+                                // copy. Delivery happens on the deduplicated
+                                // `Event` notification above.
+                                if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                                    tracing::trace!(
+                                        target: "transport_nostr_adapter::sdk_client",
+                                        method = "spawn_notification_forwarder",
+                                        "observing per-relay event copy"
+                                    );
+                                    adapter
+                                        .observe_relay_event(NostrRelayEvent {
+                                            endpoint: TransportEndpoint(relay_url.to_string()),
+                                            subscription_id: Some(subscription_id.to_string()),
+                                            event,
+                                        })
+                                        .await;
+                                }
+                                Ok(false)
+                            }
+                            RelayPoolNotification::Message {
+                                relay_url,
                                 message: RelayMessage::EndOfStoredEvents(subscription_id),
                             } => {
                                 tracing::trace!(

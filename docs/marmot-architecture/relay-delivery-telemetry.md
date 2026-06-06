@@ -110,9 +110,9 @@ values in any emitted form.
 | `time_to_eose` | Per relay: local time from subscription start to EOSE. | Initial-sync gating; relays that never EOSE. |
 | `observed_reorg_rate` | Rate of post-settle convergence reorgs attributable to late delivery within the horizon. | The other side of the quiescence loss function. |
 
-`cross_relay_spread` is the foundational one and is fully self-contained in the transport adapter. The per-relay timing
-and EOSE metrics require EOSE plumbing the adapter does not yet have. `observed_reorg_rate` is owned by the engine, not
-the adapter, and is recorded against settle outcomes.
+`cross_relay_spread` is the foundational one and is self-contained in the transport adapter. The first-event and EOSE
+timing land via the raw per-relay event/EOSE stream (phase 2; see [Instrumentation interface](#instrumentation-interface)).
+`observed_reorg_rate` is owned by the engine, not the adapter, and is recorded against settle outcomes.
 
 ## Mapping metrics to policy
 
@@ -156,15 +156,25 @@ Telemetry extends the adapter's existing diagnostic surface rather than introduc
 is `NostrAdapterMetrics` (aggregate lifecycle counters, explicitly barred from feeding convergence) and
 `NostrSdkRelayHealth` (redacted aggregate relay status).
 
-- The adapter records `cross_relay_spread` inside `handle_relay_event`, keyed by the transport-independent
-  `TransportMessage.id`, using a local monotonic clock captured at the adapter, never `created_at`. The per-message
-  first-sighting table is local-only ephemeral state, pruned on a window, and its keys never leave the device or appear
-  in logs.
-- The snapshot accessor returns only aggregate histogram buckets and counts. Relays appear as opaque local indices in
-  any per-relay breakdown, never as URLs, keeping the privacy boundary structural rather than a redaction step.
-- Per-relay `time_to_first_event` / `time_to_eose` and the EOSE initial-sync gate require routing relay EOSE
-  notifications into the adapter (the SDK forwarder currently observes only `Event`). That is a follow-up capability.
-- `observed_reorg_rate` is recorded by the engine against settle outcomes and is out of scope for the adapter.
+There are **two distinct relay taps**, and conflating them silently breaks the spread metric. `nostr-sdk` 0.44 emits a
+`RelayPoolNotification::Event` only the **first time** an event is seen across the pool (deduplicated against its shared
+database), but emits a `RelayPoolNotification::Message` for **every** relay copy, carrying that relay's URL. So:
+
+- **Delivery tap** consumes the deduplicated `Event` notification (`handle_relay_event`): each message is routed to the
+  engine once. It records lifecycle metrics only and MUST NOT record spread or first-event timing — on this path it
+  would only ever see the first relay's copy.
+- **Telemetry tap** consumes the raw per-relay `Message`/`RelayMessage::Event` stream (`observe_relay_event`): it records
+  `cross_relay_spread` (keyed by the transport-independent `TransportMessage.id`) and per-relay first-event timing,
+  seeing every relay copy. Timing uses a local monotonic clock captured at the adapter, never `created_at`. The
+  per-message first-sighting table is local-only ephemeral state, pruned on a window; its keys never leave the device or
+  appear in logs.
+- **EOSE tap** consumes the per-relay `Message`/`RelayMessage::EndOfStoredEvents` stream (`handle_relay_eose`): it
+  advances the initial-sync gate (`subscription_synced`) and records EOSE latency.
+
+This split depends on the SDK deduplicating against a real event database (true for the default in-memory store); a
+no-op store would make the `Event` path double-deliver. The snapshot accessors return only aggregate histogram buckets
+and counts; any future per-relay breakdown uses opaque local indices, never URLs. `observed_reorg_rate` is recorded by
+the engine against settle outcomes and is out of scope for the adapter.
 
 ## Phasing
 

@@ -335,22 +335,12 @@ impl NostrTransportAdapter {
             delivered += 1;
         }
 
-        // Local-time sighting for cross-relay arrival spread and per-relay
-        // sync timing. Uses the adapter's monotonic clock, never the
-        // publisher-controlled `created_at`.
-        let now_ms = self.now_ms();
-        {
-            let mut state = self.state.write().await;
-            state.record_inbound_event(delivered);
-            state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
-            if let Some(subscription_id) = &relay_event.subscription_id {
-                state.record_subscription_first_event(
-                    subscription_id,
-                    &relay_event.endpoint,
-                    now_ms,
-                );
-            }
-        }
+        // Delivery only. The relay pool emits one deduplicated `Event` per
+        // message, so this path counts delivered copies for routing metrics but
+        // MUST NOT record cross-relay spread or per-relay first-event timing:
+        // those need every relay's copy, which arrives on the raw per-relay
+        // stream via `observe_relay_event`, not this deduplicated path.
+        self.state.write().await.record_inbound_event(delivered);
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "handle_relay_event",
@@ -358,6 +348,27 @@ impl NostrTransportAdapter {
             "handled relay event"
         );
         Ok(delivered)
+    }
+
+    /// Record telemetry for one relay's copy of an event, taken from the raw
+    /// per-relay stream.
+    ///
+    /// Unlike [`Self::handle_relay_event`], this performs no delivery. It exists
+    /// to observe every relay copy — including duplicates the delivery path
+    /// deduplicates away — so cross-relay arrival spread and per-relay
+    /// first-event timing can be measured. Timing uses the adapter's monotonic
+    /// clock, never the publisher-controlled `created_at`. Events that fail to
+    /// map to a transport message are ignored.
+    pub async fn observe_relay_event(&self, relay_event: NostrRelayEvent) {
+        let Ok(message) = relay_event.event.to_transport_message() else {
+            return;
+        };
+        let now_ms = self.now_ms();
+        let mut state = self.state.write().await;
+        state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
+        if let Some(subscription_id) = &relay_event.subscription_id {
+            state.record_subscription_first_event(subscription_id, &relay_event.endpoint, now_ms);
+        }
     }
 
     /// Record an end-of-stored-events signal for a subscription on one relay
