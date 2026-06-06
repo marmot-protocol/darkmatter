@@ -10,16 +10,16 @@ use cgka_traits::{
     TransportPublishRequest, TransportPublishTarget,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayPoolNotification, RelayUrl,
-    SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
+    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrTransportAdapter,
+    NostrAdapterMetrics, NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient,
+    NostrSdkRelayHealth, NostrTransportAdapter, RelayDeliverySpread, RelaySyncSnapshot,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -97,6 +97,27 @@ pub struct RelayPlaneHealth {
     pub directory_completed_subscription_syncs: usize,
     pub directory_subscriptions_created: usize,
     pub directory_subscriptions_removed: usize,
+}
+
+/// Device-local relay telemetry bundled for local inspection.
+///
+/// This is the read model behind `dm relay-stats`: it surfaces the adapter's
+/// existing aggregate, privacy-safe snapshots (lifecycle counters, cross-relay
+/// arrival spread, subscription sync timing) alongside redacted relay health.
+///
+/// Per-relay attribution stays behind opaque [`transport_nostr_adapter::RelayIndex`]
+/// values here — resolving an index to a relay URL is reserved for the opt-in
+/// export boundary, never for this local read path.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RelayTelemetrySnapshot {
+    /// Adapter lifecycle counters (accounts, subscriptions, inbound, publish).
+    pub metrics: NostrAdapterMetrics,
+    /// Cross-relay arrival spread and per-relay first-deliverer attribution.
+    pub delivery_spread: RelayDeliverySpread,
+    /// First-event / EOSE subscription sync timing, aggregate and per relay.
+    pub sync: RelaySyncSnapshot,
+    /// Redacted relay-pool and directory health.
+    pub health: RelayPlaneHealth,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -277,6 +298,22 @@ impl MarmotRelayPlane {
             return RelayPlaneHealth::from_sdk(sdk_relay_client.relay_health().await, directory);
         }
         RelayPlaneHealth::from_directory(directory)
+    }
+
+    /// Snapshot the device-local relay telemetry for local inspection.
+    ///
+    /// Aggregate and privacy-safe: counts, millisecond histogram buckets, and
+    /// opaque relay indices only. There is a single shared adapter per device,
+    /// so these counters already span every local account. Resolving the opaque
+    /// indices to relay URLs is reserved for the opt-in export path.
+    pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
+        let adapter = &self.inner.transport.adapter;
+        RelayTelemetrySnapshot {
+            metrics: adapter.metrics().await,
+            delivery_spread: adapter.delivery_spread().await,
+            sync: adapter.relay_sync().await,
+            health: self.relay_health().await,
+        }
     }
 
     pub(crate) async fn fetch_directory_events(
@@ -711,6 +748,55 @@ fn spawn_relay_notification_forwarder(
                                     event,
                                 });
                             }
+                            Ok(false)
+                        }
+                        RelayPoolNotification::Message {
+                            relay_url,
+                            message:
+                                RelayMessage::Event {
+                                    subscription_id,
+                                    event,
+                                },
+                        } => {
+                            // Raw per-relay copy (not deduplicated): telemetry
+                            // only, so cross-relay arrival spread and per-relay
+                            // first-event timing see every relay's copy. Delivery
+                            // happens on the deduplicated `Event` arm above. Keep
+                            // this in sync with the relay plane's own tap; the
+                            // SDK client's standalone forwarder is unused here.
+                            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                                tracing::trace!(
+                                    target: "marmot_app::relay_plane",
+                                    method = "spawn_relay_notification_forwarder",
+                                    "observing per-relay event copy"
+                                );
+                                adapter
+                                    .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
+                                        endpoint: TransportEndpoint(relay_url.to_string()),
+                                        subscription_id: Some(subscription_id.to_string()),
+                                        event,
+                                    })
+                                    .await;
+                            }
+                            Ok(false)
+                        }
+                        RelayPoolNotification::Message {
+                            relay_url,
+                            message: RelayMessage::EndOfStoredEvents(subscription_id),
+                        } => {
+                            // EOSE tap: advances the per-relay initial-sync gate
+                            // and records EOSE latency. No delivery.
+                            tracing::trace!(
+                                target: "marmot_app::relay_plane",
+                                method = "spawn_relay_notification_forwarder",
+                                "forwarding SDK relay end-of-stored-events"
+                            );
+                            adapter
+                                .handle_relay_eose(
+                                    TransportEndpoint(relay_url.to_string()),
+                                    subscription_id.to_string(),
+                                )
+                                .await;
                             Ok(false)
                         }
                         RelayPoolNotification::Shutdown => {
@@ -1190,6 +1276,41 @@ mod tests {
             NostrSubscription::AccountInbox { endpoints, .. }
             | NostrSubscription::Group { endpoints, .. } => endpoints.len() == 1,
         }));
+    }
+
+    #[tokio::test]
+    async fn relay_telemetry_reflects_activation_through_the_plane() {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let group_id = GroupId::new(vec![0xC3; 32]);
+        let alice_adapter = relay_plane.account_adapter(alice.clone(), relay.clone());
+
+        alice_adapter
+            .activate_account(TransportAccountActivation {
+                account_id: alice,
+                inbox_endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id,
+                    transport_group_id: vec![0xD4; 32],
+                    endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+                }],
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let telemetry = relay_plane.relay_telemetry().await;
+        // The single shared adapter records subscription lifecycle and the
+        // initial-sync gate as soon as an account activates, so the bundled
+        // snapshot is populated without any relay traffic.
+        assert_eq!(telemetry.metrics.active_accounts, 1);
+        assert!(telemetry.metrics.subscriptions_created >= 2);
+        assert!(telemetry.sync.tracked_subscriptions >= 2);
+        // No SDK relay client is wired in this unit harness.
+        assert!(!telemetry.health.sdk_backed);
+        // No relay copies were observed, so spread stays empty (no URLs leak).
+        assert_eq!(telemetry.delivery_spread.spread.sample_count(), 0);
     }
 
     #[tokio::test]

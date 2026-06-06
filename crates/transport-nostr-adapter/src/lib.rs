@@ -152,7 +152,7 @@ enum NostrSubscriptionRouteKey {
 ///
 /// These counters are diagnostic. They must not feed convergence or branch
 /// selection.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NostrAdapterMetrics {
     pub active_accounts: usize,
     pub active_group_subscriptions: usize,

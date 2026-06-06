@@ -2930,6 +2930,7 @@ async fn handle_app_runtime_command_request(
             )
             .await
         }
+        crate::Command::RelayStats => crate::relay_stats_command_with_runtime(runtime).await,
         _ => return None,
     };
     Some(crate::command_output_result(cli.json, output))
@@ -2955,6 +2956,7 @@ fn is_hosted_runtime_command(cli: &Cli) -> bool {
         | crate::Command::Follows { .. }
         | crate::Command::Profile { .. }
         | crate::Command::Relays { .. }
+        | crate::Command::RelayStats
         | crate::Command::Media { .. } => true,
         _ => false,
     }

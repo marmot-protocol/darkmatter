@@ -130,11 +130,17 @@ pub use notifications::{
     PushPlatform, PushRegistration, build_notification_gift_wrap, build_notification_rumor_content,
     encrypted_mip05_token, parse_provider_token, push_token_fingerprint,
 };
-pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
+pub use relay_plane::{
+    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth, RelayTelemetrySnapshot,
+};
 pub use storage_sqlite::{
     ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,
     TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineReactionSummary,
     TimelineReplyPreview, TimelineUserReaction,
+};
+pub use transport_nostr_adapter::{
+    DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
+    RelayDeliveryStats, RelayLatencyStats, RelaySyncSnapshot,
 };
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
@@ -887,6 +893,15 @@ struct OpenAppAccount {
 impl MarmotApp {
     pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
         Self::with_relays(root, vec![relay_url.into()])
+    }
+
+    /// Snapshot the device-local relay telemetry of this app's relay plane.
+    ///
+    /// Aggregate and privacy-safe. Live numbers accumulate in the long-running
+    /// daemon runtime; a standalone command queries its own (typically empty)
+    /// relay plane.
+    pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
+        self.relay_plane.relay_telemetry().await
     }
 
     pub fn with_relay_and_config(

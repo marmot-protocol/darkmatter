@@ -29,6 +29,7 @@ use std::collections::HashSet;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
+use serde::{Deserialize, Serialize};
 
 /// Upper bounds, in milliseconds, of the duration histogram buckets shared by
 /// spread and sync-timing measurements.
@@ -59,7 +60,9 @@ const DEFAULT_TRACKING_WINDOW_MS: u64 = 60_000;
 /// Never a relay URL. The endpoint-to-index mapping lives in
 /// [`RelayIndexRegistry`] and stays on the device, so per-relay telemetry can
 /// exist without exporting relay URLs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct RelayIndex(pub u32);
 
 /// Device-local assignment of stable opaque indices to relay endpoints.
@@ -142,7 +145,7 @@ fn aggregate_histograms<'a>(
 }
 
 /// One histogram bucket of a duration distribution.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistogramBucket {
     /// Inclusive upper bound of the bucket, in milliseconds.
     pub upper_bound_ms: u64,
@@ -154,7 +157,7 @@ pub struct HistogramBucket {
 ///
 /// Contains only counts and millisecond bucket bounds: no message ids, relay
 /// endpoints, subscription ids, or payload-derived values.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurationHistogramSnapshot {
     /// Histogram by ascending upper bound.
     pub buckets: Vec<HistogramBucket>,
@@ -318,7 +321,7 @@ impl RelayDeliveryTelemetry {
 }
 
 /// Per-relay delivery attribution for one relay.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayDeliveryStats {
     /// Opaque device-local relay index.
     pub relay_index: u32,
@@ -338,7 +341,7 @@ impl RelayDeliveryStats {
 }
 
 /// Aggregate cross-relay arrival-spread snapshot.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RelayDeliverySpread {
     /// Distinct logical messages observed within the tracking window.
     pub observed: u64,
@@ -499,7 +502,7 @@ fn subscription_is_synced(sub: &SubscriptionProgress) -> bool {
 }
 
 /// Per-relay first-event and EOSE latency for one relay.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayLatencyStats {
     /// Opaque device-local relay index.
     pub relay_index: u32,
@@ -513,7 +516,7 @@ pub struct RelayLatencyStats {
 ///
 /// Counts, opaque relay indices, and millisecond histograms only: no
 /// subscription ids or relay endpoints.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelaySyncSnapshot {
     /// Subscriptions currently tracked.
     pub tracked_subscriptions: u64,
