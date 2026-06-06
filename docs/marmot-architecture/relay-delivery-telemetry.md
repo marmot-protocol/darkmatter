@@ -114,20 +114,23 @@ values in any emitted form.
 timing land via the raw per-relay event/EOSE stream (phase 2; see [Instrumentation interface](#instrumentation-interface)).
 `observed_reorg_rate` is owned by the engine, not the adapter, and is recorded against settle outcomes.
 
-## Mapping metrics to policy
+## Choosing the static value
 
-The convergence policy already says `settlement_quiescence_ms` is a group **floor** that clients MAY exceed locally but
-MUST NOT undercut. That is exactly the structure the measurements want:
+`settlement_quiescence_ms` is a single group-negotiated constant. It is **not** computed per client and it does **not**
+adapt at runtime. The point of this telemetry is the opposite of auto-tuning: it lets an operator choose the right
+constant from real data, once, and set it in group policy. The procedure is offline:
 
-- **Local adaptive value.** Each client computes a local steady-state quiescence from a high percentile of its own
-  `cross_relay_spread` distribution plus margin, clamped to at least the negotiated floor. A client with a tight,
-  redundant relay set settles fast; a client with a flaky set waits longer, without forcing everyone to the slowest
-  member's value.
-- **Negotiated floor.** The aggregate spread distribution across the membership informs what the group floor should be.
-  This is a human/policy decision fed by telemetry, not an automated negotiation.
+- **Gather.** Collect `cross_relay_spread` (and, for the initial-sync side, the EOSE / first-event timing) across the
+  real relay population and real groups, aggregated into the histograms this telemetry already produces.
+- **Read the distribution.** Pick a candidate operating point — for example a high percentile of the steady-state spread
+  plus margin. The loss function is asymmetric: too low costs extra post-settle reorgs (observable as
+  `observed_reorg_rate`), too high costs liveness. Move the candidate until the reorg rate is acceptable.
+- **Set the constant.** Encode the chosen value in the negotiated convergence policy. Every member processing an epoch
+  uses the same policy bytes; this is not a local preference.
 
-This keeps the static-constant tension resolved: the constant becomes a conservative floor, and adaptation happens
-locally and upward from measured evidence.
+The existing policy already treats `settlement_quiescence_ms` as a floor a client MAY exceed, but only as a deliberate
+static configuration choice — never derived from a client's own live measurements. The measurement-to-value step is a
+human decision fed by dashboards, not a runtime controller.
 
 ## Backfill and reconciliation
 
@@ -187,7 +190,8 @@ the engine against settle outcomes and is out of scope for the adapter.
    those latencies (opaque indices, ranking) is deferred to the broad-observability workstream, since that is where
    relay-identified export is decided.
 3. **Engine-side reorg-rate telemetry.** Closes the quiescence loss function by measuring post-settle reorgs.
-4. **Local adaptive quiescence.** Consumes (1) and (3) to compute a local value above the negotiated floor.
+4. **Set the static value from data.** Aggregate (1) and (3) over real relays and groups, read the distributions, and
+   choose the negotiated `settlement_quiescence_ms`. An offline operator/analysis step, not a runtime controller.
 5. **Set reconciliation (NIP-77).** Fetch-completeness backstop for backdated late commits.
 
 Each phase is independently useful and independently shippable, and (1) de-risks the rest by telling us what our relay
