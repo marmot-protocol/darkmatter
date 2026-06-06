@@ -22,7 +22,7 @@ for reconnect/backoff and relay status mechanics.
 | --- | --- |
 | `src/lib.rs` | Adapter implementation, relay-client boundary, routing state, lifecycle metrics. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
-| `src/telemetry.rs` | Cross-relay arrival-spread recorder (Phase 1 of relay delivery telemetry); local-time, aggregate, privacy-safe. |
+| `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
 
 ## Invariants

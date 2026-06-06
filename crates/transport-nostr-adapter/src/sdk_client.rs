@@ -8,8 +8,8 @@ use cgka_traits::{
     TransportEndpointReceipt,
 };
 use nostr_sdk::prelude::{
-    Alphabet, Client, Event, EventBuilder, Filter, Kind, PublicKey, RelayPoolNotification,
-    RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, Tag, TagKind,
+    Alphabet, Client, Event, EventBuilder, Filter, Kind, PublicKey, RelayMessage,
+    RelayPoolNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, Tag, TagKind,
     Timestamp as NostrTimestamp,
 };
 use tokio::sync::RwLock;
@@ -122,6 +122,23 @@ impl NostrSdkRelayClient {
                                         })
                                         .await;
                                 }
+                                Ok(false)
+                            }
+                            RelayPoolNotification::Message {
+                                relay_url,
+                                message: RelayMessage::EndOfStoredEvents(subscription_id),
+                            } => {
+                                tracing::trace!(
+                                    target: "transport_nostr_adapter::sdk_client",
+                                    method = "spawn_notification_forwarder",
+                                    "forwarding SDK relay EOSE"
+                                );
+                                adapter
+                                    .handle_relay_eose(
+                                        TransportEndpoint(relay_url.to_string()),
+                                        subscription_id.to_string(),
+                                    )
+                                    .await;
                                 Ok(false)
                             }
                             RelayPoolNotification::Shutdown => {

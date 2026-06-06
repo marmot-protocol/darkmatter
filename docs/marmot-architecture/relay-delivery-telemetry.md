@@ -168,16 +168,35 @@ is `NostrAdapterMetrics` (aggregate lifecycle counters, explicitly barred from f
 
 ## Phasing
 
-1. **Cross-relay arrival spread (foundational).** Self-contained in the transport adapter; no protocol change. Gives the
-   steady-state quiescence distribution and relay-redundancy health. This is the first increment.
-2. **EOSE plumbing and per-relay timing.** Routes EOSE into the adapter, enabling the initial-sync gate and per-relay
-   first-event / EOSE latencies.
+1. **Cross-relay arrival spread (foundational).** *Done.* Self-contained in the transport adapter; no protocol change.
+   Gives the steady-state quiescence distribution and relay-redundancy health.
+   ([`telemetry::RelayDeliveryTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)).
+2. **EOSE plumbing and sync timing.** *Done.* Routes EOSE into the adapter, exposing the per-subscription initial-sync
+   gate (`subscription_synced`) plus aggregate first-event / EOSE latency histograms relative to subscribe time
+   ([`telemetry::RelaySyncTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)). Per-relay *attribution* of
+   those latencies (opaque indices, ranking) is deferred to the broad-observability workstream, since that is where
+   relay-identified export is decided.
 3. **Engine-side reorg-rate telemetry.** Closes the quiescence loss function by measuring post-settle reorgs.
 4. **Local adaptive quiescence.** Consumes (1) and (3) to compute a local value above the negotiated floor.
 5. **Set reconciliation (NIP-77).** Fetch-completeness backstop for backdated late commits.
 
 Each phase is independently useful and independently shippable, and (1) de-risks the rest by telling us what our relay
 population actually looks like before we commit to (4) or (5).
+
+## Relation to broad relay observability
+
+This note is scoped to *convergence tuning*: every metric here exists to inform a quiescence decision, stays
+device-local, and carries no relay identity. A separate, larger workstream wants per-relay **performance** telemetry
+(latency, EOSE timing, delivery success, kind acceptance, negentropy sync health) exported to an operator metrics stack
+so relays can be ranked good-vs-bad, including a self-hosted strfry fleet that reconciles internally over negentropy.
+
+That workstream is distinct and gets its own design doc, because ranking relays requires relay identity in exported
+metrics, which the current [`observability.md`](./overview/observability.md) rule forbids. The agreed direction is:
+**relay-identified metrics MAY leave the device to a first-party metrics stack, but only aggregated, opt-in, and behind
+k-anonymity thresholds**; that decision will be carried into an `observability.md` amendment when the broad-telemetry
+workstream starts. Until then, the per-relay timing in phase 2 keeps relays as opaque device-local indices and exports
+nothing. The convergence telemetry here becomes one *consumer* of the shared per-relay collection layer that
+broad observability will own (most naturally in the relay plane), not a parallel measurement stack.
 
 ## Open questions
 

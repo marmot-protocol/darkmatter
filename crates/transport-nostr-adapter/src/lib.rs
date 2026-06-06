@@ -42,7 +42,10 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan};
-pub use telemetry::{RelayDeliverySpread, RelayDeliveryTelemetry, SpreadBucket};
+pub use telemetry::{
+    DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryTelemetry,
+    RelaySyncSnapshot, RelaySyncTelemetry,
+};
 
 const DELIVERY_BUFFER: usize = 1024;
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
@@ -94,6 +97,13 @@ impl NostrSubscription {
                     ],
                 )
             }
+        }
+    }
+
+    /// Relay endpoints this subscription was issued to.
+    pub fn endpoints(&self) -> &[TransportEndpoint] {
+        match self {
+            Self::AccountInbox { endpoints, .. } | Self::Group { endpoints, .. } => endpoints,
         }
     }
 
@@ -260,6 +270,33 @@ impl NostrTransportAdapter {
         self.state.read().await.telemetry.snapshot()
     }
 
+    /// Aggregate subscription sync-timing snapshot (first-event and EOSE
+    /// latencies, initial-sync completion counts). Privacy-safe.
+    pub async fn relay_sync(&self) -> RelaySyncSnapshot {
+        tracing::trace!(
+            target: "transport_nostr_adapter::adapter",
+            method = "relay_sync",
+            "snapshotting relay sync timing"
+        );
+        self.state.read().await.sync.snapshot()
+    }
+
+    /// Initial-sync gate: whether every endpoint of `subscription_id` has
+    /// reached EOSE. `None` for an unknown subscription.
+    pub async fn subscription_synced(&self, subscription_id: &str) -> Option<bool> {
+        self.state
+            .read()
+            .await
+            .sync
+            .subscription_synced(subscription_id)
+    }
+
+    /// Local monotonic timestamp in milliseconds for delivery telemetry. Never
+    /// the publisher-controlled `created_at`.
+    fn now_ms(&self) -> u64 {
+        self.monotonic_start.elapsed().as_millis() as u64
+    }
+
     /// Convert a relay event into zero or more account-scoped deliveries.
     ///
     /// Invalid Nostr DTOs fail closed before the engine sees them. Valid but
@@ -298,13 +335,21 @@ impl NostrTransportAdapter {
             delivered += 1;
         }
 
-        // Local-time sighting for cross-relay arrival spread. Uses the adapter's
-        // monotonic clock, never the publisher-controlled `created_at`.
-        let now_ms = self.monotonic_start.elapsed().as_millis() as u64;
+        // Local-time sighting for cross-relay arrival spread and per-relay
+        // sync timing. Uses the adapter's monotonic clock, never the
+        // publisher-controlled `created_at`.
+        let now_ms = self.now_ms();
         {
             let mut state = self.state.write().await;
             state.record_inbound_event(delivered);
             state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
+            if let Some(subscription_id) = &relay_event.subscription_id {
+                state.record_subscription_first_event(
+                    subscription_id,
+                    &relay_event.endpoint,
+                    now_ms,
+                );
+            }
         }
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -313,6 +358,21 @@ impl NostrTransportAdapter {
             "handled relay event"
         );
         Ok(delivered)
+    }
+
+    /// Record an end-of-stored-events signal for a subscription on one relay
+    /// endpoint. This advances the initial-sync gate; it produces no delivery.
+    pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
+        let now_ms = self.now_ms();
+        self.state
+            .write()
+            .await
+            .record_subscription_eose(&subscription_id, &endpoint, now_ms);
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "handle_relay_eose",
+            "handled relay eose"
+        );
     }
 }
 
@@ -342,23 +402,23 @@ impl TransportAdapter for NostrTransportAdapter {
             self.relay_client.unsubscribe_account(&account_id).await?;
         }
 
-        self.relay_client
-            .subscribe(NostrSubscription::AccountInbox {
-                account_id: account_id.clone(),
-                endpoints: activation.inbox_endpoints.clone(),
-                since: activation.since,
-            })
-            .await?;
+        let mut issued = Vec::with_capacity(1 + activation.group_subscriptions.len());
+        issued.push(NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: activation.inbox_endpoints.clone(),
+            since: activation.since,
+        });
         for group in &activation.group_subscriptions {
-            self.relay_client
-                .subscribe(group_subscription(&account_id, group, activation.since))
-                .await?;
+            issued.push(group_subscription(&account_id, group, activation.since));
+        }
+        for subscription in &issued {
+            self.relay_client.subscribe(subscription.clone()).await?;
         }
 
-        self.state
-            .write()
-            .await
-            .activate(activation, replaced_count);
+        let now_ms = self.now_ms();
+        let mut state = self.state.write().await;
+        state.record_subscription_starts(&issued, now_ms);
+        state.activate(activation, replaced_count);
         Ok(())
     }
 
@@ -410,10 +470,10 @@ impl TransportAdapter for NostrTransportAdapter {
             subscriptions_removed = to_remove.len(),
             "applied transport group subscription diff"
         );
-        self.state
-            .write()
-            .await
-            .sync_groups(sync, to_add.len(), to_remove.len());
+        let now_ms = self.now_ms();
+        let mut state = self.state.write().await;
+        state.record_subscription_starts(&to_add, now_ms);
+        state.sync_groups(sync, to_add.len(), to_remove.len());
         Ok(())
     }
 
@@ -564,6 +624,7 @@ struct AdapterState {
     accounts: HashMap<MemberId, AccountRoutes>,
     metrics: NostrAdapterMetrics,
     telemetry: RelayDeliveryTelemetry,
+    sync: RelaySyncTelemetry,
 }
 
 impl AdapterState {
@@ -607,6 +668,35 @@ impl AdapterState {
         now_ms: u64,
     ) {
         self.telemetry.record_sighting(message_id, endpoint, now_ms);
+    }
+
+    fn record_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
+        for subscription in subscriptions {
+            self.sync.record_subscription_start(
+                &subscription.subscription_id(),
+                subscription.endpoints(),
+                now_ms,
+            );
+        }
+    }
+
+    fn record_subscription_first_event(
+        &mut self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+        now_ms: u64,
+    ) {
+        self.sync
+            .record_first_event(subscription_id, endpoint, now_ms);
+    }
+
+    fn record_subscription_eose(
+        &mut self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+        now_ms: u64,
+    ) {
+        self.sync.record_eose(subscription_id, endpoint, now_ms);
     }
 
     fn record_publish_attempt(&mut self) {

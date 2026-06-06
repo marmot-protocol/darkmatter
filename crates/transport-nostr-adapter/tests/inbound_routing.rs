@@ -247,7 +247,75 @@ async fn same_message_from_two_relays_records_cross_relay_corroboration() {
     let spread = adapter.delivery_spread().await;
     assert_eq!(spread.observed, 1, "one logical message observed");
     assert_eq!(spread.corroborated, 1, "corroborated by a second endpoint");
-    assert_eq!(spread.sample_count(), 1, "one spread sample recorded");
+    assert_eq!(
+        spread.spread.sample_count(),
+        1,
+        "one spread sample recorded"
+    );
+}
+
+#[tokio::test]
+async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint_a = TransportEndpoint("wss://group-a.example".into());
+    let endpoint_b = TransportEndpoint("wss://group-b.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    // Reconstruct the group subscription id the adapter issued.
+    let sub_id = NostrSubscription::Group {
+        account_id,
+        group_id,
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
+        since: None,
+    }
+    .subscription_id();
+
+    // Tracked but not yet synced: no endpoint has reached EOSE.
+    assert_eq!(adapter.subscription_synced(&sub_id).await, Some(false));
+
+    // A first event then EOSE from endpoint A: still draining endpoint B.
+    adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint_a.clone(),
+            subscription_id: Some(sub_id.clone()),
+            event: group_event("11", &transport_group_id),
+        })
+        .await
+        .expect("relay event handled");
+    adapter.handle_relay_eose(endpoint_a, sub_id.clone()).await;
+    assert_eq!(adapter.subscription_synced(&sub_id).await, Some(false));
+
+    // EOSE from endpoint B closes the gate.
+    adapter.handle_relay_eose(endpoint_b, sub_id.clone()).await;
+    assert_eq!(adapter.subscription_synced(&sub_id).await, Some(true));
+
+    let sync = adapter.relay_sync().await;
+    // Inbox + group subscriptions are both tracked.
+    assert_eq!(sync.tracked_subscriptions, 2);
+    assert_eq!(sync.synced_subscriptions, 1);
+    assert_eq!(sync.eose.sample_count(), 2);
+    assert_eq!(sync.first_event.sample_count(), 1);
+
+    // Unknown subscriptions report no sync state.
+    assert_eq!(adapter.subscription_synced("nope").await, None);
 }
 
 #[tokio::test]
