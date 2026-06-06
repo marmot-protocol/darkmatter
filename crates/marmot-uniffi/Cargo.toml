@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [features]
 default = []
 cli = ["uniffi/cli"]
+otlp-export = ["marmot-app/otlp-export"]
 
 [dependencies]
 marmot-app.workspace = true

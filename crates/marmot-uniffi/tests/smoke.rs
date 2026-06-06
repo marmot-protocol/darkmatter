@@ -13,7 +13,7 @@ use std::sync::{Arc, Once};
 use marmot_account::AccountHome;
 use marmot_uniffi::{
     Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi, TimelineMessageQueryFfi,
+    PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
 };
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
@@ -271,6 +271,78 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
         .subscribe_notifications()
         .await
         .expect("empty notification subscription should be valid");
+}
+
+#[test]
+fn relay_telemetry_settings_binding_round_trips() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let settings = kit
+        .relay_telemetry_settings()
+        .expect("default telemetry settings");
+    assert!(!settings.export_enabled);
+    assert!(settings.otlp_endpoint.is_none());
+    assert_eq!(settings.export_interval_seconds, 60);
+
+    let stored = kit
+        .set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
+            export_enabled: true,
+            otlp_endpoint: Some(" https://grafana.example/otlp ".into()),
+            export_interval_seconds: 30,
+        })
+        .expect("set telemetry settings");
+    assert!(stored.export_enabled);
+    assert_eq!(
+        stored.otlp_endpoint.as_deref(),
+        Some("https://grafana.example/otlp")
+    );
+    assert_eq!(stored.export_interval_seconds, 30);
+
+    let reopened = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("reopen marmot kit");
+    assert_eq!(
+        reopened
+            .relay_telemetry_settings()
+            .expect("persisted telemetry settings")
+            .otlp_endpoint,
+        stored.otlp_endpoint
+    );
+}
+
+#[test]
+fn audit_log_binding_lists_local_jsonl_logs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("reopen account home")
+        .account_dir(&account.label)
+        .join("audit-binding.jsonl");
+    std::fs::write(&audit_path, b"{\"seq\":1}\n").expect("write audit log");
+
+    let files = kit.audit_log_files().expect("list audit logs");
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, audit_path.to_string_lossy());
+    assert_eq!(files[0].file_name, "audit-binding.jsonl");
+    assert!(files[0].size_bytes > 0);
 }
 
 #[tokio::test]

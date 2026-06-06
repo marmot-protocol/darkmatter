@@ -2569,22 +2569,9 @@ dependencies = [
 name = "marmot-forensics"
 version = "0.1.0"
 dependencies = [
- "hex",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
-]
-
-[[package]]
-name = "marmot-forensics-analyzer"
-version = "0.1.0"
-dependencies = [
- "cgka-conformance-simulator",
- "clap",
- "marmot-forensics",
- "serde",
- "serde_json",
 ]
 
 [[package]]

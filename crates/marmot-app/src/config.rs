@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +28,40 @@ impl MarmotAppConfig {
 /// aggregate and cumulative, so a coarse window respects battery and metered
 /// networks without losing resolution.
 const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayTelemetrySettings {
+    pub export_enabled: bool,
+    pub otlp_endpoint: Option<String>,
+    pub export_interval_seconds: u64,
+}
+
+impl Default for RelayTelemetrySettings {
+    fn default() -> Self {
+        Self {
+            export_enabled: false,
+            otlp_endpoint: None,
+            export_interval_seconds: DEFAULT_EXPORT_INTERVAL.as_secs(),
+        }
+    }
+}
+
+impl RelayTelemetrySettings {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.export_interval_seconds == 0 {
+            return Err("relay telemetry export interval must be greater than zero".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn export_config(&self) -> RelayTelemetryExportConfig {
+        RelayTelemetryExportConfig {
+            enabled: self.export_enabled,
+            endpoint: self.otlp_endpoint.clone(),
+            interval: Duration::from_secs(self.export_interval_seconds),
+        }
+    }
+}
 
 /// Opt-in configuration for relay-telemetry export.
 ///
@@ -101,7 +137,7 @@ impl RelayTelemetryExportConfig {
 
 /// Accept `https` for any host; accept `http` only for a loopback host (a local
 /// test collector). Reject anything else, including unparseable endpoints.
-fn endpoint_transport_allowed(endpoint: &str) -> bool {
+pub(crate) fn endpoint_transport_allowed(endpoint: &str) -> bool {
     let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
@@ -147,5 +183,28 @@ mod tests {
         assert!(RelayTelemetryExportConfig::enabled("http://127.0.0.1:4318").export_allowed());
         assert!(RelayTelemetryExportConfig::enabled("http://[::1]:4318").export_allowed());
         assert!(RelayTelemetryExportConfig::enabled("http://localhost:4318").export_allowed());
+    }
+
+    #[test]
+    fn telemetry_settings_default_to_opted_out_export_config() {
+        let settings = RelayTelemetrySettings::default();
+
+        assert!(!settings.export_enabled);
+        assert_eq!(settings.export_interval_seconds, 60);
+        assert_eq!(
+            settings.export_config(),
+            RelayTelemetryExportConfig::disabled()
+        );
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn telemetry_settings_reject_zero_interval() {
+        let settings = RelayTelemetrySettings {
+            export_interval_seconds: 0,
+            ..Default::default()
+        };
+
+        assert!(settings.validate().is_err());
     }
 }

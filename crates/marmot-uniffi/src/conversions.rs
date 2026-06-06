@@ -13,13 +13,14 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    AppProjectionUpdate, ChatListAvatar, ChatListMessagePreview, ChatListRow, ForensicsDumpMode,
-    GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
-    LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult, MediaReference,
-    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
-    NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate,
-    RuntimeChatListUpdate, RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
+    AppProjectionUpdate, AuditLogFile, AuditLogUploadResult, ChatListAvatar,
+    ChatListMessagePreview, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
+    GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult,
+    MediaReference, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
+    NotificationSettings, NotificationTrigger, NotificationUpdate, NotificationUser,
+    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth,
+    RelayTelemetrySettings, RuntimeAgentStreamUpdate, RuntimeChatListUpdate,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange, TimelineMessageRecord,
     TimelinePage, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
     TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata, account_id_hex_from_ref,
@@ -27,6 +28,44 @@ use marmot_app::{
 };
 
 use crate::errors::MarmotKitError;
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogFileFfi {
+    pub account_ref: String,
+    pub path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<u64>,
+}
+
+impl From<AuditLogFile> for AuditLogFileFfi {
+    fn from(value: AuditLogFile) -> Self {
+        Self {
+            account_ref: value.account_ref,
+            path: value.path,
+            file_name: value.file_name,
+            size_bytes: value.size_bytes,
+            modified_at_ms: value.modified_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogUploadResultFfi {
+    pub path: String,
+    pub status: u16,
+    pub bytes_sent: u64,
+}
+
+impl From<AuditLogUploadResult> for AuditLogUploadResultFfi {
+    fn from(value: AuditLogUploadResult) -> Self {
+        Self {
+            path: value.path,
+            status: value.status,
+            bytes_sent: value.bytes_sent,
+        }
+    }
+}
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountSummaryFfi {
@@ -172,6 +211,33 @@ impl From<NotificationSettings> for NotificationSettingsFfi {
             account_id_hex: value.account_id_hex,
             local_notifications_enabled: value.local_notifications_enabled,
             native_push_enabled: value.native_push_enabled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayTelemetrySettingsFfi {
+    pub export_enabled: bool,
+    pub otlp_endpoint: Option<String>,
+    pub export_interval_seconds: u64,
+}
+
+impl From<RelayTelemetrySettings> for RelayTelemetrySettingsFfi {
+    fn from(value: RelayTelemetrySettings) -> Self {
+        Self {
+            export_enabled: value.export_enabled,
+            otlp_endpoint: value.otlp_endpoint,
+            export_interval_seconds: value.export_interval_seconds,
+        }
+    }
+}
+
+impl From<RelayTelemetrySettingsFfi> for RelayTelemetrySettings {
+    fn from(value: RelayTelemetrySettingsFfi) -> Self {
+        Self {
+            export_enabled: value.export_enabled,
+            otlp_endpoint: value.otlp_endpoint,
+            export_interval_seconds: value.export_interval_seconds,
         }
     }
 }
@@ -1277,21 +1343,6 @@ pub(crate) fn group_management_state_ffi(
         can_leave,
         requires_self_demote_before_leave,
         member_actions,
-    }
-}
-
-#[derive(Clone, Copy, Debug, uniffi::Enum)]
-pub enum ForensicsDumpModeFfi {
-    Public,
-    Sensitive,
-}
-
-impl From<ForensicsDumpModeFfi> for ForensicsDumpMode {
-    fn from(value: ForensicsDumpModeFfi) -> Self {
-        match value {
-            ForensicsDumpModeFfi::Public => Self::Public,
-            ForensicsDumpModeFfi::Sensitive => Self::Sensitive,
-        }
     }
 }
 

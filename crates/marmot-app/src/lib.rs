@@ -60,7 +60,8 @@ use storage_sqlite::{
     AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
     AccountStoredPushRegistration, PublicDirectoryUserRecord, SqlCipherKey, SqliteAccountStorage,
     SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, TimelineProjectionUpdate,
+    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, StoredRelayTelemetrySettings,
+    TimelineProjectionUpdate,
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
@@ -103,7 +104,7 @@ pub use agent_streams::{
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
 pub use client::AppClient;
-pub use config::{MarmotAppConfig, RelayTelemetryExportConfig};
+pub use config::{MarmotAppConfig, RelayTelemetryExportConfig, RelayTelemetrySettings};
 pub use error::AppError;
 pub use groups::{
     AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupImageComponent,
@@ -111,11 +112,6 @@ pub use groups::{
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
 };
 pub use ids::{account_id_hex_from_ref, npub_for_account_id};
-pub use marmot_forensics::{
-    FORENSICS_SCHEMA_VERSION, ForensicsAccount, ForensicsBundle, ForensicsDumpMode,
-    ForensicsEngineGroupState, ForensicsExportOptions, ForensicsGroup, ForensicsMessage,
-    ForensicsOpenMlsMessage, ForensicsProducer, ForensicsSnapshot,
-};
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, MediaDownloadResult, MediaReference, MediaUploadRequest,
     MediaUploadResult,
@@ -158,6 +154,7 @@ const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
+const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 const SESSION_DB_FILE: &str = "session.sqlite";
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_SALT_LEN: usize = 32;
@@ -359,6 +356,22 @@ pub struct ReceivedMessage {
     /// reflects send time, not delivery time. Zero means the timestamp was
     /// unavailable at decode time.
     pub recorded_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditLogFile {
+    pub account_ref: String,
+    pub path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditLogUploadResult {
+    pub path: String,
+    pub status: u16,
+    pub bytes_sent: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -798,6 +811,88 @@ fn notification_settings_from_account(
     }
 }
 
+fn audit_engine_id_hex(account_id: &MemberId) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-engine-id/v1");
+    hasher.update(account_id.as_slice());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..16])
+}
+
+fn relay_telemetry_settings_from_storage(
+    settings: StoredRelayTelemetrySettings,
+) -> RelayTelemetrySettings {
+    RelayTelemetrySettings {
+        export_enabled: settings.export_enabled,
+        otlp_endpoint: settings.otlp_endpoint,
+        export_interval_seconds: settings.export_interval_seconds,
+    }
+}
+
+fn relay_telemetry_settings_to_storage(
+    settings: RelayTelemetrySettings,
+) -> StoredRelayTelemetrySettings {
+    StoredRelayTelemetrySettings {
+        export_enabled: settings.export_enabled,
+        otlp_endpoint: settings.otlp_endpoint,
+        export_interval_seconds: settings.export_interval_seconds,
+    }
+}
+
+fn normalize_relay_telemetry_settings(
+    mut settings: RelayTelemetrySettings,
+) -> Result<RelayTelemetrySettings, AppError> {
+    settings
+        .validate()
+        .map_err(AppError::InvalidRelayTelemetrySettings)?;
+    settings.otlp_endpoint = settings.otlp_endpoint.and_then(|endpoint| {
+        let endpoint = endpoint.trim().to_owned();
+        (!endpoint.is_empty()).then_some(endpoint)
+    });
+    Ok(settings)
+}
+
+fn audit_log_file_name(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_string_lossy();
+    (file_name.starts_with("audit-") && file_name.ends_with(".jsonl"))
+        .then(|| file_name.into_owned())
+}
+
+fn system_time_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+}
+
+fn validate_audit_upload_endpoint(endpoint: &str) -> Result<String, AppError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(AppError::AuditLogUpload(
+            "forensic upload endpoint is empty".to_owned(),
+        ));
+    }
+    if !config::endpoint_transport_allowed(endpoint) {
+        return Err(AppError::AuditLogUpload(
+            "forensic upload endpoint must be https, or loopback http for local testing".to_owned(),
+        ));
+    }
+    Ok(endpoint.to_owned())
+}
+
+fn audit_log_reqwest_error(err: reqwest::Error) -> AppError {
+    if let Some(status) = err.status() {
+        AppError::AuditLogUpload(format!("HTTP {}", status.as_u16()))
+    } else if err.is_timeout() {
+        AppError::AuditLogUpload("request timed out".into())
+    } else if err.is_connect() {
+        AppError::AuditLogUpload("connection failed".into())
+    } else if err.is_body() {
+        AppError::AuditLogUpload("invalid response body".into())
+    } else {
+        AppError::AuditLogUpload("request failed".into())
+    }
+}
+
 fn account_push_registration_from_app(registration: PushRegistration) -> AccountPushRegistration {
     AccountPushRegistration {
         account_label: registration.account_ref,
@@ -908,6 +1003,90 @@ impl MarmotApp {
     /// relay plane.
     pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
         self.relay_plane.relay_telemetry().await
+    }
+
+    pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
+        Ok(relay_telemetry_settings_from_storage(
+            self.shared_storage()?.relay_telemetry_settings()?,
+        ))
+    }
+
+    pub fn set_relay_telemetry_settings(
+        &self,
+        settings: RelayTelemetrySettings,
+    ) -> Result<RelayTelemetrySettings, AppError> {
+        let settings = normalize_relay_telemetry_settings(settings)?;
+        self.shared_storage()?
+            .set_relay_telemetry_settings(&relay_telemetry_settings_to_storage(settings.clone()))?;
+        Ok(settings)
+    }
+
+    pub fn relay_telemetry_export_config(&self) -> Result<RelayTelemetryExportConfig, AppError> {
+        Ok(self.relay_telemetry_settings()?.export_config())
+    }
+
+    pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
+        let mut files = Vec::new();
+        for account in self.account_home().accounts()? {
+            let account_dir = self.account_dir(&account.label);
+            if !account_dir.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(account_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let Some(file_name) = audit_log_file_name(&path) else {
+                    continue;
+                };
+                let metadata = entry.metadata()?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                files.push(AuditLogFile {
+                    account_ref: account.label.clone(),
+                    path: path.to_string_lossy().into_owned(),
+                    file_name,
+                    size_bytes: metadata.len(),
+                    modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
+                });
+            }
+        }
+        files.sort_by(|left, right| {
+            left.account_ref
+                .cmp(&right.account_ref)
+                .then_with(|| left.file_name.cmp(&right.file_name))
+        });
+        Ok(files)
+    }
+
+    pub async fn post_audit_log_file(
+        &self,
+        path: &str,
+        endpoint: &str,
+    ) -> Result<AuditLogUploadResult, AppError> {
+        let path = self.validate_audit_log_path(path)?;
+        let endpoint = validate_audit_upload_endpoint(endpoint)?;
+        let body = fs::read(&path)?;
+        let bytes_sent = body.len() as u64;
+        let response = reqwest::Client::new()
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+            .map_err(audit_log_reqwest_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::AuditLogUpload(format!(
+                "upload returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        Ok(AuditLogUploadResult {
+            path: path.to_string_lossy().into_owned(),
+            status: status.as_u16(),
+            bytes_sent,
+        })
     }
 
     pub fn with_relay_and_config(
@@ -2095,8 +2274,7 @@ impl MarmotApp {
             .filter(|v| !v.is_empty())
             .is_some()
         {
-            let engine_id_hex =
-                hex::encode(&account_id.as_slice()[..8.min(account_id.as_slice().len())]);
+            let engine_id_hex = audit_engine_id_hex(&account_id);
             let audit_path = self
                 .account_dir(label)
                 .join(format!("audit-{engine_id_hex}.jsonl"));
@@ -3219,6 +3397,29 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
+    }
+
+    fn validate_audit_log_path(&self, path: &str) -> Result<PathBuf, AppError> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(AppError::InvalidAuditLogFile(
+                "audit log path is empty".to_owned(),
+            ));
+        }
+        let path = PathBuf::from(path);
+        if audit_log_file_name(&path).is_none() {
+            return Err(AppError::InvalidAuditLogFile(
+                "audit log file must be named audit-*.jsonl".to_owned(),
+            ));
+        }
+        let path = fs::canonicalize(path)?;
+        let root = fs::canonicalize(&self.root)?;
+        if !path.starts_with(&root) {
+            return Err(AppError::InvalidAuditLogFile(
+                "audit log file must be inside the app root".to_owned(),
+            ));
+        }
+        Ok(path)
     }
 
     fn legacy_directory_cache_path(&self) -> PathBuf {
@@ -5628,5 +5829,69 @@ mod tests {
             assert!(!error.contains(&group_id), "{error}");
             assert!(!error.contains(&account_id), "{error}");
         }
+    }
+
+    #[test]
+    fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {
+        let account_id = MemberId::new(vec![0xab; 32]);
+
+        let engine_id = audit_engine_id_hex(&account_id);
+
+        assert_eq!(engine_id.len(), 32);
+        assert_eq!(engine_id, audit_engine_id_hex(&account_id));
+        assert_ne!(engine_id, hex::encode(&account_id.as_slice()[..16]));
+    }
+
+    #[test]
+    fn relay_telemetry_settings_persist_in_shared_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        assert_eq!(
+            app.relay_telemetry_settings().unwrap(),
+            RelayTelemetrySettings::default()
+        );
+
+        let updated = RelayTelemetrySettings {
+            export_enabled: true,
+            otlp_endpoint: Some(" https://grafana.example/otlp ".to_owned()),
+            export_interval_seconds: 30,
+        };
+        let stored = app.set_relay_telemetry_settings(updated).unwrap();
+
+        assert_eq!(
+            stored,
+            RelayTelemetrySettings {
+                export_enabled: true,
+                otlp_endpoint: Some("https://grafana.example/otlp".to_owned()),
+                export_interval_seconds: 30,
+            }
+        );
+        assert_eq!(
+            app.relay_telemetry_export_config().unwrap(),
+            RelayTelemetryExportConfig {
+                enabled: true,
+                endpoint: Some("https://grafana.example/otlp".to_owned()),
+                interval: Duration::from_secs(30),
+            }
+        );
+
+        let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        assert_eq!(reopened.relay_telemetry_settings().unwrap(), stored);
+    }
+
+    #[test]
+    fn relay_telemetry_settings_reject_zero_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        let err = app
+            .set_relay_telemetry_settings(RelayTelemetrySettings {
+                export_interval_seconds: 0,
+                ..Default::default()
+            })
+            .expect_err("zero interval should be rejected");
+
+        assert!(matches!(err, AppError::InvalidRelayTelemetrySettings(_)));
     }
 }
