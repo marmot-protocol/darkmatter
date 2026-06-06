@@ -131,7 +131,8 @@ pub use notifications::{
     encrypted_mip05_token, parse_provider_token, push_token_fingerprint,
 };
 pub use relay_plane::{
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth, RelayTelemetrySnapshot,
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
+    RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
 };
 pub use storage_sqlite::{
     ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,
