@@ -391,6 +391,11 @@ CanonicalizationResult {
 }
 ```
 
+`selected_fork_epoch` is the fork epoch of the selected branch (the epoch it diverges from common history), or absent when
+no branch was selected. It is diagnostic only: the engine's post-settle reorg telemetry
+([`relay-delivery-telemetry.md`](./relay-delivery-telemetry.md)) reads it to classify a settle as a forward advance or a
+reorg. It MUST NOT influence convergence or branch selection.
+
 `AlreadySeen` is observable:
 
 ```text
