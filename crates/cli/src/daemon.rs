@@ -4517,7 +4517,11 @@ mod tests {
     #[test]
     fn daemon_peer_authorization_rejects_mismatched_uid_value() {
         let current_uid = current_effective_uid();
-        let other_uid = current_uid.checked_add(1).unwrap_or(current_uid - 1);
+        // Lazily compute the fallback: `unwrap_or` would eagerly evaluate
+        // `current_uid - 1`, which underflows when running as uid 0 (root).
+        let other_uid = current_uid
+            .checked_add(1)
+            .unwrap_or_else(|| current_uid - 1);
 
         assert!(!daemon_peer_uid_authorized(other_uid, current_uid));
     }
