@@ -81,6 +81,7 @@ mod messages;
 mod notifications;
 mod projection;
 mod relay_plane;
+mod relay_telemetry_export;
 mod runtime;
 
 pub(crate) use groups::AppGroupImageInput;
@@ -133,6 +134,10 @@ pub use notifications::{
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
     RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+};
+pub use relay_telemetry_export::{
+    ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
+    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch, metric_names,
 };
 pub use storage_sqlite::{
     ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,

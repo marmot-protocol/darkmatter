@@ -1678,7 +1678,10 @@ mod tests {
 
         // Opted in: the export boundary resolves the opaque index for the
         // activated inbox endpoint back to its relay URL.
-        let enabled = RelayTelemetryExportConfig { enabled: true };
+        let enabled = RelayTelemetryExportConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let resolution = relay_plane
             .resolve_relay_labels(&enabled)
             .await
