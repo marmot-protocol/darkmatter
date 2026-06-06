@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-05-19
+updated: 2026-06-06
 tags: [marmot, architecture, index]
 ---
 
