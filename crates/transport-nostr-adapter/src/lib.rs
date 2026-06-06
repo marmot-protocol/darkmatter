@@ -43,8 +43,9 @@ pub use relay_list::{
 #[cfg(feature = "sdk")]
 pub use sdk_client::{NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan};
 pub use telemetry::{
-    DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryTelemetry,
-    RelaySyncSnapshot, RelaySyncTelemetry,
+    DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
+    RelayDeliveryTelemetry, RelayIndex, RelayIndexRegistry, RelayLatencyStats, RelaySyncSnapshot,
+    RelaySyncTelemetry,
 };
 
 const DELIVERY_BUFFER: usize = 1024;
@@ -634,6 +635,7 @@ struct AccountRoutes {
 struct AdapterState {
     accounts: HashMap<MemberId, AccountRoutes>,
     metrics: NostrAdapterMetrics,
+    relay_index: RelayIndexRegistry,
     telemetry: RelayDeliveryTelemetry,
     sync: RelaySyncTelemetry,
 }
@@ -678,16 +680,19 @@ impl AdapterState {
         endpoint: &TransportEndpoint,
         now_ms: u64,
     ) {
-        self.telemetry.record_sighting(message_id, endpoint, now_ms);
+        let relay = self.relay_index.index_for(endpoint);
+        self.telemetry.record_sighting(message_id, relay, now_ms);
     }
 
     fn record_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
         for subscription in subscriptions {
-            self.sync.record_subscription_start(
-                &subscription.subscription_id(),
-                subscription.endpoints(),
-                now_ms,
-            );
+            let relays: Vec<RelayIndex> = subscription
+                .endpoints()
+                .iter()
+                .map(|endpoint| self.relay_index.index_for(endpoint))
+                .collect();
+            self.sync
+                .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
         }
     }
 
@@ -697,8 +702,8 @@ impl AdapterState {
         endpoint: &TransportEndpoint,
         now_ms: u64,
     ) {
-        self.sync
-            .record_first_event(subscription_id, endpoint, now_ms);
+        let relay = self.relay_index.index_for(endpoint);
+        self.sync.record_first_event(subscription_id, relay, now_ms);
     }
 
     fn record_subscription_eose(
@@ -707,7 +712,8 @@ impl AdapterState {
         endpoint: &TransportEndpoint,
         now_ms: u64,
     ) {
-        self.sync.record_eose(subscription_id, endpoint, now_ms);
+        let relay = self.relay_index.index_for(endpoint);
+        self.sync.record_eose(subscription_id, relay, now_ms);
     }
 
     fn record_publish_attempt(&mut self) {

@@ -83,8 +83,10 @@ binding.
 
 `cross_relay_spread` is exported as a population-level distribution (no relay label — it is inherently cross-relay), and
 is the direct input to the static quiescence decision in `relay-delivery-telemetry.md`. The per-relay metrics are the
-ranking signal. Per-relay attribution of the latency histograms is the piece phase 2 deferred precisely because it
-needs this export contract decided first.
+ranking signal. Per-relay attribution of the latency histograms and the first-deliverer rate is **recorded today**,
+behind opaque device-local indices (`RelayLatencyStats`, `RelayDeliveryStats`); that is allowed under the current rules
+because no relay identity leaves the device. Only *resolving* an index to a relay label for export needs this contract
+accepted.
 
 ## Collection and export architecture
 
@@ -127,8 +129,9 @@ The amendment is applied to `observability.md` when this spec is accepted, not b
 ## Phasing
 
 1. **Spec accepted** (this document) and the `observability.md` amendment applied.
-2. **Per-relay attribution** in the adapter: resolve the deferred phase-2 per-relay latency histograms and the
-   first-deliverer rate, behind opaque local indices.
+2. **Per-relay attribution** in the adapter — *done*: per-relay first-event / EOSE latency histograms and the
+   first-deliverer rate, behind opaque local indices (`RelayLatencyStats`, `RelayDeliveryStats`). Useful for local
+   analysis today and independent of the export decision.
 3. **Relay-plane rollup**: cross-account aggregation of the per-relay series into an export-ready snapshot.
 4. **Opt-in exporter**: consent surface, push binding (`remote_write`/OTLP), contract enforcement, off by default.
 5. **Dashboards and k-anonymity gate** in the first-party stack; relay ranking and the quiescence-tuning view.

@@ -238,6 +238,13 @@ async fn observe_relay_event_records_every_relay_copy_for_spread() {
         2,
         "two laggard copies recorded as spread samples"
     );
+    // Per-relay attribution: the first relay delivered first, the rest later.
+    // Indices are assigned in first-seen order (a, b, c) and reported ascending.
+    assert_eq!(spread.per_relay.len(), 3);
+    assert_eq!(spread.per_relay[0].delivered_first, 1);
+    assert_eq!(spread.per_relay[0].first_deliverer_rate(), Some(1.0));
+    assert_eq!(spread.per_relay[1].delivered_later, 1);
+    assert_eq!(spread.per_relay[2].delivered_later, 1);
 }
 
 #[tokio::test]

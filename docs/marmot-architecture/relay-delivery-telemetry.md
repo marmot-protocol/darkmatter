@@ -185,10 +185,11 @@ the engine against settle outcomes and is out of scope for the adapter.
    Gives the steady-state quiescence distribution and relay-redundancy health.
    ([`telemetry::RelayDeliveryTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)).
 2. **EOSE plumbing and sync timing.** *Done.* Routes EOSE into the adapter, exposing the per-subscription initial-sync
-   gate (`subscription_synced`) plus aggregate first-event / EOSE latency histograms relative to subscribe time
-   ([`telemetry::RelaySyncTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)). Per-relay *attribution* of
-   those latencies (opaque indices, ranking) is deferred to the broad-observability workstream, since that is where
-   relay-identified export is decided.
+   gate (`subscription_synced`) plus first-event / EOSE latency histograms relative to subscribe time, both in aggregate
+   and per relay behind opaque local indices
+   ([`telemetry::RelaySyncTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)). *Resolving* those opaque
+   indices to relay identity for export is the broad-observability workstream
+   ([`relay-observability.md`](./relay-observability.md)).
 3. **Engine-side reorg-rate telemetry.** Closes the quiescence loss function by measuring post-settle reorgs.
 4. **Set the static value from data.** Aggregate (1) and (3) over real relays and groups, read the distributions, and
    choose the negotiated `settlement_quiescence_ms`. An offline operator/analysis step, not a runtime controller.

@@ -1,25 +1,28 @@
 //! Relay delivery telemetry: cross-relay arrival spread and subscription sync
-//! timing.
+//! timing, with per-relay attribution behind opaque local indices.
 //!
 //! Implements phases 1 and 2 of the measurement model in
-//! `docs/marmot-architecture/relay-delivery-telemetry.md`:
+//! `docs/marmot-architecture/relay-delivery-telemetry.md`, plus the per-relay
+//! attribution that `docs/marmot-architecture/relay-observability.md` needs:
 //!
 //! - [`RelayDeliveryTelemetry`] records, per logical message seen on more than
-//!   one relay endpoint, the local-time delta between the first copy and each
-//!   later distinct-endpoint copy. That distribution estimates the client's
-//!   relay-set delivery jitter, which steady-state convergence quiescence must
-//!   cover.
-//! - [`RelaySyncTelemetry`] records, per subscription, when each endpoint
-//!   delivered its first event and its EOSE relative to subscribe time, and
-//!   whether every subscribed endpoint has reached EOSE (the initial-sync
-//!   gate).
+//!   one relay, the local-time delta between the first copy and each later
+//!   distinct-relay copy (cross-relay arrival spread), and per relay how often
+//!   it delivered a copy first vs. later (first-deliverer rate).
+//! - [`RelaySyncTelemetry`] records, per subscription, when each relay
+//!   delivered its first event and its EOSE relative to subscribe time, whether
+//!   every subscribed relay has reached EOSE (the initial-sync gate), and the
+//!   first-event / EOSE latency histograms both in aggregate and per relay.
+//!
+//! Relays are identified inside this module only by an opaque [`RelayIndex`].
+//! The endpoint-to-index mapping ([`RelayIndexRegistry`]) is held by the adapter
+//! and stays device-local, so per-relay telemetry never puts a relay URL in a
+//! snapshot. Resolving an index back to a relay is the export layer's job.
 //!
 //! Privacy: all timing uses a local monotonic clock, never Nostr `created_at`
 //! (which is identical across copies of an event and publisher-controlled).
-//! Snapshots expose only aggregate histogram buckets and counts. Per-message
-//! and per-subscription tracking tables are local-only ephemeral state; their
-//! keys, relay endpoints, and subscription ids never appear in a snapshot or in
-//! logs.
+//! Snapshots expose only opaque relay indices, aggregate histogram buckets, and
+//! counts.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -37,10 +40,38 @@ const BUCKET_BOUNDS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000
 /// Default retention window for the per-message first-sighting table.
 ///
 /// A message first seen longer ago than this is pruned. If it was only ever
-/// seen on one endpoint it is counted as single-source. The window should be
+/// seen on one relay it is counted as single-source. The window should be
 /// comfortably larger than the largest histogram bucket so that genuine laggard
 /// copies are still corroborated rather than pruned.
 const DEFAULT_TRACKING_WINDOW_MS: u64 = 60_000;
+
+/// Opaque, device-local relay identifier, stable within a process.
+///
+/// Never a relay URL. The endpoint-to-index mapping lives in
+/// [`RelayIndexRegistry`] and stays on the device, so per-relay telemetry can
+/// exist without exporting relay URLs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RelayIndex(pub u32);
+
+/// Device-local assignment of stable opaque indices to relay endpoints.
+#[derive(Clone, Debug, Default)]
+pub struct RelayIndexRegistry {
+    indices: HashMap<TransportEndpoint, RelayIndex>,
+    next: u32,
+}
+
+impl RelayIndexRegistry {
+    /// Stable index for `endpoint`, assigning a new one on first sighting.
+    pub fn index_for(&mut self, endpoint: &TransportEndpoint) -> RelayIndex {
+        if let Some(index) = self.indices.get(endpoint) {
+            return *index;
+        }
+        let index = RelayIndex(self.next);
+        self.next += 1;
+        self.indices.insert(endpoint.clone(), index);
+        index
+    }
+}
 
 /// Internal fixed-bucket duration histogram in milliseconds.
 #[derive(Clone, Debug, Default)]
@@ -73,6 +104,31 @@ impl DurationHistogram {
             buckets,
             overflow_count: self.overflow,
         }
+    }
+}
+
+/// Sum a set of histograms into one aggregate snapshot.
+fn aggregate_histograms<'a>(
+    histograms: impl Iterator<Item = &'a DurationHistogram>,
+) -> DurationHistogramSnapshot {
+    let mut buckets = [0u64; BUCKET_BOUNDS_MS.len()];
+    let mut overflow = 0;
+    for histogram in histograms {
+        for (idx, count) in histogram.buckets.iter().enumerate() {
+            buckets[idx] += count;
+        }
+        overflow += histogram.overflow;
+    }
+    DurationHistogramSnapshot {
+        buckets: BUCKET_BOUNDS_MS
+            .iter()
+            .zip(buckets.iter())
+            .map(|(bound, count)| HistogramBucket {
+                upper_bound_ms: *bound,
+                count: *count,
+            })
+            .collect(),
+        overflow_count: overflow,
     }
 }
 
@@ -129,12 +185,19 @@ impl DurationHistogramSnapshot {
     }
 }
 
-/// First local-time sighting of a logical message and the endpoints that have
+/// First local-time sighting of a logical message and the relays that have
 /// delivered it so far.
 #[derive(Clone, Debug)]
 struct FirstSighting {
     first_seen_ms: u64,
-    endpoints: HashSet<TransportEndpoint>,
+    relays: HashSet<RelayIndex>,
+}
+
+/// Per-relay delivery tallies for the first-deliverer rate.
+#[derive(Clone, Debug, Default)]
+struct DeliveryTally {
+    delivered_first: u64,
+    delivered_later: u64,
 }
 
 /// Local, aggregate cross-relay arrival-spread recorder.
@@ -146,6 +209,7 @@ pub struct RelayDeliveryTelemetry {
     tracking_window_ms: u64,
     pending: HashMap<MessageId, FirstSighting>,
     spread: DurationHistogram,
+    per_relay: HashMap<RelayIndex, DeliveryTally>,
     observed: u64,
     corroborated: u64,
     single_source: u64,
@@ -163,45 +227,43 @@ impl RelayDeliveryTelemetry {
             tracking_window_ms,
             pending: HashMap::new(),
             spread: DurationHistogram::default(),
+            per_relay: HashMap::new(),
             observed: 0,
             corroborated: 0,
             single_source: 0,
         }
     }
 
-    /// Record one local-time sighting of `message_id` from `endpoint`.
+    /// Record one local-time sighting of `message_id` from `relay`.
     ///
-    /// `now_ms` is a local monotonic timestamp in milliseconds. The same
-    /// endpoint re-delivering a message is ignored; only the first sighting
-    /// from each distinct endpoint contributes a spread sample. Pruning of the
-    /// tracking window happens here so the table stays bounded without a timer.
-    pub fn record_sighting(
-        &mut self,
-        message_id: &MessageId,
-        endpoint: &TransportEndpoint,
-        now_ms: u64,
-    ) {
+    /// `now_ms` is a local monotonic timestamp in milliseconds. The same relay
+    /// re-delivering a message is ignored; only the first sighting from each
+    /// distinct relay contributes a spread sample. Pruning of the tracking
+    /// window happens here so the table stays bounded without a timer.
+    pub fn record_sighting(&mut self, message_id: &MessageId, relay: RelayIndex, now_ms: u64) {
         self.prune(now_ms);
 
         match self.pending.get_mut(message_id) {
             None => {
                 self.observed += 1;
-                let mut endpoints = HashSet::new();
-                endpoints.insert(endpoint.clone());
+                self.per_relay.entry(relay).or_default().delivered_first += 1;
+                let mut relays = HashSet::new();
+                relays.insert(relay);
                 self.pending.insert(
                     message_id.clone(),
                     FirstSighting {
                         first_seen_ms: now_ms,
-                        endpoints,
+                        relays,
                     },
                 );
             }
             Some(sighting) => {
-                if sighting.endpoints.insert(endpoint.clone()) {
-                    // First time this distinct endpoint corroborates the message.
-                    if sighting.endpoints.len() == 2 {
+                if sighting.relays.insert(relay) {
+                    // First time this distinct relay corroborates the message.
+                    if sighting.relays.len() == 2 {
                         self.corroborated += 1;
                     }
+                    self.per_relay.entry(relay).or_default().delivered_later += 1;
                     let delta = now_ms.saturating_sub(sighting.first_seen_ms);
                     self.spread.record(delta);
                 }
@@ -210,13 +272,13 @@ impl RelayDeliveryTelemetry {
     }
 
     /// Drop first-sighting entries older than the tracking window, counting any
-    /// that never reached a second endpoint as single-source.
+    /// that never reached a second relay as single-source.
     fn prune(&mut self, now_ms: u64) {
         let window = self.tracking_window_ms;
         let mut newly_single = 0;
         self.pending.retain(|_, sighting| {
             let expired = now_ms.saturating_sub(sighting.first_seen_ms) > window;
-            if expired && sighting.endpoints.len() == 1 {
+            if expired && sighting.relays.len() == 1 {
                 newly_single += 1;
             }
             !expired
@@ -226,75 +288,106 @@ impl RelayDeliveryTelemetry {
 
     /// Aggregate, privacy-safe snapshot for diagnostics and quiescence tuning.
     pub fn snapshot(&self) -> RelayDeliverySpread {
+        let mut per_relay: Vec<RelayDeliveryStats> = self
+            .per_relay
+            .iter()
+            .map(|(relay, tally)| RelayDeliveryStats {
+                relay_index: relay.0,
+                delivered_first: tally.delivered_first,
+                delivered_later: tally.delivered_later,
+            })
+            .collect();
+        per_relay.sort_by_key(|stats| stats.relay_index);
         RelayDeliverySpread {
             observed: self.observed,
             corroborated: self.corroborated,
             single_source: self.single_source,
             spread: self.spread.snapshot(),
+            per_relay,
         }
     }
 }
 
-/// Aggregate cross-relay arrival-spread snapshot.
+/// Per-relay delivery attribution for one relay.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayDeliveryStats {
+    /// Opaque device-local relay index.
+    pub relay_index: u32,
+    /// Times this relay was the first to surface a message.
+    pub delivered_first: u64,
+    /// Times this relay corroborated a message another relay surfaced first.
+    pub delivered_later: u64,
+}
+
+impl RelayDeliveryStats {
+    /// Fraction of this relay's copies that arrived first, in `0.0..=1.0`.
+    /// `None` when the relay has delivered nothing.
+    pub fn first_deliverer_rate(&self) -> Option<f64> {
+        let total = self.delivered_first + self.delivered_later;
+        (total > 0).then(|| self.delivered_first as f64 / total as f64)
+    }
+}
+
+/// Aggregate cross-relay arrival-spread snapshot.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RelayDeliverySpread {
     /// Distinct logical messages observed within the tracking window.
     pub observed: u64,
-    /// Messages corroborated by at least a second distinct endpoint.
+    /// Messages corroborated by at least a second distinct relay.
     pub corroborated: u64,
-    /// Messages pruned having been seen on exactly one endpoint.
+    /// Messages pruned having been seen on exactly one relay.
     pub single_source: u64,
-    /// Histogram of first-to-later-endpoint spread, in local-time milliseconds.
+    /// Histogram of first-to-later-relay spread, in local-time milliseconds.
     pub spread: DurationHistogramSnapshot,
+    /// Per-relay first-deliverer attribution, ascending by index.
+    pub per_relay: Vec<RelayDeliveryStats>,
 }
 
-/// Per-endpoint subscription progress relative to subscribe time.
+/// Per-relay subscription progress relative to subscribe time.
 #[derive(Clone, Debug)]
-struct EndpointProgress {
+struct RelayProgress {
     started_ms: u64,
     first_event_seen: bool,
     eose_seen: bool,
 }
 
-/// Progress of one subscription across the endpoints it was issued to.
+/// Progress of one subscription across the relays it was issued to.
 #[derive(Clone, Debug, Default)]
 struct SubscriptionProgress {
-    endpoints: HashMap<TransportEndpoint, EndpointProgress>,
+    relays: HashMap<RelayIndex, RelayProgress>,
 }
 
 /// Local recorder for subscription sync timing and the initial-sync gate.
 ///
-/// Diagnostic only; must never feed convergence or branch selection. Relay
-/// endpoints and subscription ids are tracking keys only and never appear in a
-/// snapshot.
+/// Diagnostic only; must never feed convergence or branch selection.
 #[derive(Clone, Debug, Default)]
 pub struct RelaySyncTelemetry {
     subscriptions: HashMap<String, SubscriptionProgress>,
-    first_event: DurationHistogram,
-    eose: DurationHistogram,
+    first_event: HashMap<RelayIndex, DurationHistogram>,
+    eose: HashMap<RelayIndex, DurationHistogram>,
 }
 
 impl RelaySyncTelemetry {
-    /// Record that `subscription_id` was (re)issued to `endpoints` at `now_ms`.
+    /// Record that `subscription_id` was (re)issued to `relays` at `now_ms`.
     ///
-    /// Resets per-endpoint progress so a resubscribe is measured from its new
-    /// start. Endpoints dropped from the subscription stop being tracked.
+    /// Resets per-relay progress so a resubscribe is measured from its new
+    /// start. Relays dropped from the subscription stop being tracked.
     pub fn record_subscription_start(
         &mut self,
         subscription_id: &str,
-        endpoints: &[TransportEndpoint],
+        relays: &[RelayIndex],
         now_ms: u64,
     ) {
         let progress = self
             .subscriptions
             .entry(subscription_id.to_string())
             .or_default();
-        progress.endpoints = endpoints
+        progress.relays = relays
             .iter()
-            .map(|endpoint| {
+            .map(|relay| {
                 (
-                    endpoint.clone(),
-                    EndpointProgress {
+                    *relay,
+                    RelayProgress {
                         started_ms: now_ms,
                         first_event_seen: false,
                         eose_seen: false,
@@ -304,54 +397,49 @@ impl RelaySyncTelemetry {
             .collect();
     }
 
-    /// Record the first event from `endpoint` for `subscription_id`. Later
-    /// events and unknown subscription/endpoint pairs are ignored.
-    pub fn record_first_event(
-        &mut self,
-        subscription_id: &str,
-        endpoint: &TransportEndpoint,
-        now_ms: u64,
-    ) {
+    /// Record the first event from `relay` for `subscription_id`. Later events
+    /// and unknown subscription/relay pairs are ignored.
+    pub fn record_first_event(&mut self, subscription_id: &str, relay: RelayIndex, now_ms: u64) {
         if let Some(progress) = self
             .subscriptions
             .get_mut(subscription_id)
-            .and_then(|sub| sub.endpoints.get_mut(endpoint))
+            .and_then(|sub| sub.relays.get_mut(&relay))
             && !progress.first_event_seen
         {
             progress.first_event_seen = true;
             self.first_event
+                .entry(relay)
+                .or_default()
                 .record(now_ms.saturating_sub(progress.started_ms));
         }
     }
 
-    /// Record EOSE from `endpoint` for `subscription_id`. Repeat EOSE and
-    /// unknown subscription/endpoint pairs are ignored.
-    pub fn record_eose(
-        &mut self,
-        subscription_id: &str,
-        endpoint: &TransportEndpoint,
-        now_ms: u64,
-    ) {
+    /// Record EOSE from `relay` for `subscription_id`. Repeat EOSE and unknown
+    /// subscription/relay pairs are ignored.
+    pub fn record_eose(&mut self, subscription_id: &str, relay: RelayIndex, now_ms: u64) {
         if let Some(progress) = self
             .subscriptions
             .get_mut(subscription_id)
-            .and_then(|sub| sub.endpoints.get_mut(endpoint))
+            .and_then(|sub| sub.relays.get_mut(&relay))
             && !progress.eose_seen
         {
             progress.eose_seen = true;
-            self.eose.record(now_ms.saturating_sub(progress.started_ms));
+            self.eose
+                .entry(relay)
+                .or_default()
+                .record(now_ms.saturating_sub(progress.started_ms));
         }
     }
 
-    /// Whether every endpoint of `subscription_id` has reached EOSE.
+    /// Whether every relay of `subscription_id` has reached EOSE.
     ///
     /// Returns `None` for an unknown subscription, `Some(false)` while any
-    /// endpoint is still draining, `Some(true)` once all have completed. This
-    /// is the initial-sync gate signal.
+    /// relay is still draining, `Some(true)` once all have completed. This is
+    /// the initial-sync gate signal.
     pub fn subscription_synced(&self, subscription_id: &str) -> Option<bool> {
-        self.subscriptions.get(subscription_id).map(|sub| {
-            !sub.endpoints.is_empty() && sub.endpoints.values().all(|endpoint| endpoint.eose_seen)
-        })
+        self.subscriptions
+            .get(subscription_id)
+            .map(subscription_is_synced)
     }
 
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
@@ -359,33 +447,75 @@ impl RelaySyncTelemetry {
         let synced = self
             .subscriptions
             .values()
-            .filter(|sub| {
-                !sub.endpoints.is_empty() && sub.endpoints.values().all(|ep| ep.eose_seen)
-            })
+            .filter(|sub| subscription_is_synced(sub))
             .count() as u64;
+
+        let mut relays: Vec<RelayIndex> = self
+            .first_event
+            .keys()
+            .chain(self.eose.keys())
+            .copied()
+            .collect();
+        relays.sort_unstable();
+        relays.dedup();
+        let per_relay = relays
+            .into_iter()
+            .map(|relay| RelayLatencyStats {
+                relay_index: relay.0,
+                first_event: self
+                    .first_event
+                    .get(&relay)
+                    .map(DurationHistogram::snapshot)
+                    .unwrap_or_default(),
+                eose: self
+                    .eose
+                    .get(&relay)
+                    .map(DurationHistogram::snapshot)
+                    .unwrap_or_default(),
+            })
+            .collect();
+
         RelaySyncSnapshot {
             tracked_subscriptions: self.subscriptions.len() as u64,
             synced_subscriptions: synced,
-            first_event: self.first_event.snapshot(),
-            eose: self.eose.snapshot(),
+            first_event: aggregate_histograms(self.first_event.values()),
+            eose: aggregate_histograms(self.eose.values()),
+            per_relay,
         }
     }
 }
 
+fn subscription_is_synced(sub: &SubscriptionProgress) -> bool {
+    !sub.relays.is_empty() && sub.relays.values().all(|relay| relay.eose_seen)
+}
+
+/// Per-relay first-event and EOSE latency for one relay.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayLatencyStats {
+    /// Opaque device-local relay index.
+    pub relay_index: u32,
+    /// First-event latency from subscribe time, in local-time milliseconds.
+    pub first_event: DurationHistogramSnapshot,
+    /// EOSE latency from subscribe time, in local-time milliseconds.
+    pub eose: DurationHistogramSnapshot,
+}
+
 /// Aggregate subscription sync-timing snapshot.
 ///
-/// Counts and millisecond histograms only: no subscription ids or relay
-/// endpoints.
+/// Counts, opaque relay indices, and millisecond histograms only: no
+/// subscription ids or relay endpoints.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RelaySyncSnapshot {
     /// Subscriptions currently tracked.
     pub tracked_subscriptions: u64,
-    /// Tracked subscriptions whose every endpoint has reached EOSE.
+    /// Tracked subscriptions whose every relay has reached EOSE.
     pub synced_subscriptions: u64,
-    /// Per-endpoint first-event latency from subscribe time, in local-time ms.
+    /// Aggregate first-event latency across all relays.
     pub first_event: DurationHistogramSnapshot,
-    /// Per-endpoint EOSE latency from subscribe time, in local-time ms.
+    /// Aggregate EOSE latency across all relays.
     pub eose: DurationHistogramSnapshot,
+    /// Per-relay first-event / EOSE latency, ascending by index.
+    pub per_relay: Vec<RelayLatencyStats>,
 }
 
 #[cfg(test)]
@@ -396,33 +526,47 @@ mod tests {
         MessageId::new(vec![byte; 32])
     }
 
-    fn relay(url: &str) -> TransportEndpoint {
-        TransportEndpoint(url.to_string())
+    const A: RelayIndex = RelayIndex(0);
+    const B: RelayIndex = RelayIndex(1);
+    const C: RelayIndex = RelayIndex(2);
+
+    #[test]
+    fn registry_assigns_stable_indices() {
+        let mut registry = RelayIndexRegistry::default();
+        let a = TransportEndpoint("wss://a".into());
+        let b = TransportEndpoint("wss://b".into());
+        let first = registry.index_for(&a);
+        assert_eq!(registry.index_for(&b), RelayIndex(1));
+        assert_eq!(registry.index_for(&a), first, "stable across calls");
     }
 
     #[test]
-    fn single_endpoint_sighting_records_no_spread() {
+    fn single_relay_sighting_records_no_spread() {
         let mut telem = RelayDeliveryTelemetry::default();
-        telem.record_sighting(&msg(1), &relay("wss://a"), 0);
+        telem.record_sighting(&msg(1), A, 0);
 
         let snap = telem.snapshot();
         assert_eq!(snap.observed, 1);
         assert_eq!(snap.corroborated, 0);
         assert_eq!(snap.spread.sample_count(), 0);
+        // The first (and only) deliverer is relay A.
+        assert_eq!(snap.per_relay.len(), 1);
+        assert_eq!(snap.per_relay[0].relay_index, 0);
+        assert_eq!(snap.per_relay[0].delivered_first, 1);
+        assert_eq!(snap.per_relay[0].first_deliverer_rate(), Some(1.0));
     }
 
     #[test]
-    fn second_distinct_endpoint_records_spread_in_local_time() {
+    fn second_distinct_relay_records_spread_in_local_time() {
         let mut telem = RelayDeliveryTelemetry::default();
-        telem.record_sighting(&msg(1), &relay("wss://a"), 100);
+        telem.record_sighting(&msg(1), A, 100);
         // Same message, later, from a different relay: 40ms spread.
-        telem.record_sighting(&msg(1), &relay("wss://b"), 140);
+        telem.record_sighting(&msg(1), B, 140);
 
         let snap = telem.snapshot();
         assert_eq!(snap.observed, 1);
         assert_eq!(snap.corroborated, 1);
         assert_eq!(snap.spread.sample_count(), 1);
-        // 40ms lands in the <=50ms bucket.
         let bucket = snap
             .spread
             .buckets
@@ -430,38 +574,57 @@ mod tests {
             .find(|b| b.upper_bound_ms == 50)
             .expect("50ms bucket");
         assert_eq!(bucket.count, 1);
+        // A delivered first, B delivered later.
+        let a = &snap.per_relay[0];
+        let b = &snap.per_relay[1];
+        assert_eq!((a.delivered_first, a.delivered_later), (1, 0));
+        assert_eq!((b.delivered_first, b.delivered_later), (0, 1));
+        assert_eq!(b.first_deliverer_rate(), Some(0.0));
     }
 
     #[test]
-    fn same_endpoint_redelivery_is_ignored() {
+    fn same_relay_redelivery_is_ignored() {
         let mut telem = RelayDeliveryTelemetry::default();
-        telem.record_sighting(&msg(1), &relay("wss://a"), 0);
-        telem.record_sighting(&msg(1), &relay("wss://a"), 500);
+        telem.record_sighting(&msg(1), A, 0);
+        telem.record_sighting(&msg(1), A, 500);
 
         let snap = telem.snapshot();
         assert_eq!(snap.corroborated, 0);
         assert_eq!(snap.spread.sample_count(), 0);
+        assert_eq!(snap.per_relay[0].delivered_later, 0);
     }
 
     #[test]
-    fn third_endpoint_adds_a_second_sample_but_not_a_second_corroboration() {
+    fn third_relay_adds_a_second_sample_but_not_a_second_corroboration() {
         let mut telem = RelayDeliveryTelemetry::default();
-        telem.record_sighting(&msg(1), &relay("wss://a"), 0);
-        telem.record_sighting(&msg(1), &relay("wss://b"), 20);
-        telem.record_sighting(&msg(1), &relay("wss://c"), 300);
+        telem.record_sighting(&msg(1), A, 0);
+        telem.record_sighting(&msg(1), B, 20);
+        telem.record_sighting(&msg(1), C, 300);
 
         let snap = telem.snapshot();
-        // Corroboration counts the message once; each laggard endpoint is a sample.
         assert_eq!(snap.corroborated, 1);
         assert_eq!(snap.spread.sample_count(), 2);
     }
 
     #[test]
+    fn first_deliverer_rate_reflects_mixed_races() {
+        let mut telem = RelayDeliveryTelemetry::default();
+        // msg 1: A first, B later. msg 2: B first, A later.
+        telem.record_sighting(&msg(1), A, 0);
+        telem.record_sighting(&msg(1), B, 10);
+        telem.record_sighting(&msg(2), B, 0);
+        telem.record_sighting(&msg(2), A, 10);
+
+        let snap = telem.snapshot();
+        assert_eq!(snap.per_relay[0].first_deliverer_rate(), Some(0.5));
+        assert_eq!(snap.per_relay[1].first_deliverer_rate(), Some(0.5));
+    }
+
+    #[test]
     fn expired_single_source_message_is_counted_on_prune() {
         let mut telem = RelayDeliveryTelemetry::with_window(1_000);
-        telem.record_sighting(&msg(1), &relay("wss://a"), 0);
-        // A later, unrelated sighting past the window triggers the prune.
-        telem.record_sighting(&msg(2), &relay("wss://a"), 2_000);
+        telem.record_sighting(&msg(1), A, 0);
+        telem.record_sighting(&msg(2), A, 2_000);
 
         let snap = telem.snapshot();
         assert_eq!(snap.single_source, 1);
@@ -470,19 +633,16 @@ mod tests {
     #[test]
     fn percentile_reads_the_bucket_the_target_falls_in() {
         let mut telem = RelayDeliveryTelemetry::default();
-        // Nine fast (<=10ms) and one slow (~2000ms) corroboration.
         for byte in 0..9u8 {
-            telem.record_sighting(&msg(byte), &relay("wss://a"), 0);
-            telem.record_sighting(&msg(byte), &relay("wss://b"), 5);
+            telem.record_sighting(&msg(byte), A, 0);
+            telem.record_sighting(&msg(byte), B, 5);
         }
-        telem.record_sighting(&msg(200), &relay("wss://a"), 0);
-        telem.record_sighting(&msg(200), &relay("wss://b"), 2_000);
+        telem.record_sighting(&msg(200), A, 0);
+        telem.record_sighting(&msg(200), B, 2_000);
 
         let snap = telem.snapshot();
         assert_eq!(snap.spread.sample_count(), 10);
-        // p50 sits among the fast samples.
         assert_eq!(snap.spread.approx_percentile_ms(0.5), Some(10));
-        // p100 reaches the slow laggard's bucket (<=2500ms).
         assert_eq!(snap.spread.approx_percentile_ms(1.0), Some(2500));
     }
 
@@ -495,13 +655,12 @@ mod tests {
     #[test]
     fn spread_beyond_largest_bucket_counts_as_overflow() {
         let mut telem = RelayDeliveryTelemetry::default();
-        telem.record_sighting(&msg(1), &relay("wss://a"), 0);
-        telem.record_sighting(&msg(1), &relay("wss://b"), 20_000);
+        telem.record_sighting(&msg(1), A, 0);
+        telem.record_sighting(&msg(1), B, 20_000);
 
         let snap = telem.snapshot();
         assert_eq!(snap.spread.overflow_count, 1);
         assert_eq!(snap.spread.sample_count(), 1);
-        // Overflow-only distribution reports "wider than measured".
         assert_eq!(snap.spread.approx_percentile_ms(1.0), None);
     }
 
@@ -512,36 +671,38 @@ mod tests {
     }
 
     #[test]
-    fn subscription_is_synced_only_when_all_endpoints_eose() {
+    fn subscription_is_synced_only_when_all_relays_eose() {
         let mut telem = RelaySyncTelemetry::default();
-        let (a, b) = (relay("wss://a"), relay("wss://b"));
-        telem.record_subscription_start("sub", &[a.clone(), b.clone()], 0);
+        telem.record_subscription_start("sub", &[A, B], 0);
         assert_eq!(telem.subscription_synced("sub"), Some(false));
 
-        telem.record_eose("sub", &a, 30);
+        telem.record_eose("sub", A, 30);
         assert_eq!(telem.subscription_synced("sub"), Some(false));
 
-        telem.record_eose("sub", &b, 70);
+        telem.record_eose("sub", B, 70);
         assert_eq!(telem.subscription_synced("sub"), Some(true));
 
         let snap = telem.snapshot();
         assert_eq!(snap.tracked_subscriptions, 1);
         assert_eq!(snap.synced_subscriptions, 1);
         assert_eq!(snap.eose.sample_count(), 2);
+        // Per-relay EOSE latency is attributed to both relays.
+        assert_eq!(snap.per_relay.len(), 2);
+        assert_eq!(snap.per_relay[0].eose.sample_count(), 1);
+        assert_eq!(snap.per_relay[1].eose.sample_count(), 1);
     }
 
     #[test]
-    fn first_event_latency_recorded_once_per_endpoint() {
+    fn first_event_latency_recorded_once_per_relay() {
         let mut telem = RelaySyncTelemetry::default();
-        let a = relay("wss://a");
-        telem.record_subscription_start("sub", std::slice::from_ref(&a), 100);
-        telem.record_first_event("sub", &a, 130);
-        // A later event from the same endpoint does not record again.
-        telem.record_first_event("sub", &a, 900);
+        telem.record_subscription_start("sub", &[A], 100);
+        telem.record_first_event("sub", A, 130);
+        telem.record_first_event("sub", A, 900);
 
         let snap = telem.snapshot();
         assert_eq!(snap.first_event.sample_count(), 1);
-        // 30ms latency lands in the <=50ms bucket.
+        assert_eq!(snap.per_relay[0].relay_index, 0);
+        assert_eq!(snap.per_relay[0].first_event.sample_count(), 1);
         let bucket = snap
             .first_event
             .buckets
@@ -554,26 +715,25 @@ mod tests {
     #[test]
     fn events_for_untracked_subscription_are_ignored() {
         let mut telem = RelaySyncTelemetry::default();
-        let a = relay("wss://a");
-        telem.record_first_event("ghost", &a, 10);
-        telem.record_eose("ghost", &a, 20);
+        telem.record_first_event("ghost", A, 10);
+        telem.record_eose("ghost", A, 20);
 
         let snap = telem.snapshot();
         assert_eq!(snap.tracked_subscriptions, 0);
         assert_eq!(snap.first_event.sample_count(), 0);
         assert_eq!(snap.eose.sample_count(), 0);
+        assert!(snap.per_relay.is_empty());
     }
 
     #[test]
-    fn resubscribe_resets_endpoint_progress() {
+    fn resubscribe_resets_relay_progress() {
         let mut telem = RelaySyncTelemetry::default();
-        let a = relay("wss://a");
-        telem.record_subscription_start("sub", std::slice::from_ref(&a), 0);
-        telem.record_eose("sub", &a, 10);
+        telem.record_subscription_start("sub", &[A], 0);
+        telem.record_eose("sub", A, 10);
         assert_eq!(telem.subscription_synced("sub"), Some(true));
 
         // Reissued: the prior EOSE no longer counts.
-        telem.record_subscription_start("sub", std::slice::from_ref(&a), 100);
+        telem.record_subscription_start("sub", &[A], 100);
         assert_eq!(telem.subscription_synced("sub"), Some(false));
     }
 }
