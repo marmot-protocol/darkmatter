@@ -63,6 +63,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Removed the kind `10051` KeyPackage relay list. KeyPackage kind `30443` events now publish to, and are fetched from,
+  the account's kind `10002` NIP-65 relays. The `key_package` relay type is no longer accepted by `dm relays`, account
+  relay-list status no longer reports a `key_package` list, and account bootstrap only requires the NIP-65 and inbox
+  relay lists.
 - Added plural `dm messages` command spelling for the message send/list/subscribe surface, matching the daemon-hosted
   runtime subscription model. The older singular `dm message` spelling still works during the transition.
 - `dm messages subscribe` can now omit the group argument to stream live updates across all local groups for the
