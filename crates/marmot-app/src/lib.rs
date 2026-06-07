@@ -5,7 +5,8 @@
 //! transport publishing, and relay-backed app projections.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -155,6 +156,8 @@ const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
+const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
+const AUDIT_ID_BYTES: usize = 16;
 const SESSION_DB_FILE: &str = "session.sqlite";
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_SALT_LEN: usize = 32;
@@ -811,12 +814,62 @@ fn notification_settings_from_account(
     }
 }
 
-fn audit_engine_id_hex(account_id: &MemberId) -> String {
+fn audit_account_ref_hex(account_id: &MemberId) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"marmot-audit-engine-id/v1");
+    hasher.update(b"marmot-audit-account-ref/v1");
     hasher.update(account_id.as_slice());
     let digest = hasher.finalize();
-    hex::encode(&digest[..16])
+    hex::encode(&digest[..AUDIT_ID_BYTES])
+}
+
+fn audit_engine_id_hex(account_id: &MemberId, device_id_hex: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-engine-id/v2");
+    hasher.update(account_id.as_slice());
+    hasher.update(device_id_hex.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..AUDIT_ID_BYTES])
+}
+
+fn parse_audit_device_id_hex(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    let bytes = hex::decode(value).map_err(|_| {
+        AppError::InvalidAuditLogFile("audit device id must be hex encoded".to_owned())
+    })?;
+    if bytes.len() != AUDIT_ID_BYTES {
+        return Err(AppError::InvalidAuditLogFile(format!(
+            "audit device id must be {AUDIT_ID_BYTES} bytes"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn generate_audit_device_id_hex() -> String {
+    let mut bytes = [0u8; AUDIT_ID_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn audit_device_id_hex(account_dir: &Path) -> Result<String, AppError> {
+    let path = account_dir.join(AUDIT_DEVICE_ID_FILE);
+    match fs::read_to_string(&path) {
+        Ok(value) => return parse_audit_device_id_hex(&value),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let device_id = generate_audit_device_id_hex();
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(device_id.as_bytes())?;
+            file.write_all(b"\n")?;
+            Ok(device_id)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            parse_audit_device_id_hex(&fs::read_to_string(&path)?)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn relay_telemetry_settings_from_storage(
@@ -2251,7 +2304,7 @@ impl MarmotApp {
         let session_key =
             self.sqlcipher_key(label, &keys, &session_path, SqlcipherDatabaseKind::Session)?;
         // Optional forensic audit log. Set `MARMOT_AUDIT_LOG=1` (or any non-empty
-        // value) to enable per-account JSONL recording at
+        // value) to enable per-account/device JSONL recording at
         // `<account_dir>/audit-<engine_id>.jsonl`. Sensitive mode — raw values.
         // Temporary forensic measure; remove the file when done debugging.
         let mut session_config = SessionConfig::new(
@@ -2274,20 +2327,36 @@ impl MarmotApp {
             .filter(|v| !v.is_empty())
             .is_some()
         {
-            let engine_id_hex = audit_engine_id_hex(&account_id);
-            let audit_path = self
-                .account_dir(label)
-                .join(format!("audit-{engine_id_hex}.jsonl"));
-            match marmot_forensics::JsonlRecorder::open(&audit_path, engine_id_hex.clone()) {
-                Ok(recorder) => {
-                    session_config = session_config.recorder(Box::new(recorder));
+            let account_dir = self.account_dir(label);
+            match audit_device_id_hex(&account_dir) {
+                Ok(device_id_hex) => {
+                    let account_ref_hex = audit_account_ref_hex(&account_id);
+                    let engine_id_hex = audit_engine_id_hex(&account_id, &device_id_hex);
+                    let audit_path = account_dir.join(format!("audit-{engine_id_hex}.jsonl"));
+                    match marmot_forensics::JsonlRecorder::open_with_account_ref(
+                        &audit_path,
+                        engine_id_hex.clone(),
+                        Some(account_ref_hex),
+                    ) {
+                        Ok(recorder) => {
+                            session_config = session_config.recorder(Box::new(recorder));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "marmot_app",
+                                method = "open_account",
+                                error = %e,
+                                "failed to open forensic audit log; continuing without it"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
                         target: "marmot_app",
                         method = "open_account",
                         error = %e,
-                        "failed to open forensic audit log; continuing without it"
+                        "failed to prepare forensic audit identity; continuing without it"
                     );
                 }
             }
@@ -5835,11 +5904,47 @@ mod tests {
     fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {
         let account_id = MemberId::new(vec![0xab; 32]);
 
-        let engine_id = audit_engine_id_hex(&account_id);
+        let engine_id = audit_engine_id_hex(&account_id, "01".repeat(16).as_str());
 
         assert_eq!(engine_id.len(), 32);
-        assert_eq!(engine_id, audit_engine_id_hex(&account_id));
+        assert_eq!(
+            engine_id,
+            audit_engine_id_hex(&account_id, "01".repeat(16).as_str())
+        );
         assert_ne!(engine_id, hex::encode(&account_id.as_slice()[..16]));
+    }
+
+    #[test]
+    fn audit_identity_hashes_separate_account_and_device_scope() {
+        let account_id = MemberId::new(vec![0xab; 32]);
+        let first_device = "01".repeat(16);
+        let second_device = "02".repeat(16);
+
+        let account_ref = audit_account_ref_hex(&account_id);
+        let first_engine = audit_engine_id_hex(&account_id, &first_device);
+        let second_engine = audit_engine_id_hex(&account_id, &second_device);
+
+        assert_eq!(account_ref.len(), 32);
+        assert_eq!(account_ref, audit_account_ref_hex(&account_id));
+        assert_ne!(account_ref, hex::encode(&account_id.as_slice()[..16]));
+        assert_ne!(first_engine, second_engine);
+    }
+
+    #[test]
+    fn audit_device_id_is_generated_once_per_account_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = audit_device_id_hex(dir.path()).unwrap();
+        let second = audit_device_id_hex(dir.path()).unwrap();
+
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(AUDIT_DEVICE_ID_FILE))
+                .unwrap()
+                .trim(),
+            first
+        );
     }
 
     #[test]
