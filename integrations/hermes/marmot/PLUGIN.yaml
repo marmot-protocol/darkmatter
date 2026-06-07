@@ -4,12 +4,11 @@ kind: platform
 version: 0.1.0
 description: Hermes platform adapter for Marmot through the local dm-agent control socket
 author: Darkmatter
-requires_env:
+requires_env: []
+optional_env:
   - name: MARMOT_HOME
     description: "dm-agent home directory; required unless MARMOT_AGENT_SOCKET is set"
-    prompt: "Marmot home"
     password: false
-optional_env:
   - name: MARMOT_AGENT_SOCKET
     description: "Unix socket for dm-agent; defaults to $MARMOT_HOME/dev/dm-agent.sock"
     password: false

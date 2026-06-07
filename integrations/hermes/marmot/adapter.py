@@ -376,8 +376,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
         self.socket_path = resolve_socket_path(extra)
         self.client = client or MarmotAgentControlClient(self.socket_path)
-        self.account_id_hex = _optional_hex(_first_config_value(extra, "account_id_hex", "account", env="MARMOT_ACCOUNT_ID_HEX"))
-        self.group_id_hex = _optional_hex(_first_config_value(extra, "group_id_hex", "group", env="MARMOT_GROUP_ID_HEX"))
+        self.account_id_hex = _optional_hex(
+            _first_config_value(extra, "account_id_hex", "account", env="MARMOT_ACCOUNT_ID_HEX"),
+            "MARMOT_ACCOUNT_ID_HEX",
+        )
+        self.group_id_hex = _optional_hex(
+            _first_config_value(extra, "group_id_hex", "group", env="MARMOT_GROUP_ID_HEX"),
+            "MARMOT_GROUP_ID_HEX",
+        )
         self.quic_candidates = resolve_quic_candidates(extra)
         self.stream_chunk_bytes = int(extra.get("stream_chunk_bytes") or DEFAULT_STREAM_CHUNK_BYTES)
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
@@ -830,10 +836,7 @@ def _normalize_hex(value: Any, field: str = "hex") -> str:
 def _optional_hex(value: Any, field: str = "hex") -> Optional[str]:
     if value is None or str(value).strip() == "":
         return None
-    try:
-        return _normalize_hex(value, field)
-    except AgentControlError:
-        return None
+    return _normalize_hex(value, field)
 
 
 def _hash_len_prefixed(hasher: Any, data: bytes) -> None:
@@ -869,8 +872,8 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
     writer.close()
     try:
         await writer.wait_closed()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("error while closing Marmot socket writer: %s", exc)
 
 
 class _MinimalConfig:

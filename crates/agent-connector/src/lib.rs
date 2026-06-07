@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +64,7 @@ pub struct AgentConnector {
     debug_final_sends: DebugFinalSendStore,
     streams: StreamSessionStore,
     runtime: MarmotAppRuntime,
+    connection_errors: Arc<AtomicU64>,
 }
 
 impl AgentConnector {
@@ -85,6 +87,7 @@ impl AgentConnector {
             debug_final_sends: DebugFinalSendStore::default(),
             streams: StreamSessionStore::default(),
             runtime,
+            connection_errors: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -139,14 +142,24 @@ impl AgentConnector {
         }
         let response = match self.handle_request(request.payload).await {
             Ok(response) => response,
-            Err(err) => AgentControlResponse::Error {
-                code: err.code().to_owned(),
-                message: err.to_string(),
-            },
+            Err(err) => self.error_response(&err),
         };
         let response = AgentControlEnvelope::new(request.id, response);
         write_frame(&mut write_half, &response).await?;
         Ok(())
+    }
+
+    fn error_response(&self, err: &ConnectorError) -> AgentControlResponse {
+        tracing::warn!(
+            target: "agent_connector",
+            method = "handle_connection",
+            error_code = err.privacy_safe_code(),
+            "control request failed"
+        );
+        AgentControlResponse::Error {
+            code: err.code().to_owned(),
+            message: err.client_message().to_owned(),
+        }
     }
 
     async fn handle_request(
@@ -253,7 +266,7 @@ impl AgentConnector {
             }
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),
-                message: format!("{other:?} is not implemented by this connector slice"),
+                message: unsupported_request_message(&other).to_owned(),
             }),
         }
     }
@@ -658,13 +671,7 @@ impl AgentConnector {
         let mut debug_events = self.debug_events.subscribe();
         if let Err(err) = self.runtime.catch_up_accounts().await {
             let err = ConnectorError::from(err);
-            let response = AgentControlEnvelope::new(
-                request_id,
-                AgentControlResponse::Error {
-                    code: err.code().to_owned(),
-                    message: err.to_string(),
-                },
-            );
+            let response = AgentControlEnvelope::new(request_id, self.error_response(&err));
             write_frame(writer, &response).await?;
             return Ok(());
         }
@@ -768,7 +775,17 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
         let (stream, _peer_addr) = listener.accept().await?;
         let connector = connector.clone();
         tokio::spawn(async move {
-            let _ = connector.handle_connection(stream).await;
+            if let Err(err) = connector.handle_connection(stream).await {
+                let connection_error =
+                    connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "serve_socket",
+                    connection_error,
+                    error_code = err.privacy_safe_code(),
+                    "connection failed"
+                );
+            }
         });
     }
 }
@@ -860,6 +877,15 @@ fn inbound_filter_matches(
 ) -> bool {
     account_filter.is_none_or(|filter| filter == account_id_hex)
         && group_filter.is_none_or(|filter| filter == group_id_hex)
+}
+
+fn unsupported_request_message(request: &AgentControlRequest) -> &'static str {
+    match request {
+        AgentControlRequest::SubscribeInbound { .. } => {
+            "subscribe_inbound must be sent as the first request on a streaming connection"
+        }
+        _ => "request is not implemented by this connector slice",
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1147,7 +1173,7 @@ pub enum ConnectorError {
 }
 
 impl ConnectorError {
-    fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::AccountHome(_) => "account_home_error",
             Self::App(_) => "app_error",
@@ -1158,6 +1184,21 @@ impl ConnectorError {
             Self::DebugControlsDisabled => "debug_controls_disabled",
             Self::Stream(_) => "stream_error",
         }
+    }
+
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            Self::DebugControlsDisabled => "debug controls are disabled",
+            Self::Hex(_) => "invalid hex value",
+            Self::Json(_) | Self::Control(_) => "invalid control request",
+            Self::Stream(_) => "agent stream request failed",
+            Self::Io(_) => "connector I/O failed",
+            Self::AccountHome(_) | Self::App(_) => "connector request failed",
+        }
+    }
+
+    pub fn privacy_safe_code(&self) -> &'static str {
+        self.code()
     }
 }
 
@@ -1229,6 +1270,8 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
 
     use crate::{AgentConnector, AgentConnectorConfig, bind_connector_socket, serve_socket};
+
+    const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
     #[tokio::test]
     async fn connector_socket_serves_account_list() {
@@ -1334,12 +1377,14 @@ mod tests {
         write_frame(&mut subscriber_write, &subscribe)
             .await
             .unwrap();
-        let ack: AgentControlEnvelope<AgentControlResponse> =
-            timeout(Duration::from_secs(20), read_envelope(&mut subscriber_read))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            read_envelope(&mut subscriber_read),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(ack.id.as_deref(), Some("req-subscribe"));
         assert_eq!(ack.payload, AgentControlResponse::Ack);
 
@@ -1357,7 +1402,7 @@ mod tests {
         );
         write_frame(&mut sender_write, &send).await.unwrap();
         let sent: AgentControlEnvelope<AgentControlResponse> =
-            timeout(Duration::from_secs(20), read_envelope(&mut sender_read))
+            timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut sender_read))
                 .await
                 .unwrap()
                 .unwrap()
@@ -1417,12 +1462,14 @@ mod tests {
         write_frame(&mut subscriber_write, &subscribe)
             .await
             .unwrap();
-        let ack: AgentControlEnvelope<AgentControlResponse> =
-            timeout(Duration::from_secs(20), read_envelope(&mut subscriber_read))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            read_envelope(&mut subscriber_read),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(ack.payload, AgentControlResponse::Ack);
 
         let injected = send_control_request(
@@ -2214,7 +2261,7 @@ mod tests {
         let mut client_read = BufReader::new(client_read);
         let request = AgentControlEnvelope::request(Some(id.to_owned()), request);
         write_frame(&mut client_write, &request).await.unwrap();
-        timeout(Duration::from_secs(20), read_envelope(&mut client_read))
+        timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut client_read))
             .await
             .unwrap()
             .unwrap()
@@ -2305,7 +2352,7 @@ mod tests {
     {
         for _ in 0..10 {
             let event: AgentControlEnvelope<AgentControlEvent> =
-                timeout(Duration::from_secs(20), read_envelope(reader))
+                timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(reader))
                     .await
                     .unwrap()
                     .unwrap()

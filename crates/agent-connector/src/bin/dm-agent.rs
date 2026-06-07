@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use agent_connector::{AgentConnectorConfig, default_socket_path, serve_socket};
+use agent_connector::{AgentConnectorConfig, ConnectorError, default_socket_path, serve_socket};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -46,8 +46,12 @@ async fn main() -> ExitCode {
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("dm-agent: {err}");
+            eprintln!("dm-agent: {}", safe_error_message(&err));
             ExitCode::FAILURE
         }
     }
+}
+
+fn safe_error_message(err: &ConnectorError) -> String {
+    format!("startup failed code={}", err.privacy_safe_code())
 }

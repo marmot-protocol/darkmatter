@@ -60,12 +60,67 @@ if [ ! -d "$dev_parent" ]; then
 fi
 dev_root="$(cd "$dev_parent" && pwd)/$dev_base"
 
-case "$dev_root" in
-    "/"|"$HOME"|"$PWD")
-        echo "error: refusing to delete unsafe root: $dev_root" >&2
-        exit 1
-        ;;
-esac
+same_or_within() {
+    local path="${1%/}"
+    local root="${2%/}"
+    if [ -z "$path" ]; then
+        path="/"
+    fi
+    if [ -z "$root" ]; then
+        root="/"
+    fi
+    if [ "$root" = "/" ]; then
+        [ "$path" = "/" ]
+        return
+    fi
+    [ "$path" = "$root" ] || [[ "$path" = "$root/"* ]]
+}
+
+within_root() {
+    local path="${1%/}"
+    local root="${2%/}"
+    if [ -z "$path" ]; then
+        path="/"
+    fi
+    if [ -z "$root" ]; then
+        root="/"
+    fi
+    if [ "$root" = "/" ]; then
+        [ "$path" != "/" ]
+        return
+    fi
+    [[ "$path" = "$root/"* ]]
+}
+
+default_tmp_root="${default_tmp%/}"
+if [ -d "$default_tmp_root" ]; then
+    default_tmp_root="$(cd "$default_tmp_root" && pwd)"
+fi
+
+home_root="${HOME%/}"
+home_data_root="$home_root/.local/share"
+if same_or_within "$dev_root" "/" \
+    || same_or_within "$dev_root" "$PWD" \
+    || same_or_within "$dev_root" "/etc" \
+    || same_or_within "$dev_root" "/usr" \
+    || same_or_within "$dev_root" "/bin" \
+    || same_or_within "$dev_root" "/sbin" \
+    || same_or_within "$dev_root" "/System" \
+    || same_or_within "$dev_root" "/Library"; then
+    echo "error: refusing to delete unsafe root: $dev_root" >&2
+    exit 1
+fi
+if same_or_within "$dev_root" "$home_root" && ! within_root "$dev_root" "$home_data_root"; then
+    echo "error: refusing to delete unsafe root: $dev_root" >&2
+    exit 1
+fi
+if ! within_root "$dev_root" "/tmp" \
+    && ! within_root "$dev_root" "/var/tmp" \
+    && ! within_root "$dev_root" "$default_tmp_root" \
+    && ! within_root "$dev_root" "$home_data_root"; then
+    echo "error: refusing to delete unsafe root: $dev_root" >&2
+    exit 1
+fi
 
 if [ ! -e "$dev_root" ]; then
     echo "nothing to remove: $dev_root"

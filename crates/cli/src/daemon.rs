@@ -2244,6 +2244,17 @@ async fn open_stream_compose(
             "stream start did not return a start message id".to_owned(),
         );
     };
+    let Some(start_account_id) = start
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return daemon_error(
+            cli.json,
+            "stream_compose_failed",
+            "stream start did not return an account id".to_owned(),
+        );
+    };
     let start_event_id = match hex::decode(&start_message_id) {
         Ok(bytes) => cgka_traits::MessageId::new(bytes),
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
@@ -2262,7 +2273,7 @@ async fn open_stream_compose(
         };
         match crate::stream_crypto_for_start_event(
             runtime,
-            account.as_deref(),
+            Some(&start_account_id),
             Some(group_id.as_str()),
             Some(stream_id.as_str()),
             &start_message_id,

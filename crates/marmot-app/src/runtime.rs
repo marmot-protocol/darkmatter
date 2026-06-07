@@ -1387,8 +1387,13 @@ impl MarmotAppRuntime {
             )
         })
         .await?;
+        let normalized_stream_id_hex = options
+            .stream_id_hex
+            .as_deref()
+            .map(normalize_hex_app)
+            .transpose()?;
         let (start_message_id_hex, start, _sender_hex) =
-            latest_agent_stream_start(messages, options.stream_id_hex.as_deref())?;
+            latest_agent_stream_start(messages, normalized_stream_id_hex.as_deref())?;
         if start_message_id_hex.is_empty() {
             // The latest start hasn't been echoed back with a message id yet, so
             // we can't reference it to the broker; surface that rather than
@@ -1401,7 +1406,7 @@ impl MarmotAppRuntime {
         let candidates = parse_quic_candidates(&start.quic_candidates)?;
         let server_cert_der = options.server_cert_der;
         let insecure_local = options.insecure_local;
-        let stream_id_hex = start.stream_id_hex.clone();
+        let stream_id_hex = normalize_hex_app(&start.stream_id_hex)?;
         let crypto_context = self
             .agent_text_stream_crypto_for_start_event(
                 Some(account_ref),
@@ -1448,20 +1453,13 @@ impl MarmotAppRuntime {
         let group_id_hex = group_id_hex.map(normalize_group_id_hex_app).transpose()?;
         let stream_id_hex = stream_id_hex.map(normalize_hex_app).transpose()?;
 
-        let mut accounts = Vec::new();
-        if let Some(account_ref) = account_ref.filter(|account_ref| !account_ref.trim().is_empty())
+        let accounts = if let Some(account_ref) =
+            account_ref.filter(|account_ref| !account_ref.trim().is_empty())
         {
-            accounts.push(self.accounts.resolve(account_ref)?);
-        }
-        for account in self.accounts.app.account_home().accounts()? {
-            if account.local_signing
-                && !accounts
-                    .iter()
-                    .any(|existing| existing.account_id_hex == account.account_id_hex)
-            {
-                accounts.push(account);
-            }
-        }
+            vec![self.accounts.resolve(account_ref)?]
+        } else {
+            self.accounts.app.account_home().accounts()?
+        };
 
         for account in accounts {
             if !account.local_signing {
@@ -1488,14 +1486,15 @@ impl MarmotAppRuntime {
                 let Some(start) = StreamStartView::from_event(message.kind, &message.tags) else {
                     continue;
                 };
+                let start_stream_id_hex = normalize_hex_app(&start.stream_id_hex)?;
                 if stream_id_hex
                     .as_deref()
-                    .is_some_and(|stream_id| stream_id != start.stream_id_hex)
+                    .is_some_and(|stream_id| stream_id != start_stream_id_hex)
                 {
                     continue;
                 }
                 let group_id = GroupId::new(hex::decode(&message.group_id_hex)?);
-                let stream_id = hex::decode(&start.stream_id_hex)?;
+                let stream_id = hex::decode(&start_stream_id_hex)?;
                 let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
                 let group_state = match self.group_mls_state(&account.label, &group_id).await {
                     Ok(group_state) => group_state,
@@ -4135,12 +4134,17 @@ fn latest_agent_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
 ) -> Result<(String, StreamStartView, String), AppError> {
+    let stream_id_hex = stream_id_hex.map(normalize_hex_app).transpose()?;
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
             let start = StreamStartView::from_event(message.kind, &message.tags)?;
-            if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
+            let start_stream_id_hex = normalize_hex_app(&start.stream_id_hex).ok()?;
+            if stream_id_hex
+                .as_deref()
+                .is_none_or(|stream_id| stream_id == start_stream_id_hex)
+            {
                 Some((message.message_id_hex, start, message.sender))
             } else {
                 None
@@ -4647,6 +4651,33 @@ mod tests {
                 row,
             }) if row.group_id_hex == "group" && row.title == "after"
         ));
+    }
+
+    #[test]
+    fn latest_agent_stream_start_accepts_mixed_case_filter() {
+        let stream_id_hex = hex::encode([0xab; 32]);
+        let (message_id_hex, start, sender) = latest_agent_stream_start(
+            vec![AppMessageRecord {
+                message_id_hex: "11".repeat(32),
+                direction: "inbound".to_owned(),
+                group_id_hex: "22".repeat(32),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+                tags: vec![
+                    vec![STREAM_TAG.to_owned(), stream_id_hex.clone()],
+                    vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
+                ],
+                recorded_at: 0,
+                received_at: 0,
+            }],
+            Some(&stream_id_hex.to_uppercase()),
+        )
+        .unwrap();
+
+        assert_eq!(message_id_hex, "11".repeat(32));
+        assert_eq!(start.stream_id_hex, stream_id_hex);
+        assert_eq!(sender, "33".repeat(32));
     }
 
     fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {

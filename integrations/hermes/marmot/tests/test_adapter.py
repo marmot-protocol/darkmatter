@@ -270,6 +270,16 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_invalid_explicit_account_hex_is_rejected(self):
+        with self.assertRaisesRegex(
+            self.adapter_module.AgentControlError,
+            "MARMOT_ACCOUNT_ID_HEX must be hexadecimal",
+        ):
+            self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "not-hex"}),
+                client=object(),
+            )
+
     async def test_send_maps_hermes_chat_to_marmot_send_final(self):
         class FakeClient:
             def __init__(self):

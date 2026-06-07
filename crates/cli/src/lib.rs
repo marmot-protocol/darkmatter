@@ -3879,12 +3879,19 @@ pub(crate) async fn stream_command_app_with_runtime(
                 return Err(DmError::EmptyStreamText);
             }
             let text = text.join(" ");
+            let selected_account = resolve_selected_account(account_home, account_flag)?;
+            if let Some(account) = selected_account.as_ref() {
+                ensure_local_signing(account)?;
+            }
+            let selected_account_id_hex = selected_account
+                .as_ref()
+                .map(|account| account.account_id_hex.as_str());
             let start_event_id_hex = start_event_id.ok_or(DmError::MissingStreamStart)?;
             let expected_stream_id_hex =
                 stream_id.map(|value| normalize_hex(&value)).transpose()?;
             let (stream_id, crypto) = stream_crypto_for_start_event(
                 runtime,
-                account_flag.as_deref(),
+                selected_account_id_hex,
                 None,
                 expected_stream_id_hex.as_deref(),
                 &start_event_id_hex,
@@ -4140,7 +4147,7 @@ where
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
     let (stream_id, crypto) = stream_crypto_for_start_event(
         runtime,
-        account_flag.as_deref(),
+        Some(&account.account_id_hex),
         Some(&group_id_hex),
         Some(&stream_id_hex),
         &start_message_id_hex,
@@ -4213,12 +4220,17 @@ fn latest_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
 ) -> Result<(String, StreamStartView, String), DmError> {
+    let stream_id_hex = stream_id_hex.map(normalize_hex).transpose()?;
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
             let start = StreamStartView::from_event(message.kind, &message.tags)?;
-            if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
+            let start_stream_id_hex = normalize_hex(&start.stream_id_hex).ok()?;
+            if stream_id_hex
+                .as_deref()
+                .is_none_or(|stream_id| stream_id == start_stream_id_hex)
+            {
                 Some((message.message_id_hex, start, message.sender))
             } else {
                 None
@@ -4229,14 +4241,14 @@ fn latest_stream_start(
 
 pub(crate) async fn stream_crypto_for_start_event(
     runtime: &MarmotAppRuntime,
-    account_hint: Option<&str>,
+    resolved_account_id_hex: Option<&str>,
     group_id_hex: Option<&str>,
     stream_id_hex: Option<&str>,
     start_message_id_hex: &str,
 ) -> Result<(Vec<u8>, transport_quic_stream::AgentTextStreamCrypto), DmError> {
     let context = runtime
         .agent_text_stream_crypto_for_start_event(
-            account_hint,
+            resolved_account_id_hex,
             group_id_hex,
             stream_id_hex,
             start_message_id_hex,
@@ -5281,6 +5293,19 @@ fn resolve_account(
         [account] => Ok(account.clone()),
         _ => Err(DmError::MultipleAccounts),
     }
+}
+
+fn resolve_selected_account(
+    account_home: &AccountHome,
+    explicit: Option<String>,
+) -> Result<Option<marmot_account::AccountSummary>, DmError> {
+    let Some(account) = explicit
+        .or_else(|| std::env::var("DM_ACCOUNT").ok())
+        .filter(|account| !account.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(resolve_account_ref(account_home, &account)?))
 }
 
 fn resolve_account_ref(
