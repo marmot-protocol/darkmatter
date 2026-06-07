@@ -173,17 +173,17 @@ impl AgentConnector {
         }
         let response = match self.handle_request(request.payload).await {
             Ok(response) => response,
-            Err(err) => self.error_response(&err),
+            Err(err) => self.error_response("handle_connection", &err),
         };
         let response = AgentControlEnvelope::new(request.id, response);
         write_frame(&mut write_half, &response).await?;
         Ok(())
     }
 
-    fn error_response(&self, err: &ConnectorError) -> AgentControlResponse {
+    fn error_response(&self, method: &'static str, err: &ConnectorError) -> AgentControlResponse {
         tracing::warn!(
             target: "agent_connector",
-            method = "handle_connection",
+            method,
             error_code = err.privacy_safe_code(),
             "control request failed"
         );
@@ -702,7 +702,10 @@ impl AgentConnector {
         let mut debug_events = self.debug_events.subscribe();
         if let Err(err) = self.runtime.catch_up_accounts().await {
             let err = ConnectorError::from(err);
-            let response = AgentControlEnvelope::new(request_id, self.error_response(&err));
+            let response = AgentControlEnvelope::new(
+                request_id,
+                self.error_response("stream_inbound_events", &err),
+            );
             write_frame(writer, &response).await?;
             return Ok(());
         }
@@ -718,7 +721,10 @@ impl AgentConnector {
                 _ = catch_up_interval.tick() => {
                     if let Err(err) = self.runtime.catch_up_accounts().await {
                         let err = ConnectorError::from(err);
-                        let response = AgentControlEnvelope::new(request_id.clone(), self.error_response(&err));
+                        let response = AgentControlEnvelope::new(
+                            request_id.clone(),
+                            self.error_response("stream_inbound_events", &err),
+                        );
                         write_frame(writer, &response).await?;
                         return Ok(());
                     }
@@ -1284,7 +1290,19 @@ fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::R
             bind_error.kind(),
             "agent connector socket is already in use",
         )),
-        Err(_) => std::fs::remove_file(socket),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            match std::fs::remove_file(socket) {
+                Ok(()) => Ok(()),
+                Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(remove_error) => Err(remove_error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1358,6 +1376,19 @@ mod tests {
             listener.local_addr().is_ok(),
             "expected connector socket to rebind after stale socket cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn connector_socket_bind_preserves_existing_non_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"not a socket").unwrap();
+
+        let error = bind_connector_socket(&socket).unwrap_err();
+
+        assert_eq!(error.code(), "io_error");
+        assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
     }
 
     #[tokio::test]
