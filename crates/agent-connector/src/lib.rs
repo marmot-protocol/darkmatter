@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_control::{
     AgentControlAccount, AgentControlDebugFinalSend, AgentControlEnvelope, AgentControlError,
@@ -30,6 +31,7 @@ const AGENT_SOCKET_MODE: u32 = 0o600;
 const ALLOWLIST_DIR: &str = "agent-allowlist";
 const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
+const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct AgentConnectorConfig {
@@ -706,8 +708,22 @@ impl AgentConnector {
         }
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
         write_frame(writer, &response).await?;
+        let mut catch_up_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
+            INBOUND_CATCH_UP_INTERVAL,
+        );
+        catch_up_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
+                _ = catch_up_interval.tick() => {
+                    if let Err(err) = self.runtime.catch_up_accounts().await {
+                        let err = ConnectorError::from(err);
+                        let response = AgentControlEnvelope::new(request_id.clone(), self.error_response(&err));
+                        write_frame(writer, &response).await?;
+                        return Ok(());
+                    }
+                    continue;
+                }
                 event = runtime_events.recv() => {
                     let Ok(event) = event else {
                         continue;
@@ -1239,9 +1255,37 @@ pub fn bind_connector_socket(socket: &Path) -> Result<UnixListener, ConnectorErr
     if let Some(parent) = socket.parent() {
         prepare_socket_dir(parent)?;
     }
-    let listener = UnixListener::bind(socket)?;
+    let listener = match UnixListener::bind(socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == ErrorKind::AddrInUse => {
+            remove_stale_socket(socket, &error)?;
+            UnixListener::bind(socket)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     harden_socket_permissions(socket)?;
     Ok(listener)
+}
+
+fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::Result<()> {
+    let metadata = match std::fs::metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            bind_error.kind(),
+            "agent connector socket path exists and is not a Unix socket",
+        ));
+    }
+    match StdUnixStream::connect(socket) {
+        Ok(_) => Err(std::io::Error::new(
+            bind_error.kind(),
+            "agent connector socket is already in use",
+        )),
+        Err(_) => std::fs::remove_file(socket),
+    }
 }
 
 fn prepare_socket_dir(parent: &Path) -> std::io::Result<()> {
@@ -1300,6 +1344,21 @@ mod tests {
     use crate::{AgentConnector, AgentConnectorConfig, bind_connector_socket, serve_socket};
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    #[tokio::test]
+    async fn connector_socket_bind_removes_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let listener = bind_connector_socket(&socket).unwrap();
+        drop(listener);
+
+        let listener = bind_connector_socket(&socket).unwrap();
+
+        assert!(
+            listener.local_addr().is_ok(),
+            "expected connector socket to rebind after stale socket cleanup"
+        );
+    }
 
     #[tokio::test]
     async fn connector_socket_serves_account_list() {
