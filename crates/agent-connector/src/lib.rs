@@ -64,15 +64,17 @@ pub struct AgentConnector {
     debug_final_sends: DebugFinalSendStore,
     streams: StreamSessionStore,
     runtime: MarmotAppRuntime,
+    relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
 }
 
 impl AgentConnector {
     pub fn open(config: AgentConnectorConfig) -> Result<Self, ConnectorError> {
         let account_home = AccountHome::open(&config.home);
+        let relays = config.relays;
         let app = MarmotApp::with_relays_and_account_home(
             &config.home,
-            config.relays,
+            relays.clone(),
             account_home.clone(),
         );
         let runtime = MarmotAppRuntime::new(app);
@@ -87,6 +89,7 @@ impl AgentConnector {
             debug_final_sends: DebugFinalSendStore::default(),
             streams: StreamSessionStore::default(),
             runtime,
+            relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -106,20 +109,46 @@ impl AgentConnector {
     async fn ensure_agent_accounts_ready(&self) -> Result<(), ConnectorError> {
         let accounts = self.account_home.accounts()?;
         for account in accounts.into_iter().filter(|account| account.local_signing) {
-            let has_key_package_relays = !self
-                .runtime
-                .account_key_package_relays(&account.label)?
-                .is_empty();
+            self.ensure_agent_account_relay_lists(&account.label)
+                .await?;
             let has_key_package = !self
                 .runtime
                 .account_key_packages(&account.label, Vec::new())
                 .await?
                 .is_empty();
-            if !has_key_package_relays || !has_key_package {
+            if !has_key_package {
                 self.runtime.publish_key_package(&account.label).await?;
             }
         }
         Ok(())
+    }
+
+    async fn ensure_agent_account_relay_lists(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), ConnectorError> {
+        let missing_nip65 = self.runtime.account_nip65_relays(account_ref)?.is_empty();
+        let missing_inbox = self.runtime.account_inbox_relays(account_ref)?.is_empty();
+        if self.relays.is_empty() || (!missing_nip65 && !missing_inbox) {
+            return Ok(());
+        }
+
+        let relays = self.configured_relay_endpoints();
+        if missing_nip65 {
+            self.runtime
+                .set_account_nip65_relays(account_ref, relays.clone(), relays.clone())
+                .await?;
+        }
+        if missing_inbox {
+            self.runtime
+                .set_account_inbox_relays(account_ref, relays.clone(), relays)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn configured_relay_endpoints(&self) -> Vec<cgka_traits::TransportEndpoint> {
+        self.relays.iter().map(|relay| endpoint(relay)).collect()
     }
 
     pub async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
@@ -1244,7 +1273,6 @@ fn current_effective_uid() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
-#[cfg(test)]
 fn endpoint(url: &str) -> cgka_traits::TransportEndpoint {
     cgka_traits::TransportEndpoint(url.to_owned())
 }
