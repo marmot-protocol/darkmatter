@@ -287,21 +287,15 @@ fn relay_telemetry_settings_binding_round_trips() {
         .relay_telemetry_settings()
         .expect("default telemetry settings");
     assert!(!settings.export_enabled);
-    assert!(settings.otlp_endpoint.is_none());
     assert_eq!(settings.export_interval_seconds, 60);
 
     let stored = kit
         .set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
             export_enabled: true,
-            otlp_endpoint: Some(" https://grafana.example/otlp ".into()),
             export_interval_seconds: 30,
         })
         .expect("set telemetry settings");
     assert!(stored.export_enabled);
-    assert_eq!(
-        stored.otlp_endpoint.as_deref(),
-        Some("https://grafana.example/otlp")
-    );
     assert_eq!(stored.export_interval_seconds, 30);
 
     let reopened = Marmot::new(
@@ -313,8 +307,8 @@ fn relay_telemetry_settings_binding_round_trips() {
         reopened
             .relay_telemetry_settings()
             .expect("persisted telemetry settings")
-            .otlp_endpoint,
-        stored.otlp_endpoint
+            .export_interval_seconds,
+        stored.export_interval_seconds
     );
 }
 

@@ -1182,7 +1182,8 @@ impl Marmot {
     }
 
     /// Device-wide relay telemetry export settings. Export is opt-in and stays
-    /// inert until `export_enabled` is true and `otlp_endpoint` is configured.
+    /// inert until `export_enabled` is true and the runtime config supplies a
+    /// valid OTLP endpoint, bearer token, and resource attributes.
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettingsFfi, MarmotKitError> {
         Ok(self.runtime.relay_telemetry_settings()?.into())
     }
@@ -1194,8 +1195,9 @@ impl Marmot {
         Ok(self.runtime.telemetry_install_id()?)
     }
 
-    /// Supply non-persisted OTLP runtime metadata: bearer token from the host
-    /// app's build-time secret plus resource attributes from the platform shell.
+    /// Supply non-persisted OTLP runtime metadata: full metrics URL, bearer
+    /// token from the host app's build-time secret, and resource attributes
+    /// from the platform shell.
     pub fn set_relay_telemetry_runtime_config(
         &self,
         config: RelayTelemetryRuntimeConfigFfi,

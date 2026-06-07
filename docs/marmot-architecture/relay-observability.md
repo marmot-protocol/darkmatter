@@ -113,8 +113,9 @@ adapter (per-relay raw)  ->  relay plane (aggregate across accounts)  ->  export
   Implemented as `marmot_app::RelayTelemetryExporter`, constructed only through the opt-in gate
   `MarmotRelayPlane::telemetry_exporter`. The privacy-critical mapping (`build_export_batch`) lives in the default build
   and is fully tested; the OTLP protobuf encoding and HTTP `POST` to the configured full metrics URL are behind the
-  `otlp-export` feature. Exporter construction requires the persisted opt-in settings plus host-supplied bearer auth and
-  resource metadata. The export batch is a flat list of points each carrying at most a single `relay` label — there is
+  `otlp-export` feature. Exporter construction requires the persisted opt-in settings plus host-supplied full metrics
+  URL, bearer auth, and resource metadata; these runtime values are not persisted by Marmot. The export batch is a flat
+  list of points each carrying at most a single `relay` label — there is
   structurally no field for any other identifier.
 
 Export mechanism: clients roam and are not scrapeable servers, so this is **push**, not pull — Prometheus `remote_write`

@@ -222,6 +222,18 @@ struct JsonlInner {
     engine_id: EngineIdHex,
 }
 
+fn validate_account_ref_hex(account_ref: &str) -> std::io::Result<()> {
+    let is_valid =
+        account_ref.len() == 32 && account_ref.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if is_valid {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "account_ref must be a 16-byte hex string",
+    ))
+}
+
 impl JsonlRecorder {
     pub fn open(path: impl AsRef<Path>, engine_id: EngineIdHex) -> std::io::Result<Self> {
         Self::open_with_account_ref(path, engine_id, None)
@@ -232,6 +244,9 @@ impl JsonlRecorder {
         engine_id: EngineIdHex,
         account_ref: Option<AccountRefHex>,
     ) -> std::io::Result<Self> {
+        if let Some(account_ref) = account_ref.as_deref() {
+            validate_account_ref_hex(account_ref)?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -349,10 +364,11 @@ mod tests {
     fn jsonl_recorder_records_account_ref_when_supplied() {
         let dir = TempDir::new().unwrap();
         let path = default_jsonl_path(dir.path(), "engine-abc");
+        let account_ref = "0123456789abcdef0123456789abcdef".to_owned();
         let recorder = JsonlRecorder::open_with_account_ref(
             &path,
             "engine-abc".to_string(),
-            Some("account-abc".to_string()),
+            Some(account_ref.clone()),
         )
         .unwrap();
         recorder.record(AuditRecord {
@@ -365,7 +381,24 @@ mod tests {
 
         let contents = fs::read_to_string(&path).unwrap();
         let event: AuditEvent = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
-        assert_eq!(event.account_ref.as_deref(), Some("account-abc"));
+        assert_eq!(event.account_ref.as_deref(), Some(account_ref.as_str()));
+    }
+
+    #[test]
+    fn jsonl_recorder_rejects_invalid_account_ref() {
+        let dir = TempDir::new().unwrap();
+        let path = default_jsonl_path(dir.path(), "engine-abc");
+
+        let err = match JsonlRecorder::open_with_account_ref(
+            &path,
+            "engine-abc".to_string(),
+            Some("account-abc".to_string()),
+        ) {
+            Ok(_) => panic!("invalid account_ref should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

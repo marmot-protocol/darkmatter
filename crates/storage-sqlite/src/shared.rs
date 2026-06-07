@@ -30,7 +30,6 @@ pub struct PublicDirectoryUserRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredRelayTelemetrySettings {
     pub export_enabled: bool,
-    pub otlp_endpoint: Option<String>,
     pub export_interval_seconds: u64,
 }
 
@@ -113,7 +112,6 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
 	CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
 	    id INTEGER PRIMARY KEY CHECK (id = 1),
 	    export_enabled INTEGER NOT NULL DEFAULT 0,
-	    otlp_endpoint TEXT,
 	    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
 	    updated_at_ms INTEGER NOT NULL
 	);
@@ -130,6 +128,7 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
 		"#,
         )
         .storage()?;
+        Self::clear_legacy_relay_telemetry_endpoint(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -264,15 +263,14 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         self.ensure_relay_telemetry_settings()?;
         self.lock()
             .query_row(
-                "SELECT export_enabled, otlp_endpoint, export_interval_seconds
+                "SELECT export_enabled, export_interval_seconds
                  FROM relay_telemetry_settings
                  WHERE id = 1",
                 [],
                 |row| {
-                    let interval: i64 = row.get(2)?;
+                    let interval: i64 = row.get(1)?;
                     Ok(StoredRelayTelemetrySettings {
                         export_enabled: row.get::<_, i64>(0)? != 0,
-                        otlp_endpoint: row.get(1)?,
                         export_interval_seconds: u64::try_from(interval).unwrap_or(60),
                     })
                 },
@@ -287,17 +285,15 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         self.lock()
             .execute(
                 "INSERT INTO relay_telemetry_settings (
-                    id, export_enabled, otlp_endpoint, export_interval_seconds, updated_at_ms
+                    id, export_enabled, export_interval_seconds, updated_at_ms
                  )
-                 VALUES (1, ?1, ?2, ?3, ?4)
+                 VALUES (1, ?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
                     export_enabled = excluded.export_enabled,
-                    otlp_endpoint = excluded.otlp_endpoint,
                     export_interval_seconds = excluded.export_interval_seconds,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     bool_i64(settings.export_enabled),
-                    &settings.otlp_endpoint,
                     u64_to_i64(settings.export_interval_seconds)?,
                     unix_now_ms(),
                 ],
@@ -396,13 +392,33 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         self.lock()
             .execute(
                 "INSERT INTO relay_telemetry_settings (
-                    id, export_enabled, otlp_endpoint, export_interval_seconds, updated_at_ms
+                    id, export_enabled, export_interval_seconds, updated_at_ms
                  )
-                 VALUES (1, 0, NULL, 60, ?1)
+                 VALUES (1, 0, 60, ?1)
                  ON CONFLICT(id) DO NOTHING",
                 params![unix_now_ms()],
             )
             .storage()?;
+        Ok(())
+    }
+
+    fn clear_legacy_relay_telemetry_endpoint(conn: &rusqlite::Connection) -> StorageResult<()> {
+        let columns = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(relay_telemetry_settings)")
+                .storage()?;
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+        };
+        if columns.iter().any(|column| column == "otlp_endpoint") {
+            conn.execute(
+                "UPDATE relay_telemetry_settings SET otlp_endpoint = NULL",
+                [],
+            )
+            .storage()?;
+        }
         Ok(())
     }
 
@@ -514,19 +530,63 @@ mod tests {
             storage.relay_telemetry_settings().unwrap(),
             StoredRelayTelemetrySettings {
                 export_enabled: false,
-                otlp_endpoint: None,
                 export_interval_seconds: 60,
             }
         );
 
         let updated = StoredRelayTelemetrySettings {
             export_enabled: true,
-            otlp_endpoint: Some("https://grafana.example/otlp".to_owned()),
             export_interval_seconds: 30,
         };
         storage.set_relay_telemetry_settings(&updated).unwrap();
 
         assert_eq!(storage.relay_telemetry_settings().unwrap(), updated);
+    }
+
+    #[test]
+    fn clears_legacy_plaintext_relay_telemetry_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE relay_telemetry_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    export_enabled INTEGER NOT NULL DEFAULT 0,
+                    otlp_endpoint TEXT,
+                    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO relay_telemetry_settings (
+                    id, export_enabled, otlp_endpoint, export_interval_seconds, updated_at_ms
+                )
+                VALUES (1, 1, 'https://collector.example/v1/metrics?token=secret', 30, 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+
+        assert_eq!(
+            storage.relay_telemetry_settings().unwrap(),
+            StoredRelayTelemetrySettings {
+                export_enabled: true,
+                export_interval_seconds: 30,
+            }
+        );
+        drop(storage);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let endpoint: Option<String> = conn
+            .query_row(
+                "SELECT otlp_endpoint FROM relay_telemetry_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(endpoint, None);
     }
 
     #[test]

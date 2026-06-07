@@ -1514,13 +1514,13 @@ impl MarmotAppRuntime {
 
     pub async fn start(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
-        self.sync_user_directory_subscriptions().await?;
-        self.reconcile_accounts().await?;
         let config = self
             .accounts
             .app
             .relay_telemetry_settings()?
             .export_config_with_runtime(self.shared.relay_telemetry_runtime_config());
+        self.sync_user_directory_subscriptions().await?;
+        self.reconcile_accounts().await?;
         self.shared.lifecycle().mark_running();
         self.shared.configure_relay_telemetry_exporter(config);
         Ok(())

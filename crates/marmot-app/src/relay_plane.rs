@@ -1341,6 +1341,7 @@ mod tests {
 
     fn relay_telemetry_runtime_config() -> RelayTelemetryRuntimeConfig {
         RelayTelemetryRuntimeConfig {
+            otlp_endpoint: Some("https://otlp.example.org/v1/metrics".to_owned()),
             authorization_bearer_token: Some("token".to_owned()),
             resource: Some(RelayTelemetryResource {
                 service_version: "1.4.2".to_owned(),

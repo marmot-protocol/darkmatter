@@ -218,7 +218,6 @@ impl From<NotificationSettings> for NotificationSettingsFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RelayTelemetrySettingsFfi {
     pub export_enabled: bool,
-    pub otlp_endpoint: Option<String>,
     pub export_interval_seconds: u64,
 }
 
@@ -226,7 +225,6 @@ impl From<RelayTelemetrySettings> for RelayTelemetrySettingsFfi {
     fn from(value: RelayTelemetrySettings) -> Self {
         Self {
             export_enabled: value.export_enabled,
-            otlp_endpoint: value.otlp_endpoint,
             export_interval_seconds: value.export_interval_seconds,
         }
     }
@@ -236,7 +234,6 @@ impl From<RelayTelemetrySettingsFfi> for RelayTelemetrySettings {
     fn from(value: RelayTelemetrySettingsFfi) -> Self {
         Self {
             export_enabled: value.export_enabled,
-            otlp_endpoint: value.otlp_endpoint,
             export_interval_seconds: value.export_interval_seconds,
         }
     }
@@ -267,6 +264,7 @@ impl From<RelayTelemetryResourceFfi> for RelayTelemetryResource {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RelayTelemetryRuntimeConfigFfi {
+    pub otlp_endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
     pub resource: Option<RelayTelemetryResourceFfi>,
 }
@@ -274,6 +272,7 @@ pub struct RelayTelemetryRuntimeConfigFfi {
 impl From<RelayTelemetryRuntimeConfigFfi> for RelayTelemetryRuntimeConfig {
     fn from(value: RelayTelemetryRuntimeConfigFfi) -> Self {
         Self {
+            otlp_endpoint: value.otlp_endpoint,
             authorization_bearer_token: value.authorization_bearer_token,
             resource: value.resource.map(Into::into),
         }

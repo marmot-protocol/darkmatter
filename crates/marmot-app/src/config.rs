@@ -32,7 +32,6 @@ const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayTelemetrySettings {
     pub export_enabled: bool,
-    pub otlp_endpoint: Option<String>,
     pub export_interval_seconds: u64,
 }
 
@@ -48,6 +47,7 @@ pub struct RelayTelemetryResource {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RelayTelemetryRuntimeConfig {
+    pub otlp_endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
     pub resource: Option<RelayTelemetryResource>,
 }
@@ -82,16 +82,30 @@ impl RelayTelemetryResource {
 
 impl RelayTelemetryRuntimeConfig {
     pub(crate) fn normalize(mut self) -> Result<Self, String> {
-        self.authorization_bearer_token = self.authorization_bearer_token.and_then(|value| {
-            let value = value.trim().to_owned();
-            (!value.is_empty()).then_some(value)
-        });
+        self.otlp_endpoint = trim_optional(self.otlp_endpoint);
+        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
         self.resource = self
             .resource
             .map(RelayTelemetryResource::normalize)
             .transpose()?;
         Ok(self)
     }
+
+    fn normalize_for_export(mut self) -> Self {
+        self.otlp_endpoint = trim_optional(self.otlp_endpoint);
+        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
+        self.resource = self
+            .resource
+            .and_then(|resource| RelayTelemetryResource::normalize(resource).ok());
+        self
+    }
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    })
 }
 
 fn trim_required(name: &str, value: String) -> Result<String, String> {
@@ -106,7 +120,6 @@ impl Default for RelayTelemetrySettings {
     fn default() -> Self {
         Self {
             export_enabled: false,
-            otlp_endpoint: None,
             export_interval_seconds: DEFAULT_EXPORT_INTERVAL.as_secs(),
         }
     }
@@ -128,9 +141,10 @@ impl RelayTelemetrySettings {
         &self,
         runtime: RelayTelemetryRuntimeConfig,
     ) -> RelayTelemetryExportConfig {
+        let runtime = runtime.normalize_for_export();
         RelayTelemetryExportConfig {
             enabled: self.export_enabled,
-            endpoint: self.otlp_endpoint.clone(),
+            endpoint: runtime.otlp_endpoint,
             interval: Duration::from_secs(self.export_interval_seconds),
             authorization_bearer_token: runtime.authorization_bearer_token,
             resource: runtime.resource,
@@ -204,6 +218,8 @@ impl RelayTelemetryExportConfig {
     }
 
     pub fn with_runtime_config(mut self, runtime: RelayTelemetryRuntimeConfig) -> Self {
+        let runtime = runtime.normalize_for_export();
+        self.endpoint = runtime.otlp_endpoint.or(self.endpoint);
         self.authorization_bearer_token = runtime.authorization_bearer_token;
         self.resource = runtime.resource;
         self
@@ -260,6 +276,7 @@ mod tests {
 
     fn runtime_config() -> RelayTelemetryRuntimeConfig {
         RelayTelemetryRuntimeConfig {
+            otlp_endpoint: None,
             authorization_bearer_token: Some("token".to_owned()),
             resource: Some(RelayTelemetryResource {
                 service_version: "1.4.2".to_owned(),
@@ -352,5 +369,47 @@ mod tests {
         };
 
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_config_builders_normalize_export_inputs() {
+        let runtime = RelayTelemetryRuntimeConfig {
+            otlp_endpoint: Some(" https://otlp.example.org/v1/metrics ".to_owned()),
+            authorization_bearer_token: Some(" token ".to_owned()),
+            resource: Some(RelayTelemetryResource {
+                service_version: " 1.4.2 ".to_owned(),
+                service_instance_id: " 8e1ca50b-05a2-4c31-a31c-1e69c75a9366 ".to_owned(),
+                deployment_environment: " staging ".to_owned(),
+                os_type: " ios ".to_owned(),
+                os_version: " 17.5 ".to_owned(),
+                device_model_identifier: Some(" iPhone15,2 ".to_owned()),
+            }),
+        };
+
+        let config = RelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 60,
+        }
+        .export_config_with_runtime(runtime.clone());
+
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://otlp.example.org/v1/metrics")
+        );
+        assert_eq!(config.authorization_bearer_token.as_deref(), Some("token"));
+        let resource = config.resource.as_ref().unwrap();
+        assert_eq!(resource.os_type, "ios");
+        assert_eq!(
+            resource.device_model_identifier.as_deref(),
+            Some("iPhone15,2")
+        );
+
+        let config = RelayTelemetryExportConfig::enabled("https://fallback.example/v1/metrics")
+            .with_runtime_config(runtime);
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://otlp.example.org/v1/metrics")
+        );
+        assert_eq!(config.authorization_bearer_token.as_deref(), Some("token"));
     }
 }

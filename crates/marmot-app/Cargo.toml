@@ -34,7 +34,7 @@ serde_json.workspace = true
 sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["fs", "net"] }
 tracing.workspace = true
 transport-nostr-adapter = { workspace = true, features = ["sdk"] }
 transport-nostr-peeler.workspace = true

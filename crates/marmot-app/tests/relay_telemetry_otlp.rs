@@ -166,8 +166,9 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<CapturedRequ
     }
 }
 
-fn runtime_config() -> RelayTelemetryRuntimeConfig {
+fn runtime_config(endpoint: impl Into<String>) -> RelayTelemetryRuntimeConfig {
     RelayTelemetryRuntimeConfig {
+        otlp_endpoint: Some(endpoint.into()),
         authorization_bearer_token: Some("test-token".to_owned()),
         resource: Some(RelayTelemetryResource {
             service_version: "1.4.2".to_owned(),
@@ -188,10 +189,11 @@ async fn export_once_pushes_otlp_metrics_over_http() {
     let server = tokio::spawn(capture_one_request(listener, tx));
 
     let relay_plane = MarmotRelayPlane::full_history();
+    let endpoint = format!("http://{addr}/custom/v1/metrics");
     let exporter = relay_plane
         .telemetry_exporter(
-            RelayTelemetryExportConfig::enabled(format!("http://{addr}/custom/v1/metrics"))
-                .with_runtime_config(runtime_config()),
+            RelayTelemetryExportConfig::enabled(endpoint.clone())
+                .with_runtime_config(runtime_config(endpoint)),
         )
         .expect("opted-in exporter is constructed");
 
@@ -225,11 +227,12 @@ async fn export_retries_transient_collector_failures_within_interval() {
     let server = tokio::spawn(capture_requests(listener, vec![500, 500, 200], tx));
 
     let relay_plane = MarmotRelayPlane::full_history();
+    let endpoint = format!("http://{addr}/v1/metrics");
     let exporter = relay_plane
         .telemetry_exporter(
-            RelayTelemetryExportConfig::enabled(format!("http://{addr}/v1/metrics"))
+            RelayTelemetryExportConfig::enabled(endpoint.clone())
                 .with_interval(Duration::from_secs(1))
-                .with_runtime_config(runtime_config()),
+                .with_runtime_config(runtime_config(endpoint)),
         )
         .expect("opted-in exporter is constructed");
 
@@ -267,12 +270,11 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     runtime.start().await.expect("runtime starts");
 
     runtime
-        .set_relay_telemetry_runtime_config(runtime_config())
+        .set_relay_telemetry_runtime_config(runtime_config(format!("http://{addr}/v1/metrics")))
         .expect("runtime telemetry metadata is accepted");
     runtime
         .set_relay_telemetry_settings(RelayTelemetrySettings {
             export_enabled: true,
-            otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
             export_interval_seconds: 1,
         })
         .expect("telemetry settings persist");
@@ -301,14 +303,13 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     let app = MarmotApp::with_relay(tmp.path(), relay.url().await.to_string());
     app.set_relay_telemetry_settings(RelayTelemetrySettings {
         export_enabled: true,
-        otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
         export_interval_seconds: 1,
     })
     .expect("telemetry settings persist before start");
 
     let runtime = MarmotAppRuntime::new(app);
     runtime
-        .set_relay_telemetry_runtime_config(runtime_config())
+        .set_relay_telemetry_runtime_config(runtime_config(format!("http://{addr}/v1/metrics")))
         .expect("runtime telemetry metadata is accepted");
     runtime.start().await.expect("runtime starts");
 

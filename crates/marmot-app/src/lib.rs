@@ -161,6 +161,8 @@ const SHARED_DB_FILE: &str = "shared.sqlite3";
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 const AUDIT_ID_BYTES: usize = 16;
+const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_DB_FILE: &str = "session.sqlite";
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_SALT_LEN: usize = 32;
@@ -901,7 +903,6 @@ fn relay_telemetry_settings_from_storage(
 ) -> RelayTelemetrySettings {
     RelayTelemetrySettings {
         export_enabled: settings.export_enabled,
-        otlp_endpoint: settings.otlp_endpoint,
         export_interval_seconds: settings.export_interval_seconds,
     }
 }
@@ -911,7 +912,6 @@ fn relay_telemetry_settings_to_storage(
 ) -> StoredRelayTelemetrySettings {
     StoredRelayTelemetrySettings {
         export_enabled: settings.export_enabled,
-        otlp_endpoint: settings.otlp_endpoint,
         export_interval_seconds: settings.export_interval_seconds,
     }
 }
@@ -929,15 +929,11 @@ fn audit_log_settings_to_storage(settings: AuditLogSettings) -> StoredAuditLogSe
 }
 
 fn normalize_relay_telemetry_settings(
-    mut settings: RelayTelemetrySettings,
+    settings: RelayTelemetrySettings,
 ) -> Result<RelayTelemetrySettings, AppError> {
     settings
         .validate()
         .map_err(AppError::InvalidRelayTelemetrySettings)?;
-    settings.otlp_endpoint = settings.otlp_endpoint.and_then(|endpoint| {
-        let endpoint = endpoint.trim().to_owned();
-        (!endpoint.is_empty()).then_some(endpoint)
-    });
     Ok(settings)
 }
 
@@ -1095,7 +1091,7 @@ impl MarmotApp {
     }
 
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
-        Ok(relay_telemetry_settings_from_storage(
+        normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
             self.shared_storage()?.relay_telemetry_settings()?,
         ))
     }
@@ -1180,9 +1176,14 @@ impl MarmotApp {
     ) -> Result<AuditLogUploadResult, AppError> {
         let path = self.validate_audit_log_path(path)?;
         let endpoint = validate_audit_upload_endpoint(endpoint)?;
-        let body = fs::read(&path)?;
+        let body = tokio::fs::read(&path).await?;
         let bytes_sent = body.len() as u64;
-        let response = reqwest::Client::new()
+        let client = reqwest::Client::builder()
+            .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
+            .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
+            .build()
+            .map_err(audit_log_reqwest_error)?;
+        let response = client
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
             .body(body)
@@ -6048,7 +6049,6 @@ mod tests {
 
         let updated = RelayTelemetrySettings {
             export_enabled: true,
-            otlp_endpoint: Some(" https://grafana.example/otlp ".to_owned()),
             export_interval_seconds: 30,
         };
         let stored = app.set_relay_telemetry_settings(updated).unwrap();
@@ -6057,7 +6057,6 @@ mod tests {
             stored,
             RelayTelemetrySettings {
                 export_enabled: true,
-                otlp_endpoint: Some("https://grafana.example/otlp".to_owned()),
                 export_interval_seconds: 30,
             }
         );
@@ -6065,7 +6064,7 @@ mod tests {
             app.relay_telemetry_export_config().unwrap(),
             RelayTelemetryExportConfig {
                 enabled: true,
-                endpoint: Some("https://grafana.example/otlp".to_owned()),
+                endpoint: None,
                 interval: Duration::from_secs(30),
                 authorization_bearer_token: None,
                 resource: None,
@@ -6087,6 +6086,25 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("zero interval should be rejected");
+
+        assert!(matches!(err, AppError::InvalidRelayTelemetrySettings(_)));
+    }
+
+    #[test]
+    fn relay_telemetry_settings_reject_invalid_persisted_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.shared_storage()
+            .unwrap()
+            .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
+                export_enabled: true,
+                export_interval_seconds: 0,
+            })
+            .unwrap();
+
+        let err = app
+            .relay_telemetry_settings()
+            .expect_err("invalid persisted interval should be rejected");
 
         assert!(matches!(err, AppError::InvalidRelayTelemetrySettings(_)));
     }
