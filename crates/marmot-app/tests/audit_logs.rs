@@ -136,6 +136,27 @@ async fn post_audit_log_file_posts_jsonl_body() {
 }
 
 #[tokio::test]
+async fn post_audit_log_file_rejects_oversized_files_before_upload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let audit_path = home.account_dir(&account.label).join("audit-huge.jsonl");
+    let file = std::fs::File::create(&audit_path).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let err = app
+        .post_audit_log_file(&audit_path.to_string_lossy(), "http://127.0.0.1:9/ingest")
+        .await
+        .expect_err("oversized audit log should be rejected");
+
+    assert!(
+        err.to_string().contains("upload limit"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());

@@ -826,6 +826,13 @@ impl RelayTelemetryExporter {
     /// reports adapter and relay-plane metrics until the engine snapshot is
     /// wired in at this seam.
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        if !*shutdown.borrow() && self.export_once_with_retries(None).await.is_err() {
+            tracing::warn!(
+                target: "marmot_app::relay_telemetry_export",
+                method = "run",
+                "relay telemetry export push failed"
+            );
+        }
         loop {
             let delay = jittered_export_interval(self.config.interval);
             tokio::select! {

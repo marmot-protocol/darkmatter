@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -64,6 +64,7 @@ use storage_sqlite::{
     StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, StoredAuditLogSettings,
     StoredRelayTelemetrySettings, TimelineProjectionUpdate,
 };
+use tokio_util::io::ReaderStream;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
     KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind, NostrAccountRelayListPublication,
@@ -161,8 +162,16 @@ const SHARED_DB_FILE: &str = "shared.sqlite3";
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 const AUDIT_ID_BYTES: usize = 16;
+const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+static AUDIT_LOG_UPLOAD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
+        .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
+        .build()
+        .expect("audit log upload client configuration should be valid")
+});
 const SESSION_DB_FILE: &str = "session.sqlite";
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_SALT_LEN: usize = 32;
@@ -1176,16 +1185,19 @@ impl MarmotApp {
     ) -> Result<AuditLogUploadResult, AppError> {
         let path = self.validate_audit_log_path(path)?;
         let endpoint = validate_audit_upload_endpoint(endpoint)?;
-        let body = tokio::fs::read(&path).await?;
-        let bytes_sent = body.len() as u64;
-        let client = reqwest::Client::builder()
-            .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
-            .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
-            .build()
-            .map_err(audit_log_reqwest_error)?;
-        let response = client
+        let file = tokio::fs::File::open(&path).await?;
+        let bytes_sent = file.metadata().await?.len();
+        if bytes_sent > AUDIT_LOG_UPLOAD_MAX_BYTES {
+            return Err(AppError::AuditLogUpload(format!(
+                "audit log exceeds {} byte upload limit",
+                AUDIT_LOG_UPLOAD_MAX_BYTES
+            )));
+        }
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        let response = AUDIT_LOG_UPLOAD_CLIENT
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
+            .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
             .body(body)
             .send()
             .await

@@ -34,6 +34,7 @@ tls_codec = "~0.4"
 
 # async
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -54,7 +55,7 @@ rand = "0.8"
 sha2 = "0.10"
 url = "2"
 chacha20poly1305 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }

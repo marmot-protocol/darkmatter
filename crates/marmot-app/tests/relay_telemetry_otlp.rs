@@ -88,7 +88,7 @@ async fn capture_one_request(listener: TcpListener, tx: oneshot::Sender<Captured
             path,
             authorization,
             content_type,
-            body_len: buf.len().saturating_sub(header_end),
+            body_len: content_length,
         });
         return;
     }
@@ -161,7 +161,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<CapturedRequ
             path,
             authorization: header_value("authorization"),
             content_type: header_value("content-type"),
-            body_len: buf.len().saturating_sub(header_end),
+            body_len: content_length,
         });
     }
 }
@@ -252,6 +252,11 @@ async fn export_retries_transient_collector_failures_within_interval() {
             .iter()
             .all(|request| request.authorization.as_deref() == Some("Bearer test-token"))
     );
+    assert!(
+        captured
+            .iter()
+            .all(|request| request.content_type.as_deref() == Some("application/x-protobuf"))
+    );
 
     server.await.unwrap();
 }
@@ -275,7 +280,7 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     runtime
         .set_relay_telemetry_settings(RelayTelemetrySettings {
             export_enabled: true,
-            export_interval_seconds: 1,
+            export_interval_seconds: 10,
         })
         .expect("telemetry settings persist");
 
@@ -285,6 +290,10 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
         .expect("captured request");
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/v1/metrics");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-protobuf")
+    );
     assert!(captured.body_len > 0, "OTLP protobuf body is non-empty");
 
     runtime.shutdown().await;
@@ -303,7 +312,7 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     let app = MarmotApp::with_relay(tmp.path(), relay.url().await.to_string());
     app.set_relay_telemetry_settings(RelayTelemetrySettings {
         export_enabled: true,
-        export_interval_seconds: 1,
+        export_interval_seconds: 10,
     })
     .expect("telemetry settings persist before start");
 
@@ -319,6 +328,10 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
         .expect("captured request");
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/v1/metrics");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-protobuf")
+    );
     assert!(captured.body_len > 0, "OTLP protobuf body is non-empty");
 
     runtime.shutdown().await;

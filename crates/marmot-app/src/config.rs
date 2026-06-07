@@ -28,6 +28,8 @@ impl MarmotAppConfig {
 /// aggregate and cumulative, so a coarse window respects battery and metered
 /// networks without losing resolution.
 const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+const MIN_EXPORT_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_EXPORT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayTelemetrySettings {
@@ -127,8 +129,13 @@ impl Default for RelayTelemetrySettings {
 
 impl RelayTelemetrySettings {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.export_interval_seconds == 0 {
-            return Err("relay telemetry export interval must be greater than zero".to_owned());
+        let interval = Duration::from_secs(self.export_interval_seconds);
+        if interval < MIN_EXPORT_INTERVAL || interval > MAX_EXPORT_INTERVAL {
+            return Err(format!(
+                "relay telemetry export interval must be between {} and {} seconds",
+                MIN_EXPORT_INTERVAL.as_secs(),
+                MAX_EXPORT_INTERVAL.as_secs()
+            ));
         }
         Ok(())
     }
@@ -369,6 +376,34 @@ mod tests {
         };
 
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn telemetry_settings_reject_out_of_range_intervals() {
+        assert!(
+            RelayTelemetrySettings {
+                export_interval_seconds: 9,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RelayTelemetrySettings {
+                export_interval_seconds: 3_601,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RelayTelemetrySettings {
+                export_interval_seconds: 10,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]
