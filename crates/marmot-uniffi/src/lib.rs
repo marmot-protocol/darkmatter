@@ -46,17 +46,18 @@ use subscriptions::{
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    AuditLogFileFfi, AuditLogUploadResultFfi, BackgroundNotificationCollectionFfi,
-    ChatListAvatarFfi, ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
-    ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
-    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
-    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, RelayTelemetrySettingsFfi,
-    RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
+    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogUploadResultFfi,
+    BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
+    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi,
+    GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi, MediaDownloadResultFfi,
+    MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
+    PushRegistrationFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
+    TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -1195,6 +1196,21 @@ impl Marmot {
             .runtime
             .set_relay_telemetry_settings(settings.into())?
             .into())
+    }
+
+    /// Local forensic audit-log recording settings. Recording is opt-in and only
+    /// applies to account sessions opened after the setting is enabled.
+    pub fn audit_log_settings(&self) -> Result<AuditLogSettingsFfi, MarmotKitError> {
+        Ok(self.runtime.audit_log_settings()?.into())
+    }
+
+    /// Persist local forensic audit-log recording settings and return the stored
+    /// value.
+    pub fn set_audit_log_settings(
+        &self,
+        settings: AuditLogSettingsFfi,
+    ) -> Result<AuditLogSettingsFfi, MarmotKitError> {
+        Ok(self.runtime.set_audit_log_settings(settings.into())?.into())
     }
 
     /// Local JSONL audit logs available for explicit forensic upload.

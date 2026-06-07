@@ -34,6 +34,11 @@ pub struct StoredRelayTelemetrySettings {
     pub export_interval_seconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAuditLogSettings {
+    pub enabled: bool,
+}
+
 impl SqliteSharedStorage {
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
@@ -105,14 +110,19 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     event_created_at INTEGER,
     PRIMARY KEY (account_id_hex, follow_account_id_hex)
 );
-CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    export_enabled INTEGER NOT NULL DEFAULT 0,
-    otlp_endpoint TEXT,
-    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
-    updated_at_ms INTEGER NOT NULL
-);
-"#,
+	CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
+	    id INTEGER PRIMARY KEY CHECK (id = 1),
+	    export_enabled INTEGER NOT NULL DEFAULT 0,
+	    otlp_endpoint TEXT,
+	    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
+	    updated_at_ms INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS audit_log_settings (
+	    id INTEGER PRIMARY KEY CHECK (id = 1),
+	    enabled INTEGER NOT NULL DEFAULT 0,
+	    updated_at_ms INTEGER NOT NULL
+	);
+	"#,
         )
         .storage()?;
         Ok(Self {
@@ -291,6 +301,39 @@ CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
         Ok(())
     }
 
+    pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
+        self.ensure_audit_log_settings()?;
+        self.lock()
+            .query_row(
+                "SELECT enabled
+                 FROM audit_log_settings
+                 WHERE id = 1",
+                [],
+                |row| {
+                    Ok(StoredAuditLogSettings {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                    })
+                },
+            )
+            .storage()
+    }
+
+    pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO audit_log_settings (
+                    id, enabled, updated_at_ms
+                 )
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![bool_i64(settings.enabled), unix_now_ms()],
+            )
+            .storage()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn table_columns(&self, table: &str) -> Vec<String> {
         let conn = self.lock();
@@ -324,6 +367,20 @@ CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
                     id, export_enabled, otlp_endpoint, export_interval_seconds, updated_at_ms
                  )
                  VALUES (1, 0, NULL, 60, ?1)
+                 ON CONFLICT(id) DO NOTHING",
+                params![unix_now_ms()],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    fn ensure_audit_log_settings(&self) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO audit_log_settings (
+                    id, enabled, updated_at_ms
+                 )
+                 VALUES (1, 0, ?1)
                  ON CONFLICT(id) DO NOTHING",
                 params![unix_now_ms()],
             )
@@ -438,5 +495,20 @@ mod tests {
         storage.set_relay_telemetry_settings(&updated).unwrap();
 
         assert_eq!(storage.relay_telemetry_settings().unwrap(), updated);
+    }
+
+    #[test]
+    fn audit_log_settings_default_and_persist() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+
+        assert_eq!(
+            storage.audit_log_settings().unwrap(),
+            StoredAuditLogSettings { enabled: false }
+        );
+
+        let updated = StoredAuditLogSettings { enabled: true };
+        storage.set_audit_log_settings(&updated).unwrap();
+
+        assert_eq!(storage.audit_log_settings().unwrap(), updated);
     }
 }

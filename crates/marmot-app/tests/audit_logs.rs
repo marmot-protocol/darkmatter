@@ -1,5 +1,5 @@
 use marmot_account::AccountHome;
-use marmot_app::MarmotApp;
+use marmot_app::{AuditLogSettings, MarmotApp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -133,4 +133,28 @@ async fn post_audit_log_file_posts_jsonl_body() {
     );
     assert_eq!(captured.body, audit_body);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+
+    let _client = app.client(&account.label).await.unwrap();
+    assert!(
+        app.audit_log_files().unwrap().is_empty(),
+        "audit logs should be off by default"
+    );
+
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let _client = app.client(&account.label).await.unwrap();
+
+    let files = app.audit_log_files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].account_ref, "alice");
+    assert!(files[0].file_name.starts_with("audit-"));
+    assert!(files[0].file_name.ends_with(".jsonl"));
 }

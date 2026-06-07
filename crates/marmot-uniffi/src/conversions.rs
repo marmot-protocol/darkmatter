@@ -13,7 +13,7 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    AppProjectionUpdate, AuditLogFile, AuditLogUploadResult, ChatListAvatar,
+    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogUploadResult, ChatListAvatar,
     ChatListMessagePreview, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult,
     MediaReference, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
@@ -238,6 +238,27 @@ impl From<RelayTelemetrySettingsFfi> for RelayTelemetrySettings {
             export_enabled: value.export_enabled,
             otlp_endpoint: value.otlp_endpoint,
             export_interval_seconds: value.export_interval_seconds,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogSettingsFfi {
+    pub enabled: bool,
+}
+
+impl From<AuditLogSettings> for AuditLogSettingsFfi {
+    fn from(value: AuditLogSettings) -> Self {
+        Self {
+            enabled: value.enabled,
+        }
+    }
+}
+
+impl From<AuditLogSettingsFfi> for AuditLogSettings {
+    fn from(value: AuditLogSettingsFfi) -> Self {
+        Self {
+            enabled: value.enabled,
         }
     }
 }

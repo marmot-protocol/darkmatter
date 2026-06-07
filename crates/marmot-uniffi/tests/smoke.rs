@@ -12,8 +12,8 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
+    AuditLogSettingsFfi, Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
 };
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
@@ -315,6 +315,37 @@ fn relay_telemetry_settings_binding_round_trips() {
             .expect("persisted telemetry settings")
             .otlp_endpoint,
         stored.otlp_endpoint
+    );
+}
+
+#[test]
+fn audit_log_settings_binding_round_trips() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let settings = kit.audit_log_settings().expect("default audit settings");
+    assert!(!settings.enabled);
+
+    let stored = kit
+        .set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
+        .expect("set audit settings");
+    assert!(stored.enabled);
+
+    let reopened = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("reopen marmot kit");
+    assert!(
+        reopened
+            .audit_log_settings()
+            .expect("persisted audit settings")
+            .enabled
     );
 }
 

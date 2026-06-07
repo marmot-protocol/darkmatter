@@ -61,8 +61,8 @@ use storage_sqlite::{
     AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
     AccountStoredPushRegistration, PublicDirectoryUserRecord, SqlCipherKey, SqliteAccountStorage,
     SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, StoredRelayTelemetrySettings,
-    TimelineProjectionUpdate,
+    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, StoredAuditLogSettings,
+    StoredRelayTelemetrySettings, TimelineProjectionUpdate,
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
@@ -375,6 +375,11 @@ pub struct AuditLogUploadResult {
     pub path: String,
     pub status: u16,
     pub bytes_sent: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AuditLogSettings {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -892,6 +897,18 @@ fn relay_telemetry_settings_to_storage(
     }
 }
 
+fn audit_log_settings_from_storage(settings: StoredAuditLogSettings) -> AuditLogSettings {
+    AuditLogSettings {
+        enabled: settings.enabled,
+    }
+}
+
+fn audit_log_settings_to_storage(settings: AuditLogSettings) -> StoredAuditLogSettings {
+    StoredAuditLogSettings {
+        enabled: settings.enabled,
+    }
+}
+
 fn normalize_relay_telemetry_settings(
     mut settings: RelayTelemetrySettings,
 ) -> Result<RelayTelemetrySettings, AppError> {
@@ -1076,6 +1093,21 @@ impl MarmotApp {
 
     pub fn relay_telemetry_export_config(&self) -> Result<RelayTelemetryExportConfig, AppError> {
         Ok(self.relay_telemetry_settings()?.export_config())
+    }
+
+    pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
+        Ok(audit_log_settings_from_storage(
+            self.shared_storage()?.audit_log_settings()?,
+        ))
+    }
+
+    pub fn set_audit_log_settings(
+        &self,
+        settings: AuditLogSettings,
+    ) -> Result<AuditLogSettings, AppError> {
+        self.shared_storage()?
+            .set_audit_log_settings(&audit_log_settings_to_storage(settings.clone()))?;
+        Ok(settings)
     }
 
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
@@ -2303,10 +2335,11 @@ impl MarmotApp {
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         let session_key =
             self.sqlcipher_key(label, &keys, &session_path, SqlcipherDatabaseKind::Session)?;
-        // Optional forensic audit log. Set `MARMOT_AUDIT_LOG=1` (or any non-empty
-        // value) to enable per-account/device JSONL recording at
+        // Optional forensic audit log. Enable `AuditLogSettings` before opening
+        // an account session to record per-account/device JSONL at
         // `<account_dir>/audit-<engine_id>.jsonl`. Sensitive mode — raw values.
-        // Temporary forensic measure; remove the file when done debugging.
+        // Temporary forensic measure; disable the setting and remove files when
+        // done debugging.
         let mut session_config = SessionConfig::new(
             session_path,
             session_key,
@@ -2322,11 +2355,19 @@ impl MarmotApp {
             settlement_quiescence_ms: 0,
             ..CanonicalizationPolicy::default()
         });
-        if std::env::var("MARMOT_AUDIT_LOG")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
+        let audit_log_enabled = match self.audit_log_settings() {
+            Ok(settings) => settings.enabled,
+            Err(e) => {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_account",
+                    error = %e,
+                    "failed to read forensic audit log settings; continuing without audit logging"
+                );
+                false
+            }
+        };
+        if audit_log_enabled {
             let account_dir = self.account_dir(label);
             match audit_device_id_hex(&account_dir) {
                 Ok(device_id_hex) => {
@@ -5998,5 +6039,25 @@ mod tests {
             .expect_err("zero interval should be rejected");
 
         assert!(matches!(err, AppError::InvalidRelayTelemetrySettings(_)));
+    }
+
+    #[test]
+    fn audit_log_settings_persist_in_shared_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        assert_eq!(
+            app.audit_log_settings().unwrap(),
+            AuditLogSettings::default()
+        );
+
+        let stored = app
+            .set_audit_log_settings(AuditLogSettings { enabled: true })
+            .unwrap();
+
+        assert_eq!(stored, AuditLogSettings { enabled: true });
+
+        let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        assert_eq!(reopened.audit_log_settings().unwrap(), stored);
     }
 }

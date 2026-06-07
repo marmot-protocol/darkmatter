@@ -39,14 +39,14 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    AppProjectionUpdate, AuditLogFile, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp, MarmotRelayPlane,
-    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetrySettings, SendSummary, SyncSummary, TimelineMessageChange, TimelineMessageQuery,
-    TimelinePage, TimelineUpdateTrigger, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogUploadResult,
+    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
+    TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -1850,6 +1850,17 @@ impl MarmotAppRuntime {
                 .configure_relay_telemetry_exporter(settings.export_config());
         }
         Ok(settings)
+    }
+
+    pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
+        self.accounts.app.audit_log_settings()
+    }
+
+    pub fn set_audit_log_settings(
+        &self,
+        settings: AuditLogSettings,
+    ) -> Result<AuditLogSettings, AppError> {
+        self.accounts.app.set_audit_log_settings(settings)
     }
 
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
