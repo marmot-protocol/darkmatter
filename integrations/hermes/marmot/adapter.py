@@ -252,7 +252,14 @@ class MarmotAgentControlClient:
         if len(frame) > MAX_FRAME_BYTES:
             raise AgentControlError("agent control frame is too large", code="frame_too_large")
         writer.write(frame)
-        await asyncio.wait_for(writer.drain(), timeout=self.request_timeout)
+        try:
+            await asyncio.wait_for(writer.drain(), timeout=self.request_timeout)
+        except asyncio.TimeoutError as exc:
+            raise AgentControlError(
+                "timed out while writing agent control request",
+                code="timeout",
+                retryable=True,
+            ) from exc
 
     async def _read_envelope(
         self,
@@ -260,7 +267,14 @@ class MarmotAgentControlClient:
         *,
         allow_eof: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        raw = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
+        except asyncio.TimeoutError as exc:
+            raise AgentControlError(
+                "timed out while reading agent control response",
+                code="timeout",
+                retryable=True,
+            ) from exc
         if not raw:
             if allow_eof:
                 return None

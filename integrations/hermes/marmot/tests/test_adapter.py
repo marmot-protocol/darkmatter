@@ -218,6 +218,48 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["type"], "inbound_message")
         self.assertEqual(event["text"], "ping")
 
+    async def test_request_timeout_is_retryable_agent_control_error(self):
+        release = asyncio.Event()
+
+        async def handler(reader, writer):
+            await read_json_line(reader)
+            await release.wait()
+            writer.close()
+            await writer.wait_closed()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+
+        try:
+            with self.assertRaises(self.adapter.AgentControlError) as raised:
+                await client.account_list()
+        finally:
+            release.set()
+            await asyncio.sleep(0)
+
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
+
+    async def test_write_timeout_is_retryable_agent_control_error(self):
+        class SlowWriter:
+            def write(self, _frame):
+                pass
+
+            async def drain(self):
+                await asyncio.sleep(1)
+
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client._write_envelope(
+                SlowWriter(),
+                {"type": "account_list"},
+                request_id="req-timeout",
+            )
+
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
+
 
 class TranscriptTests(unittest.TestCase):
     def setUp(self):
