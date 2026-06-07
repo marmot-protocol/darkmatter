@@ -2185,22 +2185,39 @@ impl MarmotApp {
         let account_id_hex = keys.public_key().to_hex();
         let mut packages = self.local_key_package_records(label)?;
 
-        let relay_lists = if bootstrap_relays.is_empty() {
-            self.account_relay_list_status_for_account_id(&account_id_hex)?
-        } else {
+        let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
+        let mut relay_lists = if has_explicit_bootstrap_relays {
             self.fetch_account_relay_list_status_for_account_id(&account_id_hex, bootstrap_relays)
                 .await?
+        } else {
+            self.account_relay_list_status_for_account_id(&account_id_hex)?
         };
-        let mut source_relays = relay_lists
+        // Discover the account's NIP-65 list via default relays when it is not
+        // cached yet, mirroring fetch_latest_key_package_for_account_id. We never
+        // pull KeyPackage events from arbitrary default relays: the source set is
+        // always the account's own NIP-65 relays, and we fail closed when that
+        // list is missing.
+        if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
+            let discovery_relays = self.directory_source_relays(&[]);
+            if !discovery_relays.is_empty() {
+                relay_lists = self
+                    .fetch_account_relay_list_status_for_account_id(
+                        &account_id_hex,
+                        discovery_relays,
+                    )
+                    .await?;
+            }
+        }
+        if relay_lists.nip65.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["nip65".into()]));
+        }
+        let source_relays = relay_lists
             .nip65
             .relays
             .iter()
             .cloned()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        if source_relays.is_empty() {
-            source_relays = self.directory_source_relays(&[]);
-        }
 
         if !source_relays.is_empty() {
             let mut relay_records = self

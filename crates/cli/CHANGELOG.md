@@ -109,9 +109,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   subscription model.
 - Nostr SDK relay connect and publish calls are now bounded by timeouts so first-run account setup fails with JSON
   instead of hanging indefinitely when a local relay does not ACK publishes.
-- `dm create-identity` and `dm login --nsec-stdin` publish the required NIP-65, inbox, and KeyPackage relay lists for
-  new local signing identities from daemon account-relay defaults when relay-list flags are omitted; `dm login
-  --nsec-stdin --relay <url>` remains the command-local import fallback.
+- `dm create-identity` and `dm login --nsec-stdin` publish the required NIP-65 and inbox relay lists, plus the initial
+  KeyPackage event, for new local signing identities from daemon account-relay defaults when relay-list flags are
+  omitted; `dm login --nsec-stdin --relay <url>` remains the command-local import fallback.
 - Newly created local identities now publish matching Nostr `name` and `display_name` values using two-word pseudonyms
   instead of account-id-derived Marmot labels.
 - Imported `nsec` accounts now require `--publish-missing-relay-lists` before publishing missing required relay
