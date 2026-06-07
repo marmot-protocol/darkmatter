@@ -8,13 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
-use cgka_traits::agent_text_stream::AgentTextStreamKeyContextV1;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG,
     STREAM_TAG,
 };
 use cgka_traits::error::EngineError;
-use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::{GroupId, MessageId};
 use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
@@ -35,7 +34,7 @@ use transport_quic_broker::{
     subscribe_text_from_broker_with_updates,
 };
 use transport_quic_stream::{
-    AgentTextStreamCrypto, QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
+    QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
 };
 
 pub mod daemon;
@@ -3884,8 +3883,6 @@ pub(crate) async fn stream_command_app_with_runtime(
             let expected_stream_id_hex =
                 stream_id.map(|value| normalize_hex(&value)).transpose()?;
             let (stream_id, crypto) = stream_crypto_for_start_event(
-                account_home,
-                app,
                 runtime,
                 account_flag.as_deref(),
                 None,
@@ -4142,8 +4139,6 @@ where
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
     let (stream_id, crypto) = stream_crypto_for_start_event(
-        account_home,
-        app,
         runtime,
         account_flag.as_deref(),
         Some(&group_id_hex),
@@ -4233,84 +4228,38 @@ fn latest_stream_start(
 }
 
 pub(crate) async fn stream_crypto_for_start_event(
-    account_home: &AccountHome,
-    app: &MarmotApp,
     runtime: &MarmotAppRuntime,
     account_hint: Option<&str>,
     group_id_hex: Option<&str>,
     stream_id_hex: Option<&str>,
     start_message_id_hex: &str,
-) -> Result<(Vec<u8>, AgentTextStreamCrypto), DmError> {
-    let start_message_id_hex = normalize_hex(start_message_id_hex)?;
-    let group_id_hex = group_id_hex.map(normalize_group_id_hex).transpose()?;
-    let stream_id_hex = stream_id_hex.map(normalize_hex).transpose()?;
-    let mut accounts = Vec::new();
-    if let Some(account) = account_hint.filter(|hint| !hint.trim().is_empty()) {
-        accounts.push(resolve_account(account_home, Some(account.to_owned()))?);
-    }
-    for account in account_home.accounts()? {
-        if account.local_signing
-            && !accounts
-                .iter()
-                .any(|existing| existing.account_id_hex == account.account_id_hex)
-        {
-            accounts.push(account);
-        }
-    }
+) -> Result<(Vec<u8>, transport_quic_stream::AgentTextStreamCrypto), DmError> {
+    let context = runtime
+        .agent_text_stream_crypto_for_start_event(
+            account_hint,
+            group_id_hex,
+            stream_id_hex,
+            start_message_id_hex,
+        )
+        .await
+        .map_err(map_agent_stream_crypto_error)?;
+    Ok((context.stream_id, context.crypto))
+}
 
-    for account in accounts {
-        if !account.local_signing {
-            continue;
+fn map_agent_stream_crypto_error(err: AppError) -> DmError {
+    match err {
+        AppError::AgentStreamMissingStart => DmError::MissingStreamStart,
+        AppError::AgentStreamStartNotConfirmed => DmError::StreamStartNotConfirmed,
+        AppError::AgentStreamUnsupportedRoute => {
+            DmError::UnsupportedStreamRoute("non-quic".to_owned())
         }
-        let messages = app.messages_with_query(
-            &account.label,
-            AppMessageQuery {
-                group_id_hex: group_id_hex.clone(),
-                limit: None,
-            },
-        )?;
-        for message in messages.into_iter().rev() {
-            if message.message_id_hex != start_message_id_hex {
-                continue;
-            }
-            let Some(start) = StreamStartView::from_event(message.kind, &message.tags) else {
-                continue;
-            };
-            if stream_id_hex
-                .as_deref()
-                .is_some_and(|stream_id| stream_id != start.stream_id_hex)
-            {
-                continue;
-            }
-            let group_id = GroupId::new(hex::decode(&message.group_id_hex)?);
-            let stream_id = hex::decode(&start.stream_id_hex)?;
-            let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
-            let group_state = match runtime.group_mls_state(&account.label, &group_id).await {
-                Ok(group_state) => group_state,
-                Err(_) => continue,
-            };
-            let stream_secret = match runtime
-                .agent_text_stream_exporter_secret(&account.label, &group_id)
-                .await
-            {
-                Ok(secret) => secret,
-                Err(_) => continue,
-            };
-            let crypto = AgentTextStreamCrypto::new(
-                stream_secret,
-                AgentTextStreamKeyContextV1::new(
-                    group_id,
-                    stream_id.clone(),
-                    EpochId(group_state.epoch),
-                    MemberId::new(hex::decode(message.sender)?),
-                    start_event_id,
-                ),
-            );
-            return Ok((stream_id, crypto));
+        AppError::AgentStreamMissingCandidate => DmError::MissingQuicCandidate,
+        AppError::AgentStreamInvalidCandidate(candidate) => {
+            DmError::InvalidQuicCandidate(candidate)
         }
+        AppError::Hex(err) => DmError::Hex(err),
+        other => DmError::App(other),
     }
-
-    Err(DmError::MissingStreamStart)
 }
 
 struct ParsedQuicCandidate {
