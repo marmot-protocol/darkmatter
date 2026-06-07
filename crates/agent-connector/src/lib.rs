@@ -183,7 +183,7 @@ impl AgentConnector {
     fn error_response(&self, method: &'static str, err: &ConnectorError) -> AgentControlResponse {
         tracing::warn!(
             target: "agent_connector",
-            method,
+            method = method,
             error_code = err.privacy_safe_code(),
             "control request failed"
         );
