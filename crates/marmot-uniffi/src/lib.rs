@@ -53,8 +53,9 @@ pub use conversions::{
     MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
     NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
     NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
-    PushRegistrationFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    PushRegistrationFfi, RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi,
+    RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi,
@@ -1184,6 +1185,24 @@ impl Marmot {
     /// inert until `export_enabled` is true and `otlp_endpoint` is configured.
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettingsFfi, MarmotKitError> {
         Ok(self.runtime.relay_telemetry_settings()?.into())
+    }
+
+    /// Stable random identifier for this app install, suitable for the OTLP
+    /// `service.instance.id` resource attribute. Separate from audit-log device
+    /// identity.
+    pub fn telemetry_install_id(&self) -> Result<String, MarmotKitError> {
+        Ok(self.runtime.telemetry_install_id()?)
+    }
+
+    /// Supply non-persisted OTLP runtime metadata: bearer token from the host
+    /// app's build-time secret plus resource attributes from the platform shell.
+    pub fn set_relay_telemetry_runtime_config(
+        &self,
+        config: RelayTelemetryRuntimeConfigFfi,
+    ) -> Result<(), MarmotKitError> {
+        self.runtime
+            .set_relay_telemetry_runtime_config(config.into())?;
+        Ok(())
     }
 
     /// Persist device-wide relay telemetry export settings and return the

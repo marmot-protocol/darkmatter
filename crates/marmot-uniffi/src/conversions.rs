@@ -19,12 +19,12 @@ use marmot_app::{
     MediaReference, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
     NotificationSettings, NotificationTrigger, NotificationUpdate, NotificationUser,
     NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth,
-    RelayTelemetrySettings, RuntimeAgentStreamUpdate, RuntimeChatListUpdate,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
-    RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange, TimelineMessageRecord,
-    TimelinePage, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
-    TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata, account_id_hex_from_ref,
-    npub_for_account_id,
+    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RuntimeAgentStreamUpdate, RuntimeChatListUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeProjectionUpdate, RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange,
+    TimelineMessageRecord, TimelinePage, TimelineReactionSummary, TimelineRemoveReason,
+    TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata,
+    account_id_hex_from_ref, npub_for_account_id,
 };
 
 use crate::errors::MarmotKitError;
@@ -238,6 +238,44 @@ impl From<RelayTelemetrySettingsFfi> for RelayTelemetrySettings {
             export_enabled: value.export_enabled,
             otlp_endpoint: value.otlp_endpoint,
             export_interval_seconds: value.export_interval_seconds,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayTelemetryResourceFfi {
+    pub service_version: String,
+    pub service_instance_id: String,
+    pub deployment_environment: String,
+    pub os_type: String,
+    pub os_version: String,
+    pub device_model_identifier: Option<String>,
+}
+
+impl From<RelayTelemetryResourceFfi> for RelayTelemetryResource {
+    fn from(value: RelayTelemetryResourceFfi) -> Self {
+        Self {
+            service_version: value.service_version,
+            service_instance_id: value.service_instance_id,
+            deployment_environment: value.deployment_environment,
+            os_type: value.os_type,
+            os_version: value.os_version,
+            device_model_identifier: value.device_model_identifier,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayTelemetryRuntimeConfigFfi {
+    pub authorization_bearer_token: Option<String>,
+    pub resource: Option<RelayTelemetryResourceFfi>,
+}
+
+impl From<RelayTelemetryRuntimeConfigFfi> for RelayTelemetryRuntimeConfig {
+    fn from(value: RelayTelemetryRuntimeConfigFfi) -> Self {
+        Self {
+            authorization_bearer_token: value.authorization_bearer_token,
+            resource: value.resource.map(Into::into),
         }
     }
 }

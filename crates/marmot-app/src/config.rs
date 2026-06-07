@@ -36,6 +36,72 @@ pub struct RelayTelemetrySettings {
     pub export_interval_seconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayTelemetryResource {
+    pub service_version: String,
+    pub service_instance_id: String,
+    pub deployment_environment: String,
+    pub os_type: String,
+    pub os_version: String,
+    pub device_model_identifier: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayTelemetryRuntimeConfig {
+    pub authorization_bearer_token: Option<String>,
+    pub resource: Option<RelayTelemetryResource>,
+}
+
+impl RelayTelemetryResource {
+    fn has_required_attributes(&self) -> bool {
+        [
+            self.service_version.as_str(),
+            self.service_instance_id.as_str(),
+            self.deployment_environment.as_str(),
+            self.os_type.as_str(),
+            self.os_version.as_str(),
+        ]
+        .into_iter()
+        .all(|value| !value.trim().is_empty())
+    }
+
+    fn normalize(mut self) -> Result<Self, String> {
+        self.service_version = trim_required("service.version", self.service_version)?;
+        self.service_instance_id = trim_required("service.instance.id", self.service_instance_id)?;
+        self.deployment_environment =
+            trim_required("deployment.environment", self.deployment_environment)?;
+        self.os_type = trim_required("os.type", self.os_type)?;
+        self.os_version = trim_required("os.version", self.os_version)?;
+        self.device_model_identifier = self.device_model_identifier.and_then(|value| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        });
+        Ok(self)
+    }
+}
+
+impl RelayTelemetryRuntimeConfig {
+    pub(crate) fn normalize(mut self) -> Result<Self, String> {
+        self.authorization_bearer_token = self.authorization_bearer_token.and_then(|value| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        });
+        self.resource = self
+            .resource
+            .map(RelayTelemetryResource::normalize)
+            .transpose()?;
+        Ok(self)
+    }
+}
+
+fn trim_required(name: &str, value: String) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(value)
+}
+
 impl Default for RelayTelemetrySettings {
     fn default() -> Self {
         Self {
@@ -55,10 +121,19 @@ impl RelayTelemetrySettings {
     }
 
     pub fn export_config(&self) -> RelayTelemetryExportConfig {
+        self.export_config_with_runtime(RelayTelemetryRuntimeConfig::default())
+    }
+
+    pub fn export_config_with_runtime(
+        &self,
+        runtime: RelayTelemetryRuntimeConfig,
+    ) -> RelayTelemetryExportConfig {
         RelayTelemetryExportConfig {
             enabled: self.export_enabled,
             endpoint: self.otlp_endpoint.clone(),
             interval: Duration::from_secs(self.export_interval_seconds),
+            authorization_bearer_token: runtime.authorization_bearer_token,
+            resource: runtime.resource,
         }
     }
 }
@@ -70,22 +145,27 @@ impl RelayTelemetrySettings {
 /// gates relay-identity resolution and the OTLP exporter — see the privacy
 /// contract in `docs/marmot-architecture/relay-observability.md`.
 ///
-/// The `endpoint` must be a first-party Marmot-operated OTLP/HTTP collector
-/// reached over TLS (`https`); the exporter POSTs to `{endpoint}/v1/metrics`.
-/// Plain `http` is accepted only for loopback collectors used in local testing,
-/// so anything that actually leaves the device stays on TLS. Export is inert
-/// without an endpoint, and the exporter is not constructed for a non-TLS,
-/// non-loopback endpoint.
+/// The `endpoint` must be the full first-party Marmot-operated OTLP/HTTP
+/// metrics URL reached over TLS (`https`). Plain `http` is accepted only for
+/// loopback collectors used in local testing, so anything that actually leaves
+/// the device stays on TLS. Export is inert without an endpoint, and the
+/// exporter is not constructed for a non-TLS, non-loopback endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayTelemetryExportConfig {
     /// Whether the user has opted in to relay-telemetry export. Off by default.
     pub enabled: bool,
-    /// First-party OTLP/HTTP collector base URL. Must be `https`, except a
+    /// Full first-party OTLP/HTTP metrics URL. Must be `https`, except a
     /// loopback `http` collector for local testing. `None` keeps export inert
     /// even when `enabled`.
     pub endpoint: Option<String>,
     /// How often to poll the rollup and push.
     pub interval: Duration,
+    /// Bearer token supplied by the host app at runtime from its build-time
+    /// platform secret. Never persisted by Marmot.
+    pub authorization_bearer_token: Option<String>,
+    /// Resource attributes supplied by the host app at runtime. Never persisted
+    /// by Marmot because these describe the binary/device shell.
+    pub resource: Option<RelayTelemetryResource>,
 }
 
 impl Default for RelayTelemetryExportConfig {
@@ -101,6 +181,8 @@ impl RelayTelemetryExportConfig {
             enabled: false,
             endpoint: None,
             interval: DEFAULT_EXPORT_INTERVAL,
+            authorization_bearer_token: None,
+            resource: None,
         }
     }
 
@@ -110,12 +192,20 @@ impl RelayTelemetryExportConfig {
             enabled: true,
             endpoint: Some(endpoint.into()),
             interval: DEFAULT_EXPORT_INTERVAL,
+            authorization_bearer_token: None,
+            resource: None,
         }
     }
 
     /// Override the poll/push interval.
     pub fn with_interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
+        self
+    }
+
+    pub fn with_runtime_config(mut self, runtime: RelayTelemetryRuntimeConfig) -> Self {
+        self.authorization_bearer_token = runtime.authorization_bearer_token;
+        self.resource = runtime.resource;
         self
     }
 
@@ -132,6 +222,14 @@ impl RelayTelemetryExportConfig {
                 .endpoint
                 .as_deref()
                 .is_some_and(endpoint_transport_allowed)
+            && self
+                .authorization_bearer_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+            && self
+                .resource
+                .as_ref()
+                .is_some_and(RelayTelemetryResource::has_required_attributes)
     }
 }
 
@@ -160,6 +258,20 @@ fn host_is_loopback(host: url::Host<&str>) -> bool {
 mod tests {
     use super::*;
 
+    fn runtime_config() -> RelayTelemetryRuntimeConfig {
+        RelayTelemetryRuntimeConfig {
+            authorization_bearer_token: Some("token".to_owned()),
+            resource: Some(RelayTelemetryResource {
+                service_version: "1.4.2".to_owned(),
+                service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
+                deployment_environment: "staging".to_owned(),
+                os_type: "ios".to_owned(),
+                os_version: "17.5".to_owned(),
+                device_model_identifier: None,
+            }),
+        }
+    }
+
     #[test]
     fn export_allowed_requires_opt_in_endpoint_and_tls() {
         // Off by default, and an endpoint alone does not enable export.
@@ -168,21 +280,55 @@ mod tests {
             !RelayTelemetryExportConfig {
                 enabled: true,
                 endpoint: None,
+                authorization_bearer_token: Some("token".to_owned()),
+                resource: runtime_config().resource,
                 ..Default::default()
             }
             .export_allowed()
         );
 
         // https is accepted; plain http to a remote host is rejected.
-        assert!(RelayTelemetryExportConfig::enabled("https://otlp.example.org").export_allowed());
-        assert!(!RelayTelemetryExportConfig::enabled("http://otlp.example.org").export_allowed());
-        assert!(!RelayTelemetryExportConfig::enabled("ftp://otlp.example.org").export_allowed());
-        assert!(!RelayTelemetryExportConfig::enabled("not a url").export_allowed());
+        assert!(
+            RelayTelemetryExportConfig::enabled("https://otlp.example.org/v1/metrics")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
+        assert!(
+            !RelayTelemetryExportConfig::enabled("http://otlp.example.org/v1/metrics")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
+        assert!(
+            !RelayTelemetryExportConfig::enabled("ftp://otlp.example.org/v1/metrics")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
+        assert!(
+            !RelayTelemetryExportConfig::enabled("not a url")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
+        assert!(
+            !RelayTelemetryExportConfig::enabled("https://otlp.example.org/v1/metrics")
+                .export_allowed()
+        );
 
         // http is allowed only for loopback collectors (local testing).
-        assert!(RelayTelemetryExportConfig::enabled("http://127.0.0.1:4318").export_allowed());
-        assert!(RelayTelemetryExportConfig::enabled("http://[::1]:4318").export_allowed());
-        assert!(RelayTelemetryExportConfig::enabled("http://localhost:4318").export_allowed());
+        assert!(
+            RelayTelemetryExportConfig::enabled("http://127.0.0.1:4318/v1/metrics")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
+        assert!(
+            RelayTelemetryExportConfig::enabled("http://[::1]:4318/v1/metrics")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
+        assert!(
+            RelayTelemetryExportConfig::enabled("http://localhost:4318/v1/metrics")
+                .with_runtime_config(runtime_config())
+                .export_allowed()
+        );
     }
 
     #[test]

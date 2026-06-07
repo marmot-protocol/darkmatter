@@ -117,12 +117,17 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
 	    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
 	    updated_at_ms INTEGER NOT NULL
 	);
-	CREATE TABLE IF NOT EXISTS audit_log_settings (
-	    id INTEGER PRIMARY KEY CHECK (id = 1),
-	    enabled INTEGER NOT NULL DEFAULT 0,
-	    updated_at_ms INTEGER NOT NULL
-	);
-	"#,
+		CREATE TABLE IF NOT EXISTS audit_log_settings (
+		    id INTEGER PRIMARY KEY CHECK (id = 1),
+		    enabled INTEGER NOT NULL DEFAULT 0,
+		    updated_at_ms INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS telemetry_install (
+		    id INTEGER PRIMARY KEY CHECK (id = 1),
+		    install_id TEXT NOT NULL,
+		    updated_at_ms INTEGER NOT NULL
+		);
+		"#,
         )
         .storage()?;
         Ok(Self {
@@ -296,6 +301,33 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
                     u64_to_i64(settings.export_interval_seconds)?,
                     unix_now_ms(),
                 ],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    pub fn telemetry_install_id(&self) -> StorageResult<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT install_id
+                 FROM telemetry_install
+                 WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()
+    }
+
+    pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    install_id = excluded.install_id,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![install_id, unix_now_ms()],
             )
             .storage()?;
         Ok(())

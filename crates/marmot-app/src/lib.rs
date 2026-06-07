@@ -105,7 +105,10 @@ pub use agent_streams::{
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
 pub use client::AppClient;
-pub use config::{MarmotAppConfig, RelayTelemetryExportConfig, RelayTelemetrySettings};
+pub use config::{
+    MarmotAppConfig, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+};
 pub use error::AppError;
 pub use groups::{
     AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupImageComponent,
@@ -855,6 +858,22 @@ fn generate_audit_device_id_hex() -> String {
     hex::encode(bytes)
 }
 
+fn generate_telemetry_install_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let encoded = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &encoded[0..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+        &encoded[20..32]
+    )
+}
+
 fn audit_device_id_hex(account_dir: &Path) -> Result<String, AppError> {
     let path = account_dir.join(AUDIT_DEVICE_ID_FILE);
     match fs::read_to_string(&path) {
@@ -1093,6 +1112,16 @@ impl MarmotApp {
 
     pub fn relay_telemetry_export_config(&self) -> Result<RelayTelemetryExportConfig, AppError> {
         Ok(self.relay_telemetry_settings()?.export_config())
+    }
+
+    pub fn telemetry_install_id(&self) -> Result<String, AppError> {
+        let storage = self.shared_storage()?;
+        if let Some(install_id) = storage.telemetry_install_id()? {
+            return Ok(install_id);
+        }
+        let install_id = generate_telemetry_install_id();
+        storage.set_telemetry_install_id(&install_id)?;
+        Ok(install_id)
     }
 
     pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
@@ -5989,6 +6018,25 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_install_id_is_stable_uuid_per_app_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        let first = app.telemetry_install_id().unwrap();
+        let second = app.telemetry_install_id().unwrap();
+        let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .telemetry_install_id()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, reopened);
+        assert_eq!(first.len(), 36);
+        assert_eq!(first.as_bytes()[14], b'4');
+        assert_eq!(first.chars().filter(|ch| *ch == '-').count(), 4);
+        assert_ne!(first.len(), AUDIT_ID_BYTES * 2);
+    }
+
+    #[test]
     fn relay_telemetry_settings_persist_in_shared_storage() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -6019,6 +6067,8 @@ mod tests {
                 enabled: true,
                 endpoint: Some("https://grafana.example/otlp".to_owned()),
                 interval: Duration::from_secs(30),
+                authorization_bearer_token: None,
+                resource: None,
             }
         );
 

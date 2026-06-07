@@ -44,8 +44,8 @@ use crate::{
     MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest,
     MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
     NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
-    TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
+    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
     UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
@@ -71,6 +71,7 @@ pub struct RuntimeSharedServices {
     agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
+    relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
 }
 
 impl Default for RuntimeSharedServices {
@@ -80,6 +81,9 @@ impl Default for RuntimeSharedServices {
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
+            relay_telemetry_runtime_config: Arc::new(StdMutex::new(
+                RelayTelemetryRuntimeConfig::default(),
+            )),
         }
     }
 }
@@ -91,6 +95,9 @@ impl RuntimeSharedServices {
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
+            relay_telemetry_runtime_config: Arc::new(StdMutex::new(
+                RelayTelemetryRuntimeConfig::default(),
+            )),
         }
     }
 
@@ -129,6 +136,20 @@ impl RuntimeSharedServices {
                 );
             }
         }
+    }
+
+    fn relay_telemetry_runtime_config(&self) -> RelayTelemetryRuntimeConfig {
+        self.relay_telemetry_runtime_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_relay_telemetry_runtime_config(&self, config: RelayTelemetryRuntimeConfig) {
+        *self
+            .relay_telemetry_runtime_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
 
     fn stop_relay_telemetry_exporter(&self) {
@@ -650,7 +671,7 @@ pub enum RuntimeChatListUpdate {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatListUpdateTrigger {
     NewGroup,
     NewLastMessage,
@@ -659,14 +680,9 @@ pub enum ChatListUpdateTrigger {
     PendingConfirmationChanged,
     MembershipChanged,
     UnreadChanged,
+    #[default]
     SnapshotRefresh,
     Removed,
-}
-
-impl Default for ChatListUpdateTrigger {
-    fn default() -> Self {
-        Self::SnapshotRefresh
-    }
 }
 
 impl ChatListUpdateTrigger {
@@ -1500,7 +1516,11 @@ impl MarmotAppRuntime {
         self.shared.lifecycle().ensure_running()?;
         self.sync_user_directory_subscriptions().await?;
         self.reconcile_accounts().await?;
-        let config = self.accounts.app.relay_telemetry_export_config()?;
+        let config = self
+            .accounts
+            .app
+            .relay_telemetry_settings()?
+            .export_config_with_runtime(self.shared.relay_telemetry_runtime_config());
         self.shared.lifecycle().mark_running();
         self.shared.configure_relay_telemetry_exporter(config);
         Ok(())
@@ -1840,16 +1860,39 @@ impl MarmotAppRuntime {
         self.accounts.app.relay_telemetry_settings()
     }
 
+    pub fn telemetry_install_id(&self) -> Result<String, AppError> {
+        self.accounts.app.telemetry_install_id()
+    }
+
     pub fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettings,
     ) -> Result<RelayTelemetrySettings, AppError> {
         let settings = self.accounts.app.set_relay_telemetry_settings(settings)?;
         if self.shared.lifecycle().is_running() {
-            self.shared
-                .configure_relay_telemetry_exporter(settings.export_config());
+            self.shared.configure_relay_telemetry_exporter(
+                settings.export_config_with_runtime(self.shared.relay_telemetry_runtime_config()),
+            );
         }
         Ok(settings)
+    }
+
+    pub fn set_relay_telemetry_runtime_config(
+        &self,
+        config: RelayTelemetryRuntimeConfig,
+    ) -> Result<RelayTelemetryRuntimeConfig, AppError> {
+        let config = config
+            .normalize()
+            .map_err(AppError::InvalidRelayTelemetrySettings)?;
+        self.shared
+            .set_relay_telemetry_runtime_config(config.clone());
+        if self.shared.lifecycle().is_running() {
+            let settings = self.accounts.app.relay_telemetry_settings()?;
+            self.shared.configure_relay_telemetry_exporter(
+                settings.export_config_with_runtime(config.clone()),
+            );
+        }
+        Ok(config)
     }
 
     pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
