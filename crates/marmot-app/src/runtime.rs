@@ -4215,6 +4215,14 @@ async fn run_app_runtime_account_worker(
                         let result = client
                             .update_group_avatar_url(&group_id, url, dim, thumbhash)
                             .await;
+                        if result.is_ok() {
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::SafeExportSecret {

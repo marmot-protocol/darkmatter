@@ -310,7 +310,11 @@ impl AppGroupAvatarUrlComponent {
             thumbhash,
         };
         let data = encode_group_avatar_url_v1(&avatar).map_err(AppError::InvalidGroupAvatarUrl)?;
-        Ok(Self::from_decoded(avatar, data))
+        // Decode the encoded bytes back so the struct fields carry the normalized
+        // URL, matching `from_bytes(to_app_component_data(..))` for any input.
+        let normalized =
+            decode_group_avatar_url_v1(&data).map_err(AppError::InvalidGroupAvatarUrl)?;
+        Ok(Self::from_decoded(normalized, data))
     }
 
     pub(crate) fn absent() -> Self {
