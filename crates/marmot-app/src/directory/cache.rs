@@ -98,8 +98,11 @@ impl DirectoryCache {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
-        let conn = self.lock();
-        Self::put_with_reason_locked(&conn, entry, reason)
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        Self::put_with_reason_locked(&tx, entry, reason)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn put_with_reason_locked(
@@ -254,8 +257,11 @@ impl DirectoryCache {
         record: &DirectorySearchGraphRecord,
         now: i64,
     ) -> Result<(), AppError> {
-        let conn = self.lock();
-        Self::put_search_graph_record_locked(&conn, record, now)
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        Self::put_search_graph_record_locked(&tx, record, now)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn put_search_graph_record_locked(
@@ -440,12 +446,13 @@ impl DirectoryCache {
     }
 
     fn migrate_legacy_json_records(&self) -> Result<(), AppError> {
-        let conn = self.lock();
+        let mut conn = self.lock();
         if !Self::table_exists_locked(&conn, "user_directory_records")? {
             return Ok(());
         }
+        let tx = conn.transaction()?;
         let mut statement =
-            conn.prepare("SELECT entry_json FROM user_directory_records ORDER BY account_id_hex")?;
+            tx.prepare("SELECT entry_json FROM user_directory_records ORDER BY account_id_hex")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         let mut json_entries = Vec::new();
         for row in rows {
@@ -455,9 +462,10 @@ impl DirectoryCache {
 
         for json in json_entries {
             let entry = serde_json::from_str::<UserDirectoryRecord>(&json)?;
-            Self::put_with_reason_locked(&conn, &entry, "directory")?;
+            Self::put_with_reason_locked(&tx, &entry, "directory")?;
         }
-        conn.execute_batch("DROP TABLE IF EXISTS user_directory_records;")?;
+        tx.execute_batch("DROP TABLE IF EXISTS user_directory_records;")?;
+        tx.commit()?;
         Ok(())
     }
 

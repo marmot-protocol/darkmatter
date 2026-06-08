@@ -3731,15 +3731,42 @@ impl MarmotApp {
             .map(|cache| cache.entries())
             .transpose()?;
 
-        if let Some(entries) = &legacy_entries {
+        let Some(entries) = legacy_entries else {
+            *checked = true;
+            return Ok(());
+        };
+
+        let entries = entries
+            .into_iter()
+            .map(|entry| self.hydrate_directory_record(entry))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shared_storage = self.shared_storage()?;
+        for entry in &entries {
+            shared_storage.put_public_directory_user(&public_directory_user_record(entry)?)?;
+        }
+        for cache in caches {
+            for entry in &entries {
+                cache.put(entry)?;
+            }
+        }
+        for entry in &entries {
+            if shared_storage
+                .public_directory_user(&entry.account_id_hex)?
+                .is_none()
+            {
+                return Err(AppError::MissingDirectoryEntry(
+                    entry.account_id_hex.clone(),
+                ));
+            }
             for cache in caches {
-                for entry in entries {
-                    cache.put(&self.hydrate_directory_record(entry.clone())?)?;
+                if cache.entry(&entry.account_id_hex)?.is_none() {
+                    return Err(AppError::MissingDirectoryEntry(
+                        entry.account_id_hex.clone(),
+                    ));
                 }
             }
-            remove_sqlite_file_set(&legacy_path)?;
         }
-
+        remove_sqlite_file_set(&legacy_path)?;
         *checked = true;
         Ok(())
     }
@@ -5439,6 +5466,13 @@ mod tests {
             entry.profile.and_then(|profile| profile.name),
             Some("Legacy Contact".to_owned())
         );
+        let shared_entry = app
+            .shared_storage()
+            .unwrap()
+            .public_directory_user(&contact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared_entry.account_id_hex, contact);
         assert!(!legacy_path.exists());
         let open_count_after_migration = app.directory_cache_open_count_for_test();
         assert!(open_count_after_migration >= 1);
@@ -5454,6 +5488,70 @@ mod tests {
         assert_eq!(
             app.directory_cache_open_count_for_test(),
             open_count_after_migration
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_directory_cache_migrates_to_shared_storage_without_account_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join(APP_CACHE_DB_FILE);
+        drop(Connection::open(&legacy_path).unwrap());
+        let legacy_cache = DirectoryCache::open_legacy_plaintext(legacy_path.clone())
+            .unwrap()
+            .unwrap();
+        let contact = format!("{:064x}", 47);
+        legacy_cache
+            .put(&test_directory_record(&contact, "Shared Legacy Contact", 1))
+            .unwrap();
+        drop(legacy_cache);
+
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.migrate_legacy_directory_cache_once(&[]).unwrap();
+
+        let shared_entry = app
+            .shared_storage()
+            .unwrap()
+            .public_directory_user(&contact)
+            .unwrap()
+            .unwrap();
+        let hydrated = app.hydrate_public_directory_record(shared_entry).unwrap();
+        assert_eq!(
+            hydrated.profile.and_then(|profile| profile.name),
+            Some("Shared Legacy Contact".to_owned())
+        );
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn legacy_plaintext_directory_cache_keeps_file_when_migration_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join(APP_CACHE_DB_FILE);
+        drop(Connection::open(&legacy_path).unwrap());
+        let legacy_cache = DirectoryCache::open_legacy_plaintext(legacy_path.clone())
+            .unwrap()
+            .unwrap();
+        legacy_cache
+            .put(&UserDirectoryRecord {
+                account_id_hex: "not-a-public-key".to_owned(),
+                npub: "npub-invalid".to_owned(),
+                local_account: None,
+                profile: None,
+                follows: Vec::new(),
+                follow_source_relays: Vec::new(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap();
+        drop(legacy_cache);
+
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        assert!(app.migrate_legacy_directory_cache_once(&[]).is_err());
+        assert!(legacy_path.exists());
+        assert!(
+            !*app
+                .legacy_directory_cache_checked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         );
     }
 
