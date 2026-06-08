@@ -409,7 +409,7 @@ impl AuditLogTrackerUploader {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if worker
             .as_ref()
-            .map_or(true, |worker| worker.handle.is_finished())
+            .is_none_or(|worker| worker.handle.is_finished())
         {
             let (commands, receiver) = mpsc::channel(APP_RUNTIME_AUDIT_TRACKER_QUEUE);
             let stopping = self.lifecycle.subscribe_shutdown();
