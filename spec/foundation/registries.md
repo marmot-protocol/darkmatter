@@ -18,6 +18,7 @@ Marmot app components use MLS private-use component ids.
 | `0x8004`     | `marmot.transport.nostr.routing.v1`      | [doc](../app-components/nostr-routing-v1.md)          |
 | `0x8005`     | `marmot.group.message-retention.v1`      | [doc](../app-components/message-retention-v1.md)      |
 | `0x8006`     | `marmot.group.agent-text-stream.quic.v1` | [doc](../app-components/agent-text-stream-quic-v1.md) |
+| `0x8007`     | `marmot.group.avatar-url.v1`             | [doc](../app-components/group-avatar-url-v1.md)       |
 
 ## Upstream MLS extension draft ids
 
