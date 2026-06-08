@@ -23,7 +23,7 @@ use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::Client as NostrSdkClient;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
@@ -75,11 +75,51 @@ async fn capture_delayed_audit_upload(
     let Ok((mut stream, _peer)) = listener.accept().await else {
         return;
     };
+    let Some(captured) = read_captured_audit_upload(&mut stream).await else {
+        return;
+    };
+    let _ = tx.send(captured);
+
+    let _ = release.await;
+    write_http_response(&mut stream, 204, "text/plain", b"").await;
+}
+
+async fn capture_delayed_audit_upload_with_overlap_probe(
+    listener: TcpListener,
+    tx: oneshot::Sender<CapturedAuditUpload>,
+    overlap_tx: oneshot::Sender<()>,
+    mut release: oneshot::Receiver<()>,
+) {
+    let Ok((mut stream, _peer)) = listener.accept().await else {
+        return;
+    };
+    let Some(captured) = read_captured_audit_upload(&mut stream).await else {
+        return;
+    };
+    let _ = tx.send(captured);
+
+    tokio::select! {
+        _ = &mut release => {
+            write_http_response(&mut stream, 204, "text/plain", b"").await;
+        }
+        accepted = listener.accept() => {
+            if let Ok((mut second, _peer)) = accepted {
+                let _ = read_captured_audit_upload(&mut second).await;
+                let _ = overlap_tx.send(());
+                write_http_response(&mut second, 204, "text/plain", b"").await;
+            }
+            let _ = release.await;
+            write_http_response(&mut stream, 204, "text/plain", b"").await;
+        }
+    }
+}
+
+async fn read_captured_audit_upload(stream: &mut TcpStream) -> Option<CapturedAuditUpload> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     let header_end = loop {
         let read = match stream.read(&mut buffer).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return None,
             Ok(read) => read,
         };
         request.extend_from_slice(&buffer[..read]);
@@ -93,7 +133,7 @@ async fn capture_delayed_audit_upload(
         .unwrap_or_default();
     while request.len() < header_end + content_length {
         let read = match stream.read(&mut buffer).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return None,
             Ok(read) => read,
         };
         request.extend_from_slice(&buffer[..read]);
@@ -104,16 +144,13 @@ async fn capture_delayed_audit_upload(
     let method = parts.next().unwrap_or_default().to_owned();
     let path = parts.next().unwrap_or_default().to_owned();
     let body = request[header_end..header_end + content_length].to_vec();
-    let _ = tx.send(CapturedAuditUpload {
+    Some(CapturedAuditUpload {
         method,
         path,
         authorization: header_value(&headers, "authorization"),
         content_type: header_value(&headers, "content-type"),
         body,
-    });
-
-    let _ = release.await;
-    write_http_response(&mut stream, 204, "text/plain", b"").await;
+    })
 }
 
 impl MockBlossom {
@@ -943,6 +980,79 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
         Some("Bearer goggles_welcome_secret")
     );
     assert!(!captured.body.is_empty());
+
+    let _ = release_tx.send(());
+    server.await.unwrap();
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "runtime audit coalesce",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let (overlap_tx, overlap_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(capture_delayed_audit_upload_with_overlap_probe(
+        listener, tx, overlap_tx, release_rx,
+    ));
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            authorization_bearer_token: Some("goggles_coalesce_secret".to_owned()),
+            source: AuditLogUploadSource::default(),
+        })
+        .unwrap();
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"first upload remains in flight".to_vec(),
+        )
+        .await
+        .unwrap();
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive the first upload")
+        .unwrap();
+    assert_eq!(captured.method, "POST");
+
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"second trigger should coalesce".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(1), overlap_rx).await.is_err(),
+        "audit tracker uploader should not start an overlapping upload"
+    );
 
     let _ = release_tx.send(());
     server.await.unwrap();
