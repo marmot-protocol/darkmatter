@@ -32,6 +32,10 @@ these assignments, Marmot needs an explicit compatibility plan before changing w
 | `0x000a` | `self_remove`         | MLS extensions draft proposal type   |
 | `0x000a` | `last_resort`         | MLS extensions draft extension type  |
 
+`self_remove` and `last_resort` share the value `0x000a` but this is not an id collision: they are assigned in different
+MLS registries — `self_remove` in the proposal-type namespace and `last_resort` in the extension-type namespace, as the
+Upstream source column shows. An MLS value is only unique within its own registry.
+
 The `app_components`, `app_data_dictionary`, `app_data_update`, and `self_remove` values match
 draft-ietf-mls-extensions-09. The `last_resort` value is the extension-type assignment Marmot currently implements
 through OpenMLS. Confirm `last_resort` against draft-09 before relying on it: the draft MAY track last-resort handling
