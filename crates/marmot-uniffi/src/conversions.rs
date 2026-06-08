@@ -1262,6 +1262,11 @@ pub struct AppGroupRecordFfi {
     pub admins: Vec<String>,
     pub relays: Vec<String>,
     pub nostr_group_id_hex: String,
+    /// URL-based group avatar (`marmot.group.avatar-url.v1`), `None` when absent.
+    /// When set it takes precedence over a Blossom image avatar.
+    pub avatar_url: Option<String>,
+    pub avatar_dim: Option<String>,
+    pub avatar_thumbhash: Option<String>,
     pub archived: bool,
     pub pending_confirmation: bool,
     pub welcomer_account_id_hex: Option<String>,
@@ -1279,6 +1284,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             relays,
             ..
         } = value.nostr_routing;
+        let avatar = value.avatar_url;
         Self {
             group_id_hex: value.group_id_hex,
             endpoint: value.endpoint,
@@ -1287,6 +1293,9 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             admins,
             relays,
             nostr_group_id_hex,
+            avatar_url: avatar.present.then_some(avatar.url),
+            avatar_dim: avatar.dim,
+            avatar_thumbhash: avatar.thumbhash,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
@@ -1804,6 +1813,9 @@ mod tests {
             admins: admins.into_iter().map(ToOwned::to_owned).collect(),
             relays: vec![],
             nostr_group_id_hex: "02".repeat(32),
+            avatar_url: None,
+            avatar_dim: None,
+            avatar_thumbhash: None,
             archived: false,
             pending_confirmation: false,
             welcomer_account_id_hex: None,

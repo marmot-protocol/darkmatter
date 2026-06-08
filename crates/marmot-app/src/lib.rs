@@ -114,9 +114,9 @@ pub use config::{
 };
 pub use error::AppError;
 pub use groups::{
-    AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupImageComponent,
-    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppAgentTextStreamComponent, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
+    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
 };
 pub use ids::{account_id_hex_from_ref, npub_for_account_id};
 pub use media::{

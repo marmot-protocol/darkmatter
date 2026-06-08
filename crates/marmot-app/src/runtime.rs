@@ -712,6 +712,13 @@ enum AccountWorkerCommand {
         disappearing_message_secs: u64,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    UpdateGroupAvatarUrl {
+        group_id: GroupId,
+        url: Option<String>,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     SendMessage {
         group_id: GroupId,
         payload: Vec<u8>,
@@ -2162,6 +2169,19 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn update_group_avatar_url(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        url: Option<String>,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .update_group_avatar_url(account_ref, group_id, url, dim, thumbhash)
+            .await
+    }
+
     pub async fn promote_admin(
         &self,
         account_ref: &str,
@@ -3361,6 +3381,32 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn update_group_avatar_url(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        url: Option<String>,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpdateGroupAvatarUrl {
+                group_id: group_id.clone(),
+                url,
+                dim,
+                thumbhash,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("update_group_avatar_url");
+        Ok(summary)
+    }
+
     pub async fn promote_admin(
         &self,
         account_ref: &str,
@@ -4156,6 +4202,18 @@ async fn run_app_runtime_account_worker(
                     }) => {
                         let result = client
                             .update_message_retention(&group_id, disappearing_message_secs)
+                            .await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::UpdateGroupAvatarUrl {
+                        group_id,
+                        url,
+                        dim,
+                        thumbhash,
+                        respond,
+                    }) => {
+                        let result = client
+                            .update_group_avatar_url(&group_id, url, dim, thumbhash)
                             .await;
                         let _ = respond.send(result);
                     }
