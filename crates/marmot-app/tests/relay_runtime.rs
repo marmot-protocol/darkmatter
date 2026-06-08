@@ -12,9 +12,10 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::KeyPackage;
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime, MediaReference, MediaUploadRequest, NotificationWakeSource,
-    PushPlatform, RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
+    AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig, MarmotAppEvent,
+    MarmotAppRuntime, MediaReference, MediaUploadRequest, NotificationWakeSource, PushPlatform,
+    RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -23,10 +24,13 @@ use nostr_sdk::prelude::Client as NostrSdkClient;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
+
+const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const AUDIT_TRACKER_NON_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -44,6 +48,72 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
 struct MockBlossom {
     url: String,
     blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+struct CapturedAuditUpload {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    headers.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        candidate
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_owned())
+    })
+}
+
+async fn capture_delayed_audit_upload(
+    listener: TcpListener,
+    tx: oneshot::Sender<CapturedAuditUpload>,
+    release: oneshot::Receiver<()>,
+) {
+    let Ok((mut stream, _peer)) = listener.accept().await else {
+        return;
+    };
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let header_end = loop {
+        let read = match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+    let content_length = header_value(&headers, "content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+    while request.len() < header_end + content_length {
+        let read = match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        request.extend_from_slice(&buffer[..read]);
+    }
+
+    let request_line = headers.lines().next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+    let body = request[header_end..header_end + content_length].to_vec();
+    let _ = tx.send(CapturedAuditUpload {
+        method,
+        path,
+        authorization: header_value(&headers, "authorization"),
+        content_type: header_value(&headers, "content-type"),
+        body,
+    });
+
+    let _ = release.await;
+    write_http_response(&mut stream, 204, "text/plain", b"").await;
 }
 
 impl MockBlossom {
@@ -732,6 +802,150 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     assert_eq!(stream_crypto.group_id, group_id);
     assert_eq!(stream_crypto.stream_id, stream_id.to_vec());
 
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "runtime audit tracker",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            authorization_bearer_token: Some("goggles_runtime_secret".to_owned()),
+            source: AuditLogUploadSource {
+                account_label: Some("Alice".to_owned()),
+                device_label: Some("Alice iPhone".to_owned()),
+                platform: Some("ios".to_owned()),
+                app_version: Some("2026.6.8".to_owned()),
+            },
+        })
+        .unwrap();
+
+    let send_runtime = runtime.clone();
+    let send_account = alice.account.account_id_hex.clone();
+    let send_group_id = group_id.clone();
+    let send = tokio::spawn(async move {
+        send_runtime
+            .send_message(
+                &send_account,
+                &send_group_id,
+                b"send should not wait for audit tracker".to_vec(),
+            )
+            .await
+    });
+
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive background upload")
+        .unwrap();
+    timeout(AUDIT_TRACKER_NON_BLOCKING_TIMEOUT, send)
+        .await
+        .expect("send should finish before tracker response is released")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(
+        captured.authorization.as_deref(),
+        Some("Bearer goggles_runtime_secret")
+    );
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-ndjson")
+    );
+    assert!(!captured.body.is_empty());
+
+    let _ = release_tx.send(());
+    server.await.unwrap();
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            authorization_bearer_token: Some("goggles_welcome_secret".to_owned()),
+            source: AuditLogUploadSource::default(),
+        })
+        .unwrap();
+
+    let create_runtime = runtime.clone();
+    let create_account = alice.account.account_id_hex.clone();
+    let members = vec![bob.account.account_id_hex.clone()];
+    let create = tokio::spawn(async move {
+        create_runtime
+            .create_group(&create_account, "runtime audit welcome", &members, None)
+            .await
+    });
+
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive welcome-triggered upload")
+        .unwrap();
+    timeout(AUDIT_TRACKER_NON_BLOCKING_TIMEOUT, create)
+        .await
+        .expect("create_group should finish before tracker response is released")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(
+        captured.authorization.as_deref(),
+        Some("Bearer goggles_welcome_secret")
+    );
+    assert!(!captured.body.is_empty());
+
+    let _ = release_tx.send(());
+    server.await.unwrap();
     runtime.shutdown().await;
 }
 

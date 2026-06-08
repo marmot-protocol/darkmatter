@@ -39,13 +39,14 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogUploadResult,
-    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest,
-    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
-    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
+    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp, MarmotRelayPlane,
+    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
+    TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
     UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
@@ -72,6 +73,7 @@ pub struct RuntimeSharedServices {
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
+    audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
 }
 
 impl Default for RuntimeSharedServices {
@@ -84,6 +86,7 @@ impl Default for RuntimeSharedServices {
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
                 RelayTelemetryRuntimeConfig::default(),
             )),
+            audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
         }
     }
 }
@@ -98,6 +101,7 @@ impl RuntimeSharedServices {
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
                 RelayTelemetryRuntimeConfig::default(),
             )),
+            audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
         }
     }
 
@@ -148,6 +152,20 @@ impl RuntimeSharedServices {
     fn set_relay_telemetry_runtime_config(&self, config: RelayTelemetryRuntimeConfig) {
         *self
             .relay_telemetry_runtime_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+    }
+
+    fn audit_log_tracker_config(&self) -> AuditLogTrackerConfig {
+        self.audit_log_tracker_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_audit_log_tracker_config(&self, config: AuditLogTrackerConfig) {
+        *self
+            .audit_log_tracker_config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
@@ -2015,6 +2033,22 @@ impl MarmotAppRuntime {
         self.accounts.app.post_audit_log_file(path, endpoint).await
     }
 
+    pub fn set_audit_log_tracker_config(
+        &self,
+        config: AuditLogTrackerConfig,
+    ) -> Result<AuditLogTrackerConfig, AppError> {
+        let config = config.normalize().map_err(AppError::AuditLogUpload)?;
+        self.shared.set_audit_log_tracker_config(config.clone());
+        Ok(config)
+    }
+
+    pub async fn post_audit_log_tracker_update(
+        &self,
+    ) -> Result<AuditLogTrackerUpdateResult, AppError> {
+        let config = self.shared.audit_log_tracker_config();
+        post_audit_log_tracker_update_for_app(&self.accounts.app, config).await
+    }
+
     pub fn set_local_notifications_enabled(
         &self,
         account_ref: &str,
@@ -2568,6 +2602,54 @@ impl MarmotAppRuntime {
     }
 }
 
+async fn post_audit_log_tracker_update_for_app(
+    app: &MarmotApp,
+    config: AuditLogTrackerConfig,
+) -> Result<AuditLogTrackerUpdateResult, AppError> {
+    if !app.audit_log_settings()?.enabled {
+        return Ok(AuditLogTrackerUpdateResult {
+            enabled: false,
+            uploaded: Vec::new(),
+            skipped_reason: Some("audit logging disabled".to_owned()),
+        });
+    }
+
+    if config.endpoint.is_none() {
+        return Ok(AuditLogTrackerUpdateResult {
+            enabled: true,
+            uploaded: Vec::new(),
+            skipped_reason: Some("audit log tracker endpoint missing".to_owned()),
+        });
+    }
+    if config.authorization_bearer_token.is_none() {
+        return Ok(AuditLogTrackerUpdateResult {
+            enabled: true,
+            uploaded: Vec::new(),
+            skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
+        });
+    }
+    if !config.upload_allowed() {
+        return Ok(AuditLogTrackerUpdateResult {
+            enabled: true,
+            uploaded: Vec::new(),
+            skipped_reason: Some("audit log tracker not configured".to_owned()),
+        });
+    }
+
+    let mut uploaded = Vec::new();
+    for file in app.audit_log_files()? {
+        uploaded.push(
+            app.post_audit_log_file_with_tracker_config(&file.path, &config)
+                .await?,
+        );
+    }
+    Ok(AuditLogTrackerUpdateResult {
+        enabled: true,
+        uploaded,
+        skipped_reason: None,
+    })
+}
+
 impl AccountManager {
     fn new(
         app: MarmotApp,
@@ -2606,6 +2688,38 @@ impl AccountManager {
 
     pub fn resolve(&self, account_ref: &str) -> Result<AccountSummary, AppError> {
         Ok(self.app.account_home().account(account_ref)?)
+    }
+
+    fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
+        let config = self.shared.audit_log_tracker_config();
+        if !config.upload_allowed() {
+            return;
+        }
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            match post_audit_log_tracker_update_for_app(&app, config).await {
+                Ok(result) => {
+                    if result.skipped_reason.is_none() {
+                        tracing::debug!(
+                            target: "marmot_app::audit_log",
+                            method = "schedule_audit_log_tracker_update",
+                            trigger,
+                            uploaded = result.uploaded.len(),
+                            "posted forensic audit log tracker update"
+                        );
+                    }
+                }
+                Err(_err) => {
+                    tracing::warn!(
+                        target: "marmot_app::audit_log",
+                        method = "schedule_audit_log_tracker_update",
+                        trigger,
+                        error = "audit_log_tracker_update_failed",
+                        "failed to post forensic audit log tracker update"
+                    );
+                }
+            }
+        });
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
@@ -2775,6 +2889,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let group_id = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("create_group");
         Ok(group_id)
     }
 
@@ -2870,6 +2985,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("invite_members");
         Ok(summary)
     }
 
@@ -2891,6 +3007,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("remove_members");
         Ok(summary)
     }
 
@@ -2910,6 +3027,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("leave_group");
         Ok(summary)
     }
 
@@ -2946,6 +3064,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let result = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("decline_group_invite");
         Ok(result)
     }
 
@@ -2967,6 +3086,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("update_message_retention");
         Ok(summary)
     }
 
@@ -2988,6 +3108,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("promote_admin");
         Ok(summary)
     }
 
@@ -3009,6 +3130,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("demote_admin");
         Ok(summary)
     }
 
@@ -3028,6 +3150,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("self_demote_admin");
         Ok(summary)
     }
 
@@ -3051,6 +3174,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("update_group_profile");
         Ok(summary)
     }
 
@@ -3070,7 +3194,9 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let summary = account_worker_response(response).await?;
+        self.schedule_audit_log_tracker_update("send_message");
+        Ok(summary)
     }
 
     async fn share_push_registration(&self, account_ref: &str) -> Result<usize, AppError> {
@@ -3080,7 +3206,11 @@ impl AccountManager {
             .send(AccountWorkerCommand::SharePushRegistration { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let published = account_worker_response(response).await?;
+        if published > 0 {
+            self.schedule_audit_log_tracker_update("share_push_registration");
+        }
+        Ok(published)
     }
 
     async fn remove_push_registration(
@@ -3097,7 +3227,11 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let removed = account_worker_response(response).await?;
+        if removed > 0 {
+            self.schedule_audit_log_tracker_update("remove_push_registration");
+        }
+        Ok(removed)
     }
 
     async fn group_push_debug_info(
@@ -3141,7 +3275,9 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let summary = account_worker_response(response).await?;
+        self.schedule_audit_log_tracker_update("send_app_event");
+        Ok(summary)
     }
 
     async fn upload_media(
@@ -3160,7 +3296,11 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let result = account_worker_response(response).await?;
+        if result.sent.is_some() {
+            self.schedule_audit_log_tracker_update("upload_media_send");
+        }
+        Ok(result)
     }
 
     async fn download_media(
@@ -3200,7 +3340,9 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let result = account_worker_response(response).await?;
+        self.schedule_audit_log_tracker_update("start_agent_text_stream");
+        Ok(result)
     }
 
     async fn finish_agent_text_stream(
@@ -3219,7 +3361,9 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let result = account_worker_response(response).await?;
+        self.schedule_audit_log_tracker_update("finish_agent_text_stream");
+        Ok(result)
     }
 
     pub async fn retry_group_convergence(
@@ -3238,6 +3382,7 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("retry_group_convergence");
         Ok(summary)
     }
 
