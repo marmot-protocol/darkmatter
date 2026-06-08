@@ -895,6 +895,15 @@ impl MarmotAppRuntime {
             .flatten()
     }
 
+    pub fn display_names_for_account_ids(
+        &self,
+        account_id_hexes: &[String],
+    ) -> Result<HashMap<String, String>, AppError> {
+        self.accounts
+            .app
+            .display_names_for_account_ids(account_id_hexes)
+    }
+
     pub fn subscribe_messages(
         &self,
         account_ref: &str,
@@ -1611,6 +1620,8 @@ impl MarmotAppRuntime {
 
     pub async fn start(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
+        let app = self.accounts.app.clone();
+        blocking_app_task(move || app.warm_directory_storage()).await?;
         let config = self
             .accounts
             .app
@@ -2618,6 +2629,7 @@ impl AccountManager {
         }
         // Hold the worker map lock until storage is updated so reconcile()
         // cannot recreate this account's worker mid-removal.
+        self.app.drop_directory_cache_for_account(&account.label);
         self.app.account_home().remove_account(&account.label)?;
         Ok(())
     }
