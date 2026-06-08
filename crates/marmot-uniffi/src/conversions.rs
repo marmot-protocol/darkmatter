@@ -1011,6 +1011,11 @@ pub struct TimelineMessageRecordFfi {
     pub reactions: TimelineReactionSummaryFfi,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
+    /// Set when convergence invalidated this message (it landed on a losing
+    /// branch). The message is kept as a "did not reach the group" tombstone
+    /// instead of disappearing; the value is the engine invalidation reason
+    /// (e.g. `LosingBranch`). `None` for delivered messages.
+    pub invalidation_status: Option<String>,
 }
 
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
@@ -1033,6 +1038,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             reactions: value.reactions.into(),
             deleted: value.deleted,
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
+            invalidation_status: value.invalidation_status,
         }
     }
 }
@@ -1891,6 +1897,7 @@ mod tests {
             },
             deleted: true,
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
+            invalidation_status: None,
         };
 
         let page = TimelinePageFfi::from(TimelinePage {

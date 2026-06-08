@@ -5113,6 +5113,7 @@ mod tests {
                     received_at: 1,
                     deleted: false,
                     deleted_by_message_id_hex: None,
+                    invalidation_status: None,
                     reply_to_message_id_hex: None,
                     reply_preview: None,
                     media: None,
