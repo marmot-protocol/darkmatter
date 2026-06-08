@@ -979,7 +979,7 @@ fn validate_audit_upload_endpoint(
         ));
     }
     if !config::endpoint_host_is_loopback(endpoint)
-        && !authorization_bearer_token.is_some_and(|token| !token.trim().is_empty())
+        && authorization_bearer_token.is_none_or(|token| token.trim().is_empty())
     {
         return Err(AppError::AuditLogUpload(
             "forensic upload endpoint requires an authorization bearer token unless it is loopback"
