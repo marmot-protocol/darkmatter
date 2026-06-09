@@ -164,9 +164,10 @@ just hermes-phone-test-logs
 For this manual test the container starts `dm-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
 without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
 
-On the first encrypted chat message, the Marmot Hermes adapter asks whether to publish a public Nostr profile name for
-the agent account. Reply with the name to publish it as kind-0 metadata, or reply `skip` to leave the agent unnamed.
-Set `MARMOT_PROFILE_NAME_ONBOARDING=0` to disable that first-chat prompt.
+In the phone-test container, `MARMOT_PROFILE_NAME_ONBOARDING=1` makes the Marmot Hermes adapter ask on the first
+encrypted chat message whether to publish a public Nostr profile name for the agent account. Reply with the name to
+publish it as kind-0 metadata, or reply `skip` to leave the agent unnamed. Outside this container path the prompt is
+opt-in; set `MARMOT_PROFILE_NAME_ONBOARDING=1` or plugin extra `profile_name_onboarding: true` to enable it.
 
 Stop the container without deleting the agent account:
 

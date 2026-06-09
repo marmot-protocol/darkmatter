@@ -692,7 +692,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._capture_loop()
         if message_id.startswith(TOOL_PROGRESS_MESSAGE_PREFIX):
             chat_id = _normalize_hex(chat_id, "chat_id")
-            tool_events = _tool_events_from_progress_text(content)
+            visible_content = self._strip_streaming_cursor(content)
+            tool_events = _tool_events_from_progress_text(visible_content)
             if not tool_events:
                 return SendResult(success=True, message_id=message_id)
             return await self._send_tool_progress_events(
@@ -791,6 +792,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         key = (chat_id, int(draft_id))
         visible_content = self._strip_streaming_cursor(content)
         if not visible_content.strip():
+            stream = self._draft_streams.pop(key, None)
+            if stream is not None:
+                await self._cancel_stream(chat_id, None, stream, "draft cleared")
             return SendResult(success=True)
 
         try:
@@ -1347,7 +1351,7 @@ def resolve_profile_name_onboarding_enabled(extra: Dict[str, Any]) -> bool:
             if key in extra:
                 configured = extra[key]
                 break
-    return _config_bool(configured, default=True)
+    return _config_bool(configured, default=False)
 
 
 def resolve_profile_onboarding_state_path(extra: Dict[str, Any], socket_path: str | Path) -> Path:

@@ -613,7 +613,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = await adapter.edit_message(
             chat_id="22" * 32,
             message_id=first.message_id,
-            content='* search: "glp-1"',
+            content='* search: "glp-1"\u2589',
         )
 
         self.assertTrue(retry.success)
@@ -703,6 +703,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.config_cls(
                     extra={
                         "account_id_hex": "11" * 32,
+                        "profile_name_onboarding": True,
                         "profile_onboarding_state_path": str(Path(tempdir) / "profile-state.json"),
                     }
                 ),
@@ -764,6 +765,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.config_cls(
                     extra={
                         "account_id_hex": account_id,
+                        "profile_name_onboarding": True,
                         "profile_onboarding_state_path": str(state_path),
                     }
                 ),
@@ -879,6 +881,48 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(fake_client.stream_begins, [])
         self.assertEqual(fake_client.stream_appends, [])
+
+    async def test_draft_stream_clear_cancels_existing_preview(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_appends = []
+                self.stream_cancels = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
+                return {"type": "ack"}
+
+            async def stream_cancel(self, stream_id_hex, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        first = await adapter.send_draft("22" * 32, 1, "Let me search")
+        cleared = await adapter.send_draft("22" * 32, 1, "\u2589")
+
+        self.assertTrue(first.success)
+        self.assertTrue(cleared.success)
+        self.assertEqual(fake_client.stream_appends, [("55" * 32, "Let me search")])
+        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "draft cleared")])
+        self.assertEqual(adapter._draft_streams, {})
 
     async def test_draft_stream_rotation_cancels_previous_preview(self):
         class FakeClient:
