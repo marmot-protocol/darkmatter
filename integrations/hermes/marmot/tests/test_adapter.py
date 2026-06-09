@@ -566,6 +566,67 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["preview"], "glp-1")
         self.assertEqual(kwargs["reply_to_message_id_hex"], "33" * 32)
 
+    async def test_tool_progress_retry_resends_failed_event(self):
+        class FakeClient:
+            def __init__(self):
+                self.tool_events = []
+                self.final_sends = []
+                self.fail_next = True
+
+            async def send_agent_tool_event(self, account_id_hex, group_id_hex, **kwargs):
+                self.tool_events.append((account_id_hex, group_id_hex, kwargs))
+                if self.fail_next:
+                    self.fail_next = False
+                    raise RuntimeError("temporary send failure")
+                return {
+                    "type": "app_event_sent",
+                    "message_ids_hex": ["44" * 32],
+                }
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+        first = await adapter.send(
+            chat_id="22" * 32,
+            content='* search: "glp-1"',
+            reply_to="33" * 32,
+        )
+        self.assertFalse(first.success)
+        self.assertTrue(first.message_id.startswith("marmot-tool-progress:"))
+
+        retry = await adapter.edit_message(
+            chat_id="22" * 32,
+            message_id=first.message_id,
+            content='* search: "glp-1"',
+        )
+
+        self.assertTrue(retry.success)
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(len(fake_client.tool_events), 2)
+        self.assertEqual(fake_client.tool_events[0][0:2], fake_client.tool_events[1][0:2])
+        self.assertEqual(fake_client.tool_events[0][2], fake_client.tool_events[1][2])
+        self.assertEqual(fake_client.tool_events[1][2]["reply_to_message_id_hex"], "33" * 32)
+
+    async def test_disconnect_clears_tool_progress_dedupe_cache(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=object(),
+        )
+        adapter._tool_progress_events["marmot-tool-progress:test"] = {"event"}
+        adapter._tool_progress_replies["marmot-tool-progress:test"] = "33" * 32
+
+        await adapter.disconnect()
+
+        self.assertEqual(adapter._tool_progress_events, {})
+        self.assertEqual(adapter._tool_progress_replies, {})
+
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
             {

@@ -5009,10 +5009,9 @@ async fn watch_broker_candidates(
                     crypto: crypto.clone(),
                 };
                 let chunk_tx = updates_tx.clone();
+                let dropped_non_text_record = Arc::new(AtomicBool::new(false));
+                let dropped_non_text_record_for_chunk = dropped_non_text_record.clone();
                 match subscribe_text_from_broker_with_updates(config, |chunk| {
-                    // Non-blocking: if the consumer falls behind we drop a
-                    // delta; the Finished update carries the full transcript
-                    // for reconcile.
                     let update = match chunk.record_type {
                         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
                             seq: chunk.seq,
@@ -5032,17 +5031,38 @@ async fn watch_broker_candidates(
                             text: chunk.text.clone(),
                         },
                     };
-                    if let Err(mpsc::error::TrySendError::Full(_)) = chunk_tx.try_send(update) {
-                        tracing::warn!(
-                            target: "marmot_app::agent_stream",
-                            method = "watch_agent_text_stream",
-                            "dropping live agent text stream delta; consumer is behind",
-                        );
+                    match chunk_tx.try_send(update) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_))
+                            if chunk.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA =>
+                        {
+                            tracing::warn!(
+                                target: "marmot_app::agent_stream",
+                                method = "watch_agent_text_stream",
+                                "dropping live agent text stream delta; consumer is behind",
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            dropped_non_text_record_for_chunk.store(true, Ordering::Relaxed);
+                            tracing::warn!(
+                                target: "marmot_app::agent_stream",
+                                method = "watch_agent_text_stream",
+                                record_type = chunk.record_type,
+                                "dropping non-text agent stream record; consumer is behind",
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
                     }
                 })
                 .await
                 {
                     Ok(received) => {
+                        if dropped_non_text_record.load(Ordering::Relaxed) {
+                            return RuntimeAgentStreamUpdate::Failed {
+                                message: "agent text stream subscriber fell behind and dropped non-text records"
+                                    .to_owned(),
+                            };
+                        }
                         return RuntimeAgentStreamUpdate::Finished {
                             text: received.text,
                             transcript_hash_hex: hex::encode(received.transcript_hash),

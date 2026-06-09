@@ -426,7 +426,7 @@ mod tests {
     use cgka_traits::MessageId;
     use cgka_traits::agent_text_stream::{
         AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-        AgentTextStreamTranscriptV1,
+        AGENT_TEXT_STREAM_RECORD_TOOL_DELTA, AgentTextStreamTranscriptV1,
     };
     use tokio::sync::{mpsc, oneshot};
     use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
@@ -669,6 +669,80 @@ mod tests {
 
         assert_eq!(finished.status, "finished");
         assert_eq!(finished.text, "hello");
+        assert_eq!(finished.chunk_count, 2);
+        assert_eq!(
+            finished.transcript_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        session.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_session_tool_updates_transcript_without_changing_text() {
+        let stream_id = vec![0x9a; 32];
+        let start_event_id = MessageId::new(vec![0x9b; 32]);
+        let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+        let report = test_stream_compose_report(&stream_id);
+        let (tx, rx) = mpsc::channel(4);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, report));
+
+        let (append_respond, append_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "answer".to_owned(),
+            respond: append_respond,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), append_response)
+            .await
+            .expect("append should complete")
+            .unwrap()
+            .unwrap();
+
+        let (tool_respond, tool_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Tool {
+            text: "search: glp-1".to_owned(),
+            respond: tool_respond,
+        })
+        .await
+        .unwrap();
+        let tool_report = tokio::time::timeout(Duration::from_millis(250), tool_response)
+            .await
+            .expect("tool should complete")
+            .unwrap()
+            .unwrap();
+
+        let expected_hash = expected_stream_transcript_hash_for_records(
+            &stream_id,
+            &start_event_id,
+            &[
+                (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "answer"),
+                (AGENT_TEXT_STREAM_RECORD_TOOL_DELTA, "search: glp-1"),
+            ],
+            16,
+        );
+        assert_eq!(tool_report.text, "answer");
+        assert_eq!(tool_report.chunk_count, 2);
+        assert_eq!(
+            tool_report.transcript_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        let (finish_respond, finish_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Finish {
+            respond: finish_respond,
+        })
+        .await
+        .unwrap();
+        let finished = tokio::time::timeout(Duration::from_millis(250), finish_response)
+            .await
+            .expect("finish should complete")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finished.status, "finished");
+        assert_eq!(finished.text, "answer");
         assert_eq!(finished.chunk_count, 2);
         assert_eq!(
             finished.transcript_hash.as_deref(),

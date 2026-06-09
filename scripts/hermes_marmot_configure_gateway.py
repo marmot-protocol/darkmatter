@@ -12,7 +12,9 @@ from typing import Any
 
 try:
     import yaml  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover - exercised on hosts without PyYAML.
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised on hosts without PyYAML.
+    if exc.name != "yaml":
+        raise
     yaml = None
 
 

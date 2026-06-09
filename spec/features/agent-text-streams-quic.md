@@ -201,7 +201,6 @@ Kind `1210` group system content is JSON:
 ```json
 {
   "v": 1,
-  "status": "member_added",
   "system_type": "member_added",
   "text": "Member added",
   "data": {}

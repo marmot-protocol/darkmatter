@@ -323,8 +323,10 @@ pub(crate) fn build_inner_event(
             data,
         } => {
             let system_type = validate_non_empty_field(system_type, "group system type")?;
-            let mut content = app_payload_base(system_type.clone(), text.clone());
+            let mut content = Map::new();
+            content.insert("v".to_owned(), json!(1));
             content.insert("system_type".to_owned(), Value::String(system_type.clone()));
+            content.insert("text".to_owned(), Value::String(text.clone()));
             if let Some(data) = data {
                 content.insert("data".to_owned(), data.clone());
             }

@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterable, Optional
 
@@ -39,6 +40,7 @@ TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
 TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
+MAX_TOOL_PROGRESS_MESSAGES = 512
 MAX_PROFILE_NAME_CHARS = 80
 PROFILE_NAME_PROMPT = (
     "I do not have a public Nostr profile name yet. What should I publish as "
@@ -589,7 +591,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._active_streams: Dict[str, MarmotLiveStream] = {}
         self._draft_streams: Dict[tuple[str, int], MarmotLiveStream] = {}
         self._last_chat_stream: Dict[str, MarmotLiveStream] = {}
-        self._tool_progress_events: Dict[str, set[str]] = {}
+        self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
+        self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
@@ -626,6 +629,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 pass
             self._listener_task = None
         await self._cancel_all_streams("adapter disconnect")
+        self._tool_progress_events.clear()
+        self._tool_progress_replies.clear()
         self._mark_disconnected()
 
     async def send(
@@ -837,7 +842,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         message_id: Optional[str] = None,
     ) -> SendResult:
         message_id = message_id or _tool_progress_message_id()
-        seen = self._tool_progress_events.setdefault(message_id, set())
+        seen = self._tool_progress_seen(message_id)
+        if reply_to_message_id_hex is not None or message_id not in self._tool_progress_replies:
+            self._tool_progress_replies[message_id] = reply_to_message_id_hex
+        else:
+            reply_to_message_id_hex = self._tool_progress_replies[message_id]
         sent_message_ids = []
         try:
             account_id = await self._ensure_account_id()
@@ -845,7 +854,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 key = json.dumps(event, sort_keys=True, separators=(",", ":"))
                 if key in seen:
                     continue
-                seen.add(key)
                 response = await self.client.send_agent_tool_event(
                     account_id,
                     chat_id,
@@ -859,7 +867,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     duration_ms=event.get("duration_ms"),
                     reply_to_message_id_hex=reply_to_message_id_hex,
                 )
-                sent_message_ids.extend(response.get("message_ids_hex") or ())
+                message_ids = tuple(response.get("message_ids_hex") or ())
+                if response.get("type") != "app_event_sent" or not message_ids:
+                    raise AgentControlError(
+                        "Marmot agent tool event send returned no message ids",
+                        code="unexpected_tool_event_response",
+                        retryable=True,
+                    )
+                seen.add(key)
+                sent_message_ids.extend(message_ids)
             return SendResult(
                 success=True,
                 message_id=message_id,
@@ -867,7 +883,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.debug("Marmot send_agent_tool_event failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+            return SendResult(success=False, message_id=message_id, error=str(exc), retryable=is_retryable(exc))
+
+    def _tool_progress_seen(self, message_id: str) -> set[str]:
+        seen = self._tool_progress_events.get(message_id)
+        if seen is None:
+            seen = set()
+            self._tool_progress_events[message_id] = seen
+        else:
+            self._tool_progress_events.move_to_end(message_id)
+        while len(self._tool_progress_events) > MAX_TOOL_PROGRESS_MESSAGES:
+            dropped_message_id, _ = self._tool_progress_events.popitem(last=False)
+            self._tool_progress_replies.pop(dropped_message_id, None)
+        return seen
 
     async def _begin_live_stream(self, chat_id: str) -> MarmotLiveStream:
         account_id = await self._ensure_account_id()

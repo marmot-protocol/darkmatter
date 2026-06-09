@@ -6466,6 +6466,7 @@ mod tests {
         assert_eq!(content["system_type"], "member_added");
         assert_eq!(content["text"], "Member added");
         assert_eq!(content["data"]["member"], "alice");
+        assert!(content.get("status").is_none());
     }
 
     #[test]
