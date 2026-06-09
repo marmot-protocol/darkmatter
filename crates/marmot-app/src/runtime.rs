@@ -5017,8 +5017,6 @@ async fn watch_broker_candidates(
                     crypto: crypto.clone(),
                 };
                 let chunk_tx = updates_tx.clone();
-                let dropped_non_text_record = Arc::new(AtomicBool::new(false));
-                let dropped_non_text_record_for_chunk = dropped_non_text_record.clone();
                 match subscribe_text_from_broker_with_updates(config, |chunk| {
                     let update = match chunk.record_type {
                         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
@@ -5053,11 +5051,11 @@ async fn watch_broker_candidates(
                             );
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            dropped_non_text_record_for_chunk.store(true, Ordering::Relaxed);
                             tracing::warn!(
                                 target: "marmot_app::agent_stream",
                                 method = "watch_agent_text_stream",
                                 record_type = chunk.record_type,
+                                dropped_record_class = "non_text",
                                 "dropping non-text agent stream record; consumer is behind",
                             );
                         }
@@ -5067,12 +5065,6 @@ async fn watch_broker_candidates(
                 .await
                 {
                     Ok(received) => {
-                        if dropped_non_text_record.load(Ordering::Relaxed) {
-                            return RuntimeAgentStreamUpdate::Failed {
-                                message: "agent text stream subscriber fell behind and dropped non-text records"
-                                    .to_owned(),
-                            };
-                        }
                         return RuntimeAgentStreamUpdate::Finished {
                             text: received.text,
                             transcript_hash_hex: hex::encode(received.transcript_hash),
