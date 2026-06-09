@@ -14,6 +14,10 @@ mod migration_0006_chat_list_projection;
 mod migration_0007_timeline_projection_indexes;
 #[path = "migrations/0008_timeline_invalidation_status.rs"]
 mod migration_0008_timeline_invalidation_status;
+#[path = "migrations/0009_app_event_source_epoch.rs"]
+mod migration_0009_app_event_source_epoch;
+#[path = "migrations/0010_encrypted_media_epoch_secrets.rs"]
+mod migration_0010_encrypted_media_epoch_secrets;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -65,6 +69,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "0008_timeline_invalidation_status",
         apply: migration_0008_timeline_invalidation_status::apply,
+    },
+    Migration {
+        version: 9,
+        name: "0009_app_event_source_epoch",
+        apply: migration_0009_app_event_source_epoch::apply,
+    },
+    Migration {
+        version: 10,
+        name: "0010_encrypted_media_epoch_secrets",
+        apply: migration_0010_encrypted_media_epoch_secrets::apply,
     },
 ];
 
