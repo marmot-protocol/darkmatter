@@ -1,4 +1,4 @@
-use marmot_markdown::{Block, Inline, ListItem, ListKind};
+use marmot_markdown::{Block, CodeBlockKind, Inline, ListItem, ListKind};
 
 mod common;
 use common::{paragraph, parse_blocks};
@@ -544,4 +544,115 @@ fn nested_sibling_lists_do_not_lazy_continue_deeper_paragraphs() {
             ],
         )]
     );
+}
+
+#[test]
+fn lazy_continuation_strips_matched_blockquote_marker() {
+    assert_eq!(
+        parse_blocks("> - item\n> still item"),
+        vec![Block::BlockQuote {
+            blocks: vec![bullet_list(
+                b'-',
+                true,
+                vec![item(None, vec![paragraph("item\nstill item")])],
+            )],
+        }]
+    );
+}
+
+#[test]
+fn empty_list_marker_does_not_seed_softbreak() {
+    assert_eq!(
+        parse_blocks("-\n  text"),
+        vec![bullet_list(
+            b'-',
+            true,
+            vec![item(None, vec![paragraph("text")])],
+        )]
+    );
+    assert_eq!(
+        parse_blocks("1.\n   text"),
+        vec![ordered_list(
+            1,
+            b'.',
+            true,
+            vec![item(None, vec![paragraph("text")])],
+        )]
+    );
+}
+
+#[test]
+fn blank_inside_fenced_code_does_not_loosen_list() {
+    assert_eq!(
+        parse_blocks("- ```\n  a\n\n  b\n  ```"),
+        vec![bullet_list(
+            b'-',
+            true,
+            vec![item(
+                None,
+                vec![Block::CodeBlock {
+                    kind: CodeBlockKind::Fenced,
+                    info: String::new(),
+                    content: "a\n\nb\n".to_string(),
+                }],
+            )],
+        )]
+    );
+}
+
+#[test]
+fn blank_after_nested_list_only_loosens_outer_list() {
+    let parsed = parse_blocks("- a\n  - b\n\n  c");
+    let [
+        Block::List {
+            tight: outer_tight,
+            items,
+            ..
+        },
+    ] = parsed.as_slice()
+    else {
+        panic!("expected one outer list, got {parsed:?}");
+    };
+    assert!(!outer_tight);
+    let [outer_item] = items.as_slice() else {
+        panic!("expected one outer item, got {items:?}");
+    };
+    let Some(Block::List {
+        tight: inner_tight, ..
+    }) = outer_item
+        .blocks
+        .iter()
+        .find(|block| matches!(block, Block::List { .. }))
+    else {
+        panic!(
+            "expected nested list in outer item, got {:?}",
+            outer_item.blocks
+        );
+    };
+    assert!(*inner_tight);
+}
+
+#[test]
+fn excessive_blockquote_depth_is_capped() {
+    let input = ">".repeat(2_000);
+    let parsed = parse_blocks(&input);
+    assert!(max_block_depth(&parsed) <= 128);
+}
+
+fn max_block_depth(blocks: &[Block]) -> usize {
+    blocks.iter().map(max_single_block_depth).max().unwrap_or(0)
+}
+
+fn max_single_block_depth(block: &Block) -> usize {
+    match block {
+        Block::BlockQuote { blocks } => 1 + max_block_depth(blocks),
+        Block::List { items, .. } => {
+            1 + items
+                .iter()
+                .map(|item| max_block_depth(&item.blocks))
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 1,
+    }
 }

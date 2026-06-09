@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, TableCell};
 use crate::scanner;
 
+const MAX_CONTAINER_DEPTH: usize = 96;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // populated in Phase 3 (link reference definitions)
 pub(crate) struct LinkRef {
@@ -126,19 +128,24 @@ impl BlockParser {
         );
 
         if blank {
+            let mut mark_blank = true;
             match &mut self.leaf {
                 Some(Leaf::IndentedCode { pending_blanks, .. }) => {
                     *pending_blanks += 1;
+                    mark_blank = false;
                 }
                 Some(Leaf::FencedCode { content, .. } | Leaf::MathBlock { content, .. }) => {
                     content.push('\n');
+                    mark_blank = false;
                 }
                 Some(Leaf::Table { .. }) => {
                     self.close_leaf();
                 }
                 _ => self.close_leaf(),
             }
-            self.mark_lists_blank();
+            if mark_blank {
+                self.mark_list_blank_at_depth(matched_depth);
+            }
             return;
         }
 
@@ -146,8 +153,7 @@ impl BlockParser {
             if matches!(self.leaf, Some(Leaf::Paragraph(_)))
                 && self.can_lazy_continue(bytes, cursor, matched_depth)
             {
-                let stripped = strip_paragraph_indent(line);
-                self.append_paragraph(stripped);
+                self.append_paragraph_from(line, cursor.off);
                 return;
             }
             self.close_to_depth(matched_depth);
@@ -230,15 +236,15 @@ impl BlockParser {
                         let raw = self.harvest_ref_defs(raw);
                         if raw.is_empty() {
                             // All paragraph text was ref-defs — nothing to
-                            // promote; emit no heading, fall through as if
-                            // the paragraph were never here.
+                            // promote. Reclassify the underline itself as
+                            // ordinary content below.
+                        } else {
+                            self.push_block(Block::Heading {
+                                level,
+                                inlines: vec![Inline::Text(raw)],
+                            });
                             return;
                         }
-                        self.push_block(Block::Heading {
-                            level,
-                            inlines: vec![Inline::Text(raw)],
-                        });
-                        return;
                     }
                     if is_thematic_break(rest) {
                         self.close_leaf();
@@ -270,6 +276,10 @@ impl BlockParser {
                     if rest[0] == b'>'
                         && let Some((nc, no)) = try_open_blockquote(bytes, probe_col, probe_off)
                     {
+                        if self.containers.len() >= MAX_CONTAINER_DEPTH {
+                            self.append_paragraph_from(line, probe_off);
+                            return;
+                        }
                         self.close_leaf();
                         self.containers.push(Container::BlockQuote {
                             children: Vec::new(),
@@ -284,6 +294,10 @@ impl BlockParser {
                         probe_off,
                         matches!(self.leaf, Some(Leaf::Paragraph(_))),
                     ) {
+                        if self.containers.len() + 2 > MAX_CONTAINER_DEPTH {
+                            self.append_paragraph_from(line, probe_off);
+                            return;
+                        }
                         self.close_leaf();
                         self.ensure_list_open(open.kind);
                         self.containers.push(Container::ListItem {
@@ -292,6 +306,9 @@ impl BlockParser {
                         });
                         col = open.col_after;
                         off = open.off_after;
+                        if off >= bytes.len() {
+                            return;
+                        }
                         continue;
                     }
                 }
@@ -627,11 +644,15 @@ impl BlockParser {
 
     // -------- last_blank bookkeeping (loose vs tight) --------
 
-    fn mark_lists_blank(&mut self) {
-        for c in self.containers.iter_mut() {
-            if let Container::List { last_blank, .. } = c {
-                *last_blank = true;
-            }
+    fn mark_list_blank_at_depth(&mut self, depth: usize) {
+        if let Some(Container::List { last_blank, .. }) = self
+            .containers
+            .iter_mut()
+            .take(depth)
+            .rev()
+            .find(|c| matches!(c, Container::List { .. }))
+        {
+            *last_blank = true;
         }
     }
 
@@ -852,7 +873,7 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
     }
     i += 1;
     // Skip optional spaces/tabs (and at most one newline) before destination.
-    i = skip_ws_and_one_newline(b, i);
+    i = scanner::skip_ws_and_one_newline(b, i);
     if i >= b.len() {
         return None;
     }
@@ -893,19 +914,6 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
 fn skip_inline_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
         i += 1;
-    }
-    i
-}
-
-fn skip_ws_and_one_newline(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'\n' {
-        i += 1;
-        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-            i += 1;
-        }
     }
     i
 }

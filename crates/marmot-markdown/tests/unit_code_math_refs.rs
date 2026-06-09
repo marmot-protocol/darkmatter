@@ -101,18 +101,13 @@ fn fenced_close_must_be_at_least_as_long() {
 #[test]
 fn fenced_backtick_in_info_rejected() {
     // A backtick in the info string disqualifies the would-be opener; the
-    // line falls through to a paragraph. (The inline pass then tokenizes
-    // the text and finds an inline code span — that's separate from the
-    // fence-rejection rule and is the correct CommonMark behaviour.)
+    // line falls through to a paragraph. The unmatched opening code-span run
+    // stays literal and is not rescanned as a shorter opener.
     let input = "```foo`bar";
     assert_eq!(
         parse_blocks(input),
         vec![Block::Paragraph {
-            inlines: vec![
-                Inline::Text("``".into()),
-                Inline::Code("foo".into()),
-                Inline::Text("bar".into()),
-            ]
+            inlines: vec![Inline::Text("```foo`bar".into())]
         }]
     );
 }

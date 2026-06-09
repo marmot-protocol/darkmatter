@@ -72,6 +72,14 @@ fn underscore_intraword_does_not_emphasize() {
     assert_eq!(parse_inlines("a_b_c"), vec![t("a_b_c")]);
 }
 
+#[test]
+fn emphasis_openers_bottom_updates_after_compaction() {
+    assert_eq!(
+        parse_inlines("_*_*a*a"),
+        vec![em(vec![t("*")]), em(vec![t("a")]), t("a")]
+    );
+}
+
 // ----- Strikethrough: `~~` --------------------------------------------
 
 #[test]
@@ -113,6 +121,11 @@ fn strikethrough_inside_emphasis() {
 #[test]
 fn code_span_takes_priority_over_emph() {
     assert_eq!(parse_inlines("`*foo*`"), vec![Inline::Code("*foo*".into())]);
+}
+
+#[test]
+fn wrapped_text_runs_are_coalesced() {
+    assert_eq!(parse_inlines("*a**b*"), vec![em(vec![t("a**b")])]);
 }
 
 #[test]

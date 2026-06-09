@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use cgka_traits::GroupId;
+use cgka_traits::{GroupId, app_event::MARMOT_APP_EVENT_KIND_CHAT};
 use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
@@ -735,6 +735,14 @@ fn message_tags_ffi(tags: Vec<Vec<String>>) -> Vec<MessageTagFfi> {
         .collect()
 }
 
+fn markdown_content_tokens(kind: u64, plaintext: &str) -> MarkdownDocumentFfi {
+    if kind == MARMOT_APP_EVENT_KIND_CHAT {
+        parse_markdown_document(plaintext)
+    } else {
+        MarkdownDocumentFfi::default()
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppMessageRecordFfi {
     pub message_id_hex: String,
@@ -753,7 +761,7 @@ pub struct AppMessageRecordFfi {
 
 impl From<AppMessageRecord> for AppMessageRecordFfi {
     fn from(value: AppMessageRecord) -> Self {
-        let content_tokens = parse_markdown_document(&value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             direction: value.direction,
@@ -804,7 +812,7 @@ pub struct ChatListMessagePreviewFfi {
 
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
-        let content_tokens = parse_markdown_document(&value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -988,7 +996,7 @@ pub struct TimelineReplyPreviewFfi {
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
-        let content_tokens = parse_markdown_document(&value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -1031,7 +1039,7 @@ pub struct TimelineMessageRecordFfi {
 
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
-        let content_tokens = parse_markdown_document(&value.plaintext);
+        let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -1595,7 +1603,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             sender: value.sender.clone(),
             sender_display_name: value.sender_display_name.clone(),
             plaintext: value.plaintext.clone(),
-            content_tokens: parse_markdown_document(&value.plaintext),
+            content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
             recorded_at: value.recorded_at,
@@ -1984,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn app_message_record_ffi_derives_tokens_for_non_chat_kinds() {
+    fn app_message_record_ffi_leaves_non_chat_tokens_empty() {
         let record = AppMessageRecord {
             message_id_hex: "reaction-1".to_owned(),
             direction: "sent".to_owned(),
@@ -2000,14 +2008,7 @@ mod tests {
         let ffi = AppMessageRecordFfi::from(record);
 
         assert_eq!(ffi.kind, 7);
-        assert!(matches!(
-            &ffi.content_tokens.blocks[0],
-            MarkdownBlockFfi::Paragraph { inlines }
-                if matches!(
-                    &inlines[0],
-                    MarkdownInlineFfi::Text { content } if content == "reaction"
-                )
-        ));
+        assert_eq!(ffi.content_tokens, MarkdownDocumentFfi::default());
     }
 
     #[test]

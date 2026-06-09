@@ -78,6 +78,20 @@ pub(crate) fn is_blank(line: &[u8]) -> bool {
     line.iter().all(|&b| b == b' ' || b == b'\t')
 }
 
+/// Skip spaces/tabs, optionally one newline, then spaces/tabs again.
+pub(crate) fn skip_ws_and_one_newline(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'\n' {
+        i += 1;
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+    }
+    i
+}
+
 /// True if `b` is a CommonMark ASCII-punctuation byte (`!`..=`~` excluding
 /// letters and digits) — the escapable set per the spec.
 pub(crate) fn is_ascii_punct(b: u8) -> bool {

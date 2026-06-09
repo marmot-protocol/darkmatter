@@ -10,6 +10,8 @@ use marmot_markdown::{
     NostrHrp as MdNostrHrp, TableCell as MdTableCell,
 };
 
+const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MarkdownDocumentFfi {
     pub blocks: Vec<MarkdownBlockFfi>,
@@ -158,7 +160,11 @@ pub(crate) fn parse_markdown_document(text: &str) -> MarkdownDocumentFfi {
 impl From<&MdDocument> for MarkdownDocumentFfi {
     fn from(value: &MdDocument) -> Self {
         Self {
-            blocks: value.blocks.iter().map(MarkdownBlockFfi::from).collect(),
+            blocks: value
+                .blocks
+                .iter()
+                .map(|block| markdown_block_from_md(block, 0))
+                .collect(),
         }
     }
 }
@@ -171,51 +177,66 @@ impl From<MdDocument> for MarkdownDocumentFfi {
 
 impl From<&MdBlock> for MarkdownBlockFfi {
     fn from(value: &MdBlock) -> Self {
-        match value {
-            MdBlock::Paragraph { inlines } => Self::Paragraph {
-                inlines: inlines.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdBlock::Heading { level, inlines } => Self::Heading {
-                level: *level,
-                inlines: inlines.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdBlock::ThematicBreak => Self::ThematicBreak,
-            MdBlock::CodeBlock {
-                kind,
-                info,
-                content,
-            } => Self::CodeBlock {
-                kind: (*kind).into(),
-                info: info.clone(),
-                content: content.clone(),
-            },
-            MdBlock::BlockQuote { blocks } => Self::BlockQuote {
-                blocks: blocks.iter().map(MarkdownBlockFfi::from).collect(),
-            },
-            MdBlock::List { kind, tight, items } => Self::List {
-                kind: kind.into(),
-                tight: *tight,
-                items: items.iter().map(MarkdownListItemFfi::from).collect(),
-            },
-            MdBlock::Table {
-                alignments,
-                header,
-                rows,
-            } => Self::Table {
-                alignments: alignments
-                    .iter()
-                    .map(|alignment| (*alignment).into())
-                    .collect(),
-                header: header.iter().map(MarkdownTableCellFfi::from).collect(),
-                rows: rows
-                    .iter()
-                    .map(|row| row.iter().map(MarkdownTableCellFfi::from).collect())
-                    .collect(),
-            },
-            MdBlock::MathBlock { content } => Self::MathBlock {
-                content: content.clone(),
-            },
-        }
+        markdown_block_from_md(value, 0)
+    }
+}
+
+fn markdown_block_from_md(value: &MdBlock, depth: usize) -> MarkdownBlockFfi {
+    if depth >= MAX_FFI_MARKDOWN_DEPTH {
+        return MarkdownBlockFfi::Paragraph {
+            inlines: Vec::new(),
+        };
+    }
+    match value {
+        MdBlock::Paragraph { inlines } => MarkdownBlockFfi::Paragraph {
+            inlines: markdown_inlines_from_md(inlines, 0),
+        },
+        MdBlock::Heading { level, inlines } => MarkdownBlockFfi::Heading {
+            level: *level,
+            inlines: markdown_inlines_from_md(inlines, 0),
+        },
+        MdBlock::ThematicBreak => MarkdownBlockFfi::ThematicBreak,
+        MdBlock::CodeBlock {
+            kind,
+            info,
+            content,
+        } => MarkdownBlockFfi::CodeBlock {
+            kind: (*kind).into(),
+            info: info.clone(),
+            content: content.clone(),
+        },
+        MdBlock::BlockQuote { blocks } => MarkdownBlockFfi::BlockQuote {
+            blocks: blocks
+                .iter()
+                .map(|block| markdown_block_from_md(block, depth + 1))
+                .collect(),
+        },
+        MdBlock::List { kind, tight, items } => MarkdownBlockFfi::List {
+            kind: kind.into(),
+            tight: *tight,
+            items: items
+                .iter()
+                .map(|item| markdown_list_item_from_md(item, depth + 1))
+                .collect(),
+        },
+        MdBlock::Table {
+            alignments,
+            header,
+            rows,
+        } => MarkdownBlockFfi::Table {
+            alignments: alignments
+                .iter()
+                .map(|alignment| (*alignment).into())
+                .collect(),
+            header: header.iter().map(markdown_table_cell_from_md).collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(markdown_table_cell_from_md).collect())
+                .collect(),
+        },
+        MdBlock::MathBlock { content } => MarkdownBlockFfi::MathBlock {
+            content: content.clone(),
+        },
     }
 }
 
@@ -244,10 +265,18 @@ impl From<&MdListKind> for MarkdownListKindFfi {
 
 impl From<&MdListItem> for MarkdownListItemFfi {
     fn from(value: &MdListItem) -> Self {
-        Self {
-            blocks: value.blocks.iter().map(MarkdownBlockFfi::from).collect(),
-            checked: value.checked,
-        }
+        markdown_list_item_from_md(value, 0)
+    }
+}
+
+fn markdown_list_item_from_md(value: &MdListItem, depth: usize) -> MarkdownListItemFfi {
+    MarkdownListItemFfi {
+        blocks: value
+            .blocks
+            .iter()
+            .map(|block| markdown_block_from_md(block, depth))
+            .collect(),
+        checked: value.checked,
     }
 }
 
@@ -264,60 +293,80 @@ impl From<MdAlignment> for MarkdownAlignmentFfi {
 
 impl From<&MdTableCell> for MarkdownTableCellFfi {
     fn from(value: &MdTableCell) -> Self {
-        Self {
-            inlines: value.inlines.iter().map(MarkdownInlineFfi::from).collect(),
-        }
+        markdown_table_cell_from_md(value)
+    }
+}
+
+fn markdown_table_cell_from_md(value: &MdTableCell) -> MarkdownTableCellFfi {
+    MarkdownTableCellFfi {
+        inlines: markdown_inlines_from_md(&value.inlines, 0),
     }
 }
 
 impl From<&MdInline> for MarkdownInlineFfi {
     fn from(value: &MdInline) -> Self {
-        match value {
-            MdInline::Text(content) => Self::Text {
-                content: content.clone(),
-            },
-            MdInline::SoftBreak => Self::SoftBreak,
-            MdInline::HardBreak => Self::HardBreak,
-            MdInline::Code(content) => Self::Code {
-                content: content.clone(),
-            },
-            MdInline::Emph(children) => Self::Emph {
-                children: children.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdInline::Strong(children) => Self::Strong {
-                children: children.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdInline::Strikethrough(children) => Self::Strikethrough {
-                children: children.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdInline::Link {
-                dest,
-                title,
-                children,
-            } => Self::Link {
-                dest: dest.clone(),
-                title: title.clone(),
-                children: children.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdInline::Image { dest, title, alt } => Self::Image {
-                dest: dest.clone(),
-                title: title.clone(),
-                alt: alt.iter().map(MarkdownInlineFfi::from).collect(),
-            },
-            MdInline::Autolink { url, kind } => Self::Autolink {
-                url: url.clone(),
-                kind: (*kind).into(),
-            },
-            MdInline::Math(content) => Self::Math {
-                content: content.clone(),
-            },
-            MdInline::NostrMention(entity) => Self::NostrMention {
-                entity: entity.into(),
-            },
-            MdInline::NostrUri(entity) => Self::NostrUri {
-                entity: entity.into(),
-            },
-        }
+        markdown_inline_from_md(value, 0)
+    }
+}
+
+fn markdown_inlines_from_md(values: &[MdInline], depth: usize) -> Vec<MarkdownInlineFfi> {
+    values
+        .iter()
+        .map(|value| markdown_inline_from_md(value, depth))
+        .collect()
+}
+
+fn markdown_inline_from_md(value: &MdInline, depth: usize) -> MarkdownInlineFfi {
+    if depth >= MAX_FFI_MARKDOWN_DEPTH {
+        return MarkdownInlineFfi::Text {
+            content: String::new(),
+        };
+    }
+    match value {
+        MdInline::Text(content) => MarkdownInlineFfi::Text {
+            content: content.clone(),
+        },
+        MdInline::SoftBreak => MarkdownInlineFfi::SoftBreak,
+        MdInline::HardBreak => MarkdownInlineFfi::HardBreak,
+        MdInline::Code(content) => MarkdownInlineFfi::Code {
+            content: content.clone(),
+        },
+        MdInline::Emph(children) => MarkdownInlineFfi::Emph {
+            children: markdown_inlines_from_md(children, depth + 1),
+        },
+        MdInline::Strong(children) => MarkdownInlineFfi::Strong {
+            children: markdown_inlines_from_md(children, depth + 1),
+        },
+        MdInline::Strikethrough(children) => MarkdownInlineFfi::Strikethrough {
+            children: markdown_inlines_from_md(children, depth + 1),
+        },
+        MdInline::Link {
+            dest,
+            title,
+            children,
+        } => MarkdownInlineFfi::Link {
+            dest: dest.clone(),
+            title: title.clone(),
+            children: markdown_inlines_from_md(children, depth + 1),
+        },
+        MdInline::Image { dest, title, alt } => MarkdownInlineFfi::Image {
+            dest: dest.clone(),
+            title: title.clone(),
+            alt: markdown_inlines_from_md(alt, depth + 1),
+        },
+        MdInline::Autolink { url, kind } => MarkdownInlineFfi::Autolink {
+            url: url.clone(),
+            kind: (*kind).into(),
+        },
+        MdInline::Math(content) => MarkdownInlineFfi::Math {
+            content: content.clone(),
+        },
+        MdInline::NostrMention(entity) => MarkdownInlineFfi::NostrMention {
+            entity: entity.into(),
+        },
+        MdInline::NostrUri(entity) => MarkdownInlineFfi::NostrUri {
+            entity: entity.into(),
+        },
     }
 }
 
@@ -430,5 +479,29 @@ mod tests {
                 && header.len() == 2
                 && rows.len() == 1
         ));
+    }
+
+    #[test]
+    fn bridges_pathological_nesting_without_unbounded_recursion() {
+        let document = parse_markdown_document(&">".repeat(2_000));
+        assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);
+    }
+
+    fn max_block_depth(blocks: &[MarkdownBlockFfi]) -> usize {
+        blocks.iter().map(max_single_block_depth).max().unwrap_or(0)
+    }
+
+    fn max_single_block_depth(block: &MarkdownBlockFfi) -> usize {
+        match block {
+            MarkdownBlockFfi::BlockQuote { blocks } => 1 + max_block_depth(blocks),
+            MarkdownBlockFfi::List { items, .. } => {
+                1 + items
+                    .iter()
+                    .map(|item| max_block_depth(&item.blocks))
+                    .max()
+                    .unwrap_or(0)
+            }
+            _ => 1,
+        }
     }
 }

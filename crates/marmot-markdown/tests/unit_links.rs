@@ -61,6 +61,14 @@ fn inline_link_with_text_around() {
 }
 
 #[test]
+fn inline_link_coalesces_literal_child_runs() {
+    assert_eq!(
+        parse_inlines("[a [b] c](/url)"),
+        vec![link("/url", None, vec![t("a [b] c")])]
+    );
+}
+
+#[test]
 fn inline_link_with_emphasis_in_text() {
     // Emphasis inside link text IS processed.
     assert_eq!(

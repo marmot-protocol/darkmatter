@@ -200,7 +200,17 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 buf.push('\\');
                 i += 1;
             }
-            b'`' => try_or_literal!('`', try_code_span(bytes, i), Inline::Code),
+            b'`' => {
+                if let Some((content, end)) = try_code_span(bytes, i) {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(Inline::Code(content));
+                    i = end;
+                } else {
+                    let end = skip_backtick_run(bytes, i);
+                    buf.push_str(std::str::from_utf8(&bytes[i..end]).unwrap_or(""));
+                    i = end;
+                }
+            }
             b'$' => try_or_literal!('$', try_inline_math(bytes, i), Inline::Math),
             b'&' => match entity::decode(bytes, i) {
                 Some((decoded, end)) => {
@@ -394,6 +404,16 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
 }
 
 fn coalesce_text_runs(items: &mut Vec<Inline>) {
+    for item in items.iter_mut() {
+        match item {
+            Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
+                coalesce_text_runs(children)
+            }
+            Inline::Link { children, .. } => coalesce_text_runs(children),
+            Inline::Image { alt, .. } => coalesce_text_runs(alt),
+            _ => {}
+        }
+    }
     // O(n) in-place compaction: `Vec::remove(i+1)` shifts the tail on every
     // merge, so the prior loop was O(n × m) for m adjacent-Text merges (which
     // emphasis pairing produces in bulk after dropping placeholder Texts).
@@ -469,6 +489,14 @@ fn try_code_span(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     None
 }
 
+fn skip_backtick_run(bytes: &[u8], i: usize) -> usize {
+    let mut end = i;
+    while end < bytes.len() && bytes[end] == b'`' {
+        end += 1;
+    }
+    end
+}
+
 fn normalize_code_span(b: &[u8]) -> String {
     // 1. Replace newlines with single spaces. `scanner::lines` already
     //    normalized `\r\n` / bare `\r` to `\n` before the block pass, so
@@ -522,7 +550,7 @@ fn try_inline_math(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         if c == b'$' {
             // Check it isn't `$$`.
             if bytes.get(k + 1) == Some(&b'$') {
-                k += 1;
+                k += 2;
                 continue;
             }
             let prev = bytes[k - 1];
@@ -614,10 +642,10 @@ fn try_close_bracket(
 fn parse_inline_link_suffix(b: &[u8], i: usize) -> Option<(String, Option<String>, usize)> {
     debug_assert_eq!(b.get(i), Some(&b'('));
     let mut j = i + 1;
-    j = skip_ws_and_one_nl(b, j);
+    j = scanner::skip_ws_and_one_newline(b, j);
     let (dest, j2) = crate::block::parse_link_destination(b, j).unwrap_or((String::new(), j));
     j = j2;
-    j = skip_ws_and_one_nl(b, j);
+    j = scanner::skip_ws_and_one_newline(b, j);
     // Optional title.
     let mut title = None;
     if let Some(&c) = b.get(j)
@@ -626,25 +654,12 @@ fn parse_inline_link_suffix(b: &[u8], i: usize) -> Option<(String, Option<String
     {
         title = Some(t);
         j = ne;
-        j = skip_ws_and_one_nl(b, j);
+        j = scanner::skip_ws_and_one_newline(b, j);
     }
     if b.get(j) != Some(&b')') {
         return None;
     }
     Some((dest, title, j + 1))
-}
-
-fn skip_ws_and_one_nl(b: &[u8], mut j: usize) -> usize {
-    while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-        j += 1;
-    }
-    if j < b.len() && b[j] == b'\n' {
-        j += 1;
-        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-            j += 1;
-        }
-    }
-    j
 }
 
 /// Parse `[label]` starting at `[`. Returns (raw label, end-after-`]`).
@@ -819,15 +834,23 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 /// - Strip `)` only when the body has more `)` than `(` (so balanced parens
 ///   inside the URL — e.g. Wikipedia disambiguation links — are kept).
 fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    for &b in &bytes[start..end] {
+        match b {
+            b'(' => opens += 1,
+            b')' => closes += 1,
+            _ => {}
+        }
+    }
     while end > start {
         let c = bytes[end - 1];
         match c {
             b'.' | b',' | b';' | b':' | b'!' | b'?' | b'*' | b'_' | b'~' => end -= 1,
             b')' => {
-                let opens = bytes[start..end].iter().filter(|&&b| b == b'(').count();
-                let closes = bytes[start..end].iter().filter(|&&b| b == b')').count();
                 if closes > opens {
                     end -= 1;
+                    closes -= 1;
                 } else {
                     return end;
                 }
@@ -989,10 +1012,10 @@ fn try_nostr_bare_mention(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)
         return None;
     }
     // Don't let the bare form rescue a prefix that already declined: if the
-    // previous byte is `@` or `:` then `@npub1…` or `nostr:npub1…` was tried
-    // and rejected (left boundary on the prefix), so the trailing bech32
-    // must stay literal too.
-    if matches!(prev, Some(b'@') | Some(b':')) {
+    // previous byte is `@`, or this starts immediately after `nostr:`, then
+    // the longer form was tried and rejected, so the trailing bech32 must
+    // stay literal too.
+    if prev == Some(b'@') || (i >= 6 && bytes.get(i - 6..i) == Some(b"nostr:")) {
         return None;
     }
     let (hrp, end) = nostr::classify_bech32(bytes, i)?;
@@ -1209,6 +1232,7 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut Vec<BracketDelim>, stack
                 w += 1;
             }
             delims.truncate(w);
+            openers_bottom.clear();
 
             // After a match, the delim list has been rewritten. Restart
             // from the opener's index — if the opener survived, the next

@@ -48,6 +48,9 @@ pub(crate) fn classify_bech32(bytes: &[u8], i: usize) -> Option<(NostrHrp, usize
     if !(8..=1024).contains(&total_len) {
         return None;
     }
+    if !right_boundary_ok(bytes.get(j).copied()) {
+        return None;
+    }
     Some((hrp, j))
 }
 
@@ -81,6 +84,13 @@ fn classify_hrp(b: &[u8]) -> Option<NostrHrp> {
 /// that case.
 pub(crate) fn left_boundary_ok(prev: Option<u8>) -> bool {
     match prev {
+        None => true,
+        Some(b) => !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/'),
+    }
+}
+
+fn right_boundary_ok(next: Option<u8>) -> bool {
+    match next {
         None => true,
         Some(b) => !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/'),
     }

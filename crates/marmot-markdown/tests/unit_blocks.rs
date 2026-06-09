@@ -141,6 +141,11 @@ fn setext_underline_after_blank_does_not_apply() {
 }
 
 #[test]
+fn setext_after_ref_def_paragraph_is_reclassified_as_text() {
+    assert_eq!(parse_blocks("[a]: /url\n==="), vec![paragraph("===")]);
+}
+
+#[test]
 fn setext_underline_no_open_paragraph_dashes_become_thematic_break() {
     assert_eq!(parse_blocks("---"), vec![Block::ThematicBreak]);
 }

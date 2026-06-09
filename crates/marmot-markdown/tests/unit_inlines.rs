@@ -93,9 +93,15 @@ fn code_span_keeps_unbalanced_outer_space() {
 
 #[test]
 fn code_span_unmatched_run_falls_through() {
-    // No matching run of length 3; backticks become literal text and the
-    // single-backtick code span "foo" matches.
-    assert_eq!(parse_inlines("```foo`"), vec![t("``"), code("foo")]);
+    // No matching run of length 3; the full opening run stays literal and
+    // is not rescanned as a shorter code span opener.
+    assert_eq!(parse_inlines("```foo`"), vec![t("```foo`")]);
+}
+
+#[test]
+fn code_span_unmatched_opening_run_is_not_rescanned() {
+    assert_eq!(parse_inlines("``a`"), vec![t("``a`")]);
+    assert_eq!(parse_inlines("a``b`c"), vec![t("a``b`c")]);
 }
 
 #[test]
@@ -144,6 +150,11 @@ fn inline_math_open_followed_by_space_rejected() {
     assert_eq!(parse_inlines("$ x$"), vec![t("$ x$")]);
 }
 
+#[test]
+fn inline_math_skips_double_dollar_runs_while_scanning() {
+    assert_eq!(parse_inlines("$a$$"), vec![t("$a$$")]);
+}
+
 // ----- Entities -------------------------------------------------------
 
 #[test]
@@ -162,8 +173,18 @@ fn entity_decimal_numeric() {
 }
 
 #[test]
+fn entity_decimal_numeric_allows_leading_zeroes() {
+    assert_eq!(parse_inlines("&#0000000065;"), vec![t("A")]);
+}
+
+#[test]
 fn entity_hex_numeric_lower() {
     assert_eq!(parse_inlines("&#x41;"), vec![t("A")]);
+}
+
+#[test]
+fn entity_hex_numeric_allows_leading_zeroes() {
+    assert_eq!(parse_inlines("&#x0000000041;"), vec![t("A")]);
 }
 
 #[test]

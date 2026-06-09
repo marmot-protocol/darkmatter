@@ -200,6 +200,12 @@ fn bare_npub_after_punctuation() {
 }
 
 #[test]
+fn bare_npub_after_colon_is_allowed() {
+    let s = format!("see:{}", npub_str());
+    assert_eq!(parse_inlines(&s), vec![t("see:"), npub(&npub_str())]);
+}
+
+#[test]
 fn bare_npub_terminator_punctuation() {
     let s = format!("see {}.", npub_str());
     assert_eq!(
@@ -218,6 +224,12 @@ fn bare_npub_after_letter_rejected() {
 #[test]
 fn bare_npub_after_digit_rejected() {
     let s = format!("1{}", npub_str());
+    assert_eq!(parse_inlines(&s), vec![t(&s)]);
+}
+
+#[test]
+fn bare_npub_fused_trailing_word_is_rejected() {
+    let s = format!("{}hello", npub_str());
     assert_eq!(parse_inlines(&s), vec![t(&s)]);
 }
 

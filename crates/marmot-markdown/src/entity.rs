@@ -57,9 +57,6 @@ fn decode_numeric(b: &[u8], start: usize) -> Option<(String, usize)> {
         let base = if hex { 16 } else { 10 };
         code = code.saturating_mul(base).saturating_add(digit);
         k += 1;
-        if k - val_start > 8 {
-            return None;
-        }
     }
     if k == val_start || b.get(k) != Some(&b';') {
         return None;
