@@ -90,18 +90,23 @@ Broker connections negotiate ALPN `marmot.quic_broker.v1`. The first frame on th
 
 ```text
 struct {
-  opaque marmot_broker<V>;   // MUST equal "marmot.quic_broker.v1"
-  BrokerControl control;     // Publish or Subscribe
+  opaque marmot_broker<1..255>;   // length-prefixed; decoded bytes MUST equal "marmot.quic_broker.v1"
+  BrokerControl control;          // Publish or Subscribe
 } QuicBrokerControlEnvelopeV1;
 ```
+
+`marmot_broker` is a length-prefixed variable-length byte string (the QUIC variable-length length prefix of the Marmot
+binary profile). A broker MUST reject an envelope whose decoded `marmot_broker` bytes are not exactly the ASCII string
+`marmot.quic_broker.v1` (21 bytes). The field is variable-length rather than a fixed array so a future protocol string
+of a different length stays decodable by an old reader, which can then reject it cleanly.
 
 `control` is one of:
 
 - `Publish { stream_id, start_event_id }` — the sender claims the room and then streams records into it;
 - `Subscribe { stream_id, start_event_id }` — a receiver joins the room and reads fanned-out records.
 
-A broker MUST reject an envelope whose `marmot_broker` protocol string is not `marmot.quic_broker.v1`. The room key is
-exactly `(stream_id, start_event_id)`; a broker MUST NOT merge or cross-deliver records between different rooms.
+The room key is exactly `(stream_id, start_event_id)`; a broker MUST NOT merge or cross-deliver records between
+different rooms.
 
 The broker is an untrusted relay. It sees only ciphertext records (encrypted under the group record key) plus the
 routing pair `(stream_id, start_event_id)`. It cannot read, author, or alter preview plaintext.
