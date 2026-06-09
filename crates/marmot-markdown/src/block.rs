@@ -143,7 +143,9 @@ impl BlockParser {
         }
 
         if matched_depth < self.containers.len() {
-            if self.leaf.is_some() && self.can_lazy_continue(bytes) {
+            if matches!(self.leaf, Some(Leaf::Paragraph(_)))
+                && self.can_lazy_continue(bytes, cursor, matched_depth)
+            {
                 let stripped = strip_paragraph_indent(line);
                 self.append_paragraph(stripped);
                 return;
@@ -276,9 +278,12 @@ impl BlockParser {
                         off = no;
                         continue;
                     }
-                    if let Some(open) =
-                        try_open_list_marker(bytes, probe_col, probe_off, self.leaf.is_some())
-                    {
+                    if let Some(open) = try_open_list_marker(
+                        bytes,
+                        probe_col,
+                        probe_off,
+                        matches!(self.leaf, Some(Leaf::Paragraph(_))),
+                    ) {
                         self.close_leaf();
                         self.ensure_list_open(open.kind);
                         self.containers.push(Container::ListItem {
@@ -1042,12 +1047,14 @@ impl BlockParser {
     /// blocks lazy continuation when the deepest open list is of compatible
     /// kind — because in that case the marker opens a sibling item, not a
     /// paragraph continuation.
-    fn can_lazy_continue(&self, bytes: &[u8]) -> bool {
-        let (col, off) = scanner::measure_indent(bytes);
+    fn can_lazy_continue(&self, bytes: &[u8], cursor: Cursor, matched_depth: usize) -> bool {
+        let (col, off) = scanner::measure_indent(&bytes[cursor.off..]);
         if col >= 4 {
             return true;
         }
-        let rest = &bytes[off..];
+        let probe_col = cursor.col + col;
+        let probe_off = cursor.off + off;
+        let rest = &bytes[probe_off..];
         if rest.is_empty() {
             return false;
         }
@@ -1066,11 +1073,11 @@ impl BlockParser {
         if is_math_fence(rest) {
             return false;
         }
-        if try_open_list_marker(bytes, 0, 0, true).is_some() {
+        if try_open_list_marker(bytes, cursor.col, cursor.off, true).is_some() {
             return false;
         }
-        if let Some(open) = try_open_list_marker(bytes, 0, 0, false)
-            && let Some(k) = self.deepest_open_list()
+        if let Some(open) = try_open_list_marker(bytes, probe_col, probe_off, false)
+            && let Some(k) = self.deepest_open_list_before(matched_depth)
             && lists_compatible(k, open.kind)
         {
             return false;
@@ -1078,11 +1085,15 @@ impl BlockParser {
         true
     }
 
-    fn deepest_open_list(&self) -> Option<ListKind> {
-        self.containers.iter().rev().find_map(|c| match c {
-            Container::List { kind, .. } => Some(*kind),
-            _ => None,
-        })
+    fn deepest_open_list_before(&self, depth: usize) -> Option<ListKind> {
+        self.containers
+            .iter()
+            .take(depth)
+            .rev()
+            .find_map(|c| match c {
+                Container::List { kind, .. } => Some(*kind),
+                _ => None,
+            })
     }
 }
 

@@ -484,3 +484,64 @@ fn nested_task_lists() {
         )]
     );
 }
+
+#[test]
+fn nested_sibling_lists_do_not_lazy_continue_deeper_paragraphs() {
+    let input = concat!(
+        "1. Ordered outer\n",
+        "   1. Ordered inner\n",
+        "      - bullet leaf\n",
+        "      - [ ] task leaf\n",
+        "   2. Another inner\n",
+        "      > Quote inside a list item.\n",
+        "2. Outer second",
+    );
+
+    assert_eq!(
+        parse_blocks(input),
+        vec![ordered_list(
+            1,
+            b'.',
+            true,
+            vec![
+                item(
+                    None,
+                    vec![
+                        paragraph("Ordered outer"),
+                        ordered_list(
+                            1,
+                            b'.',
+                            true,
+                            vec![
+                                item(
+                                    None,
+                                    vec![
+                                        paragraph("Ordered inner"),
+                                        bullet_list(
+                                            b'-',
+                                            true,
+                                            vec![
+                                                item(None, vec![paragraph("bullet leaf")]),
+                                                item(Some(false), vec![paragraph("task leaf")]),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                                item(
+                                    None,
+                                    vec![
+                                        paragraph("Another inner"),
+                                        Block::BlockQuote {
+                                            blocks: vec![paragraph("Quote inside a list item.")],
+                                        },
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                item(None, vec![paragraph("Outer second")]),
+            ],
+        )]
+    );
+}

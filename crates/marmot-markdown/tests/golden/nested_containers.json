@@ -192,34 +192,75 @@
                                       "inlines": [
                                         {
                                           "Text": "bullet leaf"
-                                        },
-                                        "SoftBreak",
-                                        {
-                                          "Text": "- [ ] task leaf"
-                                        },
-                                        "SoftBreak",
-                                        {
-                                          "Text": "2. Another inner"
-                                        },
-                                        "SoftBreak",
-                                        {
-                                          "Text": "> Quote inside a list item."
-                                        },
-                                        "SoftBreak",
-                                        {
-                                          "Text": "2. Outer second"
                                         }
                                       ]
                                     }
                                   }
                                 ],
                                 "checked": null
+                              },
+                              {
+                                "blocks": [
+                                  {
+                                    "Paragraph": {
+                                      "inlines": [
+                                        {
+                                          "Text": "task leaf"
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ],
+                                "checked": false
                               }
                             ]
                           }
                         }
                       ],
                       "checked": null
+                    },
+                    {
+                      "blocks": [
+                        {
+                          "Paragraph": {
+                            "inlines": [
+                              {
+                                "Text": "Another inner"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "BlockQuote": {
+                            "blocks": [
+                              {
+                                "Paragraph": {
+                                  "inlines": [
+                                    {
+                                      "Text": "Quote inside a list item."
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "checked": null
+                    }
+                  ]
+                }
+              }
+            ],
+            "checked": null
+          },
+          {
+            "blocks": [
+              {
+                "Paragraph": {
+                  "inlines": [
+                    {
+                      "Text": "Outer second"
                     }
                   ]
                 }
