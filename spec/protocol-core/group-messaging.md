@@ -34,7 +34,7 @@ Common app payload kinds include:
 - kind `7` for reactions;
 - kind `1200` for agent text stream starts;
 - kind `1201` for agent activity rows;
-- kind `1202` for agent tool rows;
+- kind `1202` for agent operation rows;
 - kind `1210` for group system rows;
 - feature-specific app events such as push-notification token events.
 

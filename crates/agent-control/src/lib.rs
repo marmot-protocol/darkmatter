@@ -90,7 +90,7 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         status: String,
     },
-    StreamTool {
+    StreamProgress {
         stream_id_hex: String,
         text: String,
     },
@@ -125,15 +125,19 @@ pub enum AgentControlRequest {
         reply_to_message_id_hex: Option<String>,
         extra: Option<Value>,
     },
-    SendAgentToolEvent {
+    SendAgentOperationEvent {
         account_id_hex: String,
         group_id_hex: String,
+        event_type: String,
         status: String,
-        tool_name: Option<String>,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
         text: String,
         preview: Option<String>,
-        args: Option<Value>,
-        call_index: Option<u64>,
+        details: Option<Value>,
+        sequence: Option<u64>,
         ok: Option<bool>,
         duration_ms: Option<u64>,
         reply_to_message_id_hex: Option<String>,
@@ -469,11 +473,11 @@ mod tests {
                 "stream_status",
             ),
             (
-                AgentControlRequest::StreamTool {
+                AgentControlRequest::StreamProgress {
                     stream_id_hex: stream(),
                     text: "{\"v\":1,\"status\":\"started\"}".to_owned(),
                 },
-                "stream_tool",
+                "stream_progress",
             ),
             (
                 AgentControlRequest::StreamFinalize {
@@ -525,20 +529,24 @@ mod tests {
                 "send_agent_activity",
             ),
             (
-                AgentControlRequest::SendAgentToolEvent {
+                AgentControlRequest::SendAgentOperationEvent {
                     account_id_hex: account(),
                     group_id_hex: group(),
+                    event_type: "tool_call".to_owned(),
                     status: "started".to_owned(),
-                    tool_name: Some("search".to_owned()),
+                    operation_id: Some("call-1".to_owned()),
+                    run_id: Some("run-1".to_owned()),
+                    turn_id: Some("turn-1".to_owned()),
+                    name: Some("search".to_owned()),
                     text: "Searching".to_owned(),
                     preview: Some("query".to_owned()),
-                    args: None,
-                    call_index: Some(1),
+                    details: None,
+                    sequence: Some(1),
                     ok: None,
                     duration_ms: None,
                     reply_to_message_id_hex: Some(message()),
                 },
-                "send_agent_tool_event",
+                "send_agent_operation_event",
             ),
             (
                 AgentControlRequest::SendGroupSystemEvent {

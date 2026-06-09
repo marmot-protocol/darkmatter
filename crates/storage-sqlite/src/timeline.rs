@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-    MARMOT_APP_EVENT_KIND_AGENT_TOOL, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE,
-    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
-    STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_CHUNKS_TAG, STREAM_HASH_TAG,
+    STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
@@ -136,7 +137,7 @@ pub enum TimelineUpdateTrigger {
     AgentStreamStarted,
     AgentStreamFinished,
     AgentActivity,
-    AgentTool,
+    AgentOperation,
     GroupSystem,
     DeliveryOrSendStateChanged,
     ReceiptChanged,
@@ -531,7 +532,7 @@ fn affected_timeline_message_ids_for_parts_tx(
         MARMOT_APP_EVENT_KIND_CHAT
         | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
         | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-        | MARMOT_APP_EVENT_KIND_AGENT_TOOL
+        | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
         | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
             ids.insert(message_id_hex.to_owned());
             reply_preview_targets.insert(message_id_hex.to_owned());
@@ -638,7 +639,7 @@ fn timeline_trigger_for_invalidation_row(
             MARMOT_APP_EVENT_KIND_CHAT
                 | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
                 | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-                | MARMOT_APP_EVENT_KIND_AGENT_TOOL
+                | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                 | MARMOT_APP_EVENT_KIND_DELETE
         )
@@ -681,7 +682,7 @@ fn timeline_trigger_for_event_row(
             MARMOT_APP_EVENT_KIND_CHAT
                 | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
                 | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-                | MARMOT_APP_EVENT_KIND_AGENT_TOOL
+                | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
                 | MARMOT_APP_EVENT_KIND_DELETE
         )
@@ -699,7 +700,7 @@ fn timeline_trigger_for_event_row(
         }
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => TimelineUpdateTrigger::AgentStreamStarted,
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY => TimelineUpdateTrigger::AgentActivity,
-        MARMOT_APP_EVENT_KIND_AGENT_TOOL => TimelineUpdateTrigger::AgentTool,
+        MARMOT_APP_EVENT_KIND_AGENT_OPERATION => TimelineUpdateTrigger::AgentOperation,
         MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => TimelineUpdateTrigger::GroupSystem,
         MARMOT_APP_EVENT_KIND_REACTION => TimelineUpdateTrigger::ReactionAdded,
         MARMOT_APP_EVENT_KIND_DELETE => {
@@ -942,7 +943,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
                 timeline.insert(event.message_id_hex.clone(), row);
             }
             MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-            | MARMOT_APP_EVENT_KIND_AGENT_TOOL
+            | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
             | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
                 let mut row = timeline_row_from_app_event(event);
                 if event.invalidated {
@@ -1433,7 +1434,7 @@ mod tests {
         }
     }
 
-    fn agent_tool(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
+    fn agent_operation(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
         StoredAppEvent {
             group_id_hex: "11".repeat(32),
             message_id_hex: id.to_owned(),
@@ -1441,9 +1442,9 @@ mod tests {
             source_epoch: None,
             direction: "received".to_owned(),
             sender: sender.to_owned(),
-            plaintext: r#"{"v":1,"status":"started","tool_name":"search","text":"Searching"}"#
+            plaintext: r#"{"v":1,"event_type":"tool_call","status":"started","name":"search","text":"Searching"}"#
                 .to_owned(),
-            kind: MARMOT_APP_EVENT_KIND_AGENT_TOOL,
+            kind: MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
             tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
             recorded_at: at,
             received_at: at,
@@ -1639,23 +1640,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_event_returns_typed_timeline_change() {
+    fn agent_operation_event_returns_typed_timeline_change() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .record_app_event(&chat("prompt", "alice", 1, "search this"))
             .unwrap();
 
         let update = store
-            .record_app_event(&agent_tool("tool-1", "agent", "prompt", 2))
+            .record_app_event(&agent_operation("tool-1", "agent", "prompt", 2))
             .unwrap();
 
         assert!(matches!(
             update.changes.as_slice(),
             [TimelineMessageChange::Upsert {
-                trigger: TimelineUpdateTrigger::AgentTool,
+                trigger: TimelineUpdateTrigger::AgentOperation,
                 message,
             }] if message.message_id_hex == "tool-1"
-                && message.kind == MARMOT_APP_EVENT_KIND_AGENT_TOOL
+                && message.kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION
                 && message.reply_to_message_id_hex.as_deref() == Some("prompt")
         ));
     }

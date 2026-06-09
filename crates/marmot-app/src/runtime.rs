@@ -7,8 +7,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_EXPORTER_LABEL, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_TOOL_DELTA,
+    AGENT_TEXT_STREAM_EXPORTER_LABEL, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AgentTextStreamKeyContextV1,
 };
 use cgka_traits::app_event::{
@@ -41,18 +41,18 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, AGENT_STREAM_START_LOOKBACK_LIMIT,
     APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
-    AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest,
-    AgentToolEventRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord, AppGroupMlsState,
-    AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AuditLogFile,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
-    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
-    NotificationSettings, NotificationUpdate, NotificationWakeSource, PushPlatform,
-    PushRegistration, ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings, SendSummary, SyncSummary, TimelineMessageChange, TimelineMessageQuery,
-    TimelinePage, TimelineUpdateTrigger, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    AccountRelayListBootstrap, AccountRelayListStatus, AgentOperationEventRequest,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord,
+    AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
+    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
+    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult,
+    GroupPushDebugInfo, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
+    TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -1061,8 +1061,8 @@ pub enum RuntimeAgentStreamUpdate {
     Chunk { seq: u64, text: String },
     /// A provisional stream status label. This is not final-answer text.
     Status { seq: u64, status: String },
-    /// A provisional tool-progress record. This is not final-answer text.
-    Tool { seq: u64, text: String },
+    /// A provisional agent progress record. This is not final-answer text.
+    Progress { seq: u64, text: String },
     /// A non-text stream record kept for diagnostics/future UI.
     Record {
         seq: u64,
@@ -2280,14 +2280,14 @@ impl MarmotAppRuntime {
             .await
     }
 
-    pub async fn send_agent_tool_event(
+    pub async fn send_agent_operation_event(
         &self,
         account_ref: &str,
         group_id: &GroupId,
-        request: AgentToolEventRequest,
+        request: AgentOperationEventRequest,
     ) -> Result<SendSummary, AppError> {
         self.accounts
-            .send_agent_tool_event(account_ref, group_id, request)
+            .send_agent_operation_event(account_ref, group_id, request)
             .await
     }
 
@@ -3718,19 +3718,23 @@ impl AccountManager {
         .await
     }
 
-    async fn send_agent_tool_event(
+    async fn send_agent_operation_event(
         &self,
         account_ref: &str,
         group_id: &GroupId,
-        request: AgentToolEventRequest,
+        request: AgentOperationEventRequest,
     ) -> Result<SendSummary, AppError> {
-        let AgentToolEventRequest {
+        let AgentOperationEventRequest {
+            event_type,
             status,
-            tool_name,
+            operation_id,
+            run_id,
+            turn_id,
+            name,
             text,
             preview,
-            args,
-            call_index,
+            details,
+            sequence,
             ok,
             duration_ms,
             reply_to_message_id,
@@ -3738,13 +3742,17 @@ impl AccountManager {
         self.send_app_event(
             account_ref,
             group_id,
-            AppMessageIntent::AgentTool {
+            AppMessageIntent::AgentOperation {
+                event_type,
                 status,
-                tool_name,
+                operation_id,
+                run_id,
+                turn_id,
+                name,
                 text,
                 preview,
-                args,
-                call_index,
+                details,
+                sequence,
                 ok,
                 duration_ms,
                 reply_to_message_id,
@@ -5021,10 +5029,12 @@ async fn watch_broker_candidates(
                             seq: chunk.seq,
                             status: chunk.text.clone(),
                         },
-                        AGENT_TEXT_STREAM_RECORD_TOOL_DELTA => RuntimeAgentStreamUpdate::Tool {
-                            seq: chunk.seq,
-                            text: chunk.text.clone(),
-                        },
+                        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
+                            RuntimeAgentStreamUpdate::Progress {
+                                seq: chunk.seq,
+                                text: chunk.text.clone(),
+                            }
+                        }
                         record_type => RuntimeAgentStreamUpdate::Record {
                             seq: chunk.seq,
                             record_type,

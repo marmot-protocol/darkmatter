@@ -4,8 +4,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_TOOL_DELTA,
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AgentTextStreamTranscriptV1,
 };
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ pub enum StreamComposeCommand {
         status: String,
         respond: oneshot::Sender<Result<StreamComposeReport, String>>,
     },
-    Tool {
+    Progress {
         text: String,
         respond: oneshot::Sender<Result<StreamComposeReport, String>>,
     },
@@ -126,8 +126,8 @@ pub async fn run_stream_compose_session(
                 .await;
                 let _ = respond.send(result);
             }
-            StreamComposeCommand::Tool { text, respond } => {
-                let result = append_stream_compose_tool(
+            StreamComposeCommand::Progress { text, respond } => {
+                let result = append_stream_compose_progress(
                     &mut report,
                     &mut transcript,
                     &mut publisher,
@@ -282,7 +282,7 @@ async fn append_stream_compose_status(
     .await
 }
 
-async fn append_stream_compose_tool(
+async fn append_stream_compose_progress(
     report: &mut StreamComposeReport,
     transcript: &mut LocalComposeTranscript,
     publisher: &mut Option<BrokerTextPublisher>,
@@ -299,7 +299,7 @@ async fn append_stream_compose_tool(
             pending_live_records,
             live_error,
         },
-        AGENT_TEXT_STREAM_RECORD_TOOL_DELTA,
+        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
         text,
         chunk_bytes,
     )
@@ -425,8 +425,8 @@ mod tests {
 
     use cgka_traits::MessageId;
     use cgka_traits::agent_text_stream::{
-        AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-        AGENT_TEXT_STREAM_RECORD_TOOL_DELTA, AgentTextStreamTranscriptV1,
+        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
+        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
     };
     use tokio::sync::{mpsc, oneshot};
     use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compose_session_tool_updates_transcript_without_changing_text() {
+    async fn compose_session_progress_updates_transcript_without_changing_text() {
         let stream_id = vec![0x9a; 32];
         let start_event_id = MessageId::new(vec![0x9b; 32]);
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
@@ -700,16 +700,16 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let (tool_respond, tool_response) = oneshot::channel();
-        tx.send(StreamComposeCommand::Tool {
+        let (progress_respond, progress_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Progress {
             text: "search: glp-1".to_owned(),
-            respond: tool_respond,
+            respond: progress_respond,
         })
         .await
         .unwrap();
-        let tool_report = tokio::time::timeout(Duration::from_millis(250), tool_response)
+        let progress_report = tokio::time::timeout(Duration::from_millis(250), progress_response)
             .await
-            .expect("tool should complete")
+            .expect("progress should complete")
             .unwrap()
             .unwrap();
 
@@ -718,14 +718,14 @@ mod tests {
             &start_event_id,
             &[
                 (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "answer"),
-                (AGENT_TEXT_STREAM_RECORD_TOOL_DELTA, "search: glp-1"),
+                (AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, "search: glp-1"),
             ],
             16,
         );
-        assert_eq!(tool_report.text, "answer");
-        assert_eq!(tool_report.chunk_count, 2);
+        assert_eq!(progress_report.text, "answer");
+        assert_eq!(progress_report.chunk_count, 2);
         assert_eq!(
-            tool_report.transcript_hash.as_deref(),
+            progress_report.transcript_hash.as_deref(),
             Some(expected_hash.as_str())
         );
 

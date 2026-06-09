@@ -345,32 +345,40 @@ class MarmotAgentControlClient:
             }
         )
 
-    async def send_agent_tool_event(
+    async def send_agent_operation_event(
         self,
         account_id_hex: str,
         group_id_hex: str,
         *,
+        event_type: str,
         status: str,
-        tool_name: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        name: Optional[str] = None,
         text: str = "",
         preview: Optional[str] = None,
-        args: Optional[Dict[str, Any]] = None,
-        call_index: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None,
+        sequence: Optional[int] = None,
         ok: Optional[bool] = None,
         duration_ms: Optional[int] = None,
         reply_to_message_id_hex: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await self.request(
             {
-                "type": "send_agent_tool_event",
+                "type": "send_agent_operation_event",
                 "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
                 "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "event_type": str(event_type or ""),
                 "status": str(status or ""),
-                "tool_name": str(tool_name).strip() if tool_name else None,
+                "operation_id": str(operation_id).strip() if operation_id else None,
+                "run_id": str(run_id).strip() if run_id else None,
+                "turn_id": str(turn_id).strip() if turn_id else None,
+                "name": str(name).strip() if name else None,
                 "text": str(text or ""),
                 "preview": str(preview) if preview is not None else None,
-                "args": args,
-                "call_index": int(call_index) if call_index is not None else None,
+                "details": details,
+                "sequence": int(sequence) if sequence is not None else None,
                 "ok": bool(ok) if ok is not None else None,
                 "duration_ms": int(duration_ms) if duration_ms is not None else None,
                 "reply_to_message_id_hex": _normalize_hex(reply_to_message_id_hex, "reply_to_message_id_hex")
@@ -758,12 +766,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         preview = getattr(event, "preview", None)
         args = getattr(event, "args", None)
         payload: Dict[str, Any] = {
+            "event_type": "tool_call",
             "status": "started",
-            "tool_name": tool_name,
+            "name": tool_name,
             "text": _tool_event_text(tool_name, preview),
             "preview": str(preview) if preview is not None else None,
-            "args": args if isinstance(args, dict) else None,
-            "call_index": getattr(event, "index", None),
+            "details": {"args": args} if isinstance(args, dict) else None,
+            "sequence": getattr(event, "index", None),
         }
         return _encoded_tool_event({key: value for key, value in payload.items() if value is not None})
 
@@ -854,15 +863,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 key = json.dumps(event, sort_keys=True, separators=(",", ":"))
                 if key in seen:
                     continue
-                response = await self.client.send_agent_tool_event(
+                response = await self.client.send_agent_operation_event(
                     account_id,
                     chat_id,
+                    event_type=str(event.get("event_type") or "tool_call"),
                     status=str(event.get("status") or "started"),
-                    tool_name=event.get("tool_name"),
+                    operation_id=event.get("operation_id"),
+                    run_id=event.get("run_id"),
+                    turn_id=event.get("turn_id"),
+                    name=event.get("name"),
                     text=str(event.get("text") or ""),
                     preview=event.get("preview"),
-                    args=event.get("args") if isinstance(event.get("args"), dict) else None,
-                    call_index=event.get("call_index"),
+                    details=event.get("details") if isinstance(event.get("details"), dict) else None,
+                    sequence=event.get("sequence"),
                     ok=event.get("ok"),
                     duration_ms=event.get("duration_ms"),
                     reply_to_message_id_hex=reply_to_message_id_hex,
@@ -870,8 +883,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 message_ids = tuple(response.get("message_ids_hex") or ())
                 if response.get("type") != "app_event_sent" or not message_ids:
                     raise AgentControlError(
-                        "Marmot agent tool event send returned no message ids",
-                        code="unexpected_tool_event_response",
+                        "Marmot agent operation event send returned no message ids",
+                        code="unexpected_operation_event_response",
                         retryable=True,
                     )
                 seen.add(key)
@@ -882,7 +895,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 raw_response={"type": "tool_progress_sent", "message_ids_hex": sent_message_ids},
             )
         except Exception as exc:
-            logger.debug("Marmot send_agent_tool_event failed: %s", exc)
+            logger.debug("Marmot send_agent_operation_event failed: %s", exc)
             return SendResult(success=False, message_id=message_id, error=str(exc), retryable=is_retryable(exc))
 
     def _tool_progress_seen(self, message_id: str) -> set[str]:
@@ -1512,8 +1525,9 @@ def _legacy_tool_event_from_progress_block(block: str) -> Optional[Dict[str, Any
     preview = match.group("preview")
     return _normalize_tool_event(
         {
+            "event_type": "tool_call",
             "status": "started",
-            "tool_name": tool_name,
+            "name": tool_name,
             "text": block,
             "preview": preview,
         },
@@ -1523,24 +1537,38 @@ def _legacy_tool_event_from_progress_block(block: str) -> Optional[Dict[str, Any
 
 def _normalize_tool_event(event: Dict[str, Any], *, fallback_text: str) -> Dict[str, Any]:
     normalized = {
+        "event_type": str(event.get("event_type") or "tool_call"),
         "status": str(event.get("status") or "started"),
         "text": str(event.get("text") or fallback_text or ""),
     }
-    tool_name = str(event.get("tool_name") or "").strip()
-    if tool_name:
-        normalized["tool_name"] = tool_name
+    name = str(event.get("name") or event.get("tool_name") or "").strip()
+    if name:
+        normalized["name"] = name
+    for field in ("operation_id", "run_id", "turn_id"):
+        value = str(event.get(field) or "").strip()
+        if value:
+            normalized[field] = value
     preview = event.get("preview")
     if preview is not None:
         normalized["preview"] = str(preview)
-    args = event.get("args")
-    if isinstance(args, dict):
-        normalized["args"] = args
-    for field in ("call_index", "duration_ms"):
+    details = event.get("details")
+    if isinstance(details, dict):
+        normalized["details"] = details
+    else:
+        args = event.get("args")
+        if isinstance(args, dict):
+            normalized["details"] = {"args": args}
+    for field in ("sequence", "duration_ms"):
         if event.get(field) is not None:
             try:
                 normalized[field] = int(event[field])
             except (TypeError, ValueError):
                 pass
+    if "sequence" not in normalized and event.get("call_index") is not None:
+        try:
+            normalized["sequence"] = int(event["call_index"])
+        except (TypeError, ValueError):
+            pass
     if event.get("ok") is not None:
         normalized["ok"] = bool(event["ok"])
     return normalized

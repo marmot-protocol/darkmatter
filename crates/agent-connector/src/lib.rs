@@ -18,7 +18,7 @@ use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream
 use cgka_traits::{GroupId, MessageId, engine::GroupEvent};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{
-    AccountRelayListBootstrap, AgentTextStreamFinishRequest, AgentToolEventRequest, AppError,
+    AccountRelayListBootstrap, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppError,
     MarmotApp, MarmotAppEvent, MarmotAppRuntime, UserProfileMetadata,
 };
 use serde::{Deserialize, Serialize};
@@ -303,10 +303,10 @@ impl AgentConnector {
                 stream_id_hex,
                 status,
             } => self.stream_status_response(&stream_id_hex, status).await,
-            AgentControlRequest::StreamTool {
+            AgentControlRequest::StreamProgress {
                 stream_id_hex,
                 text,
-            } => self.stream_tool_response(&stream_id_hex, text).await,
+            } => self.stream_progress_response(&stream_id_hex, text).await,
             AgentControlRequest::StreamFinalize {
                 stream_id_hex,
                 final_text,
@@ -365,28 +365,36 @@ impl AgentConnector {
                 )
                 .await
             }
-            AgentControlRequest::SendAgentToolEvent {
+            AgentControlRequest::SendAgentOperationEvent {
                 account_id_hex,
                 group_id_hex,
+                event_type,
                 status,
-                tool_name,
+                operation_id,
+                run_id,
+                turn_id,
+                name,
                 text,
                 preview,
-                args,
-                call_index,
+                details,
+                sequence,
                 ok,
                 duration_ms,
                 reply_to_message_id_hex,
             } => {
-                self.send_agent_tool_event_response(
+                self.send_agent_operation_event_response(
                     &account_id_hex,
                     &group_id_hex,
+                    event_type,
                     status,
-                    tool_name,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
                     text,
                     preview,
-                    args,
-                    call_index,
+                    details,
+                    sequence,
                     ok,
                     duration_ms,
                     reply_to_message_id_hex,
@@ -757,7 +765,7 @@ impl AgentConnector {
         Ok(AgentControlResponse::Ack)
     }
 
-    async fn stream_tool_response(
+    async fn stream_progress_response(
         &self,
         stream_id_hex: &str,
         text: String,
@@ -766,7 +774,7 @@ impl AgentConnector {
         let (respond, response) = oneshot::channel();
         session
             .tx
-            .send(StreamComposeCommand::Tool { text, respond })
+            .send(StreamComposeCommand::Progress { text, respond })
             .await
             .map_err(|_| ConnectorError::Stream("stream compose session is closed".into()))?;
         response
@@ -808,16 +816,20 @@ impl AgentConnector {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn send_agent_tool_event_response(
+    async fn send_agent_operation_event_response(
         &self,
         account_id_hex: &str,
         group_id_hex: &str,
+        event_type: String,
         status: String,
-        tool_name: Option<String>,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
         text: String,
         preview: Option<String>,
-        args: Option<serde_json::Value>,
-        call_index: Option<u64>,
+        details: Option<serde_json::Value>,
+        sequence: Option<u64>,
         ok: Option<bool>,
         duration_ms: Option<u64>,
         reply_to_message_id_hex: Option<String>,
@@ -830,16 +842,20 @@ impl AgentConnector {
             .transpose()?;
         let summary = self
             .runtime
-            .send_agent_tool_event(
+            .send_agent_operation_event(
                 &account.label,
                 &group_id,
-                AgentToolEventRequest {
+                AgentOperationEventRequest {
+                    event_type,
                     status,
-                    tool_name,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
                     text,
                     preview,
-                    args,
-                    call_index,
+                    details,
+                    sequence,
                     ok,
                     duration_ms,
                     reply_to_message_id: reply_to_message_id_hex,

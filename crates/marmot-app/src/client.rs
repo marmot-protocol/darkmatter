@@ -31,14 +31,14 @@ use crate::media::{
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
 use crate::{
-    AccountState, AgentTextStreamFinishRequest, AgentToolEventRequest, AppAgentTextStreamComponent,
-    AppBlobEndpoint, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
-    AppGroupEncryptedMediaComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
-    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection,
-    AppMessageQuery, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
+    AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest,
+    AppAgentTextStreamComponent, AppBlobEndpoint, AppError, AppGroupAdminPolicyComponent,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupMemberRecord,
+    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppRuntime, AppTransportRouting,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
     remember_seen_event, unix_now_seconds,
 };
 pub struct AppClient {
@@ -1078,18 +1078,22 @@ impl AppClient {
         Ok(summary)
     }
 
-    pub async fn send_agent_tool_event(
+    pub async fn send_agent_operation_event(
         &mut self,
         group_id: &GroupId,
-        request: AgentToolEventRequest,
+        request: AgentOperationEventRequest,
     ) -> Result<SendSummary, AppError> {
-        let AgentToolEventRequest {
+        let AgentOperationEventRequest {
+            event_type,
             status,
-            tool_name,
+            operation_id,
+            run_id,
+            turn_id,
+            name,
             text,
             preview,
-            args,
-            call_index,
+            details,
+            sequence,
             ok,
             duration_ms,
             reply_to_message_id,
@@ -1097,13 +1101,17 @@ impl AppClient {
         let (_event, summary) = self
             .send_app_event(
                 group_id,
-                AppMessageIntent::AgentTool {
+                AppMessageIntent::AgentOperation {
+                    event_type,
                     status,
-                    tool_name,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
                     text,
                     preview,
-                    args,
-                    call_index,
+                    details,
+                    sequence,
                     ok,
                     duration_ms,
                     reply_to_message_id,
@@ -1798,7 +1806,7 @@ fn notification_trigger_for_intent(
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::StreamStart { .. }
         | AppMessageIntent::AgentActivity { .. }
-        | AppMessageIntent::AgentTool { .. }
+        | AppMessageIntent::AgentOperation { .. }
         | AppMessageIntent::GroupSystem { .. }
         | AppMessageIntent::PushTokenUpdate { .. }
         | AppMessageIntent::PushTokenRemoval { .. } => None,

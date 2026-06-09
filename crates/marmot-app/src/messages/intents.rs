@@ -1,9 +1,10 @@
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN;
 use cgka_traits::app_event::{
-    AGENT_ACTIVITY_STATUS_TAG, AGENT_TOOL_NAME_TAG, AGENT_TOOL_STATUS_TAG, EVENT_REF_TAG,
-    GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_AGENT_TOOL,
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
+    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
+    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
     STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG,
     STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
@@ -58,13 +59,17 @@ pub(crate) enum AppMessageIntent {
         reply_to_message_id: Option<String>,
         extra: Option<Value>,
     },
-    AgentTool {
+    AgentOperation {
+        event_type: String,
         status: String,
-        tool_name: Option<String>,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
         text: String,
         preview: Option<String>,
-        args: Option<Value>,
-        call_index: Option<u64>,
+        details: Option<Value>,
+        sequence: Option<u64>,
         ok: Option<bool>,
         duration_ms: Option<u64>,
         reply_to_message_id: Option<String>,
@@ -273,37 +278,58 @@ pub(crate) fn build_inner_event(
                 Value::Object(content).to_string(),
             ))
         }
-        AppMessageIntent::AgentTool {
+        AppMessageIntent::AgentOperation {
+            event_type,
             status,
-            tool_name,
+            operation_id,
+            run_id,
+            turn_id,
+            name,
             text,
             preview,
-            args,
-            call_index,
+            details,
+            sequence,
             ok,
             duration_ms,
             reply_to_message_id,
         } => {
-            let status = validate_non_empty_field(status, "agent tool status")?;
-            let mut tags = vec![vec![AGENT_TOOL_STATUS_TAG.to_owned(), status.clone()]];
-            if let Some(tool_name) = optional_non_empty_field(tool_name) {
-                tags.push(vec![AGENT_TOOL_NAME_TAG.to_owned(), tool_name.to_owned()]);
+            let event_type = validate_non_empty_field(event_type, "agent operation type")?;
+            let status = validate_non_empty_field(status, "agent operation status")?;
+            let mut tags = vec![
+                vec![AGENT_OPERATION_TYPE_TAG.to_owned(), event_type.clone()],
+                vec![AGENT_OPERATION_STATUS_TAG.to_owned(), status.clone()],
+            ];
+            if let Some(name) = optional_non_empty_field(name) {
+                tags.push(vec![AGENT_OPERATION_NAME_TAG.to_owned(), name.to_owned()]);
             }
             if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
                 tags.push(event_ref_tag(&target_message_id));
             }
             let mut content = app_payload_base(status.clone(), text.clone());
-            if let Some(tool_name) = optional_non_empty_field(tool_name) {
-                content.insert("tool_name".to_owned(), Value::String(tool_name.to_owned()));
+            content.insert("event_type".to_owned(), Value::String(event_type));
+            if let Some(operation_id) = optional_non_empty_field(operation_id) {
+                content.insert(
+                    "operation_id".to_owned(),
+                    Value::String(operation_id.to_owned()),
+                );
+            }
+            if let Some(run_id) = optional_non_empty_field(run_id) {
+                content.insert("run_id".to_owned(), Value::String(run_id.to_owned()));
+            }
+            if let Some(turn_id) = optional_non_empty_field(turn_id) {
+                content.insert("turn_id".to_owned(), Value::String(turn_id.to_owned()));
+            }
+            if let Some(name) = optional_non_empty_field(name) {
+                content.insert("name".to_owned(), Value::String(name.to_owned()));
             }
             if let Some(preview) = optional_non_empty_field(preview) {
                 content.insert("preview".to_owned(), Value::String(preview.to_owned()));
             }
-            if let Some(args) = args {
-                content.insert("args".to_owned(), args.clone());
+            if let Some(details) = details {
+                content.insert("details".to_owned(), details.clone());
             }
-            if let Some(call_index) = call_index {
-                content.insert("call_index".to_owned(), json!(call_index));
+            if let Some(sequence) = sequence {
+                content.insert("sequence".to_owned(), json!(sequence));
             }
             if let Some(ok) = ok {
                 content.insert("ok".to_owned(), json!(ok));
@@ -312,7 +338,7 @@ pub(crate) fn build_inner_event(
                 content.insert("duration_ms".to_owned(), json!(duration_ms));
             }
             Ok(event(
-                MARMOT_APP_EVENT_KIND_AGENT_TOOL,
+                MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
                 tags,
                 Value::Object(content).to_string(),
             ))

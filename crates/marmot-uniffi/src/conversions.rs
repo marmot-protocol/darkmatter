@@ -760,7 +760,7 @@ pub enum AgentStreamUpdateFfi {
         seq: u64,
         status: String,
     },
-    Tool {
+    Progress {
         seq: u64,
         text: String,
     },
@@ -784,7 +784,7 @@ impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
         match value {
             RuntimeAgentStreamUpdate::Chunk { seq, text } => Self::Chunk { seq, text },
             RuntimeAgentStreamUpdate::Status { seq, status } => Self::Status { seq, status },
-            RuntimeAgentStreamUpdate::Tool { seq, text } => Self::Tool { seq, text },
+            RuntimeAgentStreamUpdate::Progress { seq, text } => Self::Progress { seq, text },
             RuntimeAgentStreamUpdate::Record {
                 seq,
                 record_type,
@@ -1190,7 +1190,7 @@ pub enum TimelineUpdateTriggerFfi {
     AgentStreamStarted,
     AgentStreamFinished,
     AgentActivity,
-    AgentTool,
+    AgentOperation,
     GroupSystem,
     DeliveryOrSendStateChanged,
     ReceiptChanged,
@@ -1209,7 +1209,7 @@ impl From<TimelineUpdateTrigger> for TimelineUpdateTriggerFfi {
             TimelineUpdateTrigger::AgentStreamStarted => Self::AgentStreamStarted,
             TimelineUpdateTrigger::AgentStreamFinished => Self::AgentStreamFinished,
             TimelineUpdateTrigger::AgentActivity => Self::AgentActivity,
-            TimelineUpdateTrigger::AgentTool => Self::AgentTool,
+            TimelineUpdateTrigger::AgentOperation => Self::AgentOperation,
             TimelineUpdateTrigger::GroupSystem => Self::GroupSystem,
             TimelineUpdateTrigger::DeliveryOrSendStateChanged => Self::DeliveryOrSendStateChanged,
             TimelineUpdateTrigger::ReceiptChanged => Self::ReceiptChanged,

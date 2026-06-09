@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN,
-    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-    AGENT_TEXT_STREAM_RECORD_TOOL_DELTA, AgentTextStreamRecordError, AgentTextStreamRecordV1,
+    AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordError, AgentTextStreamRecordV1,
     AgentTextStreamTranscriptV1,
 };
 use quinn::crypto::rustls::QuicClientConfig;
@@ -548,7 +548,7 @@ fn stream_record_text(record: &AgentTextStreamRecordV1) -> Result<String, QuicBr
     match record.record_type {
         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
         | AGENT_TEXT_STREAM_RECORD_STATUS
-        | AGENT_TEXT_STREAM_RECORD_TOOL_DELTA => {
+        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
             Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
         }
         _ => Ok(String::new()),

@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES, AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
-    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_TOOL_DELTA,
+    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AGENT_TEXT_STREAM_RECORD_VERSION, AGENT_TEXT_STREAM_START_EVENT_ID_LEN,
     AgentTextStreamKeyContextV1, AgentTextStreamRecordError, AgentTextStreamRecordV1,
     AgentTextStreamTranscriptV1,
@@ -152,7 +152,7 @@ fn stream_record_text(record: &AgentTextStreamRecordV1) -> Result<String, QuicTe
     match record.record_type {
         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
         | AGENT_TEXT_STREAM_RECORD_STATUS
-        | AGENT_TEXT_STREAM_RECORD_TOOL_DELTA => {
+        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
             Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
         }
         _ => Ok(String::new()),

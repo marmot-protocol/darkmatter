@@ -237,7 +237,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["name"], "Hermes")
         self.assertEqual(requests[0]["display_name"], "Hermes Agent")
 
-    async def test_send_agent_tool_event_writes_typed_tool_request(self):
+    async def test_send_agent_operation_event_writes_typed_operation_request(self):
         requests = []
 
         async def handler(reader, writer):
@@ -257,24 +257,32 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         await self.start_server(handler)
         client = self.adapter.MarmotAgentControlClient(self.socket_path)
 
-        response = await client.send_agent_tool_event(
+        response = await client.send_agent_operation_event(
             "11" * 32,
             "22" * 32,
+            event_type="tool_call",
             status="started",
-            tool_name="search",
+            operation_id="call-1",
+            run_id="run-1",
+            turn_id="turn-1",
+            name="search",
             text="search: glp-1",
             preview="glp-1",
-            args={"query": "glp-1"},
-            call_index=3,
+            details={"args": {"query": "glp-1"}},
+            sequence=3,
             reply_to_message_id_hex="33" * 32,
         )
 
         self.assertEqual(response["type"], "app_event_sent")
-        self.assertEqual(requests[0]["type"], "send_agent_tool_event")
-        self.assertEqual(requests[0]["tool_name"], "search")
+        self.assertEqual(requests[0]["type"], "send_agent_operation_event")
+        self.assertEqual(requests[0]["event_type"], "tool_call")
+        self.assertEqual(requests[0]["operation_id"], "call-1")
+        self.assertEqual(requests[0]["run_id"], "run-1")
+        self.assertEqual(requests[0]["turn_id"], "turn-1")
+        self.assertEqual(requests[0]["name"], "search")
         self.assertEqual(requests[0]["preview"], "glp-1")
-        self.assertEqual(requests[0]["args"], {"query": "glp-1"})
-        self.assertEqual(requests[0]["call_index"], 3)
+        self.assertEqual(requests[0]["details"], {"args": {"query": "glp-1"}})
+        self.assertEqual(requests[0]["sequence"], 3)
         self.assertEqual(requests[0]["reply_to_message_id_hex"], "33" * 32)
 
     async def test_inbound_subscription_requires_ack_then_yields_events(self):
@@ -525,13 +533,13 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.continuation_message_ids, ("aa", "bb"))
         self.assertEqual(fake_client.calls, [("11" * 32, "22" * 32, "pong", "33" * 32)])
 
-    async def test_tool_progress_send_maps_to_agent_tool_event(self):
+    async def test_tool_progress_send_maps_to_agent_operation_event(self):
         class FakeClient:
             def __init__(self):
                 self.tool_events = []
                 self.final_sends = []
 
-            async def send_agent_tool_event(self, account_id_hex, group_id_hex, **kwargs):
+            async def send_agent_operation_event(self, account_id_hex, group_id_hex, **kwargs):
                 self.tool_events.append((account_id_hex, group_id_hex, kwargs))
                 return {
                     "type": "app_event_sent",
@@ -561,8 +569,9 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         account_id, group_id, kwargs = fake_client.tool_events[0]
         self.assertEqual(account_id, "11" * 32)
         self.assertEqual(group_id, "22" * 32)
+        self.assertEqual(kwargs["event_type"], "tool_call")
         self.assertEqual(kwargs["status"], "started")
-        self.assertEqual(kwargs["tool_name"], "search")
+        self.assertEqual(kwargs["name"], "search")
         self.assertEqual(kwargs["preview"], "glp-1")
         self.assertEqual(kwargs["reply_to_message_id_hex"], "33" * 32)
 
@@ -573,7 +582,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.final_sends = []
                 self.fail_next = True
 
-            async def send_agent_tool_event(self, account_id_hex, group_id_hex, **kwargs):
+            async def send_agent_operation_event(self, account_id_hex, group_id_hex, **kwargs):
                 self.tool_events.append((account_id_hex, group_id_hex, kwargs))
                 if self.fail_next:
                     self.fail_next = False
