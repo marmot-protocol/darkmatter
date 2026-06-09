@@ -55,7 +55,23 @@ impl AppClient {
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
+        if self.cache_current_encrypted_media_epoch_secrets().is_err() {
+            tracing::warn!(
+                target: "marmot_app::media",
+                method = "sync_runtime_groups",
+                error_code = "encrypted_media_secret_cache_skipped",
+                "failed to cache encrypted media epoch secret before transport sync",
+            );
+        }
         self.runtime.sync_transport_groups(rebuild_since).await?;
+        if self.cache_current_encrypted_media_epoch_secrets().is_err() {
+            tracing::warn!(
+                target: "marmot_app::media",
+                method = "sync_runtime_groups",
+                error_code = "encrypted_media_secret_cache_skipped",
+                "failed to cache encrypted media epoch secret after transport sync",
+            );
+        }
         Ok(())
     }
 
@@ -1287,16 +1303,15 @@ impl AppClient {
                 }
                 if message.kind == MARMOT_APP_EVENT_KIND_CHAT
                     && media_imeta_tags_are_valid(&message.tags)
-                    && let Err(err) = self.remember_encrypted_media_secret_if_current(
-                        &message.group_id,
-                        message.source_epoch,
-                    )
+                    && self
+                        .remember_current_encrypted_media_secret(&message.group_id)
+                        .is_err()
                 {
                     tracing::warn!(
                         target: "marmot_app::media",
                         method = "ingest_delivery",
                         error_code = "encrypted_media_secret_cache_skipped",
-                        "failed to cache encrypted media source epoch secret: {err}",
+                        "failed to cache encrypted media source epoch secret",
                     );
                 }
                 self.app.remember_directory_message_sender(&message)?;
@@ -1515,27 +1530,30 @@ impl AppClient {
             GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
             32,
         )?;
+        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
         if epoch.0 != source_epoch {
             return Err(AppError::InvalidEncryptedMedia(format!(
                 "missing encrypted media secret for epoch {source_epoch}"
             )));
         }
-        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
         Ok(secret)
     }
 
-    fn remember_encrypted_media_secret_if_current(
-        &mut self,
-        group_id: &GroupId,
-        source_epoch: u64,
-    ) -> Result<(), AppError> {
+    fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
             group_id,
             GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
             32,
         )?;
-        if epoch.0 == source_epoch {
-            self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
+        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
+    }
+
+    fn cache_current_encrypted_media_epoch_secrets(&self) -> Result<(), AppError> {
+        for group in &self.state.groups {
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            if self.encrypted_media_for_group(&group_id).required {
+                self.remember_current_encrypted_media_secret(&group_id)?;
+            }
         }
         Ok(())
     }

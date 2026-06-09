@@ -2531,11 +2531,6 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .unwrap();
     let bob_reference = bob_upload.attachments[0].reference.clone();
     assert_eq!(bob_reference.source_epoch, reference.source_epoch);
-    let bob_download = alice
-        .download_media(&group_id, bob_reference)
-        .await
-        .unwrap();
-    assert_eq!(bob_download.plaintext, bob_plaintext);
 
     alice.update_message_retention(&group_id, 60).await.unwrap();
     bob.sync().await.unwrap();
@@ -2544,6 +2539,11 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .await
         .unwrap();
     assert_eq!(later_epoch_download.plaintext, plaintext);
+    let bob_download = alice
+        .download_media(&group_id, bob_reference)
+        .await
+        .unwrap();
+    assert_eq!(bob_download.plaintext, bob_plaintext);
 
     let third_plaintext = b"third media after the epoch update".to_vec();
     let third_upload = alice

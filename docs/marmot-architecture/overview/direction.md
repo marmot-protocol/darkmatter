@@ -3,7 +3,7 @@ title: "Direction — Where We're Going"
 created: 2026-04-19
 tags: [marmot, overview, direction, conclusions]
 status: overview
-updated: 2026-05-11
+updated: 2026-06-09
 ---
 
 # Direction — Where We're Going

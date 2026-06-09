@@ -90,10 +90,9 @@ nonce        = random(12)
 ```
 
 `media_secret` is key material. Clients MUST NOT publish, transmit, log, or expose it in diagnostics. Clients SHOULD
-cache source-epoch media secrets only in encrypted local account storage. Clients SHOULD retain recent epoch media
-secrets long enough to decrypt delayed media references according to local retention policy; once a past-epoch secret is
-unavailable, media from that epoch cannot be decrypted unless the client can recover the same epoch secret through some
-separate account recovery path.
+protect cached source-epoch media secrets at rest with confidentiality controls appropriate to the platform. Clients
+SHOULD retain recent epoch media secrets long enough to decrypt delayed media references according to local retention
+policy. If a past-epoch media secret is no longer available, media from that epoch cannot be decrypted.
 
 ## Encryption
 

@@ -1,7 +1,7 @@
 ---
 title: "Custom Proposals & Extensions — When to Inherit vs Define"
 created: 2026-04-18
-updated: 2026-06-07
+updated: 2026-06-09
 tags: [marmot, mls, extensions, proposals, capabilities, design]
 status: exploration
 related:
