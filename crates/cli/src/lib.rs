@@ -19,13 +19,12 @@ use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHA
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL,
-    DurationHistogramSnapshot, FetchedKeyPackage, MarmotApp, MarmotAppRuntime,
-    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
-    RelayDeliverySpread, RelayDeliveryStats, RelayLatencyStats, RelaySyncSnapshot,
-    RelayTelemetrySnapshot, StreamStartView, SyncSummary, TimelineMessageQuery,
-    TimelineMessageRecord, TimelinePage, TimelinePagination, UserDirectorySearch,
-    UserProfileMetadata, tag_value,
+    AppMessageQuery, AppMessageRecord, AppStatus, DurationHistogramSnapshot, FetchedKeyPackage,
+    MarmotApp, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    MediaUploadAttachmentRequest, MediaUploadRequest, RelayDeliverySpread, RelayDeliveryStats,
+    RelayLatencyStats, RelaySyncSnapshot, RelayTelemetrySnapshot, StreamStartView, SyncSummary,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
+    UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -473,10 +472,9 @@ enum MediaCommand {
         #[arg(
             long,
             value_name = "URL",
-            help = "Blossom server URL for upload",
-            default_value = DEFAULT_BLOSSOM_SERVER_URL
+            help = "Blossom server URL for upload; defaults to the group's encrypted-media endpoint"
         )]
-        server: String,
+        server: Option<String>,
     },
     #[command(about = "Download and decrypt a media file from Blossom")]
     Download {
@@ -2246,7 +2244,7 @@ pub(crate) async fn media_command_with_runtime(
                         }],
                         caption: message,
                         send,
-                        blossom_server: Some(server),
+                        blossom_server: server,
                     },
                 )
                 .await?;
@@ -2316,7 +2314,7 @@ pub(crate) async fn media_command_with_runtime(
                     limit: None,
                 },
             )?;
-            let media = media_records_json(messages);
+            let media = media_records_json(messages)?;
             Ok(CommandOutput {
                 plain: if media.is_empty() {
                     "no media".to_owned()
@@ -4996,11 +4994,11 @@ fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<String> {
     profile_display_name(profile.as_ref())
 }
 
-fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
+fn media_records_json(messages: Vec<AppMessageRecord>) -> Result<Vec<Value>, DmError> {
     let mut records = Vec::new();
     for message in messages {
         let caption = (!message.plaintext.is_empty()).then(|| message.plaintext.clone());
-        for (attachment_index, reference) in media_attachments_from_message(&message)
+        for (attachment_index, reference) in media_attachments_from_message(&message)?
             .into_iter()
             .enumerate()
         {
@@ -5027,7 +5025,7 @@ fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
             }));
         }
     }
-    records
+    Ok(records)
 }
 
 fn media_upload_attachment_json(attachment: &marmot_app::MediaUploadAttachmentResult) -> Value {
@@ -5075,19 +5073,24 @@ fn media_attachment_for_hash(
     messages: Vec<AppMessageRecord>,
     file_hash_hex: &str,
 ) -> Result<MediaAttachmentReference, DmError> {
-    messages
-        .into_iter()
-        .flat_map(|message| media_attachments_from_message(&message))
-        .find(|reference| reference.plaintext_sha256 == file_hash_hex)
-        .ok_or_else(|| DmError::MediaAttachmentNotFound(file_hash_hex.to_owned()))
+    for message in messages {
+        for reference in media_attachments_from_message(&message)? {
+            if reference.plaintext_sha256 == file_hash_hex {
+                return Ok(reference);
+            }
+        }
+    }
+    Err(DmError::MediaAttachmentNotFound(file_hash_hex.to_owned()))
 }
 
-fn media_attachments_from_message(message: &AppMessageRecord) -> Vec<MediaAttachmentReference> {
+fn media_attachments_from_message(
+    message: &AppMessageRecord,
+) -> Result<Vec<MediaAttachmentReference>, DmError> {
     message
         .tags
         .iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .filter_map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch).ok())
+        .map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch))
         .collect()
 }
 
@@ -5130,7 +5133,8 @@ fn media_attachment_from_imeta_tag(
         file_name: required("filename")?,
         media_type: required("m")?,
         version: required("v")?,
-        source_epoch: source_epoch.unwrap_or_default(),
+        source_epoch: source_epoch
+            .ok_or_else(|| DmError::InvalidMediaAttachment("source_epoch".to_owned()))?,
         dim: fields.get("dim").cloned(),
         thumbhash: fields.get("thumbhash").cloned(),
     })

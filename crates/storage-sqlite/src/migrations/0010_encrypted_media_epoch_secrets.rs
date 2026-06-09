@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
-CREATE TABLE encrypted_media_epoch_secrets (
+CREATE TABLE IF NOT EXISTS encrypted_media_epoch_secrets (
     group_id_hex TEXT NOT NULL,
     component_id INTEGER NOT NULL,
     source_epoch INTEGER NOT NULL,

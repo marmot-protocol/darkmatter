@@ -44,6 +44,13 @@ pub const ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN: usize = 64;
 pub const ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN: usize = 2048;
 pub const ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS: usize = 16;
 pub const ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS: usize = 16;
+// Upper bounds for nested var-bytes vectors before decoding them into owned buffers.
+const ENCRYPTED_MEDIA_LOCATOR_KINDS_VECTOR_MAX_LEN: usize =
+    ENCRYPTED_MEDIA_MAX_LOCATOR_KINDS * (ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN + 2);
+const ENCRYPTED_MEDIA_ENDPOINT_ENTRY_MAX_LEN: usize =
+    (ENCRYPTED_MEDIA_LOCATOR_KIND_MAX_LEN + 2) + (ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN + 2);
+const ENCRYPTED_MEDIA_BLOB_ENDPOINTS_VECTOR_MAX_LEN: usize =
+    ENCRYPTED_MEDIA_MAX_BLOB_ENDPOINTS * (ENCRYPTED_MEDIA_ENDPOINT_ENTRY_MAX_LEN + 2);
 
 /// Initial app-component state supplied by the app layer at group creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,10 +349,14 @@ pub fn encode_encrypted_media_policy_v1(
 pub fn decode_encrypted_media_policy_v1(bytes: &[u8]) -> Result<EncryptedMediaPolicyV1, String> {
     let mut cursor = bytes;
     let media_format = decode_var_bytes(&mut cursor, 64, "encrypted media format")?;
-    let allowed_bytes = decode_var_bytes(&mut cursor, usize::MAX, "encrypted media locator kinds")?;
+    let allowed_bytes = decode_var_bytes(
+        &mut cursor,
+        ENCRYPTED_MEDIA_LOCATOR_KINDS_VECTOR_MAX_LEN,
+        "encrypted media locator kinds",
+    )?;
     let endpoints_bytes = decode_var_bytes(
         &mut cursor,
-        usize::MAX,
+        ENCRYPTED_MEDIA_BLOB_ENDPOINTS_VECTOR_MAX_LEN,
         "encrypted media default blob endpoints",
     )?;
     if !cursor.is_empty() {
@@ -554,8 +565,12 @@ pub fn validate_and_normalize_blob_endpoint_url(
                     return Err("encrypted media https endpoint must not point at localhost".into());
                 }
             }
-            Host::Ipv4(addr) => reject_non_routable_ipv4(addr)?,
-            Host::Ipv6(addr) => reject_non_routable_ipv6(addr)?,
+            Host::Ipv4(addr) => reject_non_routable_ipv4(addr).map_err(|_| {
+                "encrypted media endpoint URL must not point at a non-routable address".to_owned()
+            })?,
+            Host::Ipv6(addr) => reject_non_routable_ipv6(addr).map_err(|_| {
+                "encrypted media endpoint URL must not point at a non-routable address".to_owned()
+            })?,
         },
         "http" if allow_loopback_http && is_loopback_host(host) => {}
         "http" => {
@@ -848,6 +863,35 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_media_policy_decode_rejects_oversized_top_level_vectors() {
+        let mut oversized_allowed = Vec::new();
+        encode_var_bytes(ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(), &mut oversized_allowed);
+        encode_quic_varint(
+            (ENCRYPTED_MEDIA_LOCATOR_KINDS_VECTOR_MAX_LEN + 1) as u64,
+            &mut oversized_allowed,
+        );
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&oversized_allowed),
+            Err("encrypted media locator kinds exceeds maximum length".into())
+        );
+
+        let mut oversized_endpoints = Vec::new();
+        encode_var_bytes(
+            ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(),
+            &mut oversized_endpoints,
+        );
+        encode_var_bytes(&[], &mut oversized_endpoints);
+        encode_quic_varint(
+            (ENCRYPTED_MEDIA_BLOB_ENDPOINTS_VECTOR_MAX_LEN + 1) as u64,
+            &mut oversized_endpoints,
+        );
+        assert_eq!(
+            decode_encrypted_media_policy_v1(&oversized_endpoints),
+            Err("encrypted media default blob endpoints exceeds maximum length".into())
+        );
+    }
+
+    #[test]
     fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
         assert!(
             EncryptedMediaPolicyV1::blossom_default(
@@ -871,6 +915,10 @@ mod tests {
         assert_eq!(
             local.default_blob_endpoints[0].base_url,
             "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
+            Err("encrypted media endpoint URL must not point at a non-routable address".into())
         );
     }
 
