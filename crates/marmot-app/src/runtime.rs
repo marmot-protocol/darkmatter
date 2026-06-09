@@ -7,7 +7,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_EXPORTER_LABEL, AgentTextStreamKeyContextV1,
+    AGENT_TEXT_STREAM_EXPORTER_LABEL, AGENT_TEXT_STREAM_RECORD_STATUS,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_TOOL_DELTA,
+    AgentTextStreamKeyContextV1,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MarmotAppEvent as MarmotInnerEvent,
@@ -40,9 +42,9 @@ use crate::{
     APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest,
-    AppBlobEndpoint, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AuditLogFile, AuditLogSettings,
-    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    AgentToolEventRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord, AppGroupMlsState,
+    AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AuditLogFile,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
     BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
     MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
@@ -1057,6 +1059,16 @@ impl RuntimeEventsSubscription {
 pub enum RuntimeAgentStreamUpdate {
     /// An incremental text delta. `text` is the new fragment, not the full text.
     Chunk { seq: u64, text: String },
+    /// A provisional stream status label. This is not final-answer text.
+    Status { seq: u64, status: String },
+    /// A provisional tool-progress record. This is not final-answer text.
+    Tool { seq: u64, text: String },
+    /// A non-text stream record kept for diagnostics/future UI.
+    Record {
+        seq: u64,
+        record_type: u8,
+        text: String,
+    },
     /// The stream closed cleanly; `text` is the complete transcript.
     Finished {
         text: String,
@@ -2245,6 +2257,51 @@ impl MarmotAppRuntime {
             ChatListUpdateTrigger::NewLastMessage,
         );
         Ok(summary)
+    }
+
+    pub async fn send_agent_activity(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        status: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+        extra: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_agent_activity(
+                account_ref,
+                group_id,
+                status,
+                text,
+                reply_to_message_id,
+                extra,
+            )
+            .await
+    }
+
+    pub async fn send_agent_tool_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: AgentToolEventRequest,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_agent_tool_event(account_ref, group_id, request)
+            .await
+    }
+
+    pub async fn send_group_system_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        system_type: String,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_group_system_event(account_ref, group_id, system_type, text, data)
+            .await
     }
 
     pub async fn share_push_registration(&self, account_ref: &str) -> Result<usize, AppError> {
@@ -3639,6 +3696,83 @@ impl AccountManager {
         Ok(summary)
     }
 
+    async fn send_agent_activity(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        status: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+        extra: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        self.send_app_event(
+            account_ref,
+            group_id,
+            AppMessageIntent::AgentActivity {
+                status,
+                text,
+                reply_to_message_id,
+                extra,
+            },
+        )
+        .await
+    }
+
+    async fn send_agent_tool_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: AgentToolEventRequest,
+    ) -> Result<SendSummary, AppError> {
+        let AgentToolEventRequest {
+            status,
+            tool_name,
+            text,
+            preview,
+            args,
+            call_index,
+            ok,
+            duration_ms,
+            reply_to_message_id,
+        } = request;
+        self.send_app_event(
+            account_ref,
+            group_id,
+            AppMessageIntent::AgentTool {
+                status,
+                tool_name,
+                text,
+                preview,
+                args,
+                call_index,
+                ok,
+                duration_ms,
+                reply_to_message_id,
+            },
+        )
+        .await
+    }
+
+    async fn send_group_system_event(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        system_type: String,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        self.send_app_event(
+            account_ref,
+            group_id,
+            AppMessageIntent::GroupSystem {
+                system_type,
+                text,
+                data,
+            },
+        )
+        .await
+    }
+
     async fn upload_media(
         &self,
         account_ref: &str,
@@ -4879,12 +5013,26 @@ async fn watch_broker_candidates(
                     // Non-blocking: if the consumer falls behind we drop a
                     // delta; the Finished update carries the full transcript
                     // for reconcile.
-                    if let Err(mpsc::error::TrySendError::Full(_)) =
-                        chunk_tx.try_send(RuntimeAgentStreamUpdate::Chunk {
+                    let update = match chunk.record_type {
+                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
                             seq: chunk.seq,
                             text: chunk.text.clone(),
-                        })
-                    {
+                        },
+                        AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
+                            seq: chunk.seq,
+                            status: chunk.text.clone(),
+                        },
+                        AGENT_TEXT_STREAM_RECORD_TOOL_DELTA => RuntimeAgentStreamUpdate::Tool {
+                            seq: chunk.seq,
+                            text: chunk.text.clone(),
+                        },
+                        record_type => RuntimeAgentStreamUpdate::Record {
+                            seq: chunk.seq,
+                            record_type,
+                            text: chunk.text.clone(),
+                        },
+                    };
+                    if let Err(mpsc::error::TrySendError::Full(_)) = chunk_tx.try_send(update) {
                         tracing::warn!(
                             target: "marmot_app::agent_stream",
                             method = "watch_agent_text_stream",

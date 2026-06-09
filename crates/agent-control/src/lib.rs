@@ -2,6 +2,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const AGENT_CONTROL_PROTOCOL_V1: &str = "marmot.agent-control.v1";
@@ -89,6 +90,10 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         status: String,
     },
+    StreamTool {
+        stream_id_hex: String,
+        text: String,
+    },
     StreamFinalize {
         stream_id_hex: String,
         final_text: String,
@@ -106,6 +111,39 @@ pub enum AgentControlRequest {
     },
     AccountPublishKeyPackage {
         account_id_hex: String,
+    },
+    AccountPublishProfile {
+        account_id_hex: String,
+        name: String,
+        display_name: Option<String>,
+    },
+    SendAgentActivity {
+        account_id_hex: String,
+        group_id_hex: String,
+        status: String,
+        text: String,
+        reply_to_message_id_hex: Option<String>,
+        extra: Option<Value>,
+    },
+    SendAgentToolEvent {
+        account_id_hex: String,
+        group_id_hex: String,
+        status: String,
+        tool_name: Option<String>,
+        text: String,
+        preview: Option<String>,
+        args: Option<Value>,
+        call_index: Option<u64>,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+        reply_to_message_id_hex: Option<String>,
+    },
+    SendGroupSystemEvent {
+        account_id_hex: String,
+        group_id_hex: String,
+        system_type: String,
+        text: String,
+        data: Option<Value>,
     },
     AllowlistList {
         account_id_hex: String,
@@ -146,7 +184,15 @@ pub enum AgentControlResponse {
         account_id_hex: String,
         key_package_bytes: usize,
     },
+    ProfilePublished {
+        account_id_hex: String,
+        name: String,
+        display_name: Option<String>,
+    },
     FinalSent {
+        message_ids_hex: Vec<String>,
+    },
+    AppEventSent {
         message_ids_hex: Vec<String>,
     },
     Allowlist {
@@ -423,6 +469,13 @@ mod tests {
                 "stream_status",
             ),
             (
+                AgentControlRequest::StreamTool {
+                    stream_id_hex: stream(),
+                    text: "{\"v\":1,\"status\":\"started\"}".to_owned(),
+                },
+                "stream_tool",
+            ),
+            (
                 AgentControlRequest::StreamFinalize {
                     stream_id_hex: stream(),
                     final_text: "hello".to_owned(),
@@ -451,6 +504,51 @@ mod tests {
                     account_id_hex: account(),
                 },
                 "account_publish_key_package",
+            ),
+            (
+                AgentControlRequest::AccountPublishProfile {
+                    account_id_hex: account(),
+                    name: "agent".to_owned(),
+                    display_name: Some("Agent".to_owned()),
+                },
+                "account_publish_profile",
+            ),
+            (
+                AgentControlRequest::SendAgentActivity {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    status: "thinking".to_owned(),
+                    text: "Thinking".to_owned(),
+                    reply_to_message_id_hex: Some(message()),
+                    extra: None,
+                },
+                "send_agent_activity",
+            ),
+            (
+                AgentControlRequest::SendAgentToolEvent {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    status: "started".to_owned(),
+                    tool_name: Some("search".to_owned()),
+                    text: "Searching".to_owned(),
+                    preview: Some("query".to_owned()),
+                    args: None,
+                    call_index: Some(1),
+                    ok: None,
+                    duration_ms: None,
+                    reply_to_message_id_hex: Some(message()),
+                },
+                "send_agent_tool_event",
+            ),
+            (
+                AgentControlRequest::SendGroupSystemEvent {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    system_type: "member_added".to_owned(),
+                    text: "Member added".to_owned(),
+                    data: None,
+                },
+                "send_group_system_event",
             ),
             (
                 AgentControlRequest::AllowlistList {

@@ -207,6 +207,76 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["type"], "account_list")
         self.assertEqual(requests[0]["auth_token"], "test-token")
 
+    async def test_account_publish_profile_writes_public_profile_request(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "id": request["id"],
+                    "type": "profile_published",
+                    "account_id_hex": request["account_id_hex"],
+                    "name": request["name"],
+                    "display_name": request["display_name"],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        response = await client.account_publish_profile("11" * 32, "Hermes", "Hermes Agent")
+
+        self.assertEqual(response["type"], "profile_published")
+        self.assertEqual(requests[0]["type"], "account_publish_profile")
+        self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
+        self.assertEqual(requests[0]["name"], "Hermes")
+        self.assertEqual(requests[0]["display_name"], "Hermes Agent")
+
+    async def test_send_agent_tool_event_writes_typed_tool_request(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "id": request["id"],
+                    "type": "app_event_sent",
+                    "message_ids_hex": ["22" * 32],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        response = await client.send_agent_tool_event(
+            "11" * 32,
+            "22" * 32,
+            status="started",
+            tool_name="search",
+            text="search: glp-1",
+            preview="glp-1",
+            args={"query": "glp-1"},
+            call_index=3,
+            reply_to_message_id_hex="33" * 32,
+        )
+
+        self.assertEqual(response["type"], "app_event_sent")
+        self.assertEqual(requests[0]["type"], "send_agent_tool_event")
+        self.assertEqual(requests[0]["tool_name"], "search")
+        self.assertEqual(requests[0]["preview"], "glp-1")
+        self.assertEqual(requests[0]["args"], {"query": "glp-1"})
+        self.assertEqual(requests[0]["call_index"], 3)
+        self.assertEqual(requests[0]["reply_to_message_id_hex"], "33" * 32)
+
     async def test_inbound_subscription_requires_ack_then_yields_events(self):
         async def handler(reader, writer):
             request = await read_json_line(reader)
@@ -367,6 +437,17 @@ class TranscriptTests(unittest.TestCase):
         with self.assertRaises(self.adapter.NonAppendOnlyUpdate):
             state.suffix_for("goodbye")
 
+    def test_profile_name_reply_parser_normalizes_names_and_skip_replies(self):
+        parse = self.adapter.parse_profile_name_reply
+
+        self.assertEqual(parse('  "Hermes Agent"  '), ("name", "Hermes Agent", ""))
+        self.assertEqual(parse("skip")[0], "skip")
+        self.assertEqual(parse(" \n ")[0], "invalid")
+        self.assertEqual(parse("x" * 81)[0], "invalid")
+
+    def test_plain_two_word_message_is_not_legacy_tool_progress(self):
+        self.assertEqual(self.adapter._tool_events_from_progress_text("hello world"), [])
+
 
 class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -444,6 +525,47 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.continuation_message_ids, ("aa", "bb"))
         self.assertEqual(fake_client.calls, [("11" * 32, "22" * 32, "pong", "33" * 32)])
 
+    async def test_tool_progress_send_maps_to_agent_tool_event(self):
+        class FakeClient:
+            def __init__(self):
+                self.tool_events = []
+                self.final_sends = []
+
+            async def send_agent_tool_event(self, account_id_hex, group_id_hex, **kwargs):
+                self.tool_events.append((account_id_hex, group_id_hex, kwargs))
+                return {
+                    "type": "app_event_sent",
+                    "message_ids_hex": ["44" * 32],
+                }
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+
+        result = await adapter.send(
+            chat_id="22" * 32,
+            content='* search: "glp-1"',
+            reply_to="33" * 32,
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.message_id.startswith("marmot-tool-progress:"))
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(len(fake_client.tool_events), 1)
+        account_id, group_id, kwargs = fake_client.tool_events[0]
+        self.assertEqual(account_id, "11" * 32)
+        self.assertEqual(group_id, "22" * 32)
+        self.assertEqual(kwargs["status"], "started")
+        self.assertEqual(kwargs["tool_name"], "search")
+        self.assertEqual(kwargs["preview"], "glp-1")
+        self.assertEqual(kwargs["reply_to_message_id_hex"], "33" * 32)
+
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
             {
@@ -462,7 +584,12 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     yield event
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
             client=FakeClient(),
         )
 
@@ -475,6 +602,111 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.source.chat_id, "22" * 32)
         self.assertEqual(event.source.chat_type, "group")
         self.assertEqual(event.source.user_id, "44" * 32)
+
+    async def test_first_inbound_message_prompts_for_public_profile_name(self):
+        events = [
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "hello",
+            }
+        ]
+
+        class FakeClient:
+            def __init__(self):
+                self.final_sends = []
+
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "profile_onboarding_state_path": str(Path(tempdir) / "profile-state.json"),
+                    }
+                ),
+                client=fake_client,
+            )
+
+            await adapter._consume_inbound_once()
+
+        self.assertEqual(adapter.events, [])
+        self.assertEqual(len(fake_client.final_sends), 1)
+        account_id, group_id, text, reply_to = fake_client.final_sends[0]
+        self.assertEqual(account_id, "11" * 32)
+        self.assertEqual(group_id, "22" * 32)
+        self.assertIn("public Nostr profile name", text)
+        self.assertEqual(reply_to, "33" * 32)
+
+    async def test_profile_name_reply_publishes_profile_and_acknowledges(self):
+        account_id = "11" * 32
+        group_id = "22" * 32
+        events = [
+            {
+                "type": "inbound_message",
+                "account_id_hex": account_id,
+                "group_id_hex": group_id,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "  Hermes Agent  ",
+            }
+        ]
+
+        class FakeClient:
+            def __init__(self):
+                self.published_profiles = []
+                self.final_sends = []
+
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+
+            async def account_publish_profile(self, account_id_hex, name, display_name=None):
+                self.published_profiles.append((account_id_hex, name, display_name))
+                return {
+                    "type": "profile_published",
+                    "account_id_hex": account_id_hex,
+                    "name": name,
+                    "display_name": display_name,
+                }
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            state_path = Path(tempdir) / "profile-state.json"
+            store = self.adapter_module.ProfileNameOnboardingStore(state_path)
+            await store.mark_prompted(account_id, group_id)
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": account_id,
+                        "profile_onboarding_state_path": str(state_path),
+                    }
+                ),
+                client=fake_client,
+            )
+
+            await adapter._consume_inbound_once()
+
+        self.assertEqual(adapter.events, [])
+        self.assertEqual(fake_client.published_profiles, [(account_id, "Hermes Agent", "Hermes Agent")])
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertIn('published this agent', fake_client.final_sends[0][2])
+        self.assertEqual(fake_client.final_sends[0][3], "33" * 32)
 
     async def test_progressive_edit_stream_finalizes_then_sends_durable_message(self):
         class FakeClient:
@@ -541,6 +773,149 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.stream_finalizes[0][1], "hello")
         self.assertEqual(fake_client.stream_finalizes[0][3], 2)
         self.assertEqual(fake_client.final_sends, [("11" * 32, "22" * 32, "hello", None)])
+
+    async def test_draft_stream_skips_empty_visible_frames(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_begins = []
+                self.stream_appends = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                self.stream_begins.append((account_id_hex, group_id_hex, tuple(quic_candidates)))
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
+                return {"type": "ack"}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        result = await adapter.send_draft("22" * 32, 1, "\u2589")
+
+        self.assertTrue(result.success)
+        self.assertEqual(fake_client.stream_begins, [])
+        self.assertEqual(fake_client.stream_appends, [])
+
+    async def test_draft_stream_rotation_cancels_previous_preview(self):
+        class FakeClient:
+            def __init__(self):
+                self.next_stream = 0
+                self.stream_appends = []
+                self.stream_cancels = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                self.next_stream += 1
+                stream_byte = f"{0x54 + self.next_stream:02x}"
+                start_byte = f"{0x64 + self.next_stream:02x}"
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": stream_byte * 32,
+                    "start_message_id_hex": start_byte * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
+                return {"type": "ack"}
+
+            async def stream_cancel(self, stream_id_hex, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        first = await adapter.send_draft("22" * 32, 1, "Let me search")
+        second = await adapter.send_draft("22" * 32, 2, "Based on")
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(
+            fake_client.stream_appends,
+            [("55" * 32, "Let me search"), ("56" * 32, "Based on")],
+        )
+        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "superseded by newer draft")])
+
+    async def test_final_send_cancels_non_append_only_draft_preview(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_appends = []
+                self.stream_finalizes = []
+                self.stream_cancels = []
+                self.final_sends = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
+                return {"type": "ack"}
+
+            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count):
+                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+                return {"type": "stream_finalized", "stream_id_hex": stream_id_hex}
+
+            async def stream_cancel(self, stream_id_hex, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {
+                    "type": "final_sent",
+                    "message_ids_hex": ["88" * 32],
+                }
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        draft = await adapter.send_draft("22" * 32, 1, "Let me search")
+        final = await adapter.send("22" * 32, "Based on my search")
+
+        self.assertTrue(draft.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.stream_appends, [("55" * 32, "Let me search")])
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(fake_client.stream_cancels, [("55" * 32, "final text was not append-only")])
+        self.assertEqual(
+            fake_client.final_sends,
+            [("11" * 32, "22" * 32, "Based on my search", None)],
+        )
 
 
 if __name__ == "__main__":

@@ -251,6 +251,19 @@ pub struct AgentTextStreamFinishRequest {
     pub finished_at: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentToolEventRequest {
+    pub status: String,
+    pub tool_name: Option<String>,
+    pub text: String,
+    pub preview: Option<String>,
+    pub args: Option<serde_json::Value>,
+    pub call_index: Option<u64>,
+    pub ok: Option<bool>,
+    pub duration_ms: Option<u64>,
+    pub reply_to_message_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppStatus {
     pub account: String,
@@ -5204,8 +5217,11 @@ mod tests {
     use super::*;
     use cgka_traits::Timestamp;
     use cgka_traits::app_event::{
-        EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+        AGENT_ACTIVITY_STATUS_TAG, AGENT_TOOL_NAME_TAG, AGENT_TOOL_STATUS_TAG, EVENT_REF_TAG,
+        GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_AGENT_TOOL,
+        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
         MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG, STREAM_CHUNKS_TAG,
         STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
     };
@@ -6384,6 +6400,72 @@ mod tests {
             Some(hex::encode([0xee; 32]).as_str())
         );
         assert_eq!(tag_value(&event.tags, STREAM_CHUNKS_TAG), Some("3"));
+    }
+
+    #[test]
+    fn agent_activity_intent_builds_kind_1201_json_payload() {
+        let event = build(AppMessageIntent::AgentActivity {
+            status: "thinking".to_owned(),
+            text: "Thinking".to_owned(),
+            reply_to_message_id: Some("parent".to_owned()),
+            extra: None,
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY);
+        assert_eq!(
+            tag_value(&event.tags, AGENT_ACTIVITY_STATUS_TAG),
+            Some("thinking")
+        );
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["v"], 1);
+        assert_eq!(content["status"], "thinking");
+        assert_eq!(content["text"], "Thinking");
+    }
+
+    #[test]
+    fn agent_tool_intent_builds_kind_1202_json_payload() {
+        let event = build(AppMessageIntent::AgentTool {
+            status: "started".to_owned(),
+            tool_name: Some("search".to_owned()),
+            text: "Searching".to_owned(),
+            preview: Some("glp-1".to_owned()),
+            args: Some(serde_json::json!({"query": "glp-1"})),
+            call_index: Some(2),
+            ok: None,
+            duration_ms: None,
+            reply_to_message_id: Some("parent".to_owned()),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_TOOL);
+        assert_eq!(
+            tag_value(&event.tags, AGENT_TOOL_STATUS_TAG),
+            Some("started")
+        );
+        assert_eq!(tag_value(&event.tags, AGENT_TOOL_NAME_TAG), Some("search"));
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["status"], "started");
+        assert_eq!(content["tool_name"], "search");
+        assert_eq!(content["preview"], "glp-1");
+        assert_eq!(content["args"]["query"], "glp-1");
+        assert_eq!(content["call_index"], 2);
+    }
+
+    #[test]
+    fn group_system_intent_builds_kind_1210_json_payload() {
+        let event = build(AppMessageIntent::GroupSystem {
+            system_type: "member_added".to_owned(),
+            text: "Member added".to_owned(),
+            data: Some(serde_json::json!({"member": "alice"})),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM);
+        assert_eq!(
+            tag_value(&event.tags, GROUP_SYSTEM_TYPE_TAG),
+            Some("member_added")
+        );
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["system_type"], "member_added");
+        assert_eq!(content["text"], "Member added");
+        assert_eq!(content["data"]["member"], "alice");
     }
 
     #[test]

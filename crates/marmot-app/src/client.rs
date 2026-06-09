@@ -31,8 +31,8 @@ use crate::media::{
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
 use crate::{
-    AccountState, AgentTextStreamFinishRequest, AppAgentTextStreamComponent, AppBlobEndpoint,
-    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AccountState, AgentTextStreamFinishRequest, AgentToolEventRequest, AppAgentTextStreamComponent,
+    AppBlobEndpoint, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
     AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection,
     AppMessageQuery, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
@@ -1056,6 +1056,83 @@ impl AppClient {
         .await
     }
 
+    pub async fn send_agent_activity(
+        &mut self,
+        group_id: &GroupId,
+        status: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+        extra: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::AgentActivity {
+                    status,
+                    text,
+                    reply_to_message_id,
+                    extra,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn send_agent_tool_event(
+        &mut self,
+        group_id: &GroupId,
+        request: AgentToolEventRequest,
+    ) -> Result<SendSummary, AppError> {
+        let AgentToolEventRequest {
+            status,
+            tool_name,
+            text,
+            preview,
+            args,
+            call_index,
+            ok,
+            duration_ms,
+            reply_to_message_id,
+        } = request;
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::AgentTool {
+                    status,
+                    tool_name,
+                    text,
+                    preview,
+                    args,
+                    call_index,
+                    ok,
+                    duration_ms,
+                    reply_to_message_id,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn send_group_system_event(
+        &mut self,
+        group_id: &GroupId,
+        system_type: String,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::GroupSystem {
+                    system_type,
+                    text,
+                    data,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
     pub async fn retry_group_convergence(
         &mut self,
         group_id: &GroupId,
@@ -1720,6 +1797,9 @@ fn notification_trigger_for_intent(
         | AppMessageIntent::Unreact { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::StreamStart { .. }
+        | AppMessageIntent::AgentActivity { .. }
+        | AppMessageIntent::AgentTool { .. }
+        | AppMessageIntent::GroupSystem { .. }
         | AppMessageIntent::PushTokenUpdate { .. }
         | AppMessageIntent::PushTokenRemoval { .. } => None,
     }
