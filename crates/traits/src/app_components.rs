@@ -221,6 +221,9 @@ pub struct GroupAvatarUrlV1 {
 /// Encode `marmot.group.avatar-url.v1` state. The URL is validated and normalized;
 /// an empty `url` encodes the absent/cleared avatar (all fields empty).
 pub fn encode_group_avatar_url_v1(avatar: &GroupAvatarUrlV1) -> Result<Vec<u8>, String> {
+    if avatar.url.is_empty() && (avatar.dim.is_some() || avatar.thumbhash.is_some()) {
+        return Err("group avatar absent state must not include hints".into());
+    }
     let url = if avatar.url.is_empty() {
         String::new()
     } else {
@@ -262,6 +265,9 @@ pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, Stri
     let dim = String::from_utf8(dim).map_err(|e| format!("group avatar dim is not UTF-8: {e}"))?;
     let thumbhash = String::from_utf8(thumbhash)
         .map_err(|e| format!("group avatar thumbhash is not UTF-8: {e}"))?;
+    if url.is_empty() && (!dim.is_empty() || !thumbhash.is_empty()) {
+        return Err("group avatar absent state must not include hints".into());
+    }
     if !url.is_empty() {
         // Compare against normalized bytes so a non-normalized stored URL is rejected.
         let normalized = validate_and_normalize_group_avatar_url(&url)?;
@@ -332,6 +338,9 @@ fn reject_non_routable_ipv4(addr: Ipv4Addr) -> Result<(), String> {
 }
 
 fn reject_non_routable_ipv6(addr: Ipv6Addr) -> Result<(), String> {
+    if let Some(mapped) = addr.to_ipv4_mapped() {
+        return reject_non_routable_ipv4(mapped);
+    }
     if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
@@ -573,6 +582,17 @@ mod tests {
     }
 
     #[test]
+    fn group_avatar_url_absent_state_rejects_hints() {
+        let absent_with_hint = GroupAvatarUrlV1 {
+            url: String::new(),
+            dim: Some("512x512".to_owned()),
+            thumbhash: None,
+        };
+
+        assert!(encode_group_avatar_url_v1(&absent_with_hint).is_err());
+    }
+
+    #[test]
     fn group_avatar_url_requires_https() {
         for raw in [
             "http://cdn.example.com/a.png",
@@ -597,6 +617,8 @@ mod tests {
             "https://172.16.0.1/a.png",
             "https://169.254.1.1/a.png",
             "https://[::1]/a.png",
+            "https://[::ffff:127.0.0.1]/a.png",
+            "https://[::ffff:10.0.0.1]/a.png",
             "https://[fc00::1]/a.png",
             "https://[fe80::1]/a.png",
         ] {
@@ -640,6 +662,16 @@ mod tests {
         encode_var_bytes(raw.as_bytes(), &mut bytes);
         encode_var_bytes(b"", &mut bytes);
         encode_var_bytes(b"", &mut bytes);
+        assert!(decode_group_avatar_url_v1(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_decode_rejects_absent_state_with_hints() {
+        let mut bytes = Vec::new();
+        encode_var_bytes(b"", &mut bytes);
+        encode_var_bytes(b"512x512", &mut bytes);
+        encode_var_bytes(b"", &mut bytes);
+
         assert!(decode_group_avatar_url_v1(&bytes).is_err());
     }
 
