@@ -55,23 +55,9 @@ impl AppClient {
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
-        if self.cache_current_encrypted_media_epoch_secrets().is_err() {
-            tracing::warn!(
-                target: "marmot_app::media",
-                method = "sync_runtime_groups",
-                error_code = "encrypted_media_secret_cache_skipped",
-                "failed to cache encrypted media epoch secret before transport sync",
-            );
-        }
+        self.cache_current_encrypted_media_epoch_secrets();
         self.runtime.sync_transport_groups(rebuild_since).await?;
-        if self.cache_current_encrypted_media_epoch_secrets().is_err() {
-            tracing::warn!(
-                target: "marmot_app::media",
-                method = "sync_runtime_groups",
-                error_code = "encrypted_media_secret_cache_skipped",
-                "failed to cache encrypted media epoch secret after transport sync",
-            );
-        }
+        self.cache_current_encrypted_media_epoch_secrets();
         Ok(())
     }
 
@@ -1548,14 +1534,33 @@ impl AppClient {
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
     }
 
-    fn cache_current_encrypted_media_epoch_secrets(&self) -> Result<(), AppError> {
+    fn cache_current_encrypted_media_epoch_secrets(&self) {
         for group in &self.state.groups {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            if self.encrypted_media_for_group(&group_id).required {
-                self.remember_current_encrypted_media_secret(&group_id)?;
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::media",
+                    method = "cache_current_encrypted_media_epoch_secrets",
+                    error_code = "encrypted_media_group_record_skipped",
+                    "skipping malformed encrypted media group record",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            if !self.encrypted_media_for_group(&group_id).required {
+                continue;
+            }
+            if self
+                .remember_current_encrypted_media_secret(&group_id)
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "marmot_app::media",
+                    method = "cache_current_encrypted_media_epoch_secrets",
+                    error_code = "encrypted_media_secret_cache_skipped",
+                    "failed to cache encrypted media epoch secret for one group",
+                );
             }
         }
-        Ok(())
     }
 
     fn remember_encrypted_media_epoch_secret(
