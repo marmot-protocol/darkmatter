@@ -5054,7 +5054,7 @@ fn media_attachment_json(reference: &MediaAttachmentReference) -> Value {
 
 fn media_locators_json(locators: &[MediaLocator]) -> Vec<Value> {
     locators
-        .into_iter()
+        .iter()
         .map(|locator| {
             json!({
                 "kind": locator.kind,

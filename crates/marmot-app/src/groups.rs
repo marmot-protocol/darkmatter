@@ -238,24 +238,16 @@ impl AppGroupRecord {
         record
     }
 
-    pub(crate) fn refresh_from_group(
-        &mut self,
-        nostr_routing: AppGroupNostrRoutingComponent,
-        group: Option<&Group>,
-        admin_policy: AppGroupAdminPolicyComponent,
-        message_retention: AppGroupMessageRetentionComponent,
-        agent_text_stream: AppAgentTextStreamComponent,
-        avatar_url: AppGroupAvatarUrlComponent,
-        encrypted_media: AppGroupEncryptedMediaComponent,
-    ) {
+    pub(crate) fn refresh_from_group(&mut self, projection: &EventGroupProjection<'_>) {
+        let nostr_routing = projection.nostr_routing.clone();
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
-        self.admin_policy = admin_policy;
-        self.message_retention = message_retention;
-        self.agent_text_stream = agent_text_stream;
-        self.avatar_url = avatar_url;
-        self.encrypted_media = encrypted_media;
-        if let Some(group) = group {
+        self.admin_policy = projection.admin_policy.clone();
+        self.message_retention = projection.message_retention.clone();
+        self.agent_text_stream = projection.agent_text_stream.clone();
+        self.avatar_url = projection.avatar_url.clone();
+        self.encrypted_media = projection.encrypted_media.clone();
+        if let Some(group) = projection.group_metadata {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
         }
@@ -816,15 +808,7 @@ pub(crate) fn add_group(
         .iter_mut()
         .find(|group| group.group_id_hex == group_id_hex)
     {
-        existing.refresh_from_group(
-            projection.nostr_routing.clone(),
-            projection.group_metadata,
-            projection.admin_policy.clone(),
-            projection.message_retention.clone(),
-            projection.agent_text_stream.clone(),
-            projection.avatar_url.clone(),
-            projection.encrypted_media.clone(),
-        );
+        existing.refresh_from_group(projection);
         existing.apply_confirmation_state(confirmation);
         return;
     }
