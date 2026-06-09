@@ -7,8 +7,8 @@ use cgka_traits::agent_text_stream::{
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
     ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -1493,9 +1493,11 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(u64, SecretBytes), AppError> {
-        let (epoch, secret) = self
-            .runtime
-            .safe_export_secret_with_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            32,
+        )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
         Ok((epoch.0, secret))
     }
@@ -1508,16 +1510,18 @@ impl AppClient {
         if let Some(secret) = self.cached_encrypted_media_epoch_secret(group_id, source_epoch)? {
             return Ok(SecretBytes::new(secret));
         }
-        let current_epoch = self
-            .runtime
-            .current_safe_export_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
-        if current_epoch.0 != source_epoch {
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            32,
+        )?;
+        if epoch.0 != source_epoch {
             return Err(AppError::InvalidEncryptedMedia(format!(
                 "missing encrypted media secret for epoch {source_epoch}"
             )));
         }
-        self.encrypted_media_secret(group_id)
-            .map(|(_, secret)| secret)
+        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
+        Ok(secret)
     }
 
     fn remember_encrypted_media_secret_if_current(
@@ -1525,11 +1529,13 @@ impl AppClient {
         group_id: &GroupId,
         source_epoch: u64,
     ) -> Result<(), AppError> {
-        let current_epoch = self
-            .runtime
-            .current_safe_export_epoch(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)?;
-        if current_epoch.0 == source_epoch {
-            let _ = self.encrypted_media_secret(group_id)?;
+        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            32,
+        )?;
+        if epoch.0 == source_epoch {
+            self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
         }
         Ok(())
     }
