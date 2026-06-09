@@ -29,6 +29,7 @@ use marmot_app::{
 };
 
 use crate::errors::MarmotKitError;
+use crate::markdown::{MarkdownDocumentFfi, parse_markdown_document};
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AuditLogFileFfi {
@@ -741,6 +742,7 @@ pub struct AppMessageRecordFfi {
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
+    pub content_tokens: MarkdownDocumentFfi,
     /// Nostr `kind` of the inner Marmot app event (9 chat, 7 reaction, …).
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
@@ -751,12 +753,14 @@ pub struct AppMessageRecordFfi {
 
 impl From<AppMessageRecord> for AppMessageRecordFfi {
     fn from(value: AppMessageRecord) -> Self {
+        let content_tokens = parse_markdown_document(&value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             direction: value.direction,
             group_id_hex: value.group_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
+            content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
             recorded_at: value.recorded_at,
@@ -792,6 +796,7 @@ pub struct ChatListMessagePreviewFfi {
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub plaintext: String,
+    pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub timeline_at: u64,
     pub deleted: bool,
@@ -799,11 +804,13 @@ pub struct ChatListMessagePreviewFfi {
 
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
+        let content_tokens = parse_markdown_document(&value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
             sender_display_name: value.sender_display_name,
             plaintext: value.plaintext,
+            content_tokens,
             kind: value.kind,
             timeline_at: value.timeline_at,
             deleted: value.deleted,
@@ -972,6 +979,7 @@ pub struct TimelineReplyPreviewFfi {
     pub message_id_hex: String,
     pub sender: String,
     pub plaintext: String,
+    pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub media_json: Option<String>,
     pub agent_text_stream_json: Option<String>,
@@ -980,10 +988,12 @@ pub struct TimelineReplyPreviewFfi {
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
+        let content_tokens = parse_markdown_document(&value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
+            content_tokens,
             kind: value.kind,
             media_json: value.media.map(|media| media.to_string()),
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
@@ -1000,6 +1010,7 @@ pub struct TimelineMessageRecordFfi {
     pub group_id_hex: String,
     pub sender: String,
     pub plaintext: String,
+    pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub tags: Vec<MessageTagFfi>,
     pub timeline_at: u64,
@@ -1020,6 +1031,7 @@ pub struct TimelineMessageRecordFfi {
 
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
+        let content_tokens = parse_markdown_document(&value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -1027,6 +1039,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             group_id_hex: value.group_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
+            content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
             timeline_at: value.timeline_at,
@@ -1562,6 +1575,7 @@ pub struct ReceivedMessageFfi {
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub plaintext: String,
+    pub content_tokens: MarkdownDocumentFfi,
     /// Nostr `kind` of the inner Marmot app event.
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
@@ -1581,6 +1595,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             sender: value.sender.clone(),
             sender_display_name: value.sender_display_name.clone(),
             plaintext: value.plaintext.clone(),
+            content_tokens: parse_markdown_document(&value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
             recorded_at: value.recorded_at,
@@ -1802,6 +1817,7 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::{MarkdownBlockFfi, MarkdownInlineFfi};
     use std::collections::BTreeMap;
 
     fn group(admins: Vec<&str>) -> AppGroupRecordFfi {
@@ -1924,10 +1940,26 @@ mod tests {
         assert_eq!(message.message_id_hex, "message-1");
         assert_eq!(message.source_message_id_hex.as_deref(), Some("source-1"));
         assert_eq!(message.reply_to_message_id_hex.as_deref(), Some("parent"));
+        assert!(matches!(
+            &message.content_tokens.blocks[0],
+            MarkdownBlockFfi::Paragraph { inlines }
+                if matches!(
+                    &inlines[0],
+                    MarkdownInlineFfi::Text { content } if content == "hello"
+                )
+        ));
         let preview = message.reply_preview.as_ref().expect("reply preview");
         assert_eq!(preview.message_id_hex, "parent");
         assert_eq!(preview.sender, "bb".repeat(32));
         assert_eq!(preview.plaintext, "parent text");
+        assert!(matches!(
+            &preview.content_tokens.blocks[0],
+            MarkdownBlockFfi::Paragraph { inlines }
+                if matches!(
+                    &inlines[0],
+                    MarkdownInlineFfi::Text { content } if content == "parent text"
+                )
+        ));
         assert!(!preview.deleted);
         assert_eq!(message.tags[0].values, vec!["q", "parent"]);
         assert_eq!(
@@ -1949,6 +1981,33 @@ mod tests {
             message.deleted_by_message_id_hex.as_deref(),
             Some("delete-1")
         );
+    }
+
+    #[test]
+    fn app_message_record_ffi_derives_tokens_for_non_chat_kinds() {
+        let record = AppMessageRecord {
+            message_id_hex: "reaction-1".to_owned(),
+            direction: "sent".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "aa".repeat(32),
+            plaintext: "reaction".to_owned(),
+            kind: 7,
+            tags: vec![vec!["e".to_owned(), "target".to_owned()]],
+            recorded_at: 10,
+            received_at: 11,
+        };
+
+        let ffi = AppMessageRecordFfi::from(record);
+
+        assert_eq!(ffi.kind, 7);
+        assert!(matches!(
+            &ffi.content_tokens.blocks[0],
+            MarkdownBlockFfi::Paragraph { inlines }
+                if matches!(
+                    &inlines[0],
+                    MarkdownInlineFfi::Text { content } if content == "reaction"
+                )
+        ));
     }
 
     #[test]
