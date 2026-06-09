@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, TableCell};
 use crate::scanner;
 
-const MAX_CONTAINER_DEPTH: usize = 96;
+pub(crate) const MAX_CONTAINER_DEPTH: usize = 96;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // populated in Phase 3 (link reference definitions)

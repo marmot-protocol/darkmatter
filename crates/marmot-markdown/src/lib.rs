@@ -55,6 +55,9 @@ mod inline;
 mod nostr;
 mod scanner;
 
+/// Maximum nested block-container depth emitted by the parser.
+pub const MAX_CONTAINER_DEPTH: usize = block::MAX_CONTAINER_DEPTH;
+
 pub use ast::{
     Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, ListItem, ListKind,
     NostrEntity, NostrHrp, TableCell,

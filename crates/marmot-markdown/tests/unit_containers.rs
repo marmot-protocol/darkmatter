@@ -1,4 +1,4 @@
-use marmot_markdown::{Block, CodeBlockKind, Inline, ListItem, ListKind};
+use marmot_markdown::{Block, CodeBlockKind, Inline, ListItem, ListKind, MAX_CONTAINER_DEPTH};
 
 mod common;
 use common::{paragraph, parse_blocks};
@@ -636,23 +636,27 @@ fn blank_after_nested_list_only_loosens_outer_list() {
 fn excessive_blockquote_depth_is_capped() {
     let input = ">".repeat(2_000);
     let parsed = parse_blocks(&input);
-    assert!(max_block_depth(&parsed) <= 128);
+    assert!(max_container_depth(&parsed) <= MAX_CONTAINER_DEPTH);
 }
 
-fn max_block_depth(blocks: &[Block]) -> usize {
-    blocks.iter().map(max_single_block_depth).max().unwrap_or(0)
+fn max_container_depth(blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(max_single_block_container_depth)
+        .max()
+        .unwrap_or(0)
 }
 
-fn max_single_block_depth(block: &Block) -> usize {
+fn max_single_block_container_depth(block: &Block) -> usize {
     match block {
-        Block::BlockQuote { blocks } => 1 + max_block_depth(blocks),
+        Block::BlockQuote { blocks } => 1 + max_container_depth(blocks),
         Block::List { items, .. } => {
             1 + items
                 .iter()
-                .map(|item| max_block_depth(&item.blocks))
+                .map(|item| max_container_depth(&item.blocks))
                 .max()
                 .unwrap_or(0)
         }
-        _ => 1,
+        _ => 0,
     }
 }
