@@ -847,14 +847,11 @@ fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
         let c = bytes[end - 1];
         match c {
             b'.' | b',' | b';' | b':' | b'!' | b'?' | b'*' | b'_' | b'~' => end -= 1,
-            b')' => {
-                if closes > opens {
-                    end -= 1;
-                    closes -= 1;
-                } else {
-                    return end;
-                }
+            b')' if closes > opens => {
+                end -= 1;
+                closes -= 1;
             }
+            b')' => return end,
             _ => return end,
         }
     }

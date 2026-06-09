@@ -2158,6 +2158,7 @@ mod tests {
             plaintext: "reaction".to_owned(),
             kind: 7,
             tags: vec![vec!["e".to_owned(), "target".to_owned()]],
+            source_epoch: None,
             recorded_at: 10,
             received_at: 11,
         };
