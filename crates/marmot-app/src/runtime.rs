@@ -1104,12 +1104,31 @@ pub struct AgentTextStreamCryptoContext {
 pub struct RuntimeAgentStreamWatch {
     pub stream_id_hex: String,
     updates: mpsc::Receiver<RuntimeAgentStreamUpdate>,
+    terminal: Option<oneshot::Receiver<RuntimeAgentStreamUpdate>>,
     abort: tokio::task::AbortHandle,
     stopping: watch::Receiver<bool>,
 }
 
 impl RuntimeAgentStreamWatch {
     pub async fn recv(&mut self) -> Option<RuntimeAgentStreamUpdate> {
+        if let Some(mut terminal) = self.terminal.take() {
+            return tokio::select! {
+                biased;
+                terminal = &mut terminal => {
+                    self.updates.close();
+                    while self.updates.try_recv().is_ok() {}
+                    terminal.ok()
+                }
+                update = self.updates.recv() => {
+                    self.terminal = Some(terminal);
+                    update
+                }
+                _ = wait_for_runtime_shutdown(&mut self.stopping) => {
+                    self.terminal = Some(terminal);
+                    None
+                }
+            };
+        }
         tokio::select! {
             update = self.updates.recv() => update,
             _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
@@ -1781,6 +1800,7 @@ impl MarmotAppRuntime {
             .await?;
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let handle = tokio::spawn(async move {
             let final_update = tokio::select! {
@@ -1795,11 +1815,12 @@ impl MarmotAppRuntime {
                     updates_tx.clone(),
                 ) => update,
             };
-            let _ = updates_tx.send(final_update).await;
+            let _ = terminal_tx.send(final_update);
         });
         Ok(RuntimeAgentStreamWatch {
             stream_id_hex,
             updates: updates_rx,
+            terminal: Some(terminal_rx),
             abort: handle.abort_handle(),
             stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
@@ -5388,6 +5409,38 @@ mod tests {
 
         assert!(subscription.recv().await.is_none());
         drop(updates_tx);
+    }
+
+    #[tokio::test]
+    async fn agent_stream_watch_recv_prioritizes_terminal_update() {
+        let lifecycle = RuntimeLifecycle::new();
+        let (updates_tx, updates) = mpsc::channel(1);
+        updates_tx
+            .try_send(RuntimeAgentStreamUpdate::Progress {
+                seq: 1,
+                text: "searching".to_owned(),
+            })
+            .expect("provisional queue should accept first update");
+        let (terminal_tx, terminal) = oneshot::channel();
+        let expected = RuntimeAgentStreamUpdate::Finished {
+            text: "done".to_owned(),
+            transcript_hash_hex: "00".to_owned(),
+            chunk_count: 1,
+        };
+        terminal_tx
+            .send(expected.clone())
+            .expect("terminal receiver should be alive");
+        let handle = tokio::spawn(async {});
+        let mut watch = RuntimeAgentStreamWatch {
+            stream_id_hex: "stream".to_owned(),
+            updates,
+            terminal: Some(terminal),
+            abort: handle.abort_handle(),
+            stopping: lifecycle.subscribe_shutdown(),
+        };
+
+        assert_eq!(watch.recv().await, Some(expected));
+        assert!(watch.recv().await.is_none());
     }
 
     #[test]
