@@ -3294,11 +3294,20 @@ impl AccountManager {
                     ready_receivers.push((Instant::now(), ready_rx));
                 }
             }
+            let mut ready_waits = JoinSet::new();
             for (account_started_at, ready) in ready_receivers {
-                let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
+                ready_waits.spawn(async move {
+                    let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
+                    (account_started_at.elapsed(), ready_result)
+                });
+            }
+            while let Some(joined) = ready_waits.join_next().await {
+                let (account_open_elapsed, ready_result) = joined.map_err(|err| {
+                    AppError::BlockingTask(format!("account worker readiness wait failed: {err}"))
+                })?;
                 self.shared.app_performance_telemetry().record(
                     AppPerformanceOperation::AccountOpen,
-                    account_started_at.elapsed(),
+                    account_open_elapsed,
                     matches!(ready_result, Ok(Ok(Ok(())))),
                 );
                 match ready_result {

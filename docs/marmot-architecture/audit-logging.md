@@ -84,8 +84,8 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 | Value | How it is produced | Where it appears |
 | --- | --- | --- |
 | `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id`; not included in JSONL events directly. |
-| `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" || account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
-| `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" || account_id || device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
+| `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
+| `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
 | File path | `<account_dir>/audit-<engine_id>.jsonl`. | Listed and uploaded by app APIs. |
 
 The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<dir>/audit-<engine_id>.jsonl`.
@@ -912,9 +912,10 @@ Recommended parser behavior:
 
 - Require `schema_version == "marmot-forensics-audit/v1"` for the current parser.
 - Preserve the raw JSON line even when normalizing fields into columns.
-- Do not assume `seq` is globally unique.
-- Do not assume every line has `account_ref` or `group_ref`.
-- Do not assume every schema variant is currently emitted in production. `rejection` is defined but inactive today.
+- Do not assume the following:
+  - `seq` is globally unique.
+  - every line has `account_ref` or `group_ref`.
+  - every schema variant is currently emitted in production; `rejection` is defined but inactive today.
 - Treat unknown future `kind.type` values as parser-version mismatches unless the analyzer is explicitly designed for
   forward-compatible raw retention.
 

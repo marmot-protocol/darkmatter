@@ -22,8 +22,8 @@ runtime. It complements the policy docs:
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `dm relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
 | Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, account reconcile/open/sync/catch-up, one-sided outbound message send, and media upload/download. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
-| Opt-in telemetry export | Implemented and off by default. Requires persisted opt-in settings plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
-| Engine reorg telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg counters/histograms. Exposed by `Engine::engine_metrics()`. The relay-plane/export structs have an optional seam for it, but the periodic runtime exporter currently passes `None`. | No via the runtime exporter today. Can be exported only if a caller explicitly folds a snapshot into the rollup/batch. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
+| Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
+| Engine reorg telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg counters/histograms. Exposed by `Engine::engine_metrics()`. The relay-plane/export structs have an optional seam for it, but the periodic runtime exporter currently passes `None`. | No via the runtime exporter today. Engine metrics can be exported only if a caller explicitly folds a snapshot into the rollup/batch. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
 
 ## Source map
@@ -278,7 +278,7 @@ The UniFFI bridge exposes:
 ## Export gate
 
 `RelayTelemetryExportConfig::export_allowed()` must be true before the exporter can be constructed or relay labels can
-be resolved. The gate requires all of the following:
+be resolved. The gate requires all the following:
 
 - `enabled == true`;
 - an endpoint is configured;
@@ -417,7 +417,7 @@ Exporter timing:
 - first push happens immediately when `run()` starts, unless shutdown was already requested;
 - later pushes happen on the configured interval with jitter up to half the interval, capped at `10s`;
 - `export_once_with_retries()` performs the initial attempt plus up to three retries within one export window;
-- retry base delay is one tenth of the interval, clamped from `50ms` through `1000ms`, then exponentially backed off;
+- retry base delay is one-tenth of the interval, clamped from `50ms` through `1000ms`, then exponentially backed off;
 - HTTP connect timeout is `10s`, request timeout is `30s`;
 - failures are logged with a privacy-safe warning and are not persisted to disk or queued for later.
 
