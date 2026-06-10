@@ -53,6 +53,63 @@ pub struct AppClient {
     pub(crate) state: AccountState,
 }
 
+struct ObservedHumanActionAudit {
+    action: &'static str,
+    fields: Vec<&'static str>,
+    component_ids: Vec<u16>,
+    target_count: Option<u64>,
+    message_ids: Vec<String>,
+    from_epoch: Option<u64>,
+    to_epoch: Option<u64>,
+}
+
+impl ObservedHumanActionAudit {
+    fn source(
+        action: &'static str,
+        fields: Vec<&'static str>,
+        component_ids: Vec<u16>,
+        source_message_id_hex: &str,
+    ) -> Self {
+        Self {
+            action,
+            fields,
+            component_ids,
+            target_count: None,
+            message_ids: vec![source_message_id_hex.to_string()],
+            from_epoch: None,
+            to_epoch: None,
+        }
+    }
+
+    fn messages(
+        action: &'static str,
+        fields: Vec<&'static str>,
+        component_ids: Vec<u16>,
+        message_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            action,
+            fields,
+            component_ids,
+            target_count: None,
+            message_ids,
+            from_epoch: None,
+            to_epoch: None,
+        }
+    }
+
+    fn with_target_count(mut self, target_count: u64) -> Self {
+        self.target_count = Some(target_count);
+        self
+    }
+
+    fn with_epoch_range(mut self, from_epoch: Option<u64>, to_epoch: Option<u64>) -> Self {
+        self.from_epoch = from_epoch;
+        self.to_epoch = to_epoch;
+        self
+    }
+}
+
 impl AppClient {
     fn local_human_action_context(
         action: impl Into<String>,
@@ -1772,13 +1829,13 @@ impl AppClient {
             cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
                 self.record_observed_human_action(
                     group_id,
-                    "create_group",
-                    vec!["membership"],
-                    Vec::new(),
-                    Some(1),
-                    source_message_id_hex,
-                    None,
-                    None,
+                    ObservedHumanActionAudit::source(
+                        "create_group",
+                        vec!["membership"],
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_target_count(1),
                 );
             }
             cgka_traits::engine::GroupEvent::GroupJoined {
@@ -1786,63 +1843,63 @@ impl AppClient {
                 via_welcome,
                 ..
             } => {
-                self.record_observed_human_action_with_messages(
+                self.record_observed_human_action(
                     group_id,
-                    "group_joined",
-                    vec!["membership"],
-                    Vec::new(),
-                    Some(1),
-                    vec![hex::encode(via_welcome.as_slice())],
-                    None,
-                    None,
+                    ObservedHumanActionAudit::messages(
+                        "group_joined",
+                        vec!["membership"],
+                        Vec::new(),
+                        vec![hex::encode(via_welcome.as_slice())],
+                    )
+                    .with_target_count(1),
                 );
             }
             cgka_traits::engine::GroupEvent::MemberAdded { group_id, .. } => {
                 self.record_observed_human_action(
                     group_id,
-                    "invite_members",
-                    vec!["members"],
-                    Vec::new(),
-                    Some(1),
-                    source_message_id_hex,
-                    None,
-                    None,
+                    ObservedHumanActionAudit::source(
+                        "invite_members",
+                        vec!["members"],
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_target_count(1),
                 );
             }
             cgka_traits::engine::GroupEvent::MemberRemoved { group_id, .. } => {
                 self.record_observed_human_action(
                     group_id,
-                    "remove_members",
-                    vec!["members"],
-                    Vec::new(),
-                    Some(1),
-                    source_message_id_hex,
-                    None,
-                    None,
+                    ObservedHumanActionAudit::source(
+                        "remove_members",
+                        vec!["members"],
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_target_count(1),
                 );
             }
             cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
-                if let (Some(previous), Some(updated)) = (previous, updated) {
-                    if self.audit_observed_group_projection_delta(
+                if let (Some(previous), Some(updated)) = (previous, updated)
+                    && self.audit_observed_group_projection_delta(
                         group_id,
                         previous,
                         updated,
                         source_message_id_hex,
                         Some(from.0),
                         Some(to.0),
-                    ) {
-                        return;
-                    }
+                    )
+                {
+                    return;
                 }
                 self.record_observed_human_action(
                     group_id,
-                    "epoch_changed",
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    source_message_id_hex,
-                    Some(from.0),
-                    Some(to.0),
+                    ObservedHumanActionAudit::source(
+                        "epoch_changed",
+                        Vec::new(),
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_epoch_range(Some(from.0), Some(to.0)),
                 );
             }
             _ => {}
@@ -1869,13 +1926,13 @@ impl AppClient {
         if !profile_fields.is_empty() {
             self.record_observed_human_action(
                 group_id,
-                "update_group_profile",
-                profile_fields,
-                vec![GROUP_PROFILE_COMPONENT_ID],
-                None,
-                source_message_id_hex,
-                from_epoch,
-                to_epoch,
+                ObservedHumanActionAudit::source(
+                    "update_group_profile",
+                    profile_fields,
+                    vec![GROUP_PROFILE_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
             );
             recorded = true;
         }
@@ -1897,114 +1954,87 @@ impl AppClient {
                 .abs_diff(updated.admin_policy.admins.len());
             self.record_observed_human_action(
                 group_id,
-                action,
-                vec!["admins"],
-                vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
-                Some(delta.max(1) as u64),
-                source_message_id_hex,
-                from_epoch,
-                to_epoch,
+                ObservedHumanActionAudit::source(
+                    action,
+                    vec!["admins"],
+                    vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_target_count(delta.max(1) as u64)
+                .with_epoch_range(from_epoch, to_epoch),
             );
             recorded = true;
         }
         if previous.message_retention.data_hex != updated.message_retention.data_hex {
             self.record_observed_human_action(
                 group_id,
-                "update_message_retention",
-                vec!["message_retention"],
-                vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID],
-                None,
-                source_message_id_hex,
-                from_epoch,
-                to_epoch,
+                ObservedHumanActionAudit::source(
+                    "update_message_retention",
+                    vec!["message_retention"],
+                    vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
             );
             recorded = true;
         }
         if previous.avatar_url.data_hex != updated.avatar_url.data_hex {
             self.record_observed_human_action(
                 group_id,
-                "update_group_avatar_url",
-                vec!["avatar_url"],
-                vec![GROUP_AVATAR_URL_COMPONENT_ID],
-                None,
-                source_message_id_hex,
-                from_epoch,
-                to_epoch,
+                ObservedHumanActionAudit::source(
+                    "update_group_avatar_url",
+                    vec!["avatar_url"],
+                    vec![GROUP_AVATAR_URL_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
             );
             recorded = true;
         }
         if previous.image.data_hex != updated.image.data_hex {
             self.record_observed_human_action(
                 group_id,
-                "update_group_image",
-                vec!["image"],
-                vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
-                None,
-                source_message_id_hex,
-                from_epoch,
-                to_epoch,
+                ObservedHumanActionAudit::source(
+                    "update_group_image",
+                    vec!["image"],
+                    vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
             );
             recorded = true;
         }
         if previous.encrypted_media.data_hex != updated.encrypted_media.data_hex {
             self.record_observed_human_action(
                 group_id,
-                "replace_encrypted_media_blob_endpoints",
-                vec!["encrypted_media"],
-                vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
-                Some(updated.encrypted_media.default_blob_endpoints.len() as u64),
-                source_message_id_hex,
-                from_epoch,
-                to_epoch,
+                ObservedHumanActionAudit::source(
+                    "replace_encrypted_media_blob_endpoints",
+                    vec!["encrypted_media"],
+                    vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_target_count(updated.encrypted_media.default_blob_endpoints.len() as u64)
+                .with_epoch_range(from_epoch, to_epoch),
             );
             recorded = true;
         }
         recorded
     }
 
-    fn record_observed_human_action(
-        &self,
-        group_id: &GroupId,
-        action: &'static str,
-        fields: Vec<&'static str>,
-        component_ids: Vec<u16>,
-        target_count: Option<u64>,
-        source_message_id_hex: &str,
-        from_epoch: Option<u64>,
-        to_epoch: Option<u64>,
-    ) {
-        self.record_observed_human_action_with_messages(
-            group_id,
-            action,
-            fields,
-            component_ids,
-            target_count,
-            vec![source_message_id_hex.to_string()],
-            from_epoch,
-            to_epoch,
+    fn record_observed_human_action(&self, group_id: &GroupId, audit: ObservedHumanActionAudit) {
+        let context = Self::observed_human_action_context(
+            audit.action,
+            audit.fields,
+            audit.component_ids,
+            audit.target_count,
         );
-    }
-
-    fn record_observed_human_action_with_messages(
-        &self,
-        group_id: &GroupId,
-        action: &'static str,
-        fields: Vec<&'static str>,
-        component_ids: Vec<u16>,
-        target_count: Option<u64>,
-        message_ids: Vec<String>,
-        from_epoch: Option<u64>,
-        to_epoch: Option<u64>,
-    ) {
-        let context =
-            Self::observed_human_action_context(action, fields, component_ids, target_count);
         self.record_human_action(
             group_id,
             &context,
             "observed",
-            message_ids,
-            from_epoch,
-            to_epoch,
+            audit.message_ids,
+            audit.from_epoch,
+            audit.to_epoch,
         );
     }
 
