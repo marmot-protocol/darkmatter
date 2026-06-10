@@ -41,6 +41,21 @@ const ACCOUNT_SECRET_FILE: &str = "secret.json";
 const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
 
+/// Persistent home for local Nostr account records and their signing
+/// credentials.
+///
+/// `AccountHome` is **not safe for concurrent mutation**. Methods such as
+/// [`AccountHome::create_account`], [`AccountHome::import_account`], and
+/// [`AccountHome::remove_account`] perform check-then-act sequences over the
+/// filesystem and the secret store (e.g. checking
+/// [`AccountSecretStore::has_secret_for_label`] /
+/// [`AccountSecretStore::has_secret_for_account_id`] before writing or
+/// deleting a credential). Two callers racing those methods can both observe
+/// the pre-state and both proceed, which can produce duplicate writes or
+/// inadvertently drop a credential that is still referenced by another
+/// record. The duplicate-key guard in `write_signing_account_for_label` is
+/// advisory, not atomic; callers needing concurrent access must serialize
+/// mutations externally.
 #[derive(Clone)]
 pub struct AccountHome {
     root: PathBuf,
@@ -64,6 +79,8 @@ pub enum AccountHomeError {
     Hex(#[from] hex::FromHexError),
     #[error("account already exists: {0}")]
     AccountExists(String),
+    #[error("account id is already in use: {0}")]
+    AccountIdInUse(String),
     #[error("unknown account: {0}")]
     UnknownAccount(String),
     #[error("invalid nsec or secret key")]
@@ -382,6 +399,13 @@ impl AccountHome {
     /// with the same account id share a single credential. The shared
     /// credential must outlive this record while another signing record still
     /// depends on it.
+    ///
+    /// This check is advisory: it reads the account list and the secret
+    /// store without taking a lock. Concurrent `remove_account` calls on
+    /// twin records sharing a credential can both observe the other still
+    /// present, decide to preserve the credential, and then both proceed to
+    /// delete it. Callers needing concurrent removal must serialize
+    /// mutations externally; see the `AccountHome` type-level docs.
     fn secret_shared_with_other_record(&self, account: &AccountSummary) -> AccountHomeResult<bool> {
         if !self
             .secret_store
@@ -426,11 +450,15 @@ impl AccountHome {
             return Err(AccountHomeError::AccountExists(label));
         }
         let account_id_hex = keys.public_key().to_hex();
+        // NOTE: this check-then-write is advisory. Concurrent callers can
+        // both observe an empty store and both proceed. See the `AccountHome`
+        // type-level docs; callers needing concurrent imports must serialize
+        // externally.
         if self
             .secret_store
             .has_secret_for_account_id(&account_id_hex)?
         {
-            return Err(AccountHomeError::AccountExists(account_id_hex));
+            return Err(AccountHomeError::AccountIdInUse(account_id_hex));
         }
         let account = AccountSummary {
             label,

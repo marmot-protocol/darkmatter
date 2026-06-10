@@ -12,6 +12,12 @@ use std::os::unix::fs::PermissionsExt;
 /// keychain-backed homes work on headless hosts; `AccountHome` skips its own
 /// platform init when a default store already exists. Tests isolate their
 /// entries through distinct service names.
+///
+/// `AccountHome::initialize_platform_keyring_store` also installs a
+/// `keyring_core::mock::Store` under `#[cfg(test)]`. Whichever path runs
+/// first wins; the other becomes a no-op because of the `get_default_store`
+/// guard. Both code paths use the same process-global mock store, so test
+/// isolation comes from distinct service names rather than separate stores.
 fn install_mock_keyring() {
     static KEYRING_INIT: Once = Once::new();
     KEYRING_INIT.call_once(|| {
@@ -178,7 +184,7 @@ fn account_home_keychain_rejects_second_label_for_same_account_id() {
 
     assert!(matches!(
         home.import_account("label-two", &secret_hex),
-        Err(AccountHomeError::AccountExists(_))
+        Err(AccountHomeError::AccountIdInUse(_))
     ));
 }
 
@@ -207,6 +213,32 @@ fn account_home_keychain_keeps_signing_secret_when_public_twin_record_is_removed
     // key can be imported again.
     home.remove_account("signing").unwrap();
     home.import_account("signing-again", &secret_hex).unwrap();
+}
+
+#[test]
+fn account_home_keychain_keeps_public_twin_when_signing_record_is_removed_first() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let home =
+        AccountHome::open_with_keychain(dir.path(), "com.marmot.test.public-twin-reverse").unwrap();
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let secret_hex = keys.secret_key().to_secret_hex();
+
+    home.add_public_account(&account_id).unwrap();
+    home.import_account("signing", &secret_hex).unwrap();
+
+    // Remove the signing record first; the public twin is independent and
+    // must still be queryable. It carries `local_signing = false` so it
+    // never reaches the keychain.
+    home.remove_account("signing").unwrap();
+    let twin = home.account(&account_id).unwrap();
+    assert_eq!(twin.account_id_hex, account_id);
+    assert!(!twin.local_signing);
+    assert!(matches!(
+        home.load_signing_keys(&account_id),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
 }
 
 #[test]
