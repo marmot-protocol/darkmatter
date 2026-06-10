@@ -246,6 +246,29 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
     );
 }
 
+#[test]
+fn account_home_file_store_keeps_per_label_secrets_for_same_account_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = nostr::Keys::generate();
+    let secret_hex = keys.secret_key().to_secret_hex();
+
+    // Label-keyed stores hold one secret per label, so the same key may be
+    // imported under two labels and each record stays independently removable.
+    home.import_account("label-one", &secret_hex).unwrap();
+    home.import_account("label-two", &secret_hex).unwrap();
+
+    home.remove_account("label-one").unwrap();
+
+    assert_eq!(
+        home.load_signing_keys("label-two")
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        keys.public_key().to_hex()
+    );
+}
+
 #[derive(Default)]
 struct MemorySecretStore {
     keys: Mutex<HashMap<String, String>>,
