@@ -1568,10 +1568,11 @@ fn account_create_rejects_nsec_argv_and_accepts_stdin_secret() {
 #[test]
 fn whitenoise_identity_commands_create_login_and_show_accounts() {
     let home = tempfile::tempdir().expect("tempdir");
-    let relay = test_relay_url();
+    let test_relay = TestRelay::new();
+    let relay = test_relay.url();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let created = run_json(home.path(), &["create-identity"]);
+    let created = run_json_with_relay(home.path(), relay, &["create-identity"]);
     assert_eq!(created["local_signing"], true);
     assert!(created["npub"].as_str().expect("npub").starts_with("npub1"));
     assert_eq!(created["key_package"]["published"], true);

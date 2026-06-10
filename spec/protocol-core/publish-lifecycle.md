@@ -46,6 +46,17 @@ A publish obligation has four protocol-relevant parts:
 
 The exact local representation is implementation-defined.
 
+Group creation is special because there is no existing group recipient set before the group exists.
+
+For one-member group creation, the creation publish obligation has an empty outbound byte set and an empty recipient
+scope. The creator MAY confirm the empty obligation and make the initial state canonical without publishing any group
+message bytes.
+
+For founding creation with initial invitees, the creation publish obligation contains the MLS Welcome deliveries for the
+initial invitees whose KeyPackages were consumed. Its recipient scope is exactly those initial invitees, addressed by the
+active Welcome delivery binding. It does not include a group-message publish of the founding Add commit to existing
+members, because no existing peers can be forked by a missing creation Commit.
+
 ## Auto-commit handling
 
 Policy-generated commits produce publish obligations too.
