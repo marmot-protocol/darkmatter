@@ -1,10 +1,26 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
-use marmot_account::{AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore};
+use marmot_account::{
+    AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSummary,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// Install an in-memory mock as the process-global default keyring store so
+/// keychain-backed homes work on headless hosts; `AccountHome` skips its own
+/// platform init when a default store already exists. Tests isolate their
+/// entries through distinct service names.
+fn install_mock_keyring() {
+    static KEYRING_INIT: Once = Once::new();
+    KEYRING_INIT.call_once(|| {
+        if keyring_core::get_default_store().is_none() {
+            let store = keyring_core::mock::Store::new().expect("create mock keyring store");
+            keyring_core::set_default_store(store);
+        }
+    });
+}
 
 #[test]
 fn account_home_create_lists_and_reopens_generated_account_without_exposing_secret() {
@@ -148,6 +164,85 @@ fn account_home_can_use_an_injected_secret_store() {
             .public_key()
             .to_hex(),
         created.account_id_hex
+    );
+}
+
+#[test]
+fn account_home_keychain_rejects_second_label_for_same_account_id() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_keychain(dir.path(), "com.marmot.test.dup-guard").unwrap();
+    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+
+    home.import_account("label-one", &secret_hex).unwrap();
+
+    assert!(matches!(
+        home.import_account("label-two", &secret_hex),
+        Err(AccountHomeError::AccountExists(_))
+    ));
+}
+
+#[test]
+fn account_home_keychain_keeps_signing_secret_when_public_twin_record_is_removed() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_keychain(dir.path(), "com.marmot.test.public-twin").unwrap();
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let secret_hex = keys.secret_key().to_secret_hex();
+
+    home.add_public_account(&account_id).unwrap();
+    home.import_account("signing", &secret_hex).unwrap();
+
+    home.remove_account(&account_id).unwrap();
+    assert_eq!(
+        home.load_signing_keys("signing")
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        account_id
+    );
+
+    // Removing the last signing record releases the credential, so the same
+    // key can be imported again.
+    home.remove_account("signing").unwrap();
+    home.import_account("signing-again", &secret_hex).unwrap();
+}
+
+#[test]
+fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_keychain(dir.path(), "com.marmot.test.legacy-twin").unwrap();
+    let keys = nostr::Keys::generate();
+    let account_id = keys.public_key().to_hex();
+
+    home.import_account("label-one", &keys.secret_key().to_secret_hex())
+        .unwrap();
+
+    // Homes written before the account-id-aware duplicate guard could hold two
+    // signing records sharing one keychain credential. Recreate that state.
+    let twin = AccountSummary {
+        label: "label-two".to_owned(),
+        account_id_hex: account_id.clone(),
+        local_signing: true,
+    };
+    let twin_dir = dir.path().join("accounts").join(&twin.label);
+    std::fs::create_dir_all(&twin_dir).unwrap();
+    std::fs::write(
+        twin_dir.join("account.json"),
+        serde_json::to_vec(&twin).unwrap(),
+    )
+    .unwrap();
+
+    home.remove_account("label-one").unwrap();
+
+    assert_eq!(
+        home.load_signing_keys("label-two")
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        account_id
     );
 }
 

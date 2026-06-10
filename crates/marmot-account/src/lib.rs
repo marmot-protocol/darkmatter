@@ -99,6 +99,12 @@ struct StoredAccountSecret {
 
 pub trait AccountSecretStore: Send + Sync {
     fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool>;
+    /// Whether the store already holds a credential keyed by account id.
+    /// Stores that key one credential per label never share entries across
+    /// records, so the default reports `false`.
+    fn has_secret_for_account_id(&self, _account_id_hex: &str) -> AccountHomeResult<bool> {
+        Ok(false)
+    }
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()>;
     fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys>;
     fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()>;
@@ -185,6 +191,14 @@ impl KeychainSecretStore {
 impl AccountSecretStore for KeychainSecretStore {
     fn has_secret_for_label(&self, _label: &str) -> AccountHomeResult<bool> {
         Ok(false)
+    }
+
+    fn has_secret_for_account_id(&self, account_id_hex: &str) -> AccountHomeResult<bool> {
+        match self.entry_for_account(account_id_hex)?.get_password() {
+            Ok(_) => Ok(true),
+            Err(keyring_core::Error::NoEntry) => Ok(false),
+            Err(err) => Err(map_keyring_error(err)),
+        }
     }
 
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
@@ -354,12 +368,32 @@ impl AccountHome {
 
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
         let account = self.account(account_ref)?;
-        self.secret_store.remove_secret(&account)?;
+        if !self.secret_shared_with_other_record(&account)? {
+            self.secret_store.remove_secret(&account)?;
+        }
         match fs::remove_dir_all(self.account_dir(&account.label)) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Account-id-keyed stores hold one credential per account id, so records
+    /// with the same account id share a single credential. The shared
+    /// credential must outlive this record while another signing record still
+    /// depends on it.
+    fn secret_shared_with_other_record(&self, account: &AccountSummary) -> AccountHomeResult<bool> {
+        if !self
+            .secret_store
+            .has_secret_for_account_id(&account.account_id_hex)?
+        {
+            return Ok(false);
+        }
+        Ok(self.accounts()?.iter().any(|other| {
+            other.local_signing
+                && other.label != account.label
+                && other.account_id_hex == account.account_id_hex
+        }))
     }
 
     pub fn load_signing_keys(&self, account_ref: &str) -> AccountHomeResult<nostr::Keys> {
@@ -391,9 +425,16 @@ impl AccountHome {
         {
             return Err(AccountHomeError::AccountExists(label));
         }
+        let account_id_hex = keys.public_key().to_hex();
+        if self
+            .secret_store
+            .has_secret_for_account_id(&account_id_hex)?
+        {
+            return Err(AccountHomeError::AccountExists(account_id_hex));
+        }
         let account = AccountSummary {
             label,
-            account_id_hex: keys.public_key().to_hex(),
+            account_id_hex,
             local_signing: true,
         };
         self.secret_store.write_secret(&account, keys)?;
