@@ -44,22 +44,34 @@ pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
 /// Persistent home for local Nostr account records and their signing
 /// credentials.
 ///
-/// `AccountHome` is **not safe for concurrent mutation**. Methods such as
-/// [`AccountHome::create_account`], [`AccountHome::import_account`], and
-/// [`AccountHome::remove_account`] perform check-then-act sequences over the
-/// filesystem and the secret store (e.g. checking
+/// `AccountHome` is **not safe for arbitrary concurrent mutation**.
+/// Methods such as [`AccountHome::create_account`] and
+/// [`AccountHome::import_account`] perform check-then-act sequences over
+/// the filesystem and the secret store (e.g. checking
 /// [`AccountSecretStore::has_secret_for_label`] /
-/// [`AccountSecretStore::has_secret_for_account_id`] before writing or
-/// deleting a credential). Two callers racing those methods can both observe
-/// the pre-state and both proceed, which can produce duplicate writes or
-/// inadvertently drop a credential that is still referenced by another
-/// record. The duplicate-key guard in `write_signing_account_for_label` is
-/// advisory, not atomic; callers needing concurrent access must serialize
+/// [`AccountSecretStore::has_secret_for_account_id`] before writing a
+/// credential). Two callers racing those methods can both observe the
+/// pre-state and both proceed, which can produce duplicate writes. The
+/// duplicate-key guard in `write_signing_account_for_label` is advisory,
+/// not atomic; callers needing concurrent imports must serialize
 /// mutations externally.
+///
+/// [`AccountHome::remove_account`] is the exception: it holds an internal
+/// mutation lock across its shared-credential check and the matching
+/// `remove_secret` call, so concurrent `remove_account` calls on twin
+/// records sharing a credential cannot both skip deletion and orphan it.
 #[derive(Clone)]
 pub struct AccountHome {
     root: PathBuf,
     secret_store: Arc<dyn AccountSecretStore>,
+    /// Serializes mutating operations whose check-then-act sequences would
+    /// otherwise race against concurrent callers. Currently held by
+    /// [`AccountHome::remove_account`] to make the
+    /// `secret_shared_with_other_record` check and the matching
+    /// `remove_secret` call atomic, so two concurrent removals on twin
+    /// records cannot both observe the other as still present and skip
+    /// deleting the shared credential.
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +276,7 @@ impl AccountHome {
         Self {
             secret_store: Arc::new(LocalFileSecretStore::new(&root)),
             root,
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -286,6 +299,7 @@ impl AccountHome {
         Self {
             root: root.as_ref().to_path_buf(),
             secret_store,
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -384,6 +398,14 @@ impl AccountHome {
     }
 
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
+        // Hold the mutation lock across the shared-credential check and
+        // the matching `remove_secret` call so two concurrent removals on
+        // twin records cannot both observe the other as still present,
+        // both skip deletion, and orphan the shared credential.
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let account = self.account(account_ref)?;
         if !self.secret_shared_with_other_record(&account)? {
             self.secret_store.remove_secret(&account)?;
@@ -400,12 +422,10 @@ impl AccountHome {
     /// credential must outlive this record while another signing record still
     /// depends on it.
     ///
-    /// This check is advisory: it reads the account list and the secret
-    /// store without taking a lock. Concurrent `remove_account` calls on
-    /// twin records sharing a credential can both observe the other still
-    /// present, decide to preserve the credential, and then both proceed to
-    /// delete it. Callers needing concurrent removal must serialize
-    /// mutations externally; see the `AccountHome` type-level docs.
+    /// This helper is only safe when the caller already holds
+    /// `AccountHome::mutation_lock`, which serializes the check against
+    /// concurrent removals on twin records. See
+    /// [`AccountHome::remove_account`].
     fn secret_shared_with_other_record(&self, account: &AccountSummary) -> AccountHomeResult<bool> {
         if !self
             .secret_store
