@@ -324,6 +324,7 @@ impl AppClient {
         self.add_group(&group_id)?;
         self.sync_runtime_groups().await?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(group_id)
     }
 
@@ -424,6 +425,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         let summary = send_summary_from_effects(&effects);
         self.publish_notification_trigger_best_effort(
             group_id,
@@ -467,6 +469,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -502,6 +505,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -605,6 +609,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -640,6 +645,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -693,6 +699,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -736,6 +743,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -903,6 +911,7 @@ impl AppClient {
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         if notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,
@@ -1386,6 +1395,7 @@ impl AppClient {
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(summary)
     }
 
@@ -1569,6 +1579,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -1638,6 +1649,7 @@ impl AppClient {
             GroupConfirmationProjection::Preserve,
         );
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
@@ -2430,19 +2442,24 @@ impl AppClient {
             let event_id = hex::encode(report.message_id.as_slice());
             remember_seen_event(&mut self.state, event_id);
         }
-        // Synthesize durable kind-1210 system rows for our own authenticated
-        // state changes ("you added Bob", "you renamed the group"). Best-effort:
-        // the rows persist and are queued for the runtime worker to broadcast
-        // as `ProjectionUpdated` timeline deltas.
-        //
+    }
+
+    /// Persist and queue kind-1210 system rows for our own authenticated commits.
+    /// Call only after the caller's final fallible persistence step succeeds so
+    /// failed commands do not leave stale buffered timeline updates.
+    fn queue_own_group_system_projection_updates(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
         // Gate on having published a commit: own send paths always carry a
         // report, while reportless paths (e.g. convergence retry) re-emit the
         // same changes unattributed. Those are already synthesized — attributed —
         // on the inbound path, so skipping here avoids a duplicate, actor-less row.
-        if !effects.reports.is_empty() {
-            self.pending_projection_updates
-                .extend(self.project_group_system_rows(&effects.events, unix_now_seconds()));
+        if effects.reports.is_empty() {
+            return;
         }
+        self.pending_projection_updates
+            .extend(self.project_group_system_rows(&effects.events, unix_now_seconds()));
     }
 
     pub(crate) fn take_pending_projection_updates(&mut self) -> Vec<crate::AppProjectionUpdate> {
@@ -2476,11 +2493,12 @@ impl AppClient {
                     recorded_at,
                 ) {
                     Ok(projection) => projection,
-                    Err(err) => {
+                    Err(_err) => {
                         tracing::warn!(
                             target: "marmot_app::groups",
                             method = "project_group_system_rows",
-                            "failed to build group system row: {err}",
+                            error_code = "projection_build_failed",
+                            "failed to build group system row",
                         );
                         continue;
                     }
@@ -2490,11 +2508,12 @@ impl AppClient {
                     .record_account_app_event(&self.state.label, &projection)
                 {
                     Ok(update) => updates.push(update),
-                    Err(err) => {
+                    Err(_err) => {
                         tracing::warn!(
                             target: "marmot_app::groups",
                             method = "project_group_system_rows",
-                            "failed to project group system row: {err}",
+                            error_code = "projection_apply_failed",
+                            "failed to project group system row",
                         );
                     }
                 }
