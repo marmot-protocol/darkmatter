@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_control::{
-    AgentControlAccount, AgentControlDebugFinalSend, AgentControlEnvelope, AgentControlError,
-    AgentControlEvent, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccount, AgentControlDebugFinalSend,
+    AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
+    AgentControlResponse, read_envelope, write_frame,
 };
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
 use cgka_traits::app_event::{
@@ -1510,19 +1511,19 @@ fn control_event_from_runtime_event(
 ) -> Option<AgentControlEvent> {
     match event {
         MarmotAppEvent::MessageReceived(update) => {
+            // Only kind-9 chat/media is conversational input. Edits, reactions,
+            // deletes, and telemetry need explicit control semantics before they
+            // can safely influence an agent prompt.
             if update.message.kind != MARMOT_APP_EVENT_KIND_CHAT {
                 return None;
             }
-            let group_id_hex = hex::encode(update.message.group_id.as_slice());
-            if !inbound_filter_matches(
+            let group_id_hex = inbound_event_group_id_hex(
                 account_filter,
                 &update.account_id_hex,
                 group_filter,
-                &group_id_hex,
-            ) || update.message.sender == update.account_id_hex
-            {
-                return None;
-            }
+                &update.message.group_id,
+                &update.message.sender,
+            )?;
             Some(AgentControlEvent::InboundMessage {
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
@@ -1535,16 +1536,13 @@ fn control_event_from_runtime_event(
             if update.message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
                 return None;
             }
-            let group_id_hex = hex::encode(update.message.group_id.as_slice());
-            if !inbound_filter_matches(
+            let group_id_hex = inbound_event_group_id_hex(
                 account_filter,
                 &update.account_id_hex,
                 group_filter,
-                &group_id_hex,
-            ) || update.message.sender == update.account_id_hex
-            {
-                return None;
-            }
+                &update.message.group_id,
+                &update.message.sender,
+            )?;
             let stream_id_hex = update
                 .message
                 .tags
@@ -1556,7 +1554,7 @@ fn control_event_from_runtime_event(
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
                 stream_id_hex,
-                status: "started".to_owned(),
+                status: AGENT_CONTROL_STREAM_STATUS_STARTED.to_owned(),
             })
         }
         MarmotAppEvent::GroupEvent(group_event) => match group_event.event {
@@ -1611,6 +1609,23 @@ fn control_event_from_debug_event(
     };
     inbound_filter_matches(account_filter, account_id_hex, group_filter, group_id_hex)
         .then_some(event)
+}
+
+fn inbound_event_group_id_hex(
+    account_filter: Option<&str>,
+    account_id_hex: &str,
+    group_filter: Option<&str>,
+    group_id: &GroupId,
+    sender_account_id_hex: &str,
+) -> Option<String> {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    if inbound_filter_matches(account_filter, account_id_hex, group_filter, &group_id_hex)
+        && sender_account_id_hex != account_id_hex
+    {
+        Some(group_id_hex)
+    } else {
+        None
+    }
 }
 
 fn inbound_filter_matches(
@@ -2194,8 +2209,8 @@ fn validate_profile_name(value: String) -> Result<String, ConnectorError> {
 #[cfg(test)]
 mod tests {
     use agent_control::{
-        AgentControlEnvelope, AgentControlEvent, AgentControlRequest, AgentControlResponse,
-        read_envelope, write_frame,
+        AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
+        AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
     };
     use cgka_traits::MessageId;
     use cgka_traits::agent_text_stream::{
@@ -2337,7 +2352,7 @@ mod tests {
         assert_eq!(account_id_hex, agent_account_id_hex);
         assert_eq!(group_id_hex, "22".repeat(32));
         assert_eq!(event_stream_id_hex, stream_id_hex);
-        assert_eq!(status, "started");
+        assert_eq!(status, AGENT_CONTROL_STREAM_STATUS_STARTED);
     }
 
     #[tokio::test]
