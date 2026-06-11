@@ -462,18 +462,38 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_accepts_frame_at_the_cap_boundary() {
-        // A frame exactly at the cap (including its trailing newline) must still
-        // round-trip; the read-side limit allows one byte past the cap precisely so
-        // a legal max-size frame is not truncated.
-        let request = AgentControlEnvelope::request(
-            Some("req-boundary".to_owned()),
-            AgentControlRequest::AccountList,
-        );
+        // A frame whose encoded line is exactly MAX_AGENT_CONTROL_FRAME_BYTES
+        // (including its trailing newline) must still round-trip; the read-side
+        // limit allows one byte past the cap precisely so a legal max-size frame
+        // is not truncated. We pad `append_text` with ASCII bytes (which serde
+        // serializes 1:1 with no escaping) so we can hit the cap to the byte.
+        let make = |append_text: String| {
+            AgentControlEnvelope::request(
+                Some("req-boundary".to_owned()),
+                AgentControlRequest::StreamAppend {
+                    stream_id_hex:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    append_text,
+                },
+            )
+        };
+        // Measure the frame size with an empty body, then pad the body so the
+        // total encoded length (JSON + trailing newline) is exactly the cap.
+        let base_len = encode_frame(&make(String::new())).unwrap().len();
+        assert!(base_len < MAX_AGENT_CONTROL_FRAME_BYTES);
+        let padding = MAX_AGENT_CONTROL_FRAME_BYTES - base_len;
+        let request = make("a".repeat(padding));
+
         let mut encoded = encode_frame(&request).unwrap();
         assert!(encoded.ends_with(b"\n"));
-        assert!(encoded.len() <= MAX_AGENT_CONTROL_FRAME_BYTES);
-        // Pad with trailing data after the newline to prove read_frame stops at the
-        // first newline and does not over-read into a following frame.
+        assert_eq!(
+            encoded.len(),
+            MAX_AGENT_CONTROL_FRAME_BYTES,
+            "boundary frame must encode to exactly the cap"
+        );
+        // Append a following frame's bytes to prove read_frame stops at the first
+        // newline and does not over-read past the cap into trailing data.
         encoded.extend_from_slice(b"trailing");
         let mut reader = BufReader::new(std::io::Cursor::new(encoded));
 
