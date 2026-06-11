@@ -78,7 +78,10 @@ pub enum BootstrapError {
     #[error("multiple local signing accounts exist; pass --account-id-hex ({0})")]
     MultipleAccounts(String),
     #[error("expected {expected} response, got {actual}")]
-    UnexpectedResponse { expected: &'static str, actual: String },
+    UnexpectedResponse {
+        expected: &'static str,
+        actual: String,
+    },
     #[error("control response id mismatch")]
     ResponseIdMismatch,
     #[error("{code}: {message}")]
@@ -245,7 +248,10 @@ async fn bootstrap_agent_account(
                 ..
             } = published.payload
             else {
-                return Err(unexpected_response("key_package_published", &published.payload));
+                return Err(unexpected_response(
+                    "key_package_published",
+                    &published.payload,
+                ));
             };
             key_package_bytes = Some(bytes);
         }
@@ -330,7 +336,8 @@ fn select_account<'a>(
 
 pub fn normalize_account_id_hex(value: &str) -> Result<String, BootstrapError> {
     let normalized = value.trim().to_ascii_lowercase();
-    let raw = hex::decode(&normalized).map_err(|_| BootstrapError::InvalidAccountIdHex(value.to_owned()))?;
+    let raw = hex::decode(&normalized)
+        .map_err(|_| BootstrapError::InvalidAccountIdHex(value.to_owned()))?;
     if raw.len() != 32 {
         return Err(BootstrapError::InvalidAccountIdLength(raw.len()));
     }
@@ -371,10 +378,7 @@ fn ensure_response_type(
     Ok(())
 }
 
-fn unexpected_response(
-    expected: &'static str,
-    response: &AgentControlResponse,
-) -> BootstrapError {
+fn unexpected_response(expected: &'static str, response: &AgentControlResponse) -> BootstrapError {
     BootstrapError::UnexpectedResponse {
         expected,
         actual: response_type_name(response).to_owned(),
@@ -494,7 +498,9 @@ pub fn read_bootstrap_auth_token(
 
     let explicit_env = std::env::var_os("MARMOT_AGENT_AUTH_TOKEN_FILE").map(PathBuf::from);
     let explicit_path = auth_token_file.or(explicit_env);
-    let token_path = explicit_path.clone().unwrap_or_else(|| home.join("control.token"));
+    let token_path = explicit_path
+        .clone()
+        .unwrap_or_else(|| home.join("control.token"));
     if !token_path.exists() {
         if explicit_path.is_some() {
             return Err(BootstrapError::AuthTokenFileNotFound(token_path));
@@ -505,7 +511,9 @@ pub fn read_bootstrap_auth_token(
         .map_err(|_| BootstrapError::AuthTokenFileNotFound(token_path.clone()))?;
     let token = token.trim().to_owned();
     if token.is_empty() {
-        return Err(BootstrapError::EmptyAuthToken(token_path.display().to_string()));
+        return Err(BootstrapError::EmptyAuthToken(
+            token_path.display().to_string(),
+        ));
     }
     Ok(Some(token))
 }
@@ -520,7 +528,10 @@ pub fn resolve_bootstrap_relays(cli_relays: Vec<String>) -> Vec<String> {
             return parsed;
         }
     }
-    DEFAULT_RELAYS.iter().map(|relay| (*relay).to_owned()).collect()
+    DEFAULT_RELAYS
+        .iter()
+        .map(|relay| (*relay).to_owned())
+        .collect()
 }
 
 pub fn resolve_bootstrap_quic_candidates(
@@ -569,44 +580,48 @@ fn clean_values(values: Vec<String>) -> Vec<String> {
 mod tests {
     use std::sync::Arc;
 
-    use agent_control::{AgentControlEnvelope, AgentControlRequest, AgentControlResponse, write_frame};
+    use agent_control::{
+        AgentControlEnvelope, AgentControlRequest, AgentControlResponse, write_frame,
+    };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;
 
     use super::*;
 
-    const ACCOUNT_ID: &str =
-        "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    const ACCOUNT_ID: &str = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
 
     #[tokio::test]
     async fn bootstrap_creates_agent_account_when_none_exists() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("dm-agent.sock");
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let server = spawn_mock_server(socket_path.clone(), requests.clone(), |request| {
-            match request {
-                AgentControlRequest::AccountList => AgentControlResponse::AccountList {
-                    accounts: Vec::new(),
-                },
-                AgentControlRequest::AccountCreate {
-                    label,
-                    publish_key_package,
-                } => {
-                    assert_eq!(label.as_deref(), Some(DEFAULT_BOOTSTRAP_LABEL));
-                    assert!(publish_key_package);
-                    AgentControlResponse::AccountCreated {
-                        account: AgentControlAccount {
-                            account_id_hex: ACCOUNT_ID.to_owned(),
-                            label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
-                            local_signing: true,
-                        },
+        let server =
+            spawn_mock_server(
+                socket_path.clone(),
+                requests.clone(),
+                |request| match request {
+                    AgentControlRequest::AccountList => AgentControlResponse::AccountList {
+                        accounts: Vec::new(),
+                    },
+                    AgentControlRequest::AccountCreate {
+                        label,
+                        publish_key_package,
+                    } => {
+                        assert_eq!(label.as_deref(), Some(DEFAULT_BOOTSTRAP_LABEL));
+                        assert!(publish_key_package);
+                        AgentControlResponse::AccountCreated {
+                            account: AgentControlAccount {
+                                account_id_hex: ACCOUNT_ID.to_owned(),
+                                label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
+                                local_signing: true,
+                            },
+                        }
                     }
-                }
-                other => panic!("unexpected request: {other:?}"),
-            }
-        })
-        .await;
+                    other => panic!("unexpected request: {other:?}"),
+                },
+            )
+            .await;
 
         let result = run_bootstrap(test_options(socket_path)).await.unwrap();
         server.abort();
@@ -633,26 +648,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("dm-agent.sock");
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let server = spawn_mock_server(socket_path.clone(), requests.clone(), |request| {
-            match request {
-                AgentControlRequest::AccountList => AgentControlResponse::AccountList {
-                    accounts: vec![AgentControlAccount {
-                        account_id_hex: ACCOUNT_ID.to_owned(),
-                        label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
-                        local_signing: true,
-                    }],
-                },
-                AgentControlRequest::AccountPublishKeyPackage { account_id_hex } => {
-                    assert_eq!(account_id_hex, ACCOUNT_ID);
-                    AgentControlResponse::KeyPackagePublished {
-                        account_id_hex: ACCOUNT_ID.to_owned(),
-                        key_package_bytes: 1234,
+        let server =
+            spawn_mock_server(
+                socket_path.clone(),
+                requests.clone(),
+                |request| match request {
+                    AgentControlRequest::AccountList => AgentControlResponse::AccountList {
+                        accounts: vec![AgentControlAccount {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
+                            local_signing: true,
+                        }],
+                    },
+                    AgentControlRequest::AccountPublishKeyPackage { account_id_hex } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        AgentControlResponse::KeyPackagePublished {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            key_package_bytes: 1234,
+                        }
                     }
-                }
-                other => panic!("unexpected request: {other:?}"),
-            }
-        })
-        .await;
+                    other => panic!("unexpected request: {other:?}"),
+                },
+            )
+            .await;
 
         let result = run_bootstrap(test_options(socket_path)).await.unwrap();
         server.abort();
@@ -672,8 +690,10 @@ mod tests {
     async fn bootstrap_honors_repeated_and_csv_quic_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("dm-agent.sock");
-        let server = spawn_mock_server(socket_path.clone(), Arc::new(Mutex::new(Vec::new())), |request| {
-            match request {
+        let server = spawn_mock_server(
+            socket_path.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            |request| match request {
                 AgentControlRequest::AccountList => AgentControlResponse::AccountList {
                     accounts: vec![AgentControlAccount {
                         account_id_hex: ACCOUNT_ID.to_owned(),
@@ -688,8 +708,8 @@ mod tests {
                     }
                 }
                 other => panic!("unexpected request: {other:?}"),
-            }
-        })
+            },
+        )
         .await;
 
         let mut options = test_options(socket_path);
@@ -763,8 +783,7 @@ mod tests {
                 let envelope: AgentControlEnvelope<AgentControlRequest> =
                     agent_control::decode_envelope(&line).unwrap();
                 requests.lock().await.push(envelope.payload.clone());
-                let response =
-                    AgentControlEnvelope::new(envelope.id, handler(envelope.payload));
+                let response = AgentControlEnvelope::new(envelope.id, handler(envelope.payload));
                 write_frame(&mut writer, &response).await.unwrap();
                 writer.shutdown().await.unwrap();
             }

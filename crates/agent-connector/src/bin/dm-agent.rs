@@ -3,10 +3,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use agent_connector::{
-    AgentConnectorConfig, BootstrapOptions, ConnectorError, default_socket_path,
-    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
-    resolve_bootstrap_relays, resolve_bootstrap_socket, run_bootstrap, serve_socket,
-    DEFAULT_BOOTSTRAP_LABEL,
+    AgentConnectorConfig, BootstrapOptions, ConnectorError, DEFAULT_BOOTSTRAP_LABEL,
+    default_socket_path, read_bootstrap_auth_token, resolve_bootstrap_home,
+    resolve_bootstrap_quic_candidates, resolve_bootstrap_relays, resolve_bootstrap_socket,
+    run_bootstrap, serve_socket,
 };
 use clap::{Args, Parser, Subcommand};
 
@@ -72,9 +72,17 @@ struct ServeArgs {
 
 #[derive(Debug, Args)]
 struct BootstrapArgs {
-    #[arg(long, value_name = "PATH", help = "Use this Marmot agent home directory")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Use this Marmot agent home directory"
+    )]
     home: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", help = "Connect to this dm-agent Unix control socket")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Connect to this dm-agent Unix control socket"
+    )]
     socket: Option<PathBuf>,
     #[arg(
         long,
@@ -91,11 +99,7 @@ struct BootstrapArgs {
     account_id_hex: Option<String>,
     #[arg(long, value_name = "TOKEN", help = "Control-plane auth token")]
     auth_token: Option<String>,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Control-plane auth token file"
-    )]
+    #[arg(long, value_name = "PATH", help = "Control-plane auth token file")]
     auth_token_file: Option<PathBuf>,
     #[arg(
         long,
@@ -122,15 +126,9 @@ struct BootstrapArgs {
         help = "Fail instead of creating an account when none exists locally"
     )]
     no_create: bool,
-    #[arg(
-        long,
-        help = "Skip KeyPackage publish or repair during bootstrap"
-    )]
+    #[arg(long, help = "Skip KeyPackage publish or repair during bootstrap")]
     no_publish_key_package: bool,
-    #[arg(
-        long,
-        help = "Render invite URI as a terminal QR code using qrencode"
-    )]
+    #[arg(long, help = "Render invite URI as a terminal QR code using qrencode")]
     qr: bool,
     #[arg(long, help = "Print machine-readable JSON only")]
     json: bool,
@@ -164,9 +162,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         eprintln!("dm-agent: startup failed code=missing_home detail=--home is required");
         return ExitCode::FAILURE;
     };
-    let socket = args
-        .socket
-        .unwrap_or_else(|| default_socket_path(&home));
+    let socket = args.socket.unwrap_or_else(|| default_socket_path(&home));
     let socket_dir_mode = match parse_octal_mode(&args.socket_dir_mode) {
         Ok(mode) => mode,
         Err(message) => {
@@ -210,11 +206,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
 async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
     let home = resolve_bootstrap_home(args.home);
     let socket = resolve_bootstrap_socket(&home, args.socket);
-    let auth_token = match read_bootstrap_auth_token(
-        args.auth_token,
-        args.auth_token_file,
-        &home,
-    ) {
+    let auth_token = match read_bootstrap_auth_token(args.auth_token, args.auth_token_file, &home) {
         Ok(token) => token,
         Err(err) => {
             eprintln!("error: {err}");
@@ -222,11 +214,8 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
         }
     };
     let relays = resolve_bootstrap_relays(args.relay);
-    let quic_candidates = resolve_bootstrap_quic_candidates(
-        args.quic_candidate,
-        args.quic_candidates,
-        args.no_quic,
-    );
+    let quic_candidates =
+        resolve_bootstrap_quic_candidates(args.quic_candidate, args.quic_candidates, args.no_quic);
     let options = BootstrapOptions {
         home,
         socket,

@@ -82,10 +82,9 @@ pub(crate) fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{npub_for_account_id, nprofile_for_account_id};
+    use super::{nprofile_for_account_id, npub_for_account_id};
 
-    const ACCOUNT_ID: &str =
-        "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    const ACCOUNT_ID: &str = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
 
     #[test]
     fn npub_and_nprofile_match_bootstrap_vectors() {
