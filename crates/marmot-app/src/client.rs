@@ -51,6 +51,10 @@ pub struct AppClient {
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) state: AccountState,
+    /// Group-system timeline rows synthesized during the most recent publish
+    /// path. The runtime account worker drains this after each command and
+    /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
+    pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
 }
 
 struct ObservedHumanActionAudit {
@@ -2428,16 +2432,21 @@ impl AppClient {
         }
         // Synthesize durable kind-1210 system rows for our own authenticated
         // state changes ("you added Bob", "you renamed the group"). Best-effort:
-        // the rows persist and surface via the timeline subscription / chat-list
-        // refresh that the GroupStateChanged event already triggers.
+        // the rows persist and are queued for the runtime worker to broadcast
+        // as `ProjectionUpdated` timeline deltas.
         //
         // Gate on having published a commit: own send paths always carry a
         // report, while reportless paths (e.g. convergence retry) re-emit the
         // same changes unattributed. Those are already synthesized — attributed —
         // on the inbound path, so skipping here avoids a duplicate, actor-less row.
         if !effects.reports.is_empty() {
-            let _ = self.project_group_system_rows(&effects.events, unix_now_seconds());
+            self.pending_projection_updates
+                .extend(self.project_group_system_rows(&effects.events, unix_now_seconds()));
         }
+    }
+
+    pub(crate) fn take_pending_projection_updates(&mut self) -> Vec<crate::AppProjectionUpdate> {
+        std::mem::take(&mut self.pending_projection_updates)
     }
 
     /// Synthesize a durable kind-1210 group system row for each
