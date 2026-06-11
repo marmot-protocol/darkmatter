@@ -1112,10 +1112,11 @@ impl AgentConnector {
                     match read {
                         Ok(None) => return Ok(()),
                         Ok(Some(envelope)) => {
+                            let request_type = agent_control_request_type(&envelope.payload);
                             tracing::warn!(
                                 target: "agent_connector",
                                 method = "stream_inbound_events",
-                                request_type = agent_control_request_type(&envelope.payload),
+                                request_type,
                                 "additional request received after SubscribeInbound"
                             );
                             continue;
