@@ -1322,6 +1322,9 @@ impl AllowlistStore {
                         error_code = "corrupt_allowlist_record",
                         "ignoring corrupt allowlist record"
                     );
+                    // The corrupt bytes are unrecoverable; fail closed as deny-all so the
+                    // next successful allowlist update resets the record instead of
+                    // wedging invite policy and control operations on a JSON error.
                     Ok(Self::empty_record(account_id_hex))
                 }
             },
@@ -1347,7 +1350,10 @@ impl AllowlistStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        std::fs::rename(&temp_path, &path)?;
+        if let Err(err) = std::fs::rename(&temp_path, &path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         Self::sync_parent_dir(&self.dir)?;
         Ok(())
