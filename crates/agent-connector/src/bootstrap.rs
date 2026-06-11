@@ -1,7 +1,6 @@
 //! Bootstrap a local Marmot agent account through a running `dm-agent` control socket.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use agent_control::{
@@ -34,8 +33,6 @@ pub struct BootstrapOptions {
     pub quic_candidates: Vec<String>,
     pub create_if_missing: bool,
     pub publish_key_package: bool,
-    pub render_qr: bool,
-    pub json_output: bool,
     pub wait_for_socket: Duration,
     pub request_timeout: Duration,
 }
@@ -92,8 +89,6 @@ pub enum BootstrapError {
     App(#[from] marmot_app::AppError),
     #[error("bootstrap request timed out")]
     RequestTimedOut,
-    #[error("qrencode failed")]
-    QrEncodeFailed,
 }
 
 pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult, BootstrapError> {
@@ -131,18 +126,6 @@ pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult,
         nprofile: nprofile.clone(),
         qr_payload: nprofile,
     };
-
-    if options.json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).map_err(AgentControlError::Json)?
-        );
-    } else {
-        print_human_result(&result);
-        if options.render_qr {
-            render_qr(&result.qr_payload)?;
-        }
-    }
 
     Ok(result)
 }
@@ -400,54 +383,6 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::StreamFinalized { .. } => "stream_finalized",
         AgentControlResponse::DebugRecordedFinals { .. } => "debug_recorded_finals",
     }
-}
-
-fn print_human_result(result: &BootstrapResult) {
-    let action = if result.created { "created" } else { "reused" };
-    println!("Marmot agent bootstrap complete");
-    println!("Status: {action}");
-    println!("Agent label: {}", result.label);
-    println!("Agent account hex: {}", result.account_id_hex);
-    println!("Agent npub: {}", result.npub);
-    println!("Agent nprofile: {}", result.nprofile);
-    println!("Relay(s): {}", result.relays.join(", "));
-    if result.quic_candidates.is_empty() {
-        println!("QUIC candidate(s): none");
-    } else {
-        println!("QUIC candidate(s): {}", result.quic_candidates.join(", "));
-    }
-    if result.key_package_published {
-        println!("KeyPackage: published or repaired");
-    } else {
-        println!("KeyPackage: skipped");
-    }
-    println!("QR payload: {}", result.qr_payload);
-}
-
-fn render_qr(payload: &str) -> Result<(), BootstrapError> {
-    println!();
-    let Some(qrencode) = which_qrencode() else {
-        println!("QR code: qrencode is not installed; use the QR payload above.");
-        return Ok(());
-    };
-    println!("QR code:");
-    let status = Command::new(qrencode)
-        .args(["-t", "ANSIUTF8", payload])
-        .status()
-        .map_err(|_| BootstrapError::QrEncodeFailed)?;
-    if !status.success() {
-        return Err(BootstrapError::QrEncodeFailed);
-    }
-    Ok(())
-}
-
-fn which_qrencode() -> Option<String> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let candidate = dir.join("qrencode");
-            candidate.is_file().then(|| candidate.display().to_string())
-        })
-    })
 }
 
 fn new_request_id() -> String {
@@ -749,8 +684,6 @@ mod tests {
             quic_candidates: vec![DEFAULT_QUIC_CANDIDATE.to_owned()],
             create_if_missing: true,
             publish_key_package: true,
-            render_qr: false,
-            json_output: true,
             wait_for_socket: Duration::from_millis(100),
             request_timeout: Duration::from_secs(1),
         }

@@ -1,12 +1,12 @@
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use agent_connector::{
-    AgentConnectorConfig, BootstrapOptions, ConnectorError, DEFAULT_BOOTSTRAP_LABEL,
-    default_socket_path, read_bootstrap_auth_token, resolve_bootstrap_home,
-    resolve_bootstrap_quic_candidates, resolve_bootstrap_relays, resolve_bootstrap_socket,
-    run_bootstrap, serve_socket,
+    AgentConnectorConfig, BootstrapOptions, BootstrapResult, ConnectorError,
+    DEFAULT_BOOTSTRAP_LABEL, default_socket_path, read_bootstrap_auth_token,
+    resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
+    resolve_bootstrap_socket, run_bootstrap, serve_socket,
 };
 use clap::{Args, Parser, Subcommand};
 
@@ -226,18 +226,88 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
         quic_candidates,
         create_if_missing: !args.no_create,
         publish_key_package: !args.no_publish_key_package,
-        render_qr: args.qr,
-        json_output: args.json,
         wait_for_socket: Duration::from_secs_f64(args.wait_for_socket.max(0.0)),
         request_timeout: Duration::from_secs_f64(args.request_timeout.max(0.0)),
     };
     match run_bootstrap(options).await {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(result) => match write_bootstrap_output(&result, args.json, args.qr) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        },
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn write_bootstrap_output(
+    result: &BootstrapResult,
+    json_output: bool,
+    render_qr: bool,
+) -> Result<(), String> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(result).map_err(|err| err.to_string())?
+        );
+        return Ok(());
+    }
+
+    let action = if result.created { "created" } else { "reused" };
+    println!("Marmot agent bootstrap complete");
+    println!("Status: {action}");
+    println!("Agent label: {}", result.label);
+    println!("Agent account hex: {}", result.account_id_hex);
+    println!("Agent npub: {}", result.npub);
+    println!("Agent nprofile: {}", result.nprofile);
+    println!("Relay(s): {}", result.relays.join(", "));
+    if result.quic_candidates.is_empty() {
+        println!("QUIC candidate(s): none");
+    } else {
+        println!("QUIC candidate(s): {}", result.quic_candidates.join(", "));
+    }
+    if result.key_package_published {
+        println!("KeyPackage: published or repaired");
+    } else {
+        println!("KeyPackage: skipped");
+    }
+    println!("QR payload: {}", result.qr_payload);
+
+    if render_qr {
+        render_bootstrap_qr(&result.qr_payload)?;
+    }
+    Ok(())
+}
+
+fn render_bootstrap_qr(payload: &str) -> Result<(), String> {
+    println!();
+    let Some(qrencode) = which_qrencode() else {
+        println!("QR code: qrencode is not installed; use the QR payload above.");
+        return Ok(());
+    };
+    println!("QR code:");
+    let status = Command::new(qrencode)
+        .args(["-t", "ANSIUTF8", payload])
+        .status()
+        .map_err(|err| format!("failed to run qrencode: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("qrencode failed".to_owned())
+    }
+}
+
+fn which_qrencode() -> Option<String> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join("qrencode");
+            candidate.is_file().then(|| candidate.display().to_string())
+        })
+    })
 }
 
 fn safe_error_message(err: &ConnectorError) -> String {
