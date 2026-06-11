@@ -35,6 +35,56 @@ const INLINE_SPECIAL: [bool; 128] = {
     t
 };
 
+/// Maximum inline emphasis / strong / strikethrough (and link/image) nesting
+/// depth the tokenizer will build. The analogue of [`crate::MAX_CONTAINER_DEPTH`]
+/// for inline content. Delimiter runs that would nest past this depth are left
+/// as literal text.
+///
+/// This bounds the recursion depth of every consumer that walks the inline
+/// tree — the derived `serde` (de)serialization, the `marmot-uniffi` `From`
+/// conversions, and `coalesce_text_runs` — so that hostile input cannot drive
+/// any of them into a stack-overflow abort (a fatal, uncatchable crash). See
+/// darkmatter#208.
+pub(crate) const MAX_INLINE_NESTING_DEPTH: usize = 96;
+
+/// Returns `true` if any inline in `items` is nested at least `cap` levels
+/// deep, counting the items in `items` themselves as level 1.
+///
+/// Iterative, explicit-stack walk that prunes as soon as the cap is reached,
+/// so it is cheap (`O(cap)`) on the hostile single-chain input and — unlike a
+/// recursive walk — cannot itself overflow the stack.
+fn nesting_depth_at_least(items: &[Inline], cap: usize) -> bool {
+    if cap == 0 {
+        return true;
+    }
+    if cap == 1 {
+        return !items.is_empty();
+    }
+    // Each frame: (slice, next index into slice, depth of this slice's items).
+    let mut stack: Vec<(&[Inline], usize, usize)> = vec![(items, 0, 1)];
+    while let Some(&mut (slice, ref mut idx, depth)) = stack.last_mut() {
+        if *idx >= slice.len() {
+            stack.pop();
+            continue;
+        }
+        let item = &slice[*idx];
+        *idx += 1;
+        let children = match item {
+            Inline::Emph(c) | Inline::Strong(c) | Inline::Strikethrough(c) => Some(c.as_slice()),
+            Inline::Link { children, .. } => Some(children.as_slice()),
+            Inline::Image { alt, .. } => Some(alt.as_slice()),
+            _ => None,
+        };
+        if let Some(children) = children {
+            if depth + 1 >= cap {
+                return true;
+            }
+            stack.push((children, 0, depth + 1));
+        }
+    }
+    false
+}
+
 pub(crate) fn parse_inlines(blocks: Vec<Block>, refs: &HashMap<String, LinkRef>) -> Document {
     Document {
         blocks: walk_blocks(blocks, refs),
@@ -1141,6 +1191,27 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut Vec<BracketDelim>, stack
             // closer.out_pos.
             let drain_start = opener.out_pos + 1;
             let drain_end = closer.out_pos;
+
+            // Depth guard (darkmatter#208). Wrapping these children produces a
+            // node one level deeper than the deepest child. If that would push
+            // the inline tree past MAX_INLINE_NESTING_DEPTH, refuse the pairing
+            // and leave the closer's delimiter run as literal text — exactly
+            // the "no opener found" fallback below. This bounds the recursion
+            // depth of every consumer that later walks the tree (serde,
+            // marmot-uniffi conversions, coalesce_text_runs), none of which can
+            // then be driven into a stack-overflow abort. The probe is an
+            // iterative, early-pruning O(cap) walk, so it neither overflows nor
+            // costs anything on ordinary input.
+            if nesting_depth_at_least(&out[drain_start..drain_end], MAX_INLINE_NESTING_DEPTH) {
+                openers_bottom.insert(key, closer_idx);
+                if !closer.can_open {
+                    delims.remove(closer_idx);
+                    continue;
+                }
+                closer_idx += 1;
+                continue;
+            }
+
             let children: Vec<Inline> = out.drain(drain_start..drain_end).collect();
             // After this drain, all out_pos > drain_start shift by
             // -(drain_end - drain_start).
