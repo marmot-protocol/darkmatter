@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,9 +32,9 @@ use marmot_app::{
     MarmotApp, MarmotAppEvent, MarmotAppRuntime, UserProfileMetadata,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWrite, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
 
 const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
@@ -85,6 +85,7 @@ pub struct AgentConnector {
     debug_final_sends: DebugFinalSendStore,
     streams: StreamSessionStore,
     runtime: MarmotAppRuntime,
+    inbound_catch_up: InboundCatchUpDriver,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
 }
@@ -99,6 +100,7 @@ impl AgentConnector {
             account_home.clone(),
         );
         let runtime = MarmotAppRuntime::new(app);
+        let inbound_catch_up = InboundCatchUpDriver::new(runtime.clone());
         let allowlists = AllowlistStore::new(&config.home);
         let (debug_events, _) = broadcast::channel(1024);
         Ok(Self {
@@ -111,6 +113,7 @@ impl AgentConnector {
             debug_final_sends: DebugFinalSendStore::default(),
             streams: StreamSessionStore::default(),
             runtime,
+            inbound_catch_up,
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
         })
@@ -199,7 +202,13 @@ impl AgentConnector {
         } = request.payload
         {
             return self
-                .stream_inbound_events(request.id, account_id_hex, group_id_hex, &mut write_half)
+                .stream_inbound_events(
+                    request.id,
+                    account_id_hex,
+                    group_id_hex,
+                    &mut reader,
+                    &mut write_half,
+                )
                 .await;
         }
         let response = match self.handle_request(request.payload).await {
@@ -975,19 +984,22 @@ impl AgentConnector {
         Ok(AgentControlResponse::Ack)
     }
 
-    async fn stream_inbound_events<W>(
+    async fn stream_inbound_events<R, W>(
         &self,
         request_id: Option<String>,
         account_id_hex: Option<String>,
         group_id_hex: Option<String>,
+        reader: &mut R,
         writer: &mut W,
     ) -> Result<(), ConnectorError>
     where
+        R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
         let mut runtime_events = self.runtime.subscribe();
         let mut debug_events = self.debug_events.subscribe();
-        if let Err(err) = self.runtime.catch_up_accounts().await {
+        let (mut catch_up_events, _catch_up_subscription) = self.inbound_catch_up.subscribe();
+        if let Err(err) = self.inbound_catch_up.request().await {
             let err = ConnectorError::from(err);
             let response = AgentControlEnvelope::new(
                 request_id,
@@ -998,22 +1010,32 @@ impl AgentConnector {
         }
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
         write_frame(writer, &response).await?;
-        let mut catch_up_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
-            INBOUND_CATCH_UP_INTERVAL,
-        );
-        catch_up_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
-                _ = catch_up_interval.tick() => {
-                    if let Err(err) = self.runtime.catch_up_accounts().await {
-                        let err = ConnectorError::from(err);
-                        let response = AgentControlEnvelope::new(
-                            request_id.clone(),
-                            self.error_response("stream_inbound_events", &err),
-                        );
-                        write_frame(writer, &response).await?;
-                        return Ok(());
+                read = read_envelope(reader) => {
+                    let read: Result<Option<AgentControlEnvelope<AgentControlRequest>>, AgentControlError> = read;
+                    match read {
+                        Ok(None) => return Ok(()),
+                        Ok(Some(_)) => continue,
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                catch_up = catch_up_events.recv() => {
+                    match catch_up {
+                        Ok(InboundCatchUpEvent::Completed)
+                        | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Ok(InboundCatchUpEvent::Failed)
+                        | Err(broadcast::error::RecvError::Closed) => {
+                            let err = ConnectorError::Stream(
+                                "inbound catch-up driver failed".to_owned(),
+                            );
+                            let response = AgentControlEnvelope::new(
+                                request_id.clone(),
+                                self.error_response("stream_inbound_events", &err),
+                            );
+                            write_frame(writer, &response).await?;
+                            return Ok(());
+                        }
                     }
                     continue;
                 }
@@ -1105,6 +1127,103 @@ impl AgentConnector {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InboundCatchUpEvent {
+    Completed,
+    Failed,
+}
+
+#[derive(Clone)]
+struct InboundCatchUpDriver {
+    runtime: MarmotAppRuntime,
+    lock: Arc<AsyncMutex<()>>,
+    events: broadcast::Sender<InboundCatchUpEvent>,
+    started: Arc<AtomicBool>,
+    active: Arc<AtomicU64>,
+}
+
+impl InboundCatchUpDriver {
+    fn new(runtime: MarmotAppRuntime) -> Self {
+        let (events, _) = broadcast::channel(16);
+        Self {
+            runtime,
+            lock: Arc::new(AsyncMutex::new(())),
+            events,
+            started: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn spawn(&self) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
+                INBOUND_CATCH_UP_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if driver.active.load(Ordering::Acquire) == 0 {
+                    driver.started.store(false, Ordering::Release);
+                    if driver.active.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    if driver
+                        .started
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = driver.request().await;
+            }
+        });
+    }
+
+    fn subscribe(
+        &self,
+    ) -> (
+        broadcast::Receiver<InboundCatchUpEvent>,
+        InboundCatchUpSubscription,
+    ) {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.spawn();
+        (
+            self.events.subscribe(),
+            InboundCatchUpSubscription {
+                active: self.active.clone(),
+            },
+        )
+    }
+
+    async fn request(&self) -> Result<(), AppError> {
+        let _guard = self.lock.lock().await;
+        let result = self.runtime.catch_up_accounts().await;
+        let event = if result.is_ok() {
+            InboundCatchUpEvent::Completed
+        } else {
+            InboundCatchUpEvent::Failed
+        };
+        let _ = self.events.send(event);
+        result
+    }
+}
+
+struct InboundCatchUpSubscription {
+    active: Arc<AtomicU64>,
+}
+
+impl Drop for InboundCatchUpSubscription {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
     validate_control_plane_config(&config)?;
     let listener = bind_connector_socket_with_mode(
@@ -1115,7 +1234,23 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     let connector = AgentConnector::open(config)?;
     connector.start().await?;
     loop {
-        let (stream, _peer_addr) = listener.accept().await?;
+        let (stream, _peer_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let connection_error =
+                    connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "serve_socket",
+                    connection_error,
+                    error_code = "accept_error",
+                    error_kind = ?err.kind(),
+                    "accept failed"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let connector = connector.clone();
         tokio::spawn(async move {
             if let Err(err) = connector.handle_connection(stream).await {
@@ -2083,6 +2218,54 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connector_socket_subscribe_terminates_when_client_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
+        .unwrap();
+        let listener = bind_connector_socket(&socket).unwrap();
+        let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+        let subscriber = UnixStream::connect(&socket).await.unwrap();
+        let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
+        let mut subscriber_read = BufReader::new(subscriber_read);
+        let subscribe = AgentControlEnvelope::request(
+            Some("req-disconnect-subscribe".to_owned()),
+            AgentControlRequest::SubscribeInbound {
+                account_id_hex: None,
+                group_id_hex: None,
+            },
+        );
+        write_frame(&mut subscriber_write, &subscribe)
+            .await
+            .unwrap();
+        let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            read_envelope(&mut subscriber_read),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(ack.payload, AgentControlResponse::Ack);
+
+        drop(subscriber_write);
+        drop(subscriber_read);
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("subscribe connection should terminate promptly after client disconnect")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
