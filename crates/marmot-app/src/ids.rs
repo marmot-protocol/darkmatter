@@ -52,18 +52,27 @@ pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::InvalidPublicKey)
 }
 
+fn parse_relay_urls(relays: &[String]) -> Result<Vec<RelayUrl>, AppError> {
+    relays
+        .iter()
+        .map(|relay| {
+            RelayUrl::parse(relay).map_err(|_| AppError::InvalidNostrRouting(relay.clone()))
+        })
+        .collect()
+}
+
+/// Validate relay URL strings before encoding them into invite URIs.
+pub fn validate_relay_urls(relays: &[String]) -> Result<(), AppError> {
+    parse_relay_urls(relays).map(|_| ())
+}
+
 /// Encode a hex account id and relay hints as an `nprofile1…` invite URI.
 pub fn nprofile_for_account_id(
     account_id_hex: &str,
     relays: &[String],
 ) -> Result<String, AppError> {
     let public_key = PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
-    let relay_urls = relays
-        .iter()
-        .map(|relay| {
-            RelayUrl::parse(relay).map_err(|_| AppError::InvalidNostrRouting(relay.clone()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let relay_urls = parse_relay_urls(relays)?;
     Nip19Profile::new(public_key, relay_urls)
         .to_bech32()
         .map_err(|_| AppError::InvalidPublicKey)

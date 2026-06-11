@@ -7,7 +7,7 @@ use agent_control::{
     AgentControlAccount, AgentControlEnvelope, AgentControlError, AgentControlRequest,
     AgentControlResponse, encode_frame, read_envelope,
 };
-use marmot_app::{nprofile_for_account_id, npub_for_account_id};
+use marmot_app::{nprofile_for_account_id, npub_for_account_id, validate_relay_urls};
 use rand::RngCore;
 use serde::Serialize;
 use thiserror::Error;
@@ -81,6 +81,8 @@ pub enum BootstrapError {
     },
     #[error("control response id mismatch")]
     ResponseIdMismatch,
+    #[error("key package published for unexpected account: expected {expected}, got {actual}")]
+    KeyPackageAccountMismatch { expected: String, actual: String },
     #[error("{code}: {message}")]
     ControlRejected { code: String, message: String },
     #[error(transparent)]
@@ -92,6 +94,7 @@ pub enum BootstrapError {
 }
 
 pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult, BootstrapError> {
+    validate_relay_urls(&options.relays)?;
     wait_for_socket(&options.socket, options.wait_for_socket).await?;
     let client = ControlClient::new(
         options.socket.clone(),
@@ -223,12 +226,14 @@ async fn bootstrap_agent_account(
         if options.publish_key_package {
             let account_id_hex = normalize_account_id_hex(&account.account_id_hex)?;
             let published = client
-                .request(AgentControlRequest::AccountPublishKeyPackage { account_id_hex })
+                .request(AgentControlRequest::AccountPublishKeyPackage {
+                    account_id_hex: account_id_hex.clone(),
+                })
                 .await?;
             ensure_response_type(&published, "key_package_published")?;
             let AgentControlResponse::KeyPackagePublished {
+                account_id_hex: echoed_account_id_hex,
                 key_package_bytes: bytes,
-                ..
             } = published.payload
             else {
                 return Err(unexpected_response(
@@ -236,6 +241,13 @@ async fn bootstrap_agent_account(
                     &published.payload,
                 ));
             };
+            let echoed_account_id_hex = normalize_account_id_hex(&echoed_account_id_hex)?;
+            if echoed_account_id_hex != account_id_hex {
+                return Err(BootstrapError::KeyPackageAccountMismatch {
+                    expected: account_id_hex,
+                    actual: echoed_account_id_hex,
+                });
+            }
             key_package_bytes = Some(bytes);
         }
 
@@ -668,6 +680,56 @@ mod tests {
         );
         assert!(result.qr_payload.starts_with("nprofile1"));
         assert!(!result.qr_payload.contains("quic://one"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_invalid_relay_before_account_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = test_options(dir.path().join("dm-agent.sock"));
+        options.relays = vec!["not-a-relay-url".to_owned()];
+
+        let err = run_bootstrap(options).await.unwrap_err();
+        assert!(matches!(
+            err,
+            BootstrapError::App(marmot_app::AppError::InvalidNostrRouting(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_key_package_for_wrong_account() {
+        const OTHER_ACCOUNT: &str =
+            "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b5";
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("dm-agent.sock");
+        let server = spawn_mock_server(
+            socket_path.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            |request| match request {
+                AgentControlRequest::AccountList => AgentControlResponse::AccountList {
+                    accounts: vec![AgentControlAccount {
+                        account_id_hex: ACCOUNT_ID.to_owned(),
+                        label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
+                        local_signing: true,
+                    }],
+                },
+                AgentControlRequest::AccountPublishKeyPackage { .. } => {
+                    AgentControlResponse::KeyPackagePublished {
+                        account_id_hex: OTHER_ACCOUNT.to_owned(),
+                        key_package_bytes: 1234,
+                    }
+                }
+                other => panic!("unexpected request: {other:?}"),
+            },
+        )
+        .await;
+
+        let err = run_bootstrap(test_options(socket_path)).await.unwrap_err();
+        server.abort();
+
+        assert!(matches!(
+            err,
+            BootstrapError::KeyPackageAccountMismatch { .. }
+        ));
     }
 
     fn test_options(socket: PathBuf) -> BootstrapOptions {
