@@ -3295,16 +3295,28 @@ impl MarmotApp {
 
         if salt_path.exists() {
             let salt = read_sqlcipher_salt(&salt_path)?;
-            // A migration marker means a previous salt-migration was interrupted
-            // (process killed between making the salt durable and committing
-            // `PRAGMA rekey`). The salt is durable, so the v2 key is
-            // reproducible; finish or verify the migration before handing the
-            // salt back, otherwise the derived v2 key may not match the on-disk
-            // (still legacy-keyed) database and every open would fail forever.
-            if marker_path.exists() {
+            // The salt is durable, so the v2 key is reproducible. But an existing
+            // on-disk database may not yet honor that key: a migration can have
+            // been interrupted between making the salt durable and committing
+            // `PRAGMA rekey`, leaving the database still legacy-keyed. There are
+            // two shapes of this:
+            //   * a marker is present — an interrupted migration started by the
+            //     crash-safe path below, or
+            //   * NO marker is present, but the database is still legacy-keyed —
+            //     the pre-fix #219 bricked state, where the salt was written
+            //     before the rekey and the process crashed in between. No marker
+            //     was written back then, so a marker check alone never recovers
+            //     these already-bricked accounts.
+            // `finish_interrupted_sqlcipher_migration` probes the v2 key first
+            // (a cheap no-op when the database is already migrated or freshly
+            // v2-keyed) and only re-runs the legacy -> v2 rekey when that probe
+            // fails. Running it on every existing-database open therefore both
+            // finishes interrupted migrations and self-heals the pre-fix bricked
+            // state, without changing behavior for healthy databases.
+            if db_path.exists() {
                 finish_interrupted_sqlcipher_migration(label, keys, db_path, kind, &salt)?;
-                let _ = fs::remove_file(&marker_path);
             }
+            let _ = fs::remove_file(&marker_path);
             return Ok(salt);
         }
 
@@ -6175,6 +6187,78 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "kept");
+    }
+
+    #[test]
+    fn sqlcipher_recovers_pre_fix_bricked_db_with_salt_present_no_marker() {
+        // The pre-fix #219 bricked state: the vulnerable code wrote the salt to
+        // disk and then crashed before `PRAGMA rekey` committed, so the database
+        // is still legacy-keyed. Crucially that code never wrote a migration
+        // marker, so the salt-present branch sees `.salt` with NO `.salt-migrating`
+        // sidecar. A marker-only recovery check would skip these accounts and
+        // they would stay bricked forever. Opening must self-heal: probe the v2
+        // key, find it fails, and re-run the legacy -> v2 rekey.
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let projection_path = app.legacy_account_projection_path("alice");
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+
+        let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
+            "alice",
+            &keys,
+            SqlcipherDatabaseKind::AccountProjection,
+        ))
+        .unwrap();
+        {
+            let conn = Connection::open(&projection_path).unwrap();
+            conn.pragma_update(None, "key", legacy_key.as_secret_str())
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE marker (value TEXT NOT NULL);
+                 INSERT INTO marker (value) VALUES ('kept');",
+            )
+            .unwrap();
+        }
+
+        // Persist the v2 salt but write NO migration marker, exactly as the
+        // pre-fix vulnerable code did before crashing mid-rekey.
+        let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        write_sqlcipher_salt(&sqlcipher_salt_path(&projection_path), &salt).unwrap();
+        assert!(sqlcipher_salt_path(&projection_path).exists());
+        assert!(!sqlcipher_migration_marker_path(&projection_path).exists());
+
+        let recovered_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &projection_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+
+        // The existing salt is kept as the v2 salt and the DB is rekeyed to it,
+        // so data is preserved and the DB opens under the recovered v2 key.
+        let conn = Connection::open(&projection_path).unwrap();
+        conn.pragma_update(None, "key", recovered_key.as_secret_str())
+            .unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+
+        // And the legacy key no longer opens it (the rekey really happened).
+        let conn = Connection::open(&projection_path).unwrap();
+        conn.pragma_update(None, "key", legacy_key.as_secret_str())
+            .unwrap();
+        assert!(
+            conn.query_row("SELECT value FROM marker", [], |row| row
+                .get::<_, String>(0))
+                .is_err()
+        );
     }
 
     #[test]
