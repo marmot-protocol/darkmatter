@@ -85,6 +85,8 @@ fn many_adjacent_emphasis_pairs_do_not_force_quadratic_rewrites() {
     // Regression for a delimiter-stack DoS: before emphasis wrapping used
     // Vec::remove/drain/insert in the inner loop, this ordinary chat message
     // shape took seconds because every `*a*` pair shifted the remaining tail.
+    // Keep this deterministic: output shape is asserted here; linear-time
+    // behavior is covered by the dedicated release repro outside CI.
     let pairs = 16_000;
     let parsed = parse_inlines(&"*a* ".repeat(pairs));
 
