@@ -21,6 +21,25 @@ use storage_sqlite::SqliteAccountStorage;
 mod support;
 use support::proof_signer;
 
+/// True if `events` contains a `GroupStateChanged` departure (removed or left)
+/// for `member`. Accepts either variant because the leave/removed distinction
+/// is path-dependent: the direct inbound seam classifies a SelfRemove as
+/// `MemberLeft`, while a convergence reorg surfaces it as an unattributed
+/// `MemberRemoved`.
+fn emits_departure_of(events: &[cgka_traits::engine::GroupEvent], member: &MemberId) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change:
+                    cgka_traits::engine::GroupStateChange::MemberRemoved { member: m }
+                    | cgka_traits::engine::GroupStateChange::MemberLeft { member: m },
+                ..
+            } if m == member
+        )
+    })
+}
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -366,12 +385,8 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
     alice.confirm_published(pending).await.unwrap();
     let alice_events = alice.drain_events();
     assert!(
-        alice_events.iter().any(|event| matches!(
-            event,
-            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
-                if member == &bob.self_id()
-        )),
-        "alice should emit MemberRemoved after confirm; got {alice_events:?}"
+        emits_departure_of(&alice_events, &bob.self_id()),
+        "alice should emit a departure for bob after confirm; got {alice_events:?}"
     );
 
     let routed_commit = TransportMessage {
@@ -570,12 +585,8 @@ async fn selfremove_full_flow_with_auto_commit() {
     assert!(matches!(outcome, IngestOutcome::Processed));
     let alice_events = alice.drain_events();
     assert!(
-        !alice_events.iter().any(|e| matches!(
-            e,
-            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
-                if member == &bob.self_id()
-        )),
-        "alice must not emit MemberRemoved until auto-commit publish is confirmed; got {alice_events:?}"
+        !emits_departure_of(&alice_events, &bob.self_id()),
+        "alice must not emit a departure until auto-commit publish is confirmed; got {alice_events:?}"
     );
 
     // Alice has a projected pending epoch/member set, but the group is not
@@ -605,12 +616,8 @@ async fn selfremove_full_flow_with_auto_commit() {
     alice.confirm_published(auto.pending).await.unwrap();
     let alice_events = alice.drain_events();
     assert!(
-        alice_events.iter().any(|e| matches!(
-            e,
-            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
-                if member == &bob.self_id()
-        )),
-        "alice should emit MemberRemoved for bob after confirm; got {alice_events:?}"
+        emits_departure_of(&alice_events, &bob.self_id()),
+        "alice should emit a departure for bob after confirm; got {alice_events:?}"
     );
 
     // Bob ingests alice's commit — bob's epoch advances; he sees himself
@@ -628,12 +635,8 @@ async fn selfremove_full_flow_with_auto_commit() {
     assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
     let bob_events = bob.drain_events();
     assert!(
-        bob_events.iter().any(|e| matches!(
-            e,
-            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
-                if member == &bob.self_id()
-        )),
-        "bob should emit MemberRemoved for himself; got {bob_events:?}"
+        emits_departure_of(&bob_events, &bob.self_id()),
+        "bob should emit a departure for himself; got {bob_events:?}"
     );
 }
 
@@ -740,12 +743,8 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
     assert_eq!(members.len(), 3, "publish_failed should restore bob");
     let events = alice.drain_events();
     assert!(
-        !events.iter().any(|event| matches!(
-            event,
-            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
-                if member == &bob.self_id()
-        )),
-        "failed auto-publish must not emit MemberRemoved; got {events:?}"
+        !emits_departure_of(&events, &bob.self_id()),
+        "failed auto-publish must not emit a departure; got {events:?}"
     );
 }
 

@@ -2788,10 +2788,14 @@ fn parse_message(value: &Value) -> Option<MessageRow> {
     {
         return None;
     }
-    let display_text = value
-        .get("agent_text_stream")
-        .and_then(agent_text_stream_summary)
-        .unwrap_or_else(|| plaintext.clone());
+    let display_text = if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
+        group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
+    } else {
+        value
+            .get("agent_text_stream")
+            .and_then(agent_text_stream_summary)
+            .unwrap_or_else(|| plaintext.clone())
+    };
     Some(MessageRow {
         message_id: value_string(value, "message_id").unwrap_or_default(),
         direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
@@ -2830,6 +2834,44 @@ fn cap_message_scrollback(messages: &mut Vec<MessageRow>) {
     }
     let excess = messages.len() - TUI_MESSAGE_SCROLLBACK_LIMIT;
     messages.drain(0..excess);
+}
+
+/// Inner app-event kind for durable group system rows (membership/admin/profile).
+const GROUP_SYSTEM_KIND: u64 = 1210;
+
+/// Friendly one-line rendering of a kind-1210 group system row from its JSON
+/// content, e.g. "alice added bob". Falls back to the embedded `text` field, or
+/// `None` when the content is not a parseable group system event.
+fn group_system_summary(value: &Value, plaintext: &str) -> Option<String> {
+    let content: Value = serde_json::from_str(plaintext).ok()?;
+    let system_type = content.get("system_type").and_then(Value::as_str)?;
+    let data = content.get("data");
+    let actor = non_empty_value_string(value, "from_display_name")
+        .or_else(|| value_string(value, "from").map(|from| shorten(&from, 12)))
+        .unwrap_or_else(|| "someone".to_owned());
+    let subject = data
+        .and_then(|data| data.get("subject"))
+        .and_then(Value::as_str)
+        .map_or_else(|| "someone".to_owned(), |subject| shorten(subject, 12));
+    let name = data
+        .and_then(|data| data.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let summary = match system_type {
+        "member_added" => format!("{actor} added {subject}"),
+        "member_removed" => format!("{actor} removed {subject}"),
+        "member_left" => format!("{actor} left"),
+        "admin_added" => format!("{actor} made {subject} an admin"),
+        "admin_removed" => format!("{actor} removed {subject} as admin"),
+        "group_renamed" => format!("{actor} renamed the group to \"{name}\""),
+        "group_avatar_changed" => format!("{actor} changed the group avatar"),
+        _ => content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or(system_type)
+            .to_owned(),
+    };
+    Some(summary)
 }
 
 fn agent_text_stream_summary(value: &Value) -> Option<String> {
