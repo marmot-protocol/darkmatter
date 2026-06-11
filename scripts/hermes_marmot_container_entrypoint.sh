@@ -11,7 +11,7 @@ fi
 : "${MARMOT_AGENT_AUTH_TOKEN_FILE:=$MARMOT_HOME/control.token}"
 : "${MARMOT_AGENT_SOCKET_DIR_MODE:=0770}"
 : "${MARMOT_AGENT_SOCKET_MODE:=0660}"
-: "${MARMOT_RELAYS:=${MARMOT_RELAY:-wss://relay.eu.whiteniose.chat,wss://relay.us.whitenoise.chat}}"
+: "${MARMOT_RELAYS:=${MARMOT_RELAY:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}}"
 : "${MARMOT_QUIC_CANDIDATES:=quic://quic-broker.ipf.dev:4450}"
 : "${HERMES_MARMOT_AUTO_BOOTSTRAP:=1}"
 : "${HERMES_MARMOT_START_GATEWAY:=1}"

@@ -60,9 +60,10 @@ pub fn nprofile_for_account_id(
     let public_key = PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
     let relay_urls = relays
         .iter()
-        .map(|relay| RelayUrl::parse(relay))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| AppError::InvalidPublicKey)?;
+        .map(|relay| {
+            RelayUrl::parse(relay).map_err(|_| AppError::InvalidNostrRouting(relay.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Nip19Profile::new(public_key, relay_urls)
         .to_bech32()
         .map_err(|_| AppError::InvalidPublicKey)
@@ -97,7 +98,7 @@ mod tests {
         let nprofile = nprofile_for_account_id(
             ACCOUNT_ID,
             &[
-                "wss://relay.eu.whiteniose.chat".to_owned(),
+                "wss://relay.eu.whitenoise.chat".to_owned(),
                 "wss://relay.us.whitenoise.chat".to_owned(),
             ],
         )
@@ -105,7 +106,7 @@ mod tests {
         assert_eq!(
             nprofile,
             "nprofile1qqs25n7gve04d9hr8km7rftjuwc0tv7kzkphkrek9h93eqrgkzvv0dqpremhxue69uhhyetvv9uju\
-             et49emks6t5v4hxjmmnv5hxx6rpwsq3uamnwvaz7tmjv4kxz7fww4ejuamgd96x2mn0d9ek2tnrdpshgjt0jd0"
+             et49emks6t5v4hx76tnv5hxx6rpwsq3uamnwvaz7tmjv4kxz7fww4ejuamgd96x2mn0d9ek2tnrdpshggcu28s"
         );
     }
 }

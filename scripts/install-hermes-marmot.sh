@@ -6,7 +6,7 @@ MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-dm-agent-beta}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 MARMOT_PLUGIN_DIR="${MARMOT_PLUGIN_DIR:-${HOME}/.hermes/plugins/marmot}"
 MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agent}"
-MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whiteniose.chat,wss://relay.us.whitenoise.chat}"
+MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 DM_AGENT_SHA="${DM_AGENT_SHA:-latest}"
 INSTALL_BOOTSTRAP=0
 START_DM_AGENT=0
@@ -258,7 +258,7 @@ Next steps:
   ))
   2. Start the connector:
      export MARMOT_HOME="$MARMOT_HOME"
-     dm-agent --home "\$MARMOT_HOME" --relay wss://relay.eu.whiteniose.chat --relay wss://relay.us.whitenoise.chat
+     dm-agent --home "\$MARMOT_HOME" --relay wss://relay.eu.whitenoise.chat --relay wss://relay.us.whitenoise.chat
   3. Bootstrap or reuse the agent account:
      dm-agent bootstrap --home "\$MARMOT_HOME" --qr
   4. Start Hermes:

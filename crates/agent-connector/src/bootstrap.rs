@@ -17,7 +17,7 @@ use tokio::time::{sleep, timeout};
 
 pub const DEFAULT_BOOTSTRAP_LABEL: &str = "hermes-agent";
 pub const DEFAULT_RELAYS: &[&str] = &[
-    "wss://relay.eu.whiteniose.chat",
+    "wss://relay.eu.whitenoise.chat",
     "wss://relay.us.whitenoise.chat",
 ];
 pub const DEFAULT_QUIC_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";

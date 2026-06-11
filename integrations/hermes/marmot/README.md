@@ -55,7 +55,7 @@ export MARMOT_HOME="$HOME/.marmot-agent"
 export PATH="$HOME/.local/bin:$PATH"
 
 dm-agent --home "$MARMOT_HOME" \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
 dm-agent bootstrap --home "$MARMOT_HOME" --qr
@@ -100,7 +100,7 @@ just hermes-dev-setup --hermes-ref main --print-env
 
 # Include relay and QUIC preview settings for generated helpers.
 just hermes-dev-setup \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
   --quic-candidate quic://quic-broker.ipf.dev:4450 \
   --print-env
@@ -238,7 +238,7 @@ Start the connector first with the same public Nostr relay set the phone uses:
 ```sh
 cargo run -p agent-connector --bin dm-agent -- \
   --home ~/.marmot-agent \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
 
@@ -247,7 +247,7 @@ Bootstrap or reuse the agent account through the running connector:
 ```sh
 dm-agent bootstrap \
   --home ~/.marmot-agent \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
   --qr
 ```
@@ -275,7 +275,7 @@ chmod 0600 ~/.marmot-agent/control.token
 
 cargo run -p agent-connector --bin dm-agent -- \
   --home ~/.marmot-agent \
-  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
   --auth-token-file ~/.marmot-agent/control.token \
   --socket-dir-mode 0770 \
