@@ -2555,6 +2555,13 @@ impl MarmotApp {
         };
         let account_ref_hex = audit_account_ref_hex(account_id);
         let engine_id_hex = audit_engine_id_hex(account_id, &device_id_hex);
+        // Canonicalize the directory so the recorder stores the same path that
+        // `delete_audit_log_file` derives (it canonicalizes its input). A
+        // non-canonical app root — relative, or reached through a symlinked
+        // prefix like macOS `/var` -> `/private/var` — would otherwise make the
+        // live-recorder match fail, so a delete would remove the visible file
+        // while the recorder kept appending to the orphaned inode.
+        let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
         let audit_path = account_dir.join(format!("audit-{engine_id_hex}.jsonl"));
         match marmot_forensics::JsonlRecorder::open_with_account_ref(
             &audit_path,
@@ -3901,11 +3908,27 @@ impl MarmotApp {
                 "audit log file must be named audit-*.jsonl".to_owned(),
             ));
         }
+        // Refuse a symlinked final component. `canonicalize` below resolves it
+        // to its target, so without this an `audit-*.jsonl` symlink could make
+        // us delete (or upload) an unrelated file that merely sits under the app
+        // root — e.g. the shared storage database.
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(AppError::InvalidAuditLogFile(
+                "audit log file must not be a symlink".to_owned(),
+            ));
+        }
         let path = fs::canonicalize(path)?;
         let root = fs::canonicalize(&self.root)?;
         if !path.starts_with(&root) {
             return Err(AppError::InvalidAuditLogFile(
                 "audit log file must be inside the app root".to_owned(),
+            ));
+        }
+        // The resolved target must itself be an audit log file: defense in
+        // depth against a symlinked parent component redirecting us elsewhere.
+        if audit_log_file_name(&path).is_none() {
+            return Err(AppError::InvalidAuditLogFile(
+                "resolved audit log file must be named audit-*.jsonl".to_owned(),
             ));
         }
         Ok(path)
@@ -7331,6 +7354,77 @@ mod tests {
             .audit_log_path()
             .expect("file-backed recorder when enabled");
         assert!(path.exists());
-        assert_eq!(path.parent(), Some(app.account_dir("alice").as_path()));
+        // The recorder stores the canonical path (see below); compare against
+        // the canonical account dir.
+        assert_eq!(
+            path.parent(),
+            Some(
+                std::fs::canonicalize(app.account_dir("alice"))
+                    .unwrap()
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn live_recorder_path_matches_resolved_delete_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        let recorder = app.build_audit_recorder("alice", true);
+        let recorder_path = recorder
+            .audit_log_path()
+            .expect("file-backed recorder when enabled");
+
+        // The live recorder must store the exact path that delete derives from
+        // the host-supplied (dir-relative) path it gets back from
+        // `audit_log_files`. If these differ — e.g. macOS `/var` vs
+        // `/private/var` — the worker would not recognize the live recorder and
+        // a delete would orphan its open append handle.
+        let listed = app
+            .audit_log_files()
+            .unwrap()
+            .into_iter()
+            .find(|file| file.account_ref == "alice")
+            .expect("audit file is listed");
+        let (resolved, owner) = app.resolve_audit_log_path(&listed.path).unwrap();
+        assert_eq!(resolved, recorder_path);
+        assert_eq!(
+            owner.as_deref(),
+            Some(
+                app.account_home()
+                    .account("alice")
+                    .unwrap()
+                    .account_id_hex
+                    .as_str()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_audit_log_path_rejects_symlinked_audit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        // A sensitive non-audit file under the app root.
+        let secret = app.account_dir("alice").join("shared-storage.db");
+        std::fs::write(&secret, b"do-not-delete").unwrap();
+
+        // A symlink with an audit-looking name pointing at it.
+        let link = app.account_dir("alice").join("audit-evil.jsonl");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        // Resolution (and therefore delete) refuses the symlink outright, so the
+        // target is never followed and never removed.
+        assert!(matches!(
+            app.resolve_audit_log_path(&link.to_string_lossy()),
+            Err(AppError::InvalidAuditLogFile(_))
+        ));
+        assert!(secret.exists(), "symlink target must be untouched");
     }
 }
