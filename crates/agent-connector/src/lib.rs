@@ -1076,57 +1076,89 @@ impl AgentConnector {
     where
         W: AsyncWrite + Unpin,
     {
+        // Subscribe BEFORE kicking off catch-up so the drain loop below can run concurrently
+        // with the catch-up flood (GroupJoined + MessageReceived + ProjectionUpdated + ...).
+        // catch_up_accounts() can block for up to APP_RUNTIME_ACCOUNT_READY_WAIT per account; if
+        // it ran inline in this loop the loop would stop draining the bounded broadcast channel
+        // and a reconnect backlog could overflow it, silently and permanently dropping the
+        // oldest inbound messages. Running catch-up in a separate task keeps this loop draining.
         let mut runtime_events = self.runtime.subscribe();
         let mut debug_events = self.debug_events.subscribe();
-        if let Err(err) = self.runtime.catch_up_accounts().await {
-            let err = ConnectorError::from(err);
-            let response = AgentControlEnvelope::new(
-                request_id,
-                self.error_response("stream_inbound_events", &err),
-            );
-            write_frame(writer, &response).await?;
-            return Ok(());
-        }
+
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
         write_frame(writer, &response).await?;
-        let mut catch_up_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
-            INBOUND_CATCH_UP_INTERVAL,
-        );
-        catch_up_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Run the initial + periodic catch-up in a dedicated task. Fatal catch-up errors are
+        // routed back to the drain loop over a channel so the subscription still surfaces them.
+        let (catch_up_err_tx, mut catch_up_errors) = mpsc::channel::<ConnectorError>(1);
+        let catch_up_connector = self.clone();
+        let catch_up_handle = tokio::spawn(async move {
+            // The first `tick()` fires immediately, performing the initial catch-up; subsequent
+            // ticks fire every INBOUND_CATCH_UP_INTERVAL.
+            let mut catch_up_interval = tokio::time::interval(INBOUND_CATCH_UP_INTERVAL);
+            catch_up_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                catch_up_interval.tick().await;
+                if let Err(err) = catch_up_connector.runtime.catch_up_accounts().await {
+                    let _ = catch_up_err_tx.send(ConnectorError::from(err)).await;
+                    return;
+                }
+            }
+        });
+        // Ensure the catch-up task is aborted whenever this connection ends (writer error,
+        // channel closed, etc.) instead of ticking forever for a dropped subscriber.
+        let _catch_up_guard = AbortOnDrop(catch_up_handle);
+
         loop {
             let event = tokio::select! {
-                _ = catch_up_interval.tick() => {
-                    if let Err(err) = self.runtime.catch_up_accounts().await {
-                        let err = ConnectorError::from(err);
+                catch_up_err = catch_up_errors.recv() => {
+                    if let Some(err) = catch_up_err {
                         let response = AgentControlEnvelope::new(
                             request_id.clone(),
                             self.error_response("stream_inbound_events", &err),
                         );
                         write_frame(writer, &response).await?;
-                        return Ok(());
                     }
-                    continue;
+                    return Ok(());
                 }
                 event = runtime_events.recv() => {
-                    let Ok(event) = event else {
-                        continue;
-                    };
-                    control_event_from_runtime_event(
-                        event,
-                        account_id_hex.as_deref(),
-                        group_id_hex.as_deref(),
-                    )
+                    match event {
+                        Ok(event) => control_event_from_runtime_event(
+                            event,
+                            account_id_hex.as_deref(),
+                            group_id_hex.as_deref(),
+                        ),
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            // The broadcast channel overflowed: `dropped` events were evicted
+                            // before we could deliver them and are gone for good (catch-up will
+                            // not re-emit already-broadcast messages). Tell the agent to re-sync
+                            // from its own state instead of silently losing user messages.
+                            tracing::warn!(
+                                target: "agent_connector",
+                                method = "stream_inbound_events",
+                                dropped_events = dropped,
+                                "inbound broadcast lagged; emitting resync_required"
+                            );
+                            Some(resync_required_event(
+                                account_id_hex.as_deref(),
+                                group_id_hex.as_deref(),
+                                dropped,
+                            ))
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
                 }
                 event = debug_events.recv() => {
-                    let Ok(event) = event else {
-                        continue;
-                    };
-                    control_event_from_debug_event(
-                        event,
-                        account_id_hex.as_deref(),
-                        group_id_hex.as_deref(),
-                    )
+                    match event {
+                        Ok(event) => control_event_from_debug_event(
+                            event,
+                            account_id_hex.as_deref(),
+                            group_id_hex.as_deref(),
+                        ),
+                        // Debug channel lag is not user-message loss; skip without resync.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => continue,
+                    }
                 }
             };
             let Some(event) = event else {
@@ -1360,6 +1392,16 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     }
 }
 
+/// Aborts the wrapped task when dropped, so a background catch-up loop does not outlive the
+/// subscription connection that spawned it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn control_event_from_runtime_event(
     event: MarmotAppEvent,
     account_filter: Option<&str>,
@@ -1434,6 +1476,23 @@ fn control_event_from_debug_event(
             group_id_hex,
             ..
         } => (account_id_hex, group_id_hex),
+        // ResyncRequired carries optional account/group scope and is never produced by the
+        // debug-inject path; apply the subscription filters against whatever scope it carries.
+        AgentControlEvent::ResyncRequired {
+            account_id_hex,
+            group_id_hex,
+            ..
+        } => {
+            let account_ok = match (account_filter, account_id_hex.as_deref()) {
+                (Some(filter), Some(value)) => filter == value,
+                _ => true,
+            };
+            let group_ok = match (group_filter, group_id_hex.as_deref()) {
+                (Some(filter), Some(value)) => filter == value,
+                _ => true,
+            };
+            return (account_ok && group_ok).then_some(event);
+        }
     };
     inbound_filter_matches(account_filter, account_id_hex, group_filter, group_id_hex)
         .then_some(event)
@@ -1447,6 +1506,21 @@ fn inbound_filter_matches(
 ) -> bool {
     account_filter.is_none_or(|filter| filter == account_id_hex)
         && group_filter.is_none_or(|filter| filter == group_id_hex)
+}
+
+/// Build a `ResyncRequired` control event scoped to this subscription's filters. Emitted when the
+/// inbound broadcast channel lags and drops events: the dropped inbound messages are gone for good
+/// (catch-up never re-emits already-broadcast messages), so the agent must re-query its own state.
+fn resync_required_event(
+    account_filter: Option<&str>,
+    group_filter: Option<&str>,
+    dropped_events: u64,
+) -> AgentControlEvent {
+    AgentControlEvent::ResyncRequired {
+        account_id_hex: account_filter.map(str::to_owned),
+        group_id_hex: group_filter.map(str::to_owned),
+        dropped_events,
+    }
 }
 
 fn unsupported_request_message(request: &AgentControlRequest) -> &'static str {
@@ -2013,6 +2087,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::time::{Duration, sleep, timeout};
 
+    use crate::{AbortOnDrop, control_event_from_debug_event, resync_required_event};
     use crate::{
         AgentConnector, AgentConnectorConfig, AllowlistRecord, AllowlistStore,
         bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
@@ -3642,5 +3717,90 @@ mod tests {
             }
         }
         panic!("expected inbound message event with text {expected_text:?}");
+    }
+
+    #[test]
+    fn resync_required_event_carries_dropped_count_and_subscription_scope() {
+        // Regression for darkmatter#210: a lagged inbound broadcast must surface a
+        // ResyncRequired event (scoped to the subscription) instead of silently dropping
+        // user messages to the agent.
+        let event = resync_required_event(Some("aa"), Some("bb"), 42);
+        assert_eq!(
+            event,
+            AgentControlEvent::ResyncRequired {
+                account_id_hex: Some("aa".to_owned()),
+                group_id_hex: Some("bb".to_owned()),
+                dropped_events: 42,
+            }
+        );
+
+        // An unscoped subscription leaves the fields None but still reports the drop count.
+        let unscoped = resync_required_event(None, None, 7);
+        assert_eq!(
+            unscoped,
+            AgentControlEvent::ResyncRequired {
+                account_id_hex: None,
+                group_id_hex: None,
+                dropped_events: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn control_event_from_debug_event_passes_resync_required_through_filters() {
+        let resync = AgentControlEvent::ResyncRequired {
+            account_id_hex: Some("aa".to_owned()),
+            group_id_hex: Some("bb".to_owned()),
+            dropped_events: 3,
+        };
+
+        // Matching filters keep the event.
+        assert_eq!(
+            control_event_from_debug_event(resync.clone(), Some("aa"), Some("bb")),
+            Some(resync.clone())
+        );
+        // A non-matching account filter drops it.
+        assert_eq!(
+            control_event_from_debug_event(resync.clone(), Some("zz"), None),
+            None
+        );
+        // No filters always keep it.
+        assert_eq!(
+            control_event_from_debug_event(resync.clone(), None, None),
+            Some(resync)
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_aborts_wrapped_task() {
+        let handle = tokio::spawn(async {
+            // Never completes on its own; only an abort ends it.
+            std::future::pending::<()>().await;
+        });
+        // AbortHandle observes the same task without consuming the JoinHandle.
+        let probe = handle.abort_handle();
+        // Let the task start running and park on pending().
+        tokio::task::yield_now().await;
+        assert!(
+            !probe.is_finished(),
+            "task should still be running before drop"
+        );
+
+        {
+            let _guard = AbortOnDrop(handle);
+            // Guard dropped here, which aborts the task.
+        }
+
+        // Drive the runtime so the abort is processed and the task is cancelled.
+        for _ in 0..50 {
+            if probe.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            probe.is_finished(),
+            "expected wrapped task to be aborted when AbortOnDrop is dropped"
+        );
     }
 }
