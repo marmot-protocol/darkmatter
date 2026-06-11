@@ -492,6 +492,8 @@ async fn live_broker_deadline<T>(
     if live_write_timeout.is_zero() {
         return operation.await;
     }
+    // Dropping the timed-out operation cancels the in-flight QUIC write; callers
+    // then drop the publisher so future live records fall back to the local transcript.
     tokio::time::timeout(live_write_timeout, operation)
         .await
         .map_err(|_| format!("live broker write timed out after {live_write_timeout:?}"))?
