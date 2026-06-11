@@ -96,6 +96,18 @@ fn nested_stars(n: usize) -> String {
     s
 }
 
+/// `"![" * n + "a" + "](x)" * n` — the nested-image attack shape from the
+/// adversarial review of darkmatter#208. Each `](x)` closes one image and
+/// wraps the prior content as its alt text, building image nesting of depth
+/// ~n+1 unless capped.
+fn nested_images(n: usize) -> String {
+    let mut s = String::with_capacity(6 * n + 1);
+    s.push_str(&"![".repeat(n));
+    s.push('a');
+    s.push_str(&"](x)".repeat(n));
+    s
+}
+
 #[test]
 fn deeply_nested_emphasis_does_not_overflow_parse() {
     // Pre-fix: aborts with "stack overflow" at this size on a 2 MiB stack.
@@ -140,6 +152,89 @@ fn deeply_nested_strikethrough_does_not_overflow() {
     s.push_str(&"~".repeat(n));
     let doc = parse(&s);
     assert!(max_inline_depth(&doc) <= DEPTH_CEILING);
+}
+
+#[test]
+fn deeply_nested_images_do_not_overflow_parse() {
+    // Adversarial review of darkmatter#208: the emphasis-only cap left the
+    // link/image wrapping path (`absorb_link`) unguarded, so `"![" * N + "a"
+    // + "](x)" * N` still built image nesting of depth ~N and aborted in
+    // parse()/serde/uniffi. Run on a deliberately small (1 MiB) stack so an
+    // unbounded tree reliably overflows — matching the original attack model
+    // (recipient threads with modest stacks). Reaching the assert means no
+    // abort; depth must be bounded by the cap.
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let doc = parse(&nested_images(48_000));
+            let depth = max_inline_depth(&doc);
+            assert!(
+                depth <= DEPTH_CEILING,
+                "image nesting depth {depth} exceeded the cap"
+            );
+            // Serialization walks the same tree and previously aborted too.
+            let json = serde_json::to_string(&doc).expect("serialize");
+            assert!(!json.is_empty());
+        })
+        .expect("spawn");
+    handle
+        .join()
+        .expect("nested-image parse panicked or aborted");
+}
+
+#[test]
+fn excess_image_delimiters_stay_literal_not_dropped() {
+    // When wrapping would exceed the cap, the closing `]` is left as literal
+    // text rather than silently dropping content. The single `a` must always
+    // survive, and excess `]`/`[` characters must remain as literal text.
+    let n = 4_000;
+    let doc = parse(&nested_images(n));
+    let mut letters = 0usize;
+    let mut brackets = 0usize;
+    // Iterative leaf walk over every recursive inline container.
+    let mut stack: Vec<&Inline> = Vec::new();
+    for block in &doc.blocks {
+        if let Block::Paragraph { inlines } = block {
+            stack.extend(inlines.iter());
+        }
+    }
+    while let Some(item) = stack.pop() {
+        match item {
+            Inline::Text(s) => {
+                letters += s.bytes().filter(|&b| b == b'a').count();
+                brackets += s.bytes().filter(|&b| b == b']' || b == b'[').count();
+            }
+            Inline::Emph(c) | Inline::Strong(c) | Inline::Strikethrough(c) => {
+                stack.extend(c.iter());
+            }
+            Inline::Link { children, .. } => stack.extend(children.iter()),
+            Inline::Image { alt, .. } => stack.extend(alt.iter()),
+            _ => {}
+        }
+    }
+    assert_eq!(letters, 1, "the single literal letter must survive");
+    assert!(
+        brackets > 0,
+        "excess bracket delimiters must remain as literal text"
+    );
+}
+
+#[test]
+fn shallow_image_nesting_still_parses_normally() {
+    // A modestly nested image (well under the cap) must still wrap as an
+    // Image with the inner image as its alt content.
+    let doc = parse("![![a](inner)](outer)");
+    let Block::Paragraph { inlines } = &doc.blocks[0] else {
+        panic!("expected paragraph");
+    };
+    let Inline::Image { alt, dest, .. } = &inlines[0] else {
+        panic!("expected outer image, got {:?}", inlines[0]);
+    };
+    assert_eq!(dest, "outer");
+    assert!(
+        matches!(alt.as_slice(), [Inline::Image { .. }]),
+        "outer image alt should contain the inner image"
+    );
 }
 
 #[test]

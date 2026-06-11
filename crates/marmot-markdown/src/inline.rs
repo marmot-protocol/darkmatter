@@ -646,8 +646,11 @@ fn try_close_bracket(
     if bytes.get(i + 1) == Some(&b'(')
         && let Some((dest, title, end)) = parse_inline_link_suffix(bytes, i + 1)
     {
-        absorb_link(out, delims, opener_idx, dest, title);
-        return Some(end);
+        if absorb_link(out, delims, opener_idx, dest, title) {
+            return Some(end);
+        }
+        // Wrapping refused (depth cap): treat `]` as literal text.
+        return None;
     }
 
     // 2. Full reference link: `][label]`
@@ -658,8 +661,10 @@ fn try_close_bracket(
             && let Some(def) = refs.get(&crate::block::normalize_label(&label_raw))
         {
             let (dest, title) = (def.dest.clone(), def.title.clone());
-            absorb_link(out, delims, opener_idx, dest, title);
-            return Some(end);
+            if absorb_link(out, delims, opener_idx, dest, title) {
+                return Some(end);
+            }
+            return None;
         }
         // Empty `[]` after `]` — collapsed reference: use the link text as
         // the label.
@@ -667,8 +672,10 @@ fn try_close_bracket(
             let label = label_text(bytes, opener.input_pos + 1, i);
             if let Some(def) = refs.get(&crate::block::normalize_label(&label)) {
                 let (dest, title) = (def.dest.clone(), def.title.clone());
-                absorb_link(out, delims, opener_idx, dest, title);
-                return Some(end);
+                if absorb_link(out, delims, opener_idx, dest, title) {
+                    return Some(end);
+                }
+                return None;
             }
         }
     }
@@ -679,8 +686,10 @@ fn try_close_bracket(
         && let Some(def) = refs.get(&crate::block::normalize_label(&label))
     {
         let (dest, title) = (def.dest.clone(), def.title.clone());
-        absorb_link(out, delims, opener_idx, dest, title);
-        return Some(i + 1);
+        if absorb_link(out, delims, opener_idx, dest, title) {
+            return Some(i + 1);
+        }
+        return None;
     }
 
     // No match — drop the opener and emit literal `]`.
@@ -759,17 +768,37 @@ fn label_text(b: &[u8], start: usize, end: usize) -> String {
 
 /// Replace the placeholder + intermediate inlines with a single Link/Image
 /// inline; deactivate earlier `[` openers (no nested links).
+///
+/// Returns `true` if the link/image was wrapped, `false` if wrapping was
+/// refused because it would push the inline tree past
+/// [`MAX_INLINE_NESTING_DEPTH`] (darkmatter#208). On refusal `out`/`delims`
+/// are left untouched so the caller can fall back to literal-text handling
+/// of the closing `]`.
 fn absorb_link(
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
     opener_idx: usize,
     dest: String,
     title: Option<String>,
-) {
+) -> bool {
     // First, pair any emphasis runs strictly inside the link before
     // wrapping — emphasis inside link text DOES get processed (per spec).
     process_emphasis(out, delims, opener_idx + 1);
     let opener = delims[opener_idx];
+
+    // Depth guard (darkmatter#208). Wrapping the children in a Link/Image node
+    // produces a node one level deeper than its deepest child, exactly like
+    // emphasis pairing. Without this bound, input shaped as
+    // `"![" * N + "a" + "](x)" * N` builds image nesting of depth ~N and later
+    // overflows the stack in coalesce_text_runs, serde, and the uniffi
+    // conversions — a fatal, uncatchable abort. If wrapping would exceed the
+    // cap, refuse it and leave the delimiters as literal text. The probe is the
+    // same iterative, early-pruning O(cap) walk used by process_emphasis, so it
+    // neither overflows nor costs anything on ordinary input.
+    if nesting_depth_at_least(&out[opener.out_pos + 1..], MAX_INLINE_NESTING_DEPTH) {
+        return false;
+    }
+
     let kind_is_image = opener.kind == b'!';
     // Children = items after the placeholder.
     let children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
@@ -799,6 +828,7 @@ fn absorb_link(
             }
         }
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
