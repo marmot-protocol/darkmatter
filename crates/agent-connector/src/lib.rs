@@ -9,7 +9,7 @@ pub use bootstrap::{
     resolve_bootstrap_socket, run_bootstrap,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
@@ -25,11 +25,15 @@ use agent_control::{
     AgentControlEvent, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
-use cgka_traits::{GroupId, MemberId, MessageId, engine::GroupEvent};
+use cgka_traits::{
+    GroupId, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, MemberId,
+    MessageId, engine::GroupEvent,
+};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{
     AccountRelayListBootstrap, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppError,
-    MarmotApp, MarmotAppEvent, MarmotAppRuntime, UserProfileMetadata,
+    AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent, MarmotAppRuntime,
+    UserProfileMetadata,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, BufReader};
@@ -52,6 +56,10 @@ const INVITE_POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
 const STREAM_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the background sweeper scans for idle stream compose sessions.
 const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Capacity of the per-subscription delivered-inbound-id cursor used to dedup storage-backed
+/// replay after broadcast lag. Comfortably larger than the runtime broadcast channel depth
+/// (1024) so every message that could be re-queried after a single overflow is still tracked.
+const DELIVERED_INBOUND_CURSOR_CAPACITY: usize = 4096;
 const MAX_PROFILE_NAME_CHARS: usize = 80;
 
 #[derive(Clone, Debug)]
@@ -1109,6 +1117,13 @@ impl AgentConnector {
         // channel closed, etc.) instead of ticking forever for a dropped subscriber.
         let _catch_up_guard = AbortOnDrop(catch_up_handle);
 
+        // Tracks the inbound message ids already delivered on this subscription so a
+        // storage-backed replay after broadcast lag re-delivers only genuinely-missed
+        // messages (never re-flooding the agent with messages it already handled, and never
+        // double-delivering one that raced live delivery). Bounded so a long-lived
+        // subscription cannot grow this set without limit; the queue evicts the oldest ids.
+        let mut delivered = DeliveredInboundCursor::new(DELIVERED_INBOUND_CURSOR_CAPACITY);
+
         loop {
             let event = tokio::select! {
                 catch_up_err = catch_up_errors.recv() => {
@@ -1130,20 +1145,53 @@ impl AgentConnector {
                         ),
                         Err(broadcast::error::RecvError::Lagged(dropped)) => {
                             // The broadcast channel overflowed: `dropped` events were evicted
-                            // before we could deliver them and are gone for good (catch-up will
-                            // not re-emit already-broadcast messages). Tell the agent to re-sync
-                            // from its own state instead of silently losing user messages.
-                            tracing::warn!(
-                                target: "agent_connector",
-                                method = "stream_inbound_events",
-                                dropped_events = dropped,
-                                "inbound broadcast lagged; emitting resync_required"
-                            );
-                            Some(resync_required_event(
+                            // before we could deliver them and are gone from the channel for
+                            // good (catch-up never re-emits already-broadcast messages). Recover
+                            // the missed inbound messages from durable storage and re-deliver
+                            // them on the existing InboundMessage path the consumer already
+                            // handles, so a reconnect backlog never silently loses user
+                            // messages. The delivered-id cursor guarantees we re-deliver only
+                            // messages this subscription has not already emitted.
+                            match self.replay_missed_inbound(
                                 account_id_hex.as_deref(),
                                 group_id_hex.as_deref(),
-                                dropped,
-                            ))
+                                &mut delivered,
+                            ) {
+                                Ok(missed) => {
+                                    tracing::warn!(
+                                        target: "agent_connector",
+                                        method = "stream_inbound_events",
+                                        dropped_events = dropped,
+                                        replayed_messages = missed.len(),
+                                        "inbound broadcast lagged; replayed missed messages from storage"
+                                    );
+                                    for replayed in missed {
+                                        let envelope = AgentControlEnvelope::new(
+                                            request_id.clone(),
+                                            replayed,
+                                        );
+                                        write_frame(writer, &envelope).await?;
+                                    }
+                                    continue;
+                                }
+                                Err(err) => {
+                                    // Storage replay failed: fall back to the resync_required
+                                    // signal so the agent still learns it must re-sync state
+                                    // rather than silently losing the dropped messages.
+                                    tracing::warn!(
+                                        target: "agent_connector",
+                                        method = "stream_inbound_events",
+                                        dropped_events = dropped,
+                                        error_code = err.privacy_safe_code(),
+                                        "inbound broadcast lagged; storage replay failed, emitting resync_required"
+                                    );
+                                    Some(resync_required_event(
+                                        account_id_hex.as_deref(),
+                                        group_id_hex.as_deref(),
+                                        dropped,
+                                    ))
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
@@ -1164,9 +1212,64 @@ impl AgentConnector {
             let Some(event) = event else {
                 continue;
             };
+            // Track delivered inbound message ids so a later storage replay re-delivers only
+            // genuinely-missed messages. Skip a live message the cursor already saw (e.g. one
+            // that was just recovered by a replay) so it is never delivered twice.
+            if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
+                if delivered.contains(message_id_hex) {
+                    continue;
+                }
+                delivered.record(message_id_hex.clone());
+            }
             let envelope = AgentControlEnvelope::new(request_id.clone(), event);
             write_frame(writer, &envelope).await?;
         }
+    }
+
+    /// Recover inbound messages that were dropped from the broadcast channel by re-reading them
+    /// from durable per-account storage. Returns the missed messages as `InboundMessage` events
+    /// (the same shape the live path emits) scoped to this subscription's filters, skipping any
+    /// id already recorded in `delivered` and recording the ones it returns. This is how a lagged
+    /// subscription recovers user messages instead of dropping them: the connector re-queries its
+    /// own state, exactly the resync the agent could not perform on its own.
+    fn replay_missed_inbound(
+        &self,
+        account_filter: Option<&str>,
+        group_filter: Option<&str>,
+        delivered: &mut DeliveredInboundCursor,
+    ) -> Result<Vec<AgentControlEvent>, ConnectorError> {
+        // Replay for the filtered account, or for every local account on an unscoped
+        // subscription (mirroring the live path, which emits for all local accounts).
+        let accounts = match account_filter {
+            Some(account_id_hex) => vec![self.local_account_for_account_id(account_id_hex)?],
+            None => self.account_home.accounts()?,
+        };
+        let mut events = Vec::new();
+        for account in accounts {
+            let query = AppMessageQuery {
+                group_id_hex: group_filter.map(str::to_owned),
+                limit: None,
+            };
+            let records = self.runtime.messages_with_query(&account.label, query)?;
+            for record in records {
+                let Some(event) = inbound_message_event_from_record(
+                    &account.account_id_hex,
+                    record,
+                    account_filter,
+                    group_filter,
+                ) else {
+                    continue;
+                };
+                if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
+                    if delivered.contains(message_id_hex) {
+                        continue;
+                    }
+                    delivered.record(message_id_hex.clone());
+                }
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 
     fn spawn_invite_policy_worker(&self) {
@@ -1520,6 +1623,92 @@ fn resync_required_event(
         account_id_hex: account_filter.map(str::to_owned),
         group_id_hex: group_filter.map(str::to_owned),
         dropped_events,
+    }
+}
+
+/// Project a stored app-message record into the same `InboundMessage` event the live
+/// `MessageReceived` path emits, or `None` if it is not an inbound user message for this
+/// subscription. This keeps storage-backed replay byte-for-byte consistent with live delivery:
+/// only inbound (`direction == "received"`) chat messages from a different sender are surfaced,
+/// agent text-stream starts are skipped (the live path diverts them to a separate signal), and
+/// the subscription's account/group filters are honored.
+fn inbound_message_event_from_record(
+    account_id_hex: &str,
+    record: AppMessageRecord,
+    account_filter: Option<&str>,
+    group_filter: Option<&str>,
+) -> Option<AgentControlEvent> {
+    // Only genuine inbound chat messages are user messages to the agent. Outbound (own) sends,
+    // reactions/system events, and kind-1200 agent stream starts (which the live path diverts to
+    // a separate signal) are not re-delivered as inbound. Filtering to the chat kind covers all
+    // of those non-chat kinds, including the stream-start kind.
+    debug_assert_ne!(
+        MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+    );
+    if record.direction != "received" {
+        return None;
+    }
+    if record.kind != MARMOT_APP_EVENT_KIND_CHAT {
+        return None;
+    }
+    // The live path drops messages whose sender is the subscribed account itself.
+    if record.sender == account_id_hex {
+        return None;
+    }
+    if !inbound_filter_matches(
+        account_filter,
+        account_id_hex,
+        group_filter,
+        &record.group_id_hex,
+    ) {
+        return None;
+    }
+    Some(AgentControlEvent::InboundMessage {
+        account_id_hex: account_id_hex.to_owned(),
+        group_id_hex: record.group_id_hex,
+        message_id_hex: record.message_id_hex,
+        sender_account_id_hex: record.sender,
+        text: record.plaintext,
+    })
+}
+
+/// Bounded set of inbound message ids already delivered on a subscription, used to dedup
+/// storage-backed replay against live delivery (and against itself) after broadcast lag. Keeps a
+/// FIFO of recent ids so a long-lived subscription cannot grow memory without bound; once the
+/// capacity is reached the oldest id is evicted. The capacity comfortably exceeds the broadcast
+/// channel depth, so every message that could plausibly be re-queried after a single overflow is
+/// still tracked.
+struct DeliveredInboundCursor {
+    capacity: usize,
+    order: VecDeque<String>,
+    seen: HashSet<String>,
+}
+
+impl DeliveredInboundCursor {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    fn contains(&self, message_id_hex: &str) -> bool {
+        self.seen.contains(message_id_hex)
+    }
+
+    fn record(&mut self, message_id_hex: String) {
+        if self.seen.contains(&message_id_hex) {
+            return;
+        }
+        if self.order.len() >= self.capacity
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        self.seen.insert(message_id_hex.clone());
+        self.order.push_back(message_id_hex);
     }
 }
 
@@ -2087,11 +2276,15 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::time::{Duration, sleep, timeout};
 
-    use crate::{AbortOnDrop, control_event_from_debug_event, resync_required_event};
+    use crate::{
+        AbortOnDrop, DeliveredInboundCursor, control_event_from_debug_event,
+        inbound_message_event_from_record, resync_required_event,
+    };
     use crate::{
         AgentConnector, AgentConnectorConfig, AllowlistRecord, AllowlistStore,
         bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
     };
+    use marmot_app::AppMessageRecord;
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -3801,6 +3994,211 @@ mod tests {
         assert!(
             probe.is_finished(),
             "expected wrapped task to be aborted when AbortOnDrop is dropped"
+        );
+    }
+
+    fn received_chat_record(
+        message_id_hex: &str,
+        group_id_hex: &str,
+        sender: &str,
+        text: &str,
+    ) -> AppMessageRecord {
+        AppMessageRecord {
+            message_id_hex: message_id_hex.to_owned(),
+            direction: "received".to_owned(),
+            group_id_hex: group_id_hex.to_owned(),
+            sender: sender.to_owned(),
+            plaintext: text.to_owned(),
+            kind: crate::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            recorded_at: 100,
+            received_at: 100,
+        }
+    }
+
+    #[test]
+    fn inbound_message_event_from_record_projects_received_chat() {
+        // Regression for darkmatter#210: a missed inbound chat recovered from storage must
+        // project into exactly the same InboundMessage event the live path emits, so the
+        // consumer's existing handler delivers it to the agent.
+        let record = received_chat_record("aa", "bb", "cc", "hello agent");
+        let event =
+            inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+        assert_eq!(
+            event,
+            AgentControlEvent::InboundMessage {
+                account_id_hex: "acct".to_owned(),
+                group_id_hex: "bb".to_owned(),
+                message_id_hex: "aa".to_owned(),
+                sender_account_id_hex: "cc".to_owned(),
+                text: "hello agent".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
+        // Outbound (own) messages are never re-delivered as inbound.
+        let mut own = received_chat_record("aa", "bb", "acct", "mine");
+        own.direction = "sent".to_owned();
+        assert!(inbound_message_event_from_record("acct", own, None, None).is_none());
+
+        // A received message authored by the subscribed account itself is skipped (mirrors live).
+        let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
+        assert!(inbound_message_event_from_record("acct", self_authored, None, None).is_none());
+
+        // Non-chat kinds (reactions, agent stream starts, system events) are not user messages.
+        let mut reaction = received_chat_record("aa", "bb", "cc", "+1");
+        reaction.kind = crate::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
+        assert!(inbound_message_event_from_record("acct", reaction, None, None).is_none());
+
+        // A mismatched group filter excludes the message.
+        let other_group = received_chat_record("aa", "bb", "cc", "elsewhere");
+        assert!(
+            inbound_message_event_from_record("acct", other_group, Some("acct"), Some("zz"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
+        let mut cursor = DeliveredInboundCursor::new(3);
+        assert!(!cursor.contains("a"));
+        cursor.record("a".to_owned());
+        cursor.record("b".to_owned());
+        cursor.record("c".to_owned());
+        assert!(cursor.contains("a"));
+        assert!(cursor.contains("c"));
+
+        // Re-recording an existing id is a no-op and does not evict anything.
+        cursor.record("a".to_owned());
+        assert!(cursor.contains("b"));
+
+        // Exceeding capacity evicts the oldest id ("a"), keeping the most recent three.
+        cursor.record("d".to_owned());
+        assert!(
+            !cursor.contains("a"),
+            "oldest id should be evicted at capacity"
+        );
+        assert!(cursor.contains("b"));
+        assert!(cursor.contains("c"));
+        assert!(cursor.contains("d"));
+    }
+
+    #[tokio::test]
+    async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
+        // End-to-end regression for darkmatter#210: when the inbound broadcast lags, the
+        // connector re-queries storage and re-delivers the genuinely-missed inbound messages on
+        // the existing InboundMessage path the consumer already handles. A real send populates
+        // storage; replay must surface it, and a second replay (with the id already delivered)
+        // must not re-deliver it.
+        let dir = tempfile::tempdir().unwrap();
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+        let setup_runtime = MarmotAppRuntime::new(app);
+        let setup = AccountSetupRequest {
+            default_relays: vec![crate::endpoint(&relay_url)],
+            bootstrap_relays: vec![crate::endpoint(&relay_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        };
+        let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+        let human = setup_runtime.create_identity(setup).await.unwrap();
+        let group_id = setup_runtime
+            .create_group(
+                &agent.account.account_id_hex,
+                "agent inbound replay",
+                std::slice::from_ref(&human.account.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        setup_runtime.shutdown().await;
+        let group_id_hex = hex::encode(group_id.as_slice());
+
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            dir.path().join("dev").join("dm-agent.sock"),
+            vec![relay_url],
+            false,
+            false,
+        ))
+        .unwrap();
+
+        // Deliver a real inbound message into storage via a normal send + catch-up.
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let _ = connector
+            .send_final_response(
+                &human.account.account_id_hex,
+                &group_id_hex,
+                "missed while lagging".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        // Let the agent account observe the message so it lands in its storage projection.
+        for _ in 0..40 {
+            connector.runtime.catch_up_accounts().await.unwrap();
+            let stored = connector
+                .runtime
+                .messages_with_query(
+                    &agent.account.account_id_hex,
+                    crate::AppMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        limit: None,
+                    },
+                )
+                .unwrap();
+            if stored.iter().any(|m| m.plaintext == "missed while lagging") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // First replay surfaces the missed inbound message as an InboundMessage event.
+        let mut delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
+        let replayed = connector
+            .replay_missed_inbound(
+                Some(&agent.account.account_id_hex),
+                Some(&group_id_hex),
+                &mut delivered,
+            )
+            .unwrap();
+        let recovered: Vec<_> = replayed
+            .iter()
+            .filter_map(|event| match event {
+                AgentControlEvent::InboundMessage {
+                    text,
+                    sender_account_id_hex,
+                    ..
+                } => Some((text.clone(), sender_account_id_hex.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            recovered
+                .iter()
+                .any(|(text, sender)| text == "missed while lagging"
+                    && sender == &human.account.account_id_hex),
+            "replay should recover the missed inbound message, got {recovered:?}"
+        );
+
+        // Second replay must not re-deliver the same message (cursor dedup).
+        let replayed_again = connector
+            .replay_missed_inbound(
+                Some(&agent.account.account_id_hex),
+                Some(&group_id_hex),
+                &mut delivered,
+            )
+            .unwrap();
+        assert!(
+            !replayed_again.iter().any(|event| matches!(
+                event,
+                AgentControlEvent::InboundMessage { text, .. } if text == "missed while lagging"
+            )),
+            "second replay must not duplicate an already-delivered message"
         );
     }
 }
