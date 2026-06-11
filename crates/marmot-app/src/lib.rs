@@ -126,7 +126,7 @@ pub use groups::{
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
 };
-pub use ids::{account_id_hex_from_ref, npub_for_account_id};
+pub use ids::{account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id};
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, ENCRYPTED_MEDIA_VERSION, MediaAttachmentReference,
     MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,

@@ -30,7 +30,6 @@ COPY . .
 
 RUN cargo build --locked --release -p agent-connector --bin dm-agent \
     && install -m 0755 target/release/dm-agent /usr/local/bin/dm-agent \
-    && install -m 0755 scripts/hermes_marmot_bootstrap_agent.py /usr/local/bin/marmot-agent-bootstrap \
     && install -m 0755 scripts/hermes_marmot_configure_gateway.py /usr/local/bin/marmot-configure-hermes-gateway \
     && install -m 0755 scripts/hermes_marmot_container_entrypoint.sh /usr/local/bin/hermes-marmot-entrypoint \
     && ln -sfn /opt/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes

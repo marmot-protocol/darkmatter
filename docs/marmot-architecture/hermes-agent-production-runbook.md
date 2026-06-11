@@ -163,7 +163,7 @@ Compose service passes through common provider variables when they are set in yo
 `just hermes-phone-test-bootstrap` runs this inside the container:
 
 ```sh
-docker compose exec hermes-marmot-phone-test marmot-agent-bootstrap --qr
+docker compose exec hermes-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
 ```
 
 The command creates or reuses the `hermes-agent` account, publishes or repairs its KeyPackage, then prints the agent

@@ -14,6 +14,56 @@ The current Hermes plugin loader expects platform plugins as directories directl
 under `~/.hermes/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and
 adapter implementation files.
 
+## Beta Install (Hermes Already Installed)
+
+Rolling `dm-agent` builds and the Hermes plugin are published on the
+[`dm-agent-beta`](https://github.com/marmot-protocol/darkmatter/releases/tag/dm-agent-beta)
+GitHub pre-release after each push to `master`.
+
+Prerequisites:
+
+- Hermes Agent installed and working locally
+- Dark Matter phone app pointed at the same public relay set
+- Linux x86_64 or macOS Apple Silicon
+
+One-line install:
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash
+```
+
+Install and bootstrap in one step:
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash -s -- --bootstrap
+```
+
+Pin a specific build when reporting bugs:
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | DM_AGENT_SHA=<12-char-sha> bash
+```
+
+The installer puts `dm-agent` in `~/.local/bin`, extracts the plugin to
+`~/.hermes/plugins/marmot`, and runs `hermes plugins enable marmot` when the
+`hermes` launcher is on `PATH`.
+
+After a normal install, start the connector and bootstrap the agent account:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agent"
+export PATH="$HOME/.local/bin:$PATH"
+
+dm-agent --home "$MARMOT_HOME" \
+  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.us.whitenoise.chat
+
+dm-agent bootstrap --home "$MARMOT_HOME" --qr
+hermes gateway run
+```
+
+Then invite the printed agent account from the phone app.
+
 ## Repeatable Dev Setup
 
 Use the repo scripts when testing the plugin without touching your normal Hermes
@@ -190,6 +240,16 @@ cargo run -p agent-connector --bin dm-agent -- \
   --home ~/.marmot-agent \
   --relay wss://relay.eu.whiteniose.chat \
   --relay wss://relay.us.whitenoise.chat
+```
+
+Bootstrap or reuse the agent account through the running connector:
+
+```sh
+dm-agent bootstrap \
+  --home ~/.marmot-agent \
+  --relay wss://relay.eu.whiteniose.chat \
+  --relay wss://relay.us.whitenoise.chat \
+  --qr
 ```
 
 Then configure Hermes with environment variables:

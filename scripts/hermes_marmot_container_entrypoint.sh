@@ -83,7 +83,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$HERMES_MARMOT_AUTO_BOOTSTRAP" != "0" ]; then
-    bootstrap_json="$(marmot-agent-bootstrap --json)"
+    bootstrap_json="$(dm-agent bootstrap --json --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")"
     printf '%s\n' "$bootstrap_json" >"$MARMOT_HOME/bootstrap.json"
     MARMOT_ACCOUNT_ID_HEX="$(
         printf '%s\n' "$bootstrap_json" |
