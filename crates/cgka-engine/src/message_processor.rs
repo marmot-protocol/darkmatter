@@ -1692,16 +1692,19 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
 
 /// Snapshot the two avatar-bearing component byte blobs (avatar-url and
 /// blossom-image) so a before/after comparison can detect an avatar change.
+///
+/// Presence is normalized: an absent component (`None`) and the canonical
+/// "absent" encoding both collapse to `None`, so this inbound diff matches the
+/// own-commit diff in `update_group_data` and a "clear an already-absent
+/// avatar" commit converges to no row on every client.
 fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
+    let snapshot = |component_id| {
+        crate::app_components::app_component_data_of_group(mls_group, component_id)
+            .filter(|bytes| crate::app_components::avatar_component_present(component_id, bytes))
+    };
     [
-        crate::app_components::app_component_data_of_group(
-            mls_group,
-            cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID,
-        ),
-        crate::app_components::app_component_data_of_group(
-            mls_group,
-            cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-        ),
+        snapshot(cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID),
+        snapshot(cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
     ]
 }
 

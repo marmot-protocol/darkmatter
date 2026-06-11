@@ -1846,11 +1846,8 @@ impl AppClient {
         }
         // Synthesize durable kind-1210 system rows from this delivery's
         // authenticated state changes (peer commits and auto-commits).
-        let system_updates = self.project_group_system_rows(
-            &effects.effects.events,
-            &source_message_id_hex,
-            source_recorded_at,
-        );
+        let system_updates =
+            self.project_group_system_rows(&effects.effects.events, source_recorded_at);
         summary.projection_updates.extend(system_updates);
         Ok(())
     }
@@ -2404,18 +2401,12 @@ impl AppClient {
         // the rows persist and surface via the timeline subscription / chat-list
         // refresh that the GroupStateChanged event already triggers.
         //
-        // Only when we actually published a commit: the source link must be the
-        // committing message id. Paths without a report (e.g. convergence retry)
-        // would otherwise stamp an empty source and, via upsert, clobber the
-        // correct link a row already carries from inbound ingest. Those changes
-        // are synthesized on the inbound path with their real delivery source.
-        if let Some(report) = effects.reports.first() {
-            let source_message_id_hex = hex::encode(report.message_id.as_slice());
-            let _ = self.project_group_system_rows(
-                &effects.events,
-                &source_message_id_hex,
-                unix_now_seconds(),
-            );
+        // Gate on having published a commit: own send paths always carry a
+        // report, while reportless paths (e.g. convergence retry) re-emit the
+        // same changes unattributed. Those are already synthesized — attributed —
+        // on the inbound path, so skipping here avoids a duplicate, actor-less row.
+        if !effects.reports.is_empty() {
+            let _ = self.project_group_system_rows(&effects.events, unix_now_seconds());
         }
     }
 
@@ -2427,7 +2418,6 @@ impl AppClient {
     fn project_group_system_rows(
         &self,
         events: &[cgka_traits::engine::GroupEvent],
-        source_message_id_hex: &str,
         recorded_at: u64,
     ) -> Vec<crate::AppProjectionUpdate> {
         let mut updates = Vec::new();
@@ -2444,7 +2434,6 @@ impl AppClient {
                     epoch.0,
                     actor.as_ref(),
                     change,
-                    source_message_id_hex,
                     recorded_at,
                 ) {
                     Ok(projection) => projection,
@@ -2503,7 +2492,6 @@ fn build_group_system_projection(
     epoch: u64,
     actor: Option<&cgka_traits::types::MemberId>,
     change: &cgka_traits::engine::GroupStateChange,
-    source_message_id_hex: &str,
     recorded_at: u64,
 ) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
     use cgka_traits::app_event::{
@@ -2606,7 +2594,10 @@ fn build_group_system_projection(
 
     Ok(AppMessageProjection {
         message_id_hex,
-        source_message_id_hex: Some(source_message_id_hex.to_owned()),
+        // Synthesized rows carry no source: several rows can come from one
+        // commit, which would collide on the partial unique source index, and
+        // commit ids are never targeted by source-based invalidation anyway.
+        source_message_id_hex: None,
         direction: "system".to_owned(),
         group_id_hex,
         sender,

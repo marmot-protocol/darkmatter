@@ -2214,6 +2214,55 @@ async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
 }
 
 #[tokio::test]
+async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+    home.create_account("dave").unwrap();
+
+    let (_relay, app, url) = mock_app(&dir).await;
+    for label in ["bob", "carol", "dave"] {
+        let mut client = app.client(label).await.unwrap();
+        client.publish_key_package().await.unwrap();
+    }
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+
+    // One commit invites two members, so two member_added rows must both persist
+    // — previously they collided on the unique source index and one was dropped.
+    alice
+        .invite_members(&group_id, &["carol", "dave"])
+        .await
+        .unwrap();
+
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url)
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let added_rows = alice_timeline
+        .messages
+        .iter()
+        .filter(|message| {
+            message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+                && message.plaintext.contains("member_added")
+        })
+        .count();
+    assert_eq!(
+        added_rows, 2,
+        "both invited members should get a row; got {:?}",
+        alice_timeline.messages
+    );
+}
+
+#[tokio::test]
 async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

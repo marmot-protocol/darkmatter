@@ -2846,9 +2846,14 @@ fn group_system_summary(value: &Value, plaintext: &str) -> Option<String> {
     let content: Value = serde_json::from_str(plaintext).ok()?;
     let system_type = content.get("system_type").and_then(Value::as_str)?;
     let data = content.get("data");
-    let actor = non_empty_value_string(value, "from_display_name")
-        .or_else(|| value_string(value, "from").map(|from| shorten(&from, 12)))
-        .unwrap_or_else(|| "someone".to_owned());
+    // `actor` is absent for unattributed changes (e.g. a convergence reorg,
+    // where the committer isn't resolved). Render the passive voice then rather
+    // than implying an unknown actor performed the action.
+    let actor = non_empty_value_string(value, "from_display_name").or_else(|| {
+        value_string(value, "from")
+            .filter(|from| !from.is_empty())
+            .map(|from| shorten(&from, 12))
+    });
     let subject = data
         .and_then(|data| data.get("subject"))
         .and_then(Value::as_str)
@@ -2857,14 +2862,21 @@ fn group_system_summary(value: &Value, plaintext: &str) -> Option<String> {
         .and_then(|data| data.get("name"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let summary = match system_type {
-        "member_added" => format!("{actor} added {subject}"),
-        "member_removed" => format!("{actor} removed {subject}"),
-        "member_left" => format!("{actor} left"),
-        "admin_added" => format!("{actor} made {subject} an admin"),
-        "admin_removed" => format!("{actor} removed {subject} as admin"),
-        "group_renamed" => format!("{actor} renamed the group to \"{name}\""),
-        "group_avatar_changed" => format!("{actor} changed the group avatar"),
+    let summary = match (system_type, actor.as_deref()) {
+        ("member_added", Some(actor)) => format!("{actor} added {subject}"),
+        ("member_added", None) => format!("{subject} was added"),
+        ("member_removed", Some(actor)) => format!("{actor} removed {subject}"),
+        ("member_removed", None) => format!("{subject} was removed"),
+        ("member_left", Some(actor)) => format!("{actor} left"),
+        ("member_left", None) => format!("{subject} left"),
+        ("admin_added", Some(actor)) => format!("{actor} made {subject} an admin"),
+        ("admin_added", None) => format!("{subject} was made an admin"),
+        ("admin_removed", Some(actor)) => format!("{actor} removed {subject} as admin"),
+        ("admin_removed", None) => format!("{subject} is no longer an admin"),
+        ("group_renamed", Some(actor)) => format!("{actor} renamed the group to \"{name}\""),
+        ("group_renamed", None) => format!("the group was renamed to \"{name}\""),
+        ("group_avatar_changed", Some(actor)) => format!("{actor} changed the group avatar"),
+        ("group_avatar_changed", None) => "the group avatar changed".to_owned(),
         _ => content
             .get("text")
             .and_then(Value::as_str)
@@ -3921,6 +3933,30 @@ mod tests {
         assert!(
             !summary.starts_with("someone"),
             "actor should be the pubkey"
+        );
+    }
+
+    #[test]
+    fn group_system_summary_renders_passive_for_unattributed() {
+        // An unattributed row (convergence reorg) has an empty `from` and no
+        // display name; render the passive voice instead of fabricating an actor.
+        let value = serde_json::json!({ "from": "" });
+        let added = r#"{"v":1,"system_type":"member_added","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, added).as_deref(),
+            Some("bbbbbbbb was added")
+        );
+
+        let removed = r#"{"v":1,"system_type":"member_removed","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, removed).as_deref(),
+            Some("bbbbbbbb was removed")
+        );
+
+        let renamed = r#"{"v":1,"system_type":"group_renamed","data":{"name":"ops"}}"#;
+        assert_eq!(
+            group_system_summary(&value, renamed).as_deref(),
+            Some("the group was renamed to \"ops\"")
         );
     }
 
