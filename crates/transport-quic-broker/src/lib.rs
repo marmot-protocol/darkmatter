@@ -45,6 +45,8 @@ const LOCAL_SERVER_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCAL
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
 const FINISHED_ROOM_TTL: Duration = Duration::from_secs(60);
+// Stale unfinished rooms are a defense-in-depth cleanup path for task
+// cancellation, so keep the same retention window as finished backlog rooms.
 const UNFINISHED_ROOM_TTL: Duration = FINISHED_ROOM_TTL;
 const SEND_STOP_WAIT: Duration = Duration::from_secs(5);
 
@@ -847,6 +849,8 @@ impl BrokerState {
     }
 
     fn purge_expired_rooms(&self, inner: &mut BrokerStateInner) {
+        // Finished rooms get a one-shot timer in `finish_room`; unfinished-room
+        // cleanup is activity-driven and runs when the broker state is touched.
         let mut total_backlog_bytes = 0;
         inner.rooms.retain(|_, room| {
             let retain = if let Some(finished_at) = room.finished_at {
