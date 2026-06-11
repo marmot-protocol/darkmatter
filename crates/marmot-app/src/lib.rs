@@ -425,6 +425,16 @@ pub struct AuditLogTrackerUpdateResult {
     pub skipped_reason: Option<String>,
 }
 
+/// Outcome of deleting a single audit log file.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditLogDeleteOutcome {
+    /// `true` when a live recorder owned the file and was rotated, so a fresh
+    /// file is already being recorded; `false` when the file was simply removed
+    /// because no live recorder was writing it (account session closed, or
+    /// audit logging off).
+    pub still_recording: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AuditLogSettings {
     pub enabled: bool,
@@ -2518,6 +2528,82 @@ impl MarmotApp {
         self.relay_endpoints()
     }
 
+    /// Open the file-backed forensic recorder for `label`, or `None` if it
+    /// could not be prepared.
+    ///
+    /// Best-effort and privacy-safe: every failure is logged and swallowed so
+    /// callers can continue without audit logging, matching how the recorder is
+    /// treated everywhere else. Shared by `open_account` (session construction)
+    /// and the live audit-toggle path ([`build_audit_recorder`]).
+    fn open_audit_recorder(
+        &self,
+        label: &str,
+        account_id: &MemberId,
+    ) -> Option<Box<dyn marmot_forensics::ForensicRecorder>> {
+        let account_dir = self.account_dir(label);
+        let device_id_hex = match audit_device_id_hex(&account_dir) {
+            Ok(device_id_hex) => device_id_hex,
+            Err(e) => {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_audit_recorder",
+                    error = %e,
+                    "failed to prepare forensic audit identity; continuing without it"
+                );
+                return None;
+            }
+        };
+        let account_ref_hex = audit_account_ref_hex(account_id);
+        let engine_id_hex = audit_engine_id_hex(account_id, &device_id_hex);
+        let audit_path = account_dir.join(format!("audit-{engine_id_hex}.jsonl"));
+        match marmot_forensics::JsonlRecorder::open_with_account_ref(
+            &audit_path,
+            engine_id_hex,
+            Some(account_ref_hex),
+        ) {
+            Ok(recorder) => Some(Box::new(recorder)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_audit_recorder",
+                    error = %e,
+                    "failed to open forensic audit log; continuing without it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build the recorder to install on a live session for the given audit
+    /// switch value: a file-backed recorder when `enabled` (and openable), or a
+    /// [`marmot_forensics::NoopRecorder`] when off or on failure.
+    ///
+    /// Used to apply an audit-setting change to an already-running session
+    /// in place, without reopening it.
+    pub(crate) fn build_audit_recorder(
+        &self,
+        label: &str,
+        enabled: bool,
+    ) -> Box<dyn marmot_forensics::ForensicRecorder> {
+        if !enabled {
+            return Box::new(marmot_forensics::NoopRecorder);
+        }
+        let account_id = match self.member_id(label) {
+            Ok(account_id) => account_id,
+            Err(e) => {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "build_audit_recorder",
+                    error = %e,
+                    "failed to resolve account identity for audit logging; continuing without it"
+                );
+                return Box::new(marmot_forensics::NoopRecorder);
+            }
+        };
+        self.open_audit_recorder(label, &account_id)
+            .unwrap_or_else(|| Box::new(marmot_forensics::NoopRecorder))
+    }
+
     fn open_account(
         &self,
         label: &str,
@@ -2562,40 +2648,8 @@ impl MarmotApp {
                 false
             }
         };
-        if audit_log_enabled {
-            let account_dir = self.account_dir(label);
-            match audit_device_id_hex(&account_dir) {
-                Ok(device_id_hex) => {
-                    let account_ref_hex = audit_account_ref_hex(&account_id);
-                    let engine_id_hex = audit_engine_id_hex(&account_id, &device_id_hex);
-                    let audit_path = account_dir.join(format!("audit-{engine_id_hex}.jsonl"));
-                    match marmot_forensics::JsonlRecorder::open_with_account_ref(
-                        &audit_path,
-                        engine_id_hex.clone(),
-                        Some(account_ref_hex),
-                    ) {
-                        Ok(recorder) => {
-                            session_config = session_config.recorder(Box::new(recorder));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "marmot_app",
-                                method = "open_account",
-                                error = %e,
-                                "failed to open forensic audit log; continuing without it"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "marmot_app",
-                        method = "open_account",
-                        error = %e,
-                        "failed to prepare forensic audit identity; continuing without it"
-                    );
-                }
-            }
+        if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
+            session_config = session_config.recorder(recorder);
         }
         let session = AccountDeviceSession::open(session_config)?;
 
@@ -3855,6 +3909,45 @@ impl MarmotApp {
             ));
         }
         Ok(path)
+    }
+
+    /// Validate `path` as an audit log file and resolve which local account
+    /// owns it.
+    ///
+    /// Returns the canonical path plus the owning account's `account_id_hex`
+    /// (the audit file lives directly in that account's directory). The owner
+    /// is `None` for a valid-but-unclaimed file, e.g. one left behind by a
+    /// since-removed account.
+    pub(crate) fn resolve_audit_log_path(
+        &self,
+        path: &str,
+    ) -> Result<(PathBuf, Option<String>), AppError> {
+        let path = self.validate_audit_log_path(path)?;
+        let mut owner_account_id_hex = None;
+        for account in self.account_home().accounts()? {
+            let Ok(dir) = fs::canonicalize(self.account_dir(&account.label)) else {
+                continue;
+            };
+            if path.parent() == Some(dir.as_path()) {
+                owner_account_id_hex = Some(account.account_id_hex);
+                break;
+            }
+        }
+        Ok((path, owner_account_id_hex))
+    }
+
+    /// Remove an audit log file from disk.
+    ///
+    /// Safe only when no live recorder holds the file open; a caller with a
+    /// running account worker must rotate the live recorder instead (see
+    /// `AppClient::rotate_audit_log_if_active`) so the held handle is never
+    /// orphaned. A missing file is treated as success.
+    pub(crate) fn remove_audit_log_file(&self, path: &Path) -> Result<(), AppError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn legacy_directory_cache_path(&self) -> PathBuf {
@@ -7166,5 +7259,78 @@ mod tests {
 
         let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         assert_eq!(reopened.audit_log_settings().unwrap(), stored);
+    }
+
+    #[test]
+    fn resolve_audit_log_path_maps_file_to_owning_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        let audit_path = app.account_dir("alice").join("audit-deadbeef.jsonl");
+        std::fs::write(&audit_path, b"{}\n").unwrap();
+
+        let (resolved, owner) = app
+            .resolve_audit_log_path(&audit_path.to_string_lossy())
+            .unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&audit_path).unwrap());
+        assert_eq!(owner.as_deref(), Some(account.account_id_hex.as_str()));
+    }
+
+    #[test]
+    fn resolve_audit_log_path_has_no_owner_outside_account_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        // A valid audit file directly under the app root belongs to no account.
+        let orphan = dir.path().join("audit-orphan.jsonl");
+        std::fs::write(&orphan, b"{}\n").unwrap();
+
+        let (_, owner) = app
+            .resolve_audit_log_path(&orphan.to_string_lossy())
+            .unwrap();
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn remove_audit_log_file_deletes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        let audit_path = app.account_dir("alice").join("audit-deadbeef.jsonl");
+        std::fs::write(&audit_path, b"{}\n").unwrap();
+        assert!(audit_path.exists());
+
+        app.remove_audit_log_file(&audit_path).unwrap();
+        assert!(!audit_path.exists());
+        // A missing file is treated as success.
+        app.remove_audit_log_file(&audit_path).unwrap();
+    }
+
+    #[test]
+    fn build_audit_recorder_reflects_enabled_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        // Off -> no-op recorder with no file backing.
+        assert!(
+            app.build_audit_recorder("alice", false)
+                .audit_log_path()
+                .is_none()
+        );
+
+        // On -> file-backed recorder; the backing file is created in the
+        // account directory so the live session records to it immediately.
+        let recorder = app.build_audit_recorder("alice", true);
+        let path = recorder
+            .audit_log_path()
+            .expect("file-backed recorder when enabled");
+        assert!(path.exists());
+        assert_eq!(path.parent(), Some(app.account_dir("alice").as_path()));
     }
 }
