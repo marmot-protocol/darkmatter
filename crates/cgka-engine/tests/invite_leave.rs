@@ -40,6 +40,20 @@ fn emits_departure_of(events: &[cgka_traits::engine::GroupEvent], member: &Membe
     })
 }
 
+/// Strict matcher for an admin-driven removal: only `MemberRemoved` (never
+/// `MemberLeft`), so a misclassified self-leave can't pass an admin-remove test.
+fn emits_removed_of(events: &[cgka_traits::engine::GroupEvent], member: &MemberId) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::MemberRemoved { member: m },
+                ..
+            } if m == member
+        )
+    })
+}
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -385,8 +399,8 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
     alice.confirm_published(pending).await.unwrap();
     let alice_events = alice.drain_events();
     assert!(
-        emits_departure_of(&alice_events, &bob.self_id()),
-        "alice should emit a departure for bob after confirm; got {alice_events:?}"
+        emits_removed_of(&alice_events, &bob.self_id()),
+        "alice should emit MemberRemoved for bob after confirm; got {alice_events:?}"
     );
 
     let routed_commit = TransportMessage {

@@ -1917,24 +1917,28 @@ impl AppClient {
             cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id, change, ..
             } => {
+                // Keep a self-leave distinct from a moderator removal so the
+                // audit trail preserves the split that GroupStateChanged makes.
                 let membership_action = match change {
                     cgka_traits::engine::GroupStateChange::MemberAdded { .. } => {
-                        Some("invite_members")
+                        Some(("invite_members", "members"))
                     }
-                    cgka_traits::engine::GroupStateChange::MemberRemoved { .. }
-                    | cgka_traits::engine::GroupStateChange::MemberLeft { .. } => {
-                        Some("remove_members")
+                    cgka_traits::engine::GroupStateChange::MemberRemoved { .. } => {
+                        Some(("remove_members", "members"))
+                    }
+                    cgka_traits::engine::GroupStateChange::MemberLeft { .. } => {
+                        Some(("leave_group", "membership"))
                     }
                     // Admin/profile changes are audited from the projection
                     // delta on the accompanying EpochChanged event.
                     _ => None,
                 };
-                if let Some(action) = membership_action {
+                if let Some((action, field)) = membership_action {
                     self.record_observed_human_action(
                         group_id,
                         ObservedHumanActionAudit::source(
                             action,
-                            vec!["members"],
+                            vec![field],
                             Vec::new(),
                             source_message_id_hex,
                         )
@@ -2399,16 +2403,20 @@ impl AppClient {
         // state changes ("you added Bob", "you renamed the group"). Best-effort:
         // the rows persist and surface via the timeline subscription / chat-list
         // refresh that the GroupStateChanged event already triggers.
-        let source_message_id_hex = effects
-            .reports
-            .first()
-            .map(|report| hex::encode(report.message_id.as_slice()))
-            .unwrap_or_default();
-        let _ = self.project_group_system_rows(
-            &effects.events,
-            &source_message_id_hex,
-            unix_now_seconds(),
-        );
+        //
+        // Only when we actually published a commit: the source link must be the
+        // committing message id. Paths without a report (e.g. convergence retry)
+        // would otherwise stamp an empty source and, via upsert, clobber the
+        // correct link a row already carries from inbound ingest. Those changes
+        // are synthesized on the inbound path with their real delivery source.
+        if let Some(report) = effects.reports.first() {
+            let source_message_id_hex = hex::encode(report.message_id.as_slice());
+            let _ = self.project_group_system_rows(
+                &effects.events,
+                &source_message_id_hex,
+                unix_now_seconds(),
+            );
+        }
     }
 
     /// Synthesize a durable kind-1210 group system row for each
@@ -2431,14 +2439,24 @@ impl AppClient {
                 change,
             } = event
             {
-                let projection = build_group_system_projection(
+                let projection = match build_group_system_projection(
                     group_id,
                     epoch.0,
                     actor.as_ref(),
                     change,
                     source_message_id_hex,
                     recorded_at,
-                );
+                ) {
+                    Ok(projection) => projection,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "marmot_app::groups",
+                            method = "project_group_system_rows",
+                            "failed to build group system row: {err}",
+                        );
+                        continue;
+                    }
+                };
                 match self
                     .app
                     .record_account_app_event(&self.state.label, &projection)
@@ -2487,7 +2505,7 @@ fn build_group_system_projection(
     change: &cgka_traits::engine::GroupStateChange,
     source_message_id_hex: &str,
     recorded_at: u64,
-) -> AppMessageProjection {
+) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
     use cgka_traits::app_event::{
         GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
         GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
@@ -2566,34 +2584,38 @@ fn build_group_system_projection(
         );
     }
     let data = (!data.is_empty()).then_some(serde_json::Value::Object(data));
-    let content = GroupSystemEvent::new(system_type, text, data).to_content();
+    let content = GroupSystemEvent::new(system_type, text, data).to_content()?;
+    let group_id_hex = hex::encode(group_id.as_slice());
     let tags = vec![vec![
         GROUP_SYSTEM_TYPE_TAG.to_owned(),
         system_type.to_owned(),
     ]];
     let sender = actor_hex.unwrap_or_default();
     // Deterministic, local-only id. `epoch` (not the wall-clock `recorded_at`)
-    // anchors it so the same change yields the same id on every pass.
+    // anchors it so the same change yields the same id on every pass; `group_id`
+    // is folded in so the same change in two groups can't collide (the canonical
+    // id is also used by message-id-keyed ops like reactions/invalidation).
+    let id_preimage = format!("{group_id_hex}\u{1f}{content}");
     let message_id_hex = canonical_event_id(
         &sender,
         epoch,
         MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         &tags,
-        &content,
+        &id_preimage,
     );
 
-    AppMessageProjection {
+    Ok(AppMessageProjection {
         message_id_hex,
         source_message_id_hex: Some(source_message_id_hex.to_owned()),
         direction: "system".to_owned(),
-        group_id_hex: hex::encode(group_id.as_slice()),
+        group_id_hex,
         sender,
         plaintext: content,
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         tags,
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
-    }
+    })
 }
 
 fn audit_message_ids_from_effects(effects: &marmot_account::AccountDeviceEffects) -> Vec<String> {

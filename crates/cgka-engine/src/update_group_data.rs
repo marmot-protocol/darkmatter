@@ -138,7 +138,19 @@ impl<S: StorageProvider> Engine<S> {
                         &mls_group,
                         update.component_id,
                     );
-                    if before.as_deref() != Some(update.data.as_slice()) {
+                    // Normalize presence so an absent component (`None`) and the
+                    // canonical "absent" encoding compare equal — otherwise
+                    // clearing an already-absent avatar would emit a bogus row.
+                    let before_present = before.as_deref().is_some_and(|bytes| {
+                        crate::app_components::avatar_component_present(update.component_id, bytes)
+                    });
+                    let after_present = crate::app_components::avatar_component_present(
+                        update.component_id,
+                        &update.data,
+                    );
+                    if before_present != after_present
+                        || (after_present && before.as_deref() != Some(update.data.as_slice()))
+                    {
                         avatar_changed = true;
                     }
                 }

@@ -3850,6 +3850,90 @@ fn message_subscription_args() -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn system_value(from: &str, from_display_name: Option<&str>) -> Value {
+        let mut value = serde_json::json!({ "from": from });
+        if let Some(name) = from_display_name {
+            value["from_display_name"] = Value::String(name.to_owned());
+        }
+        value
+    }
+
+    #[test]
+    fn group_system_summary_formats_known_types() {
+        let value = system_value(&"aa".repeat(32), Some("alice"));
+        let added = r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, added).as_deref(),
+            Some("alice added bbbbbbbb")
+        );
+
+        let left = r#"{"v":1,"system_type":"member_left","text":"Member left","data":{}}"#;
+        assert_eq!(
+            group_system_summary(&value, left).as_deref(),
+            Some("alice left")
+        );
+
+        let admin = r#"{"v":1,"system_type":"admin_added","text":"Admin added","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, admin).as_deref(),
+            Some("alice made bbbbbbbb an admin")
+        );
+
+        let renamed =
+            r#"{"v":1,"system_type":"group_renamed","text":"Group renamed","data":{"name":"ops"}}"#;
+        assert_eq!(
+            group_system_summary(&value, renamed).as_deref(),
+            Some("alice renamed the group to \"ops\"")
+        );
+
+        let avatar =
+            r#"{"v":1,"system_type":"group_avatar_changed","text":"Group avatar changed"}"#;
+        assert_eq!(
+            group_system_summary(&value, avatar).as_deref(),
+            Some("alice changed the group avatar")
+        );
+    }
+
+    #[test]
+    fn group_system_summary_falls_back_for_unknown_type() {
+        let value = system_value(&"aa".repeat(32), Some("alice"));
+        let with_text = r#"{"v":1,"system_type":"mystery","text":"Something happened","data":{}}"#;
+        assert_eq!(
+            group_system_summary(&value, with_text).as_deref(),
+            Some("Something happened")
+        );
+        // Unknown type with no text falls back to the system_type string.
+        let bare = r#"{"v":1,"system_type":"mystery"}"#;
+        assert_eq!(
+            group_system_summary(&value, bare).as_deref(),
+            Some("mystery")
+        );
+    }
+
+    #[test]
+    fn group_system_summary_handles_missing_actor_and_subject() {
+        // No display name: actor falls back to the shortened "from" pubkey, and a
+        // missing subject renders as "someone".
+        let value = serde_json::json!({ "from": "aa".repeat(32) });
+        let added = r#"{"v":1,"system_type":"member_added","data":{}}"#;
+        let summary = group_system_summary(&value, added).unwrap();
+        assert!(summary.ends_with("added someone"), "got {summary}");
+        assert!(
+            !summary.starts_with("someone"),
+            "actor should be the pubkey"
+        );
+    }
+
+    #[test]
+    fn group_system_summary_rejects_non_system_content() {
+        let value = system_value(&"aa".repeat(32), Some("alice"));
+        assert_eq!(group_system_summary(&value, "not json"), None);
+        assert_eq!(
+            group_system_summary(&value, r#"{"text":"no system_type"}"#),
+            None
+        );
+    }
+
     #[test]
     fn slash_command_parser_understands_core_commands() {
         assert_eq!(parse_slash_command("/help"), Ok(SlashCommand::Help));

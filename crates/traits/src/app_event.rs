@@ -227,9 +227,10 @@ impl GroupSystemEvent {
         }
     }
 
-    /// Serialize to the kind-1210 `content` JSON string.
-    pub fn to_content(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+    /// Serialize to the kind-1210 `content` JSON string. Returns an error rather
+    /// than swallowing a serialization failure into empty content.
+    pub fn to_content(&self) -> Result<String, MarmotAppEventError> {
+        serde_json::to_string(self).map_err(|err| MarmotAppEventError::Json(err.to_string()))
     }
 
     /// Parse a kind-1210 `content` JSON string.
@@ -257,7 +258,7 @@ mod tests {
                 GROUP_SYSTEM_DATA_SUBJECT: "bb".repeat(32),
             })),
         );
-        let parsed = GroupSystemEvent::parse(&event.to_content()).unwrap();
+        let parsed = GroupSystemEvent::parse(&event.to_content().unwrap()).unwrap();
         assert_eq!(parsed, event);
         assert_eq!(parsed.v, GROUP_SYSTEM_EVENT_VERSION);
         assert_eq!(
