@@ -1012,11 +1012,23 @@ impl AgentConnector {
         write_frame(writer, &response).await?;
         loop {
             let event = tokio::select! {
+                // SubscribeInbound is read-only after the initial request: clients are only
+                // expected to close the stream. read_envelope() uses read_until(), which is
+                // not cancellation-safe for partial frames inside select!; switch this to a
+                // cancellation-safe framed read before adding subscriber-side messages here.
                 read = read_envelope(reader) => {
                     let read: Result<Option<AgentControlEnvelope<AgentControlRequest>>, AgentControlError> = read;
                     match read {
                         Ok(None) => return Ok(()),
-                        Ok(Some(_)) => continue,
+                        Ok(Some(envelope)) => {
+                            tracing::warn!(
+                                target: "agent_connector",
+                                method = "stream_inbound_events",
+                                request_type = agent_control_request_type(&envelope.payload),
+                                "additional request received after SubscribeInbound"
+                            );
+                            continue;
+                        }
                         Err(err) => return Err(err.into()),
                     }
                 }
@@ -1024,18 +1036,7 @@ impl AgentConnector {
                     match catch_up {
                         Ok(InboundCatchUpEvent::Completed)
                         | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Ok(InboundCatchUpEvent::Failed)
-                        | Err(broadcast::error::RecvError::Closed) => {
-                            let err = ConnectorError::Stream(
-                                "inbound catch-up driver failed".to_owned(),
-                            );
-                            let response = AgentControlEnvelope::new(
-                                request_id.clone(),
-                                self.error_response("stream_inbound_events", &err),
-                            );
-                            write_frame(writer, &response).await?;
-                            return Ok(());
-                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                     continue;
                 }
@@ -1130,7 +1131,6 @@ impl AgentConnector {
 #[derive(Clone, Copy)]
 enum InboundCatchUpEvent {
     Completed,
-    Failed,
 }
 
 #[derive(Clone)]
@@ -1204,12 +1204,16 @@ impl InboundCatchUpDriver {
     async fn request(&self) -> Result<(), AppError> {
         let _guard = self.lock.lock().await;
         let result = self.runtime.catch_up_accounts().await;
-        let event = if result.is_ok() {
-            InboundCatchUpEvent::Completed
+        if result.is_ok() {
+            let _ = self.events.send(InboundCatchUpEvent::Completed);
         } else {
-            InboundCatchUpEvent::Failed
-        };
-        let _ = self.events.send(event);
+            tracing::warn!(
+                target: "agent_connector",
+                method = "inbound_catch_up_request",
+                error_code = "catch_up_failed",
+                "inbound catch-up request failed"
+            );
+        }
         result
     }
 }
@@ -1363,6 +1367,31 @@ fn unsupported_request_message(request: &AgentControlRequest) -> &'static str {
             "subscribe_inbound must be sent as the first request on a streaming connection"
         }
         _ => "request is not implemented by this connector slice",
+    }
+}
+
+fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
+    match request {
+        AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
+        AgentControlRequest::SendFinal { .. } => "send_final",
+        AgentControlRequest::StreamBegin { .. } => "stream_begin",
+        AgentControlRequest::StreamAppend { .. } => "stream_append",
+        AgentControlRequest::StreamStatus { .. } => "stream_status",
+        AgentControlRequest::StreamProgress { .. } => "stream_progress",
+        AgentControlRequest::StreamFinalize { .. } => "stream_finalize",
+        AgentControlRequest::StreamCancel { .. } => "stream_cancel",
+        AgentControlRequest::AccountList => "account_list",
+        AgentControlRequest::AccountCreate { .. } => "account_create",
+        AgentControlRequest::AccountPublishKeyPackage { .. } => "account_publish_key_package",
+        AgentControlRequest::AccountPublishProfile { .. } => "account_publish_profile",
+        AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
+        AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
+        AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
+        AgentControlRequest::AllowlistList { .. } => "allowlist_list",
+        AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
+        AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",
+        AgentControlRequest::DebugInjectInbound { .. } => "debug_inject_inbound",
+        AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
     }
 }
 
@@ -1892,13 +1921,14 @@ mod tests {
     use nostr_relay_builder::MockRelay;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
     use tokio::io::BufReader;
     use tokio::net::UnixStream;
     use tokio::time::{Duration, sleep, timeout};
 
     use crate::{
         AgentConnector, AgentConnectorConfig, AllowlistRecord, AllowlistStore,
-        bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
+        InboundCatchUpDriver, bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
     };
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1916,6 +1946,44 @@ mod tests {
         config.allow_any = allow_any;
         config.debug_controls = debug_controls;
         config
+    }
+
+    #[tokio::test]
+    async fn inbound_catch_up_driver_tracks_active_subscriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+        let driver = InboundCatchUpDriver::new(runtime.clone());
+
+        let (_first_events, first_subscription) = driver.subscribe();
+        assert_eq!(driver.active.load(Ordering::Acquire), 1);
+        assert!(driver.started.load(Ordering::Acquire));
+
+        let (_second_events, second_subscription) = driver.subscribe();
+        assert_eq!(driver.active.load(Ordering::Acquire), 2);
+
+        drop(first_subscription);
+        assert_eq!(driver.active.load(Ordering::Acquire), 1);
+
+        drop(second_subscription);
+        assert_eq!(driver.active.load(Ordering::Acquire), 0);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_catch_up_driver_failure_does_not_close_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+        runtime.shutdown().await;
+        let driver = InboundCatchUpDriver::new(runtime);
+        let (mut events, _subscription) = driver.subscribe();
+
+        assert!(driver.request().await.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(driver.active.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
