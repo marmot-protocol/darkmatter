@@ -141,7 +141,7 @@ jobs:
           )
           cp "$pinned_asset" "$latest_asset"
           shasum -a 256 "$pinned_asset" | awk -v name="$(basename "$pinned_asset")" '{print $1 "  " name}' > "$pinned_asset.sha256"
-          cp "$pinned_asset.sha256" "$latest_asset.sha256"
+          shasum -a 256 "$latest_asset" | awk -v name="$(basename "$latest_asset")" '{print $1 "  " name}' > "$latest_asset.sha256"
           mkdir -p "dist/dm-agent-$target"
           cp "$pinned_asset" "$pinned_asset.sha256" "$latest_asset" "$latest_asset.sha256" "dist/dm-agent-$target/"
 
@@ -202,7 +202,7 @@ jobs:
           )
           cp "$pinned_asset" "$latest_asset"
           shasum -a 256 "$pinned_asset" | awk -v name="$(basename "$pinned_asset")" '{print $1 "  " name}' > "$pinned_asset.sha256"
-          cp "$pinned_asset.sha256" "$latest_asset.sha256"
+          shasum -a 256 "$latest_asset" | awk -v name="$(basename "$latest_asset")" '{print $1 "  " name}' > "$latest_asset.sha256"
           mkdir -p dist/hermes-marmot-plugin
           cp "$pinned_asset" "$pinned_asset.sha256" "$latest_asset" "$latest_asset.sha256" dist/hermes-marmot-plugin/
 
@@ -293,10 +293,11 @@ jobs:
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "dm-agent beta" --notes-file "$notes"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "dm-agent beta" --notes-file "$notes"
           else
             gh release create "$tag" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
               --title "dm-agent beta" \
               --notes-file "$notes" \
               --prerelease

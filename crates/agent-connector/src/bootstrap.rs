@@ -194,10 +194,14 @@ impl ControlClient {
                 .map_err(AgentControlError::Io)
                 .map_err(BootstrapError::Control)?;
             let mut reader = BufReader::new(stream);
-            read_envelope::<_, AgentControlResponse>(&mut reader)
+            let response = read_envelope::<_, AgentControlResponse>(&mut reader)
                 .await
                 .map_err(BootstrapError::Control)?
-                .ok_or(BootstrapError::Control(AgentControlError::EmptyFrame))
+                .ok_or(BootstrapError::Control(AgentControlError::EmptyFrame))?;
+            if response.id.as_deref() != Some(request_id.as_str()) {
+                return Err(BootstrapError::ResponseIdMismatch);
+            }
+            Ok(response)
         })
         .await
         .map_err(|_| BootstrapError::RequestTimedOut)?
