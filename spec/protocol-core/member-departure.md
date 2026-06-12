@@ -30,6 +30,10 @@ A departing admin first commits an admin-policy update that removes it from the 
 admin-policy update is an ordinary admin-gated group-state change and is valid only if at least one other active admin
 remains, so the last active admin MUST designate another admin before leaving.
 
+This two-step flow applies to voluntary departure through SelfRemove only. An admin removed by another admin does not
+use it: the removing commit drops the account's last leaf and its `admins` key together, under the coupling rule in
+[../app-components/admin-policy-v1.md](../app-components/admin-policy-v1.md) ("Active admins").
+
 The leaving member MUST NOT commit its own SelfRemove proposal. A remaining authorized member commits it.
 
 ## Deterministic auto-commit

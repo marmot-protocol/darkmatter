@@ -38,6 +38,13 @@ A commit that removes an account's last member leaf MUST also remove that accoun
 commit. An admin-policy state that lists an account with no member leaf is invalid in the resulting epoch, so in valid
 group state every key in `admins` names an active admin.
 
+This coupling rule and the SelfRemove flow below are two different departure paths, not two orderings of one
+transition. The coupling rule binds commits that remove a listed account's last leaf — for example, an admin removing
+another listed account's last device with a Remove proposal. SelfRemove never triggers the coupling rule: a SelfRemove
+proposal whose sender is still an active admin is invalid at the sender check, so a departing admin's admin-policy
+update always lands in an earlier commit, and the account is no longer listed in `admins` by the time its SelfRemove
+commits.
+
 ## Update
 
 The update payload is a full replacement state:
