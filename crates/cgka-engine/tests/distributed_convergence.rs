@@ -1511,6 +1511,15 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
 /// tip: here convergence selects the epoch-2 commit while the app message
 /// lives at epoch 3 (its commit withheld), so the message is classified
 /// `UndecryptableInCanonicalState` and persisted alongside the applied branch.
+///
+/// Note the retryable mapping is scoped to messages whose epoch is *beyond* the
+/// settled tip (here msg epoch 3 > tip 2). An `UndecryptableInCanonicalState`
+/// message at or below the settled tip is instead stranded — the awaited commit
+/// already passed on a branch it does not belong to — and stays terminal
+/// `EpochInvalidated`; mapping that case to `Retryable` would wedge convergence
+/// (it never clears, so the group reports perpetually unsettled and all later
+/// sends stall). That at/below-tip path is covered end-to-end by the CLI test
+/// `three_user_message_lifecycle_covers_invite_remove_and_later_delivery`.
 #[tokio::test]
 async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
     let (mut alice, _alice_storage) = build_client(b"alice");

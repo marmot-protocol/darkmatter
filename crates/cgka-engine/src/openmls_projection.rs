@@ -814,10 +814,17 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
             message_state_for_dropped_reason(dropped.reason),
         );
     }
+    // The epoch convergence settled on: the selected branch tip, or the
+    // unchanged previous tip when no branch was selected this pass.
+    let resulting_tip = result.selected_tip.unwrap_or(result.previous_tip);
     for invalidated in &result.invalidated_app_messages {
         state_by_message_id.insert(
             invalidated.message_id.clone(),
-            message_state_for_invalidated_reason(invalidated.reason),
+            message_state_for_invalidated_reason(
+                invalidated.reason,
+                invalidated.epoch,
+                resulting_tip,
+            ),
         );
     }
     for accepted in result
@@ -1056,19 +1063,46 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 
 /// Map an app-message invalidation reason to the persisted message state.
 ///
-/// `UndecryptableInCanonicalState` is the one *retryable* invalidation: the
-/// message arrived for a future epoch the local context cannot peel yet (e.g.
-/// ordinary out-of-order relay delivery of an app message before the commit
-/// that advances the group to its epoch). Persisting it as `EpochInvalidated`
-/// is terminal — `record_state_is_canonicalization_input` never re-admits it —
-/// so the buffered message would be permanently dropped once the awaited commit
-/// arrives. Keep it `Retryable` so a later canonicalize pass re-feeds it.
+/// `UndecryptableInCanonicalState` (the canonicalizer found no candidate branch
+/// that decrypts the message) covers two distinct situations that must be
+/// persisted differently:
+///
+/// * **Future epoch (retryable).** The message targets an epoch *beyond* the
+///   tip convergence settled on — the commit that advances the group to its
+///   epoch has not been selected yet (ordinary out-of-order relay delivery,
+///   darkmatter#144). Persisting it as the terminal `EpochInvalidated` would
+///   permanently drop it: `record_state_is_canonicalization_input` never
+///   re-admits `EpochInvalidated`, so the buffered message could never re-enter
+///   convergence once that commit arrives. Keep it `Retryable` so a later
+///   canonicalize pass re-feeds and applies it.
+///
+/// * **At-or-below tip (terminal).** The message's epoch is already at or below
+///   the settled tip yet still decrypts on no branch — the awaited commit has
+///   come and gone on a branch this message does not belong to. It can never
+///   become decryptable, so it stays terminal `EpochInvalidated`. Marking such
+///   a message `Retryable` would wedge convergence: it re-classifies
+///   `UndecryptableInCanonicalState` on every pass, so `Retryable` never
+///   clears, and `has_unresolved_convergence_inputs` then reports the group as
+///   perpetually unsettled — stalling all later sends and delivery.
+///
+/// `resulting_tip` is the epoch convergence settled on (`selected_tip`, falling
+/// back to `previous_tip` when no branch was selected).
 ///
 /// The remaining reasons (`LosingBranch`, `BeyondAnchor`, `BeyondAppRetention`)
 /// are genuinely terminal and stay `EpochInvalidated`.
-fn message_state_for_invalidated_reason(reason: InvalidatedAppMessageReason) -> MessageState {
+fn message_state_for_invalidated_reason(
+    reason: InvalidatedAppMessageReason,
+    message_epoch: u64,
+    resulting_tip: u64,
+) -> MessageState {
     match reason {
-        InvalidatedAppMessageReason::UndecryptableInCanonicalState => MessageState::Retryable,
+        InvalidatedAppMessageReason::UndecryptableInCanonicalState => {
+            if message_epoch > resulting_tip {
+                MessageState::Retryable
+            } else {
+                MessageState::EpochInvalidated
+            }
+        }
         InvalidatedAppMessageReason::LosingBranch
         | InvalidatedAppMessageReason::BeyondAnchor
         | InvalidatedAppMessageReason::BeyondAppRetention => MessageState::EpochInvalidated,
