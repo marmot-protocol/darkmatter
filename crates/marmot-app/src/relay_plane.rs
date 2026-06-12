@@ -452,20 +452,30 @@ impl MarmotRelayPlane {
     ) -> Option<Timestamp> {
         let lookback = self.inner.subscription_rebuild_lookback?;
         let last_transport_timestamp = last_transport_timestamp?;
-        // Defensive clamp to local wall-clock. The persisted cursor is advanced
-        // from the sender-controlled inbound `created_at`; a far-future value
-        // would push `since` past the present, so relays return no present-dated
-        // events and reception silently halts forever (the cursor is persisted
-        // and monotonic, so it survives restarts). Clamping here breaks that
-        // deadlock and heals cursors that were already poisoned before the
-        // write-side clamp was in place (darkmatter#182). A cursor at or behind
-        // wall-clock is unaffected.
+        // The persisted cursor is advanced from the sender-controlled inbound
+        // `created_at`; a far-future value would push `since` past the present,
+        // so relays return no present-dated events and reception silently halts
+        // forever (the cursor is persisted and monotonic, so it survives
+        // restarts — darkmatter#182).
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let bounded = last_transport_timestamp.min(now);
-        Some(Timestamp(bounded.saturating_sub(lookback.as_secs())))
+        // A cursor detectably in the future is corrupted, not authoritative.
+        // Merely clamping it to wall-clock would yield `since = now - lookback`
+        // and permanently skip any valid backlog older than the (short,
+        // production-default 120s) lookback for an account whose cursor was
+        // poisoned before the write-side clamp existed. Treat it as untrusted
+        // and request a full-history replay (`None`) so the catch-up range is
+        // never silently dropped; the write side then heals the stored value
+        // back below wall-clock. A cursor at or behind wall-clock is trusted
+        // and used as-is.
+        if last_transport_timestamp > now {
+            return None;
+        }
+        Some(Timestamp(
+            last_transport_timestamp.saturating_sub(lookback.as_secs()),
+        ))
     }
 
     /// Attach an account's signing keys to the shared transport client so it
@@ -1382,12 +1392,16 @@ mod tests {
     }
 
     #[test]
-    fn subscription_rebuild_since_clamps_future_cursor_to_wall_clock() {
+    fn subscription_rebuild_since_treats_future_cursor_as_corrupted() {
         // A persisted cursor poisoned by a far-future sender-controlled
         // `created_at` must not push `since` past the present, or relays would
         // stop returning present-dated events and the account would silently
-        // halt forever (darkmatter#182). The read side clamps to local
-        // wall-clock so an already-poisoned cursor self-heals on rebuild.
+        // halt forever (darkmatter#182). A detectably-future cursor is
+        // corrupted, not authoritative: rather than clamping it to
+        // `now - lookback` (which would permanently skip valid backlog older
+        // than the short production lookback), we treat it as untrusted and
+        // request a full-history replay (`None`) so the catch-up range is never
+        // dropped.
         let lookback = Duration::from_secs(30);
         let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(lookback);
         let now = SystemTime::now()
@@ -1396,22 +1410,35 @@ mod tests {
             .as_secs();
         let poisoned = now + 10 * 365 * 24 * 60 * 60; // ~10 years in the future
 
+        assert!(
+            plane.subscription_rebuild_since(Some(poisoned)).is_none(),
+            "a future (poisoned) cursor must trigger full-history replay, not a clamped future `since`"
+        );
+    }
+
+    #[test]
+    fn subscription_rebuild_since_uses_trusted_past_cursor() {
+        // A cursor at or behind wall-clock is trusted and used as-is: `since`
+        // is the cursor minus the lookback margin.
+        let lookback = Duration::from_secs(30);
+        let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(lookback);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cursor = now - 10_000;
+
         let since = plane
-            .subscription_rebuild_since(Some(poisoned))
-            .expect("lookback configured")
+            .subscription_rebuild_since(Some(cursor))
+            .expect("a past cursor yields a concrete since")
             .0;
 
-        // `since` must be bounded by wall-clock minus lookback, never the
-        // future cursor minus lookback.
-        let expected_upper_bound = now.saturating_sub(lookback.as_secs());
-        assert!(
-            since <= expected_upper_bound,
-            "since {since} should be clamped to <= {expected_upper_bound}, not derived from the future cursor"
+        assert_eq!(
+            since,
+            cursor.saturating_sub(lookback.as_secs()),
+            "a trusted past cursor must produce since = cursor - lookback"
         );
-        assert!(
-            since < now,
-            "since {since} must be in the past, not the future"
-        );
+        assert!(since < now, "since {since} must be in the past");
     }
 
     #[tokio::test]

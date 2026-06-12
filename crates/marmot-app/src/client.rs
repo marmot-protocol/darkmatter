@@ -2790,8 +2790,12 @@ fn notification_trigger_for_intent(
 /// is first clamped to `now + max_future_skew_secs` so a far-future value
 /// cannot poison the cursor (which would push the relay `since` filter into the
 /// future and silently halt message reception — darkmatter#182), then folded
-/// into the existing monotonic-max cursor. A benign in-range timestamp is
-/// unaffected; the skew margin tolerates ordinary sender clock drift.
+/// into the existing monotonic-max cursor. The existing `current` is clamped
+/// the same way before the max, so a cursor that was already poisoned before
+/// this guard existed is *healed* back down to `now + max_future_skew_secs`
+/// here instead of being preserved forever by the monotonic max. A benign
+/// in-range timestamp is unaffected; the skew margin tolerates ordinary sender
+/// clock drift.
 fn clamped_transport_cursor(
     current: Option<u64>,
     candidate: u64,
@@ -2801,7 +2805,7 @@ fn clamped_transport_cursor(
     let max_allowed = now.saturating_add(max_future_skew_secs);
     let clamped = candidate.min(max_allowed);
     current
-        .map(|current| current.max(clamped))
+        .map(|current| current.min(max_allowed).max(clamped))
         .unwrap_or(clamped)
 }
 
@@ -2853,6 +2857,32 @@ mod transport_cursor_tests {
         assert_eq!(
             clamped_transport_cursor(Some(NOW), within, NOW, SKEW),
             within
+        );
+    }
+
+    #[test]
+    fn already_poisoned_cursor_is_healed_down_not_preserved() {
+        // A cursor poisoned before this guard existed (a far-future value
+        // persisted by a vulnerable version) must not be preserved forever by
+        // the monotonic max. When a present-dated message arrives, the stored
+        // cursor is clamped back to now + skew and then folded in, so the
+        // account recovers to wall-clock instead of staying degraded
+        // (darkmatter#182 — blocking adversarial finding).
+        let poisoned = NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+        assert_eq!(
+            clamped_transport_cursor(Some(poisoned), NOW, NOW, SKEW),
+            NOW + SKEW,
+            "a present-dated message must heal a poisoned future cursor down to now + skew"
+        );
+        // Once wall-clock advances past the healed value, a present-dated
+        // message advances the cursor normally, proving the account is no
+        // longer stuck in the future.
+        let healed = clamped_transport_cursor(Some(poisoned), NOW, NOW, SKEW);
+        let later = healed + 1_000;
+        assert_eq!(
+            clamped_transport_cursor(Some(healed), later, later, SKEW),
+            later,
+            "after healing, the cursor tracks present-dated messages again"
         );
     }
 }
