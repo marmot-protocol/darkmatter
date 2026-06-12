@@ -65,12 +65,14 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 struct MockPeeler;
 
 struct FailFirstGroupWrapPeeler {
+    inner: MockPeeler,
     remaining_failures: AtomicUsize,
 }
 
 impl FailFirstGroupWrapPeeler {
     fn new() -> Self {
         Self {
+            inner: MockPeeler,
             remaining_failures: AtomicUsize::new(1),
         }
     }
@@ -146,35 +148,19 @@ impl TransportPeeler for FailFirstGroupWrapPeeler {
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
-        _ctx: &GroupContextSnapshot,
+        ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::MlsMessage {
-                bytes: msg.payload.clone(),
-            },
-            origin: msg.clone(),
-        })
+        self.inner.peel_group_message(msg, ctx).await
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                bytes: msg.payload.clone(),
-            },
-            origin: msg.clone(),
-        })
+        self.inner.peel_welcome(msg).await
     }
 
     async fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
+        ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         if self
             .remaining_failures
@@ -187,16 +173,7 @@ impl TransportPeeler for FailFirstGroupWrapPeeler {
                 "injected group-wrap failure".into(),
             ));
         }
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
-            },
-        })
+        self.inner.wrap_group_message(payload, ctx).await
     }
 
     async fn wrap_welcome(
@@ -204,16 +181,7 @@ impl TransportPeeler for FailFirstGroupWrapPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
+        self.inner.wrap_welcome(payload, recipient).await
     }
 }
 
