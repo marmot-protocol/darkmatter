@@ -3254,6 +3254,9 @@ async fn update_follows_command(
     let target = parse_public_key(&pubkey)?;
     let relay = relay.ok_or(DmError::MissingRelay)?;
     let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
+    runtime
+        .refresh_user_directory_for_account_id(&account.account_id_hex, vec![endpoint.clone()])
+        .await?;
     let mut follows = app
         .directory_entry_for_account_id(&account.account_id_hex)?
         .map(|entry| entry.follows)
@@ -3444,7 +3447,22 @@ async fn update_relay_list(
 ) -> Result<CommandOutput, DmError> {
     let relay_type = normalize_relay_type(&relay_type)?;
     let url = validate_relay_url(&url)?;
-    let status = app.account_relay_list_status(&account.label)?;
+    let explicit_bootstrap = relay.map(validate_relay_url).transpose()?;
+    let cached_status = app.account_relay_list_status(&account.label)?;
+    let source_relays = if let Some(relay) = explicit_bootstrap.as_ref() {
+        vec![TransportEndpoint(relay.clone())]
+    } else {
+        relay_endpoints(relays_for_type(&cached_status, None)?)?
+    };
+    let status = if source_relays.is_empty() {
+        cached_status
+    } else {
+        app.fetch_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            source_relays.clone(),
+        )
+        .await?
+    };
     let mut relays = relays_for_type(&status, Some(&relay_type))?;
     if add {
         if !relays.contains(&url) {
@@ -3456,9 +3474,8 @@ async fn update_relay_list(
     relays.sort();
     relays.dedup();
     let publish_relays = relay_endpoints(relays.clone())?;
-    let bootstrap = relay
-        .map(validate_relay_url)
-        .transpose()?
+    let bootstrap = explicit_bootstrap
+        .or_else(|| source_relays.first().map(|endpoint| endpoint.0.clone()))
         .or_else(|| relays.first().cloned())
         .ok_or(DmError::MissingRelay)?;
     let bootstrap_relays = vec![TransportEndpoint(bootstrap)];

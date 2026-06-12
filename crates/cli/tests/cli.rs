@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use marmot_account::AccountHome;
+use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -294,7 +296,15 @@ fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
 }
 
 fn run_json_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
-    let mut child = dm(home)
+    run_json_with_stdin_command(dm(home), args, stdin)
+}
+
+fn run_json_with_stdin_without_relay(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
+    run_json_with_stdin_command(dm_without_relay(home), args, stdin)
+}
+
+fn run_json_with_stdin_command(mut command: Command, args: &[&str], stdin: &str) -> Value {
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -717,6 +727,81 @@ fn create_account_with_relays(
             bootstrap_relays,
         ],
     )
+}
+
+fn generated_nsec() -> String {
+    nostr::Keys::generate()
+        .secret_key()
+        .to_bech32()
+        .expect("nsec")
+}
+
+fn create_local_account_id(home: &std::path::Path) -> String {
+    AccountHome::open(home)
+        .create_nostr_account()
+        .expect("create local account")
+        .account_id_hex
+}
+
+fn import_nsec_account_with_relays(home: &std::path::Path, nsec: &str, relay: &str) -> String {
+    let imported = run_json_with_stdin_without_relay(
+        home,
+        &[
+            "account",
+            "create",
+            "--nsec-stdin",
+            "--default-relays",
+            relay,
+            "--bootstrap-relays",
+            relay,
+            "--publish-missing-relay-lists",
+        ],
+        &format!("{nsec}\n"),
+    );
+    imported["account_id"]
+        .as_str()
+        .expect("imported account id")
+        .to_owned()
+}
+
+fn follow_account_ids(value: &Value) -> Vec<String> {
+    let mut follows = value["follows"]
+        .as_array()
+        .expect("follows array")
+        .iter()
+        .filter_map(|follow| follow["account_id"].as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    follows.sort();
+    follows
+}
+
+fn assert_follow_account_ids(value: &Value, expected: &[&str]) {
+    let mut expected = expected
+        .iter()
+        .map(|account_id| (*account_id).to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(follow_account_ids(value), expected);
+}
+
+fn relay_urls(value: &Value) -> Vec<String> {
+    let mut relays = value["relays"]
+        .as_array()
+        .expect("relays array")
+        .iter()
+        .filter_map(|relay| relay.as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    relays.sort();
+    relays
+}
+
+fn assert_relay_urls(value: &Value, expected: &[&str]) {
+    let mut expected = expected
+        .iter()
+        .map(|relay| (*relay).to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(relay_urls(value), expected);
 }
 
 fn member_accounts(value: &Value) -> Vec<String> {
@@ -1949,6 +2034,60 @@ fn account_create_can_publish_missing_relay_lists_from_default_relays() {
     );
     let listed = run_json(home.path(), &["account", "list"]);
     assert_eq!(listed["accounts"][0]["account_id"], imported["account_id"]);
+}
+
+#[test]
+fn follows_add_fetches_remote_list_before_publishing_replaceable_event() {
+    let relay = TestRelay::new();
+    let stale_home = tempfile::tempdir().expect("stale tempdir");
+    let fresh_home = tempfile::tempdir().expect("fresh tempdir");
+    let targets_home = tempfile::tempdir().expect("targets tempdir");
+    let nsec = generated_nsec();
+
+    let bob = create_local_account_id(targets_home.path());
+    let carol = create_local_account_id(targets_home.path());
+    let stale_account = import_nsec_account_with_relays(stale_home.path(), &nsec, relay.url());
+    let fresh_account = import_nsec_account_with_relays(fresh_home.path(), &nsec, relay.url());
+    assert_eq!(stale_account, fresh_account);
+
+    let remote_update =
+        run_json_with_relay(fresh_home.path(), relay.url(), &["follows", "add", &bob]);
+    assert_follow_account_ids(&remote_update, &[&bob]);
+
+    let stale_update =
+        run_json_with_relay(stale_home.path(), relay.url(), &["follows", "add", &carol]);
+    assert_follow_account_ids(&stale_update, &[&bob, &carol]);
+}
+
+#[test]
+fn relays_add_fetches_remote_list_before_publishing_replaceable_event() {
+    let seed_relay = TestRelay::new();
+    let existing_relay = TestRelay::new();
+    let added_relay = TestRelay::new();
+    let stale_home = tempfile::tempdir().expect("stale tempdir");
+    let fresh_home = tempfile::tempdir().expect("fresh tempdir");
+    let nsec = generated_nsec();
+
+    let stale_account = import_nsec_account_with_relays(stale_home.path(), &nsec, seed_relay.url());
+    let fresh_account = import_nsec_account_with_relays(fresh_home.path(), &nsec, seed_relay.url());
+    assert_eq!(stale_account, fresh_account);
+
+    let remote_update = run_json_with_relay(
+        fresh_home.path(),
+        seed_relay.url(),
+        &["relays", "add", existing_relay.url(), "--type", "nip65"],
+    );
+    assert_relay_urls(&remote_update, &[seed_relay.url(), existing_relay.url()]);
+
+    let stale_update = run_json_with_relay(
+        stale_home.path(),
+        seed_relay.url(),
+        &["relays", "add", added_relay.url(), "--type", "nip65"],
+    );
+    assert_relay_urls(
+        &stale_update,
+        &[seed_relay.url(), existing_relay.url(), added_relay.url()],
+    );
 }
 
 #[test]
