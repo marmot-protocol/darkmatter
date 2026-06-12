@@ -29,7 +29,8 @@ use crate::groups::{
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, fetch_group_image,
-    media_imeta_tags_are_valid, upload_encrypted_media, upload_group_image,
+    is_loopback_http_endpoint, media_imeta_tags_are_valid, upload_encrypted_media,
+    upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
@@ -1296,9 +1297,27 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
-        let default_endpoint = policy.default_blob_endpoints.first().ok_or_else(|| {
-            AppError::InvalidEncryptedMedia("encrypted media policy has no default endpoint".into())
-        })?;
+        // Skip loopback-HTTP policy endpoints unless this build is configured for
+        // dev/test: they are valid component state but a production client MUST
+        // NOT upload to the local host (a remote admin could point the policy at
+        // the victim's loopback services). An explicit per-request
+        // `blossom_server` override is an intentional dev escape hatch, so when
+        // one is present any policy endpoint serves as the (unused) default.
+        let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let has_explicit_server = request.blossom_server.is_some();
+        let default_endpoint = policy
+            .default_blob_endpoints
+            .iter()
+            .find(|endpoint| {
+                has_explicit_server
+                    || allow_loopback
+                    || !is_loopback_http_endpoint(&endpoint.base_url)
+            })
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia(
+                    "encrypted media policy has no usable default endpoint".into(),
+                )
+            })?;
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let keys = self
             .app
@@ -1343,6 +1362,7 @@ impl AppClient {
             media_secret.as_ref(),
             &policy.default_blob_endpoints,
             &policy.allowed_locator_kinds,
+            self.app.allow_loopback_blob_endpoints(),
         )
         .await
     }

@@ -258,9 +258,15 @@ pub(crate) async fn download_encrypted_media(
     media_secret: &[u8],
     fallback_endpoints: &[BlobStoreEndpointV1],
     allowed_locator_kinds: &[String],
+    allow_loopback_blob_endpoints: bool,
 ) -> Result<MediaDownloadResult, AppError> {
     reference.validate(allowed_locator_kinds)?;
-    let encrypted = fetch_encrypted_media_blob(&reference, fallback_endpoints).await?;
+    let encrypted = fetch_encrypted_media_blob(
+        &reference,
+        fallback_endpoints,
+        allow_loopback_blob_endpoints,
+    )
+    .await?;
     let actual_encrypted_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_encrypted_hash != reference.ciphertext_sha256 {
         return Err(AppError::InvalidEncryptedMedia(
@@ -305,6 +311,7 @@ pub(crate) async fn download_encrypted_media(
 async fn fetch_encrypted_media_blob(
     reference: &MediaAttachmentReference,
     fallback_endpoints: &[BlobStoreEndpointV1],
+    allow_loopback_blob_endpoints: bool,
 ) -> Result<Vec<u8>, AppError> {
     let mut candidates = reference
         .locators
@@ -319,6 +326,13 @@ async fn fetch_encrypted_media_blob(
             .map(|endpoint| blossom_blob_url(&endpoint.base_url, &reference.ciphertext_sha256)),
     );
     candidates.dedup();
+    if !allow_loopback_blob_endpoints {
+        // A loopback-HTTP candidate is valid component state but unusable in a
+        // production build: skip it rather than GETting the local host. The
+        // candidate may come from a remote-admin policy endpoint or a
+        // sender-chosen locator, so the gate applies to both.
+        candidates.retain(|candidate| !is_loopback_http_endpoint(candidate));
+    }
     if candidates.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "media reference has no supported locators".into(),
@@ -815,6 +829,29 @@ fn blossom_content_hash_from_url(url: &str) -> Option<String> {
     })
 }
 
+/// Whether `url` is a loopback-HTTP blob endpoint: scheme `http` (cleartext)
+/// AND a loopback host (`localhost`/`*.localhost`, 127.0.0.0/8, or `::1`). Such
+/// endpoints are valid component state but must not be acted on outside dev/test
+/// (see `MarmotAppConfig::allow_loopback_blob_endpoints`). A URL that does not
+/// parse, uses HTTPS, or targets a routable host is not a loopback-HTTP endpoint.
+pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let lowered = domain.to_ascii_lowercase();
+            lowered == "localhost" || lowered.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
 fn blossom_authorization_header(
     keys: &nostr::Keys,
     server_host: &str,
@@ -947,5 +984,95 @@ mod tests {
             canonical_media_type("\u{00A0}image/png").expect("non-empty MIME type is valid");
         assert_eq!(canonical, "\u{00A0}image/png");
         assert!(canonical.starts_with('\u{00A0}'));
+    }
+
+    #[test]
+    fn is_loopback_http_endpoint_classifies_only_cleartext_loopback() {
+        // Cleartext loopback hosts are loopback-HTTP endpoints.
+        assert!(is_loopback_http_endpoint("http://127.0.0.1:8080/up"));
+        assert!(is_loopback_http_endpoint("http://localhost:3000"));
+        assert!(is_loopback_http_endpoint("http://sub.localhost/blob"));
+        assert!(is_loopback_http_endpoint("http://[::1]:8080"));
+        // HTTPS (even to loopback) and routable HTTP hosts are not.
+        assert!(!is_loopback_http_endpoint("https://127.0.0.1:8080"));
+        assert!(!is_loopback_http_endpoint("http://media.example/blob"));
+        assert!(!is_loopback_http_endpoint("https://blossom.example"));
+        assert!(!is_loopback_http_endpoint("not a url"));
+    }
+
+    fn loopback_reference() -> MediaAttachmentReference {
+        MediaAttachmentReference {
+            locators: vec![MediaLocator {
+                kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                value: "http://127.0.0.1:8080/blob.bin".to_owned(),
+            }],
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_sha256: "22".repeat(32),
+            nonce_hex: "33".repeat(12),
+            file_name: "diagram.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+            source_epoch: 0,
+            dim: None,
+            thumbhash: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn production_config_does_not_fetch_loopback_endpoint() {
+        // With the dev/test gate off, a loopback-HTTP locator is dropped from the
+        // candidate set, so no GET is issued and the fetch fails as "no supported
+        // locators" rather than attempting to reach the local host.
+        let reference = loopback_reference();
+        let err = fetch_encrypted_media_blob(&reference, &[], false)
+            .await
+            .expect_err("loopback-only reference must be unfetchable in production");
+        match err {
+            AppError::InvalidEncryptedMedia(message) => {
+                assert!(
+                    message.contains("no supported locators"),
+                    "expected unfetchable error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_fallback_endpoint_is_skipped_in_production() {
+        // The same gate applies to remote-admin policy fallback endpoints. With
+        // no supported locator on the message, a loopback-HTTP fallback is the
+        // only candidate; in production it is filtered out, so the fetch fails as
+        // unfetchable instead of GETting the local host.
+        let mut reference = loopback_reference();
+        // Drop the message-carried locator so the loopback fallback is the only
+        // candidate under test, keeping one policy-allowed-but-unsupported
+        // locator so the reference stays structurally valid.
+        reference.locators.clear();
+        reference.locators.push(MediaLocator {
+            kind: "ipfs-v1".to_owned(),
+            value: "ipfs://bafyexample".to_owned(),
+        });
+        let fallback = [BlobStoreEndpointV1 {
+            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            base_url: "http://127.0.0.1:8080".to_owned(),
+        }];
+        let err = fetch_encrypted_media_blob(&reference, &fallback, false)
+            .await
+            .expect_err("loopback fallback must be unfetchable in production");
+        match err {
+            AppError::InvalidEncryptedMedia(message) => assert!(
+                message.contains("no supported locators"),
+                "expected unfetchable error, got: {message}"
+            ),
+            other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        }
+        // The loopback fallback would survive the candidate filter only when the
+        // dev/test gate is on; assert the classifier agrees so the gate stays the
+        // single decision point.
+        assert!(is_loopback_http_endpoint(&blossom_blob_url(
+            &fallback[0].base_url,
+            &reference.ciphertext_sha256,
+        )));
     }
 }

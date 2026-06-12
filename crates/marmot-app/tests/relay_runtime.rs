@@ -41,7 +41,14 @@ async fn mock_relay() -> (MockRelay, String) {
 
 async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     let (relay, url) = mock_relay().await;
-    let app = MarmotApp::with_relay(dir.path(), url.clone());
+    // The test harness exercises encrypted-media upload/download against a
+    // loopback MockBlossom server, which is exactly the dev/test scenario the
+    // loopback-HTTP gate is for. Enable it so the act paths reach 127.0.0.1.
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+    );
     (relay, app, url)
 }
 

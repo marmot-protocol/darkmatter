@@ -20,7 +20,7 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppMessageQuery, AppMessageRecord, AppStatus, DurationHistogramSnapshot, FetchedKeyPackage,
-    MarmotApp, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, RelayDeliverySpread, RelayDeliveryStats,
     RelayLatencyStats, RelaySyncSnapshot, RelayTelemetrySnapshot, StreamStartView, SyncSummary,
     TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
@@ -5445,7 +5445,25 @@ fn relay_lists_json(status: AccountRelayListStatus) -> Value {
 }
 
 fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
-    MarmotApp::with_relays_and_account_home(home, relay.into_iter().collect(), account_home)
+    // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
+    // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
+    // DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
+    // installs leave it unset.
+    let config = MarmotAppConfig::default()
+        .with_allow_loopback_blob_endpoints(dm_allow_loopback_blob_endpoints());
+    MarmotApp::with_relays_and_account_home_and_config(
+        home,
+        relay.into_iter().collect(),
+        account_home,
+        config,
+    )
+}
+
+fn dm_allow_loopback_blob_endpoints() -> bool {
+    matches!(
+        std::env::var("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn open_account_home(

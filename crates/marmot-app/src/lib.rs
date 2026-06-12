@@ -1228,6 +1228,13 @@ impl MarmotApp {
         &self.config.service_endpoints
     }
 
+    /// Whether this build may act on loopback-HTTP blob endpoints (dev/test
+    /// only). Production builds return `false` and skip such endpoints in the
+    /// upload/download act paths.
+    pub(crate) fn allow_loopback_blob_endpoints(&self) -> bool {
+        self.config.allow_loopback_blob_endpoints
+    }
+
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
         let storage = self.shared_storage()?;
         if let Some(install_id) = storage.telemetry_install_id()? {
