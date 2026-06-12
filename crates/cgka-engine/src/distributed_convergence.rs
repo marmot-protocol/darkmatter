@@ -18,6 +18,10 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 
+/// Admin pubkeys + avatar component bytes snapshotted on either side of a
+/// convergence apply, for the unattributed group-state-change diffs.
+type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2]);
+
 impl<S: StorageProvider> Engine<S> {
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
         self.convergence_policy = policy;
@@ -278,11 +282,7 @@ impl<S: StorageProvider> Engine<S> {
     /// bytes for before/after diffing around a convergence apply. `None` when
     /// the MLS state isn't materialized; the caller skips those diffs rather
     /// than failing convergence over a missing caption.
-    #[allow(clippy::type_complexity)]
-    fn reorg_component_snapshot(
-        &self,
-        group_id: &GroupId,
-    ) -> Option<(Vec<[u8; 32]>, [Option<Vec<u8>>; 2])> {
+    fn reorg_component_snapshot(&self, group_id: &GroupId) -> Option<ReorgComponentSnapshot> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -308,7 +308,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         previous_members: Vec<cgka_traits::group::Member>,
         previous_name: &str,
-        previous_components: Option<(Vec<[u8; 32]>, [Option<Vec<u8>>; 2])>,
+        previous_components: Option<ReorgComponentSnapshot>,
         previous_tip: EpochId,
         selected_tip: EpochId,
     ) -> Result<(), OpenMlsProjectionError> {
