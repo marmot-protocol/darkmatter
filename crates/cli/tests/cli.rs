@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use cgka_traits::transport_adapter::TransportEndpoint;
 use marmot_account::AccountHome;
+use marmot_app::{AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp};
 use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
@@ -398,6 +400,21 @@ fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
     value["error"].clone()
 }
 
+fn run_json_error_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
+    let output = dm_with_relay(home, relay)
+        .args(args)
+        .output()
+        .expect("dm command should start");
+    assert!(
+        !output.status.success(),
+        "dm unexpectedly succeeded\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], false);
+    value["error"].clone()
+}
+
 fn run_json_error_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
     let mut child = dm(home)
         .args(args)
@@ -762,6 +779,61 @@ fn import_nsec_account_with_relays(home: &std::path::Path, nsec: &str, relay: &s
         .as_str()
         .expect("imported account id")
         .to_owned()
+}
+
+fn publish_follow_list(home: &std::path::Path, account_id: &str, relay: &str, follows: &[&str]) {
+    let account_home = AccountHome::open(home);
+    let account = account_home.account(account_id).expect("account");
+    let app = MarmotApp::with_relay(home, relay.to_owned());
+    let endpoint = TransportEndpoint(relay.to_owned());
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    runtime
+        .block_on(app.publish_account_follow_list(
+            &account.label,
+            follows,
+            AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint]),
+        ))
+        .expect("publish follow list");
+}
+
+fn fetch_remote_follow_list(home: &std::path::Path, account_id: &str, relay: &str) -> Vec<String> {
+    let app = MarmotApp::with_relay(home, relay.to_owned());
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    runtime
+        .block_on(app.fetch_current_follow_list_for_account_id(
+            account_id,
+            vec![TransportEndpoint(relay.to_owned())],
+        ))
+        .expect("fetch follow list")
+        .expect("current follow list")
+}
+
+fn fetch_remote_relay_status(
+    home: &std::path::Path,
+    account_id: &str,
+    relay: &str,
+    relay_type: &str,
+) -> AccountRelayListStatus {
+    let app = MarmotApp::with_relay(home, relay.to_owned());
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    runtime
+        .block_on(app.fetch_current_account_relay_list_status_for_account_id(
+            account_id,
+            vec![TransportEndpoint(relay.to_owned())],
+            Some(relay_type),
+        ))
+        .expect("fetch relay status")
+        .expect("current relay status")
+}
+
+fn assert_string_list(mut actual: Vec<String>, expected: &[&str]) {
+    let mut expected = expected
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
 }
 
 fn follow_account_ids(value: &Value) -> Vec<String> {
@@ -2050,13 +2122,55 @@ fn follows_add_fetches_remote_list_before_publishing_replaceable_event() {
     let fresh_account = import_nsec_account_with_relays(fresh_home.path(), &nsec, relay.url());
     assert_eq!(stale_account, fresh_account);
 
-    let remote_update =
-        run_json_with_relay(fresh_home.path(), relay.url(), &["follows", "add", &bob]);
-    assert_follow_account_ids(&remote_update, &[&bob]);
+    publish_follow_list(fresh_home.path(), &fresh_account, relay.url(), &[&bob]);
 
     let stale_update =
         run_json_with_relay(stale_home.path(), relay.url(), &["follows", "add", &carol]);
     assert_follow_account_ids(&stale_update, &[&bob, &carol]);
+
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    assert_string_list(
+        fetch_remote_follow_list(verify_home.path(), &stale_account, relay.url()),
+        &[&bob, &carol],
+    );
+}
+
+#[test]
+fn follows_add_refuses_when_selected_relay_has_no_current_list_event() {
+    let list_relay = TestRelay::new();
+    let empty_relay = TestRelay::new();
+    let stale_home = tempfile::tempdir().expect("stale tempdir");
+    let fresh_home = tempfile::tempdir().expect("fresh tempdir");
+    let targets_home = tempfile::tempdir().expect("targets tempdir");
+    let nsec = generated_nsec();
+
+    let bob = create_local_account_id(targets_home.path());
+    let carol = create_local_account_id(targets_home.path());
+    let stale_account = import_nsec_account_with_relays(stale_home.path(), &nsec, list_relay.url());
+    let fresh_account = import_nsec_account_with_relays(fresh_home.path(), &nsec, list_relay.url());
+    assert_eq!(stale_account, fresh_account);
+    publish_follow_list(fresh_home.path(), &fresh_account, list_relay.url(), &[&bob]);
+
+    let error = run_json_error_with_relay(
+        stale_home.path(),
+        empty_relay.url(),
+        &["follows", "add", &carol],
+    );
+    assert_eq!(error["code"], "replaceable_list_inconclusive");
+    assert_eq!(error["list"], "follows");
+
+    let safe_update = run_json_with_relay(
+        stale_home.path(),
+        list_relay.url(),
+        &["follows", "add", &carol],
+    );
+    assert_follow_account_ids(&safe_update, &[&bob, &carol]);
+
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    assert_string_list(
+        fetch_remote_follow_list(verify_home.path(), &stale_account, list_relay.url()),
+        &[&bob, &carol],
+    );
 }
 
 #[test]
@@ -2086,6 +2200,70 @@ fn relays_add_fetches_remote_list_before_publishing_replaceable_event() {
     );
     assert_relay_urls(
         &stale_update,
+        &[seed_relay.url(), existing_relay.url(), added_relay.url()],
+    );
+
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    let persisted = fetch_remote_relay_status(
+        verify_home.path(),
+        &stale_account,
+        seed_relay.url(),
+        "nip65",
+    );
+    assert_string_list(
+        persisted.nip65.relays,
+        &[seed_relay.url(), existing_relay.url(), added_relay.url()],
+    );
+}
+
+#[test]
+fn relays_add_refuses_when_selected_relay_has_no_current_list_event() {
+    let seed_relay = TestRelay::new();
+    let empty_relay = TestRelay::new();
+    let existing_relay = TestRelay::new();
+    let added_relay = TestRelay::new();
+    let stale_home = tempfile::tempdir().expect("stale tempdir");
+    let fresh_home = tempfile::tempdir().expect("fresh tempdir");
+    let nsec = generated_nsec();
+
+    let stale_account = import_nsec_account_with_relays(stale_home.path(), &nsec, seed_relay.url());
+    let fresh_account = import_nsec_account_with_relays(fresh_home.path(), &nsec, seed_relay.url());
+    assert_eq!(stale_account, fresh_account);
+
+    let remote_update = run_json_with_relay(
+        fresh_home.path(),
+        seed_relay.url(),
+        &["relays", "add", existing_relay.url(), "--type", "nip65"],
+    );
+    assert_relay_urls(&remote_update, &[seed_relay.url(), existing_relay.url()]);
+
+    let error = run_json_error_with_relay(
+        stale_home.path(),
+        empty_relay.url(),
+        &["relays", "add", added_relay.url(), "--type", "nip65"],
+    );
+    assert_eq!(error["code"], "replaceable_list_inconclusive");
+    assert_eq!(error["list"], "relays:nip65");
+
+    let safe_update = run_json_with_relay(
+        stale_home.path(),
+        seed_relay.url(),
+        &["relays", "add", added_relay.url(), "--type", "nip65"],
+    );
+    assert_relay_urls(
+        &safe_update,
+        &[seed_relay.url(), existing_relay.url(), added_relay.url()],
+    );
+
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    let persisted = fetch_remote_relay_status(
+        verify_home.path(),
+        &stale_account,
+        seed_relay.url(),
+        "nip65",
+    );
+    assert_string_list(
+        persisted.nip65.relays,
         &[seed_relay.url(), existing_relay.url(), added_relay.url()],
     );
 }
