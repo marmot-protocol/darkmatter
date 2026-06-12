@@ -12,7 +12,8 @@ use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
-    CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent, SendIntent, SendResult,
+    CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest, GroupEvent,
+    SendIntent, SendResult,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -210,12 +211,10 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         bob.confirm_published(*pending).await.unwrap();
     }
 
-    // Extract both wrapped commit messages so we can compute their content
-    // digests up front. With content-derived ordering, the winner is fixed by
-    // SHA-256(mls_bytes); we orchestrate the test so the LOSER ingests the
-    // WINNER's commit (the "candidate wins" path that fires fork recovery)
-    // and the WINNER ingests the LOSER's commit (the "incumbent wins" path
-    // that returns Stale).
+    // Extract both wrapped commit messages so we can compute their authenticated
+    // ordering keys up front. Both commits are privileged admin invites, so the
+    // non-grindable committer identity chooses the winner before the digest
+    // fallback; we orchestrate both recovery paths below.
     let alice_commit = match alice_invite {
         SendResult::GroupEvolution { msg, .. } => msg,
         _ => unreachable!(),
@@ -224,9 +223,19 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         SendResult::GroupEvolution { msg, .. } => msg,
         _ => unreachable!(),
     };
-    let alice_key = CommitOrderingKey::from_commit_bytes(EpochId(1), &alice_commit.payload);
-    let bob_key = CommitOrderingKey::from_commit_bytes(EpochId(1), &bob_commit.payload);
-    assert_ne!(alice_key, bob_key, "distinct commits must hash distinctly");
+    let alice_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(b"alice")),
+        &alice_commit.payload,
+    );
+    let bob_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(b"bob")),
+        &bob_commit.payload,
+    );
+    assert_ne!(alice_key, bob_key, "distinct commits must order distinctly");
     let bob_wins = bob_key < alice_key;
 
     let route = |msg: TransportMessage| TransportMessage {
