@@ -74,7 +74,7 @@ if [ "$workspace_version" != "$version" ]; then
     exit 1
 fi
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if [ -n "$(git status --porcelain)" ]; then
     if [ "$dry_run" -eq 1 ]; then
         echo "warning: working tree has uncommitted changes; a real release requires a clean tree" >&2
     else

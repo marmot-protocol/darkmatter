@@ -6,14 +6,14 @@ workspace_version_default="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/..
 workspace_version_default="${workspace_version_default:-latest}"
 
 MARMOT_RELEASE_REPO="${MARMOT_RELEASE_REPO:-marmot-protocol/darkmatter}"
-MARMOT_RELEASE_TAG_DEFAULT="${MARMOT_RELEASE_TAG_DEFAULT:-dm-agent-v${workspace_version_default}}"
 DM_AGENT_VERSION_DEFAULT="${DM_AGENT_VERSION_DEFAULT:-$workspace_version_default}"
+DM_AGENT_VERSION="${DM_AGENT_VERSION:-${DM_AGENT_SHA:-$DM_AGENT_VERSION_DEFAULT}}"
+MARMOT_RELEASE_TAG_DEFAULT="${MARMOT_RELEASE_TAG_DEFAULT:-dm-agent-v${DM_AGENT_VERSION}}"
 MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-$MARMOT_RELEASE_TAG_DEFAULT}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 MARMOT_PLUGIN_DIR="${MARMOT_PLUGIN_DIR:-${HOME}/.hermes/plugins/marmot}"
 MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agent}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
-DM_AGENT_VERSION="${DM_AGENT_VERSION:-${DM_AGENT_SHA:-$DM_AGENT_VERSION_DEFAULT}}"
 INSTALL_BOOTSTRAP=0
 START_DM_AGENT=0
 DRY_RUN=0
