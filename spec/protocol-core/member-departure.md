@@ -22,10 +22,13 @@ proposal from the MLS extensions work and does not define a Marmot custom propos
 
 A current member MAY create a SelfRemove proposal for itself.
 
-A non-admin MAY self-remove if the MLS proposal is valid.
+A non-admin member MAY self-remove if the MLS proposal is valid. A SelfRemove proposal whose sender is an active admin
+in the prior epoch is invalid (see [../app-components/admin-policy-v1.md](../app-components/admin-policy-v1.md) for the
+definition of an active admin).
 
-An admin MUST leave the admin set before using SelfRemove. The admin-policy update is an ordinary admin-gated
-group-state change. If the departing admin is the last active admin, another admin MUST be designated first.
+A departing admin first commits an admin-policy update that removes it from the admin list, then uses SelfRemove. The
+admin-policy update is an ordinary admin-gated group-state change and is valid only if at least one other active admin
+remains, so the last active admin MUST designate another admin before leaving.
 
 The leaving member MUST NOT commit its own SelfRemove proposal. A remaining authorized member commits it.
 
@@ -50,7 +53,7 @@ does not define an automatic fallback timer.
 A SelfRemove flow is invalid if:
 
 - the proposal does not target the sender;
-- the proposal sender is still listed as an active admin in the prior epoch;
+- the proposal sender is an active admin in the prior epoch;
 - the leaving member commits the proposal;
 - applying the commit would leave the group with no active admin;
 - the committer is not a current member;
