@@ -1173,6 +1173,19 @@ impl AppClient {
 
     fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {
         let local_account = self.app.account_home().account(&self.state.label)?;
+        // TODO(#305 leaf_index): per features/push-notifications.md the gossip
+        // entry `leaf_index` is the device's MLS leaf index, but this is the
+        // member-roster enumeration position, which only equals the MLS leaf
+        // index while no leaves are blanked. BLOCKED: the MLS leaf index is not
+        // exposed through the public engine/session API to marmot-app. The
+        // engine `CgkaEngine` trait surfaces only `members()` (returning
+        // `cgka_traits::Member`, which by documented invariant omits the leaf
+        // index because it changes as the tree mutates) and `self_id()`; the
+        // own leaf index lives only inside OpenMLS (`own_leaf_index()`), which
+        // is engine-internal. Reaching into engine internals from here is
+        // disallowed. Resolve by adding a leaf-index accessor (e.g. an own
+        // leaf-index method on the engine/session) and threading it here, then
+        // drop the enumeration position.
         self.runtime
             .members(group_id)?
             .into_iter()
