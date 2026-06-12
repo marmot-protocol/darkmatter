@@ -30,8 +30,8 @@ use tls_codec::{Deserialize as _, Serialize as TlsSerialize};
 use crate::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
     CanonicalizationState, ConvergenceStatus, DroppedMessage, DroppedMessageReason,
-    MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
-    canonicalize_with_materialized_candidates,
+    InvalidatedAppMessageReason, MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage,
+    PeeledMessageKind, canonicalize_with_materialized_candidates,
 };
 use crate::convergence::BranchCandidate;
 
@@ -817,7 +817,7 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
     for invalidated in &result.invalidated_app_messages {
         state_by_message_id.insert(
             invalidated.message_id.clone(),
-            MessageState::EpochInvalidated,
+            message_state_for_invalidated_reason(invalidated.reason),
         );
     }
     for accepted in result
@@ -1051,6 +1051,27 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
         | DroppedMessageReason::BeyondAnchor
         | DroppedMessageReason::BeyondAppRetention
         | DroppedMessageReason::InvalidAgainstCandidateState => MessageState::EpochInvalidated,
+    }
+}
+
+/// Map an app-message invalidation reason to the persisted message state.
+///
+/// `UndecryptableInCanonicalState` is the one *retryable* invalidation: the
+/// message arrived for a future epoch the local context cannot peel yet (e.g.
+/// ordinary out-of-order relay delivery of an app message before the commit
+/// that advances the group to its epoch). Persisting it as `EpochInvalidated`
+/// is terminal — `record_state_is_canonicalization_input` never re-admits it —
+/// so the buffered message would be permanently dropped once the awaited commit
+/// arrives. Keep it `Retryable` so a later canonicalize pass re-feeds it.
+///
+/// The remaining reasons (`LosingBranch`, `BeyondAnchor`, `BeyondAppRetention`)
+/// are genuinely terminal and stay `EpochInvalidated`.
+fn message_state_for_invalidated_reason(reason: InvalidatedAppMessageReason) -> MessageState {
+    match reason {
+        InvalidatedAppMessageReason::UndecryptableInCanonicalState => MessageState::Retryable,
+        InvalidatedAppMessageReason::LosingBranch
+        | InvalidatedAppMessageReason::BeyondAnchor
+        | InvalidatedAppMessageReason::BeyondAppRetention => MessageState::EpochInvalidated,
     }
 }
 
