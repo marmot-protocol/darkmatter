@@ -2928,6 +2928,73 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
 }
 
 #[tokio::test]
+async fn upload_media_errors_when_policy_has_no_blossom_endpoint() {
+    // PR #328 review Finding 1: `upload_encrypted_media` always performs Blossom
+    // upload semantics, so `upload_media` MUST select a `blossom-v1` policy
+    // endpoint. A group whose policy lists only a non-Blossom endpoint has no
+    // usable upload target, so the upload MUST fail early rather than push
+    // Blossom bytes to the wrong backend.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let blossom = mock_blossom().await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("non-blossom media", &["bob"])
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+
+    // Replace the default Blossom policy with one that serves only a non-Blossom
+    // locator kind. `replace_encrypted_media_blob_endpoints` derives
+    // `allowed_locator_kinds` from the endpoint kinds, so the resulting policy
+    // allows `ipfs-v1` only and has no Blossom endpoint.
+    alice
+        .replace_encrypted_media_blob_endpoints(
+            &group_id,
+            vec![marmot_app::AppBlobEndpoint {
+                locator_kind: "ipfs-v1".to_owned(),
+                base_url: "https://ipfs.example".to_owned(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let error = alice
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "note.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    plaintext: b"bytes that must never be uploaded".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                // An explicit Blossom override is the dev escape hatch, but it
+                // does not relax the requirement that the group policy actually
+                // allow Blossom uploads; the chosen default endpoint must still
+                // be a Blossom endpoint.
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .expect_err("upload must fail when the group policy has no Blossom endpoint");
+    assert!(
+        error.to_string().contains("Blossom endpoint"),
+        "expected a no-usable-Blossom-endpoint error, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn relay_app_runtime_reopens_account_state() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

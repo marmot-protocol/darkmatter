@@ -5,12 +5,12 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
-    ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    encode_nostr_routing_v1,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BLOSSOM_LOCATOR_KIND_V1,
+    BlobStoreEndpointV1, ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -1319,6 +1319,18 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        // Validate every outbound attachment against the group's ACTUAL
+        // `marmot.group.encrypted-media.v1` policy before sending: a reference
+        // whose locator kind the group does not allow would be rejected by
+        // receivers, so fail the send early rather than emit it.
+        let allowed_locator_kinds = self
+            .encrypted_media_policy_for_group(group_id)?
+            .allowed_locator_kinds;
+        for attachment in &attachments {
+            attachment.validate_outbound(&allowed_locator_kinds)?;
+        }
         let (_event, summary) = self
             .send_app_event(
                 group_id,
@@ -1339,25 +1351,31 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
+        // `upload_encrypted_media` always performs Blossom upload semantics and
+        // emits a `blossom-v1` locator, so the chosen default endpoint MUST be a
+        // Blossom endpoint. A policy whose first endpoint serves a non-Blossom
+        // locator would otherwise receive Blossom bytes at the wrong backend.
         // Skip loopback-HTTP policy endpoints unless this build is configured for
         // dev/test: they are valid component state but a production client MUST
         // NOT upload to the local host (a remote admin could point the policy at
         // the victim's loopback services). An explicit per-request
         // `blossom_server` override is an intentional dev escape hatch, so when
-        // one is present any policy endpoint serves as the (unused) default.
+        // one is present any Blossom policy endpoint serves as the (unused)
+        // default.
         let allow_loopback = self.app.allow_loopback_blob_endpoints();
         let has_explicit_server = request.blossom_server.is_some();
         let default_endpoint = policy
             .default_blob_endpoints
             .iter()
             .find(|endpoint| {
-                has_explicit_server
-                    || allow_loopback
-                    || !is_loopback_http_endpoint(&endpoint.base_url)
+                endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1
+                    && (has_explicit_server
+                        || allow_loopback
+                        || !is_loopback_http_endpoint(&endpoint.base_url))
             })
             .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia(
-                    "encrypted media policy has no usable default endpoint".into(),
+                    "group policy has no usable Blossom endpoint for upload".into(),
                 )
             })?;
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
@@ -1373,6 +1391,7 @@ impl AppClient {
             media_secret.as_ref(),
             &keys,
             default_endpoint,
+            &policy.allowed_locator_kinds,
         )
         .await?;
         if should_send {

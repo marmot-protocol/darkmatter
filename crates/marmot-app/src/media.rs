@@ -83,6 +83,21 @@ impl MediaAttachmentReference {
         Ok(())
     }
 
+    /// Validate an OUTBOUND reference this client is about to emit against the
+    /// group's actual `allowed_locator_kinds`. Unlike ingest validation (which is
+    /// purely structural — an out-of-policy locator only makes the attachment
+    /// unfetchable, never invalid), the sender MUST NOT emit a reference whose
+    /// locator kind its own group policy forbids, since receivers would skip it
+    /// as unfetchable. This enforces structural validity AND policy membership
+    /// for every locator. An empty `allowed` set falls back to the `blossom-v1`
+    /// default (see `locator_kind_allowed`).
+    pub(crate) fn validate_outbound(
+        &self,
+        allowed_locator_kinds: &[String],
+    ) -> Result<(), AppError> {
+        self.validate(allowed_locator_kinds)
+    }
+
     pub(crate) fn imeta_tag(&self) -> Vec<String> {
         let mut tag = vec!["imeta".to_owned(), format!("v {}", self.version)];
         tag.extend(
@@ -162,6 +177,7 @@ pub(crate) async fn upload_encrypted_media(
     media_secret: &[u8],
     signing_keys: &nostr::Keys,
     default_endpoint: &BlobStoreEndpointV1,
+    allowed_locator_kinds: &[String],
 ) -> Result<MediaUploadResult, AppError> {
     if request.attachments.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -181,6 +197,7 @@ pub(crate) async fn upload_encrypted_media(
                 media_secret,
                 signing_keys,
                 server,
+                allowed_locator_kinds,
             )
             .await?,
         );
@@ -197,6 +214,7 @@ async fn upload_encrypted_media_attachment(
     media_secret: &[u8],
     signing_keys: &nostr::Keys,
     server: &str,
+    allowed_locator_kinds: &[String],
 ) -> Result<MediaUploadAttachmentResult, AppError> {
     if request.plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -244,9 +262,11 @@ async fn upload_encrypted_media_attachment(
         dim: request.dim,
         thumbhash: request.thumbhash,
     };
-    // The reference we just built carries a single `blossom-v1` locator, so the
-    // default-allowed set is sufficient here.
-    reference.validate(&[])?;
+    // The reference we just built carries a single `blossom-v1` locator. Validate
+    // it against the group's ACTUAL `allowed_locator_kinds` so an upload to a
+    // group whose policy does not allow `blossom-v1` fails here rather than
+    // emitting a reference its own receivers would reject.
+    reference.validate_outbound(allowed_locator_kinds)?;
     Ok(MediaUploadAttachmentResult {
         encrypted_size_bytes: encrypted.len() as u64,
         reference,
@@ -967,6 +987,34 @@ mod tests {
         tag.insert(2, "locator ipfs-v1 ipfs://bafybeigdyrexample".to_owned());
 
         assert!(media_attachment_from_imeta_tag(&tag, None, &[]).is_err());
+    }
+
+    fn blossom_reference() -> MediaAttachmentReference {
+        let mut reference = loopback_reference();
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: "https://media.example/blob.bin".to_owned(),
+        }];
+        reference
+    }
+
+    #[test]
+    fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom() {
+        // PR #328 review Finding 1: the sender MUST NOT emit a `blossom-v1`
+        // reference to a group whose policy does not allow `blossom-v1`, since
+        // receivers would treat the locator as unfetchable. A non-empty policy
+        // that omits `blossom-v1` must fail outbound validation.
+        let reference = blossom_reference();
+        let allowed = vec!["ipfs-v1".to_owned()];
+        assert!(
+            reference.validate_outbound(&allowed).is_err(),
+            "a blossom reference must be rejected when the policy omits blossom-v1"
+        );
+        // The same reference is valid against a policy that does allow blossom-v1.
+        let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+        reference
+            .validate_outbound(&allowed)
+            .expect("a blossom reference is valid when the policy allows blossom-v1");
     }
 
     #[test]
