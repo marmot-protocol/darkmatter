@@ -162,8 +162,7 @@ pub(crate) fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<M
 
 pub(crate) fn member_id_at_leaf(group: &MlsGroup, leaf_idx: LeafNodeIndex) -> Option<MemberId> {
     let member = group.member_at(leaf_idx)?;
-    let basic = BasicCredential::try_from(member.credential).ok()?;
-    Some(MemberId::new(basic.identity().to_vec()))
+    validated_member_id(&member.credential).ok()
 }
 
 #[cfg(test)]

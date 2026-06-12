@@ -68,6 +68,13 @@ fn hash_id(b: &[u8]) -> MessageId {
     MessageId::new(h.finish().to_be_bytes().to_vec())
 }
 
+fn canonicalization_message_id(msg: &TransportMessage) -> String {
+    // Stored OpenMLS canonicalization keys commit candidates by MLS payload
+    // digest, not by the transport envelope id used by the live ingest path.
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(&msg.payload))
+}
+
 #[async_trait]
 impl TransportPeeler for MockPeeler {
     async fn peel_group_message(
@@ -367,10 +374,7 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
         &group_id,
     );
 
-    let spoofed_id = {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(&spoofed.payload))
-    };
+    let spoofed_id = canonicalization_message_id(&spoofed);
 
     let outcome = alice.ingest(spoofed).await.unwrap();
     assert!(
@@ -456,10 +460,7 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
     let before_epoch = carol.epoch(&group_id).expect("carol has group");
     let by_reference_commit =
         commit_pending_proposals(&alice_storage, &crypto, &alice.self_id(), &group_id);
-    let commit_id = {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(&by_reference_commit.payload))
-    };
+    let commit_id = canonicalization_message_id(&by_reference_commit);
 
     let outcome = carol.ingest(by_reference_commit).await.unwrap();
     assert!(

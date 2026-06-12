@@ -1317,9 +1317,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };
-        let sender = sender_identity(processed.sender(), &mls_group);
-        let sender_id = sender.clone().map(MemberId::new);
-        let sender = sender.unwrap_or_default();
+        let sender_id = sender_member_id(processed.sender(), &mls_group);
+        let sender = sender_id
+            .as_ref()
+            .map(|id| id.as_slice().to_vec())
+            .unwrap_or_default();
 
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
@@ -1371,7 +1373,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         &staged,
                         &mls_group,
                         &sender_id.clone().expect("checked above"),
-                        crate::DEFAULT_CIPHERSUITE,
+                        mls_group.ciphersuite(),
                     )
                 {
                     return Err(OpenMlsProjectionError::InvalidCommit {
@@ -1546,13 +1548,12 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
     )
 }
 
-fn sender_identity(sender: &Sender, group: &MlsGroup) -> Option<Vec<u8>> {
+fn sender_member_id(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
     let Sender::Member(leaf_idx) = sender else {
         return None;
     };
     let member = group.member_at(*leaf_idx)?;
-    let basic = BasicCredential::try_from(member.credential).ok()?;
-    Some(basic.identity().to_vec())
+    crate::identity::validated_member_id(&member.credential).ok()
 }
 
 fn message_digest(bytes: &[u8]) -> [u8; 32] {
