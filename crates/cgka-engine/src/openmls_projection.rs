@@ -1363,6 +1363,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 // commits that introduce or mutate a member LeafNode whose
                 // credential identity is invalid, lacks a valid account proof,
                 // or no longer matches the member identity being updated.
+                // Replay only needs the validation result; the returned added
+                // member ids are used by the live apply path to emit state
+                // changes before merge.
                 if let Err(err) =
                     crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
                         &staged,

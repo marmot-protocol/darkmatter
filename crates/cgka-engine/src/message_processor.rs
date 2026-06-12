@@ -11,6 +11,7 @@
 use crate::engine::Engine;
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
+use crate::identity::{member_id_at_leaf, member_id_of_sender};
 use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
@@ -33,7 +34,7 @@ use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::messages::proposals::{AppDataUpdateOperation, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessage,
-    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, Sender, ValidationError,
+    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -1903,22 +1904,6 @@ fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
         snapshot(cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID),
         snapshot(cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
     ]
-}
-
-fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
-    match sender {
-        Sender::Member(leaf_idx) => member_id_at_leaf(group, *leaf_idx),
-        _ => None,
-    }
-}
-
-fn member_id_at_leaf(
-    group: &MlsGroup,
-    leaf_idx: openmls::prelude::LeafNodeIndex,
-) -> Option<MemberId> {
-    let member = group.member_at(leaf_idx)?;
-    let basic = BasicCredential::try_from(member.credential).ok()?;
-    Some(MemberId::new(basic.identity().to_vec()))
 }
 
 fn record_group_id(msg: &TransportMessage) -> GroupId {

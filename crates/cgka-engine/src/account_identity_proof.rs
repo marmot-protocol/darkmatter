@@ -9,7 +9,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::types::MemberId;
 use openmls::extensions::{Extension, ExtensionType, UnknownExtension};
 use openmls::group::{MlsGroup, StagedCommit};
-use openmls::prelude::{BasicCredential, LeafNode, Sender, SignatureScheme};
+use openmls::prelude::{BasicCredential, LeafNode, SignatureScheme};
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 
@@ -203,11 +203,12 @@ pub(crate) fn validate_staged_commit_account_identity_proofs(
     }
 
     for update in staged.update_proposals() {
-        let expected = member_id_of_sender(update.sender(), group).ok_or_else(|| {
-            EngineError::InvalidAccountIdentityProof(
-                "Update proposal has no authenticated member sender".into(),
-            )
-        })?;
+        let expected =
+            crate::identity::member_id_of_sender(update.sender(), group).ok_or_else(|| {
+                EngineError::InvalidAccountIdentityProof(
+                    "Update proposal has no authenticated member sender".into(),
+                )
+            })?;
         validate_leaf_account_identity_proof_for_member(
             update.update_proposal().leaf_node(),
             ciphersuite,
@@ -226,17 +227,6 @@ pub(crate) fn validate_staged_commit_account_identity_proofs(
     }
 
     Ok(added)
-}
-
-fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
-    match sender {
-        Sender::Member(leaf_idx) => {
-            let member = group.member_at(*leaf_idx)?;
-            let basic = BasicCredential::try_from(member.credential).ok()?;
-            Some(MemberId::new(basic.identity().to_vec()))
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn account_identity_proof_capability() -> ExtensionType {
