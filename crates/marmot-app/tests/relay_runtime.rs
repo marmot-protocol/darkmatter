@@ -1562,6 +1562,99 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
     runtime.shutdown().await;
 }
 
+// Regression test for darkmatter#178: an external `set_group_archived` must not
+// be reverted by the long-lived account worker's stale in-memory snapshot when
+// the next inbound delivery re-persists the worker's `AccountState`.
+#[tokio::test]
+async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "archive persistence",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Bob archives the chat. This must update the worker's authoritative
+    // in-memory state, not just the database.
+    let archived = runtime
+        .set_group_archived(&bob.account.account_id_hex, &group_id_hex, true)
+        .await
+        .unwrap();
+    assert!(archived.archived);
+    assert!(
+        app.group(&bob_label, &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // A subsequent inbound delivery causes Bob's worker to re-persist its
+    // in-memory snapshot via `save_state`. Before the fix, the stale snapshot
+    // (archived = false) would clobber the archive flag.
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"delivery after archive".to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "delivery after archive"
+        )
+    })
+    .await;
+
+    // The archive flag must survive the delivery.
+    let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(
+        reloaded.archived,
+        "external archive must not be reverted by the worker's stale in-memory state"
+    );
+    assert!(
+        !app.visible_groups(&bob_label)
+            .unwrap()
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex),
+        "archived chat must stay hidden from the visible chat list"
+    );
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     let dir = tempfile::tempdir().unwrap();

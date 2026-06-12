@@ -701,6 +701,11 @@ enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<GroupInviteDeclineResult, AppError>>,
     },
+    SetGroupArchived {
+        group_id: GroupId,
+        archived: bool,
+        respond: oneshot::Sender<Result<AppGroupRecord, AppError>>,
+    },
     PromoteAdmin {
         group_id: GroupId,
         member_ref: String,
@@ -2962,7 +2967,7 @@ impl MarmotAppRuntime {
             .chat_list(&account.label, include_archived)
     }
 
-    pub fn set_group_archived(
+    pub async fn set_group_archived(
         &self,
         account_ref: &str,
         group_id_hex: &str,
@@ -2971,10 +2976,15 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let group =
-            self.accounts
-                .app
-                .set_group_archived(&account.label, &group_id_hex, archived)?;
+        // Route the archive toggle through the account worker so the
+        // long-lived in-memory `AccountState` is updated in place. A direct
+        // `MarmotApp::set_group_archived` would only touch the database; the
+        // worker's stale snapshot (archived = false) would then silently revert
+        // it on the next inbound delivery's `save_state`. See darkmatter#178.
+        let group = self
+            .accounts
+            .set_group_archived(account_ref, &group_id, archived)
+            .await?;
         let chat_list_row = self
             .accounts
             .app
@@ -3633,6 +3643,41 @@ impl AccountManager {
         self.catch_up_accounts().await?;
         self.schedule_audit_log_tracker_update("decline_group_invite");
         Ok(result)
+    }
+
+    pub async fn set_group_archived(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        // Prefer the account worker so its authoritative in-memory
+        // `AccountState` is updated in place; otherwise a later inbound
+        // delivery would re-persist the stale `archived = false` snapshot and
+        // silently un-archive the chat (darkmatter#178). When no worker is
+        // running (e.g. a public-only / non-local-signing account that holds no
+        // long-lived in-memory state), fall back to a direct persistence write,
+        // which cannot be clobbered because there is no live snapshot.
+        let group_id_hex = hex::encode(group_id.as_slice());
+        match self.worker_commands(account_ref).await {
+            Ok(command) => {
+                let (respond, response) = oneshot::channel();
+                command
+                    .send(AccountWorkerCommand::SetGroupArchived {
+                        group_id: group_id.clone(),
+                        archived,
+                        respond,
+                    })
+                    .await
+                    .map_err(|_| AppError::TransportClosed)?;
+                account_worker_response(response).await
+            }
+            Err(_) => {
+                let account = self.resolve(account_ref)?;
+                self.app
+                    .set_group_archived(&account.label, &group_id_hex, archived)
+            }
+        }
     }
 
     pub async fn update_group_image(
@@ -4849,6 +4894,22 @@ async fn run_app_runtime_account_worker(
                     }
                     Some(AccountWorkerCommand::DeclineGroupInvite { group_id, respond }) => {
                         let result = client.decline_group_invite(&group_id).await;
+                        if result.is_ok() {
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::SetGroupArchived {
+                        group_id,
+                        archived,
+                        respond,
+                    }) => {
+                        let result = client.set_group_archived(&group_id, archived);
                         if result.is_ok() {
                             publish_app_runtime_group_state_updated(
                                 &events,
