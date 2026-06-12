@@ -137,6 +137,35 @@ fn build_client(
         .expect("build engine")
 }
 
+/// Feature registry that advertises MIP-03 SelfRemove support so the
+/// auto-committer fires on a peer's leave proposal.
+fn selfremove_registry() -> FeatureRegistry {
+    use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+    let mut r = FeatureRegistry::new();
+    r.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03",
+        },
+    );
+    r
+}
+
+fn build_selfremove_client(
+    storage: SqliteAccountStorage,
+    identity: &[u8],
+) -> cgka_engine::Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build engine")
+}
+
 /// Crash after staging an invite (publish-before-apply leaves a persisted
 /// `PendingCommit`), then reopen: hydrate must clear the staged commit, roll
 /// the Marmot record back to the pre-stage epoch + member set, emit
@@ -259,4 +288,130 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
     alice.confirm_published(retry_pending).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+}
+
+/// Regression for the auto-commit leave path (darkmatter#150 follow-up).
+///
+/// A deferred SelfRemove auto-commit legitimately persists a staged commit
+/// across a process boundary: the proposer's device stages the lowest-index
+/// commit, projects the departing member out of the Marmot record *forward*,
+/// and a later run publishes + confirms it. The crash-recovery clear at
+/// hydrate must NOT fire on this surviving commit — rolling it back re-derives
+/// the record from the pre-stage MLS state and re-adds the member who already
+/// left, forking convergence (the CLI `groups_leave_publishes_self_remove`
+/// failure). Hydrate must leave a member-removing staged commit untouched.
+#[tokio::test]
+async fn reopen_preserves_deferred_selfremove_auto_commit() {
+    use cgka_traits::ingest::IngestOutcome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("deferred selfremove key").unwrap();
+
+    let group_id;
+    let bob_member_id;
+
+    // ── Phase 1: create + confirm a 3-member group, then ingest bob's
+    //    SelfRemove so alice stages an auto-commit, and "crash" before
+    //    resolving the publish. ─────────────────────────────────────────────
+    {
+        let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+        let bob_store = SqliteAccountStorage::in_memory().unwrap();
+        let carol_store = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build_selfremove_client(alice_store, b"alice-dsr");
+        let mut bob = build_selfremove_client(bob_store, b"bob-dsr");
+        let mut carol = build_selfremove_client(carol_store, b"carol-dsr");
+        bob_member_id = bob.self_id();
+
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let carol_kp = carol.fresh_key_package().await.unwrap();
+        let (gid, create) = alice
+            .create_group(CreateGroupRequest {
+                name: "dsr".into(),
+                description: "".into(),
+                members: vec![bob_kp, carol_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        group_id = gid.clone();
+        let (welcome_for_bob, _welcome_for_carol) = match create {
+            SendResult::GroupCreated {
+                pending,
+                mut welcomes,
+            } => {
+                alice.confirm_published(pending).await.unwrap();
+                (welcomes.remove(0), welcomes.remove(0))
+            }
+            other => panic!("expected GroupCreated, got {other:?}"),
+        };
+        bob.join_welcome(welcome_for_bob).await.unwrap();
+        assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+        assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+
+        // Bob (non-admin) leaves → SelfRemove proposal.
+        let proposal = match bob
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::Proposal { msg } => msg,
+            other => panic!("expected Proposal, got {other:?}"),
+        };
+
+        // Alice ingests it — she is the lowest-index non-target admin, so the
+        // auto-committer stages a commit and projects bob out of the record
+        // immediately (epoch advances to the projected value, bob dropped).
+        let routed = TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..proposal
+        };
+        let outcome = alice.ingest(routed).await.unwrap();
+        assert!(matches!(outcome, IngestOutcome::Processed));
+        assert_eq!(
+            alice.members(&group_id).unwrap().len(),
+            2,
+            "bob projected out at auto-commit stage time"
+        );
+        // The staged auto-commit exists but has NOT been resolved
+        // (confirm/fail). "Crash" by dropping alice with it still pending.
+        assert_eq!(alice.drain_auto_publish().len(), 1);
+        drop(alice);
+    }
+
+    // ── Phase 2: reopen and hydrate. The staged SelfRemove commit must
+    //    survive untouched — bob stays removed, no PendingCommitRecovered. ───
+    let reopened_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+    assert_eq!(
+        reopened_store.get_group(&group_id).unwrap().members.len(),
+        2,
+        "forward-projected leave persisted across the crash"
+    );
+
+    let mut alice = build_selfremove_client(reopened_store, b"alice-dsr");
+    alice
+        .hydrate_stable_groups_from_storage()
+        .expect("hydrate must not error on a deferred selfremove");
+
+    let events = alice.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, GroupEvent::PendingCommitRecovered { .. })),
+        "hydrate must NOT treat a deferred selfremove as a crash strand; got {events:?}"
+    );
+
+    // The departing member stays gone — the leave is not rewound.
+    let members = alice.members(&group_id).unwrap();
+    assert_eq!(members.len(), 2, "bob must remain removed after reopen");
+    assert!(
+        !members.iter().any(|m| m.id == bob_member_id),
+        "bob must not be re-added by recovery; got {members:?}"
+    );
 }

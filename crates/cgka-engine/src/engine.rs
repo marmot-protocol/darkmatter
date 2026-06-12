@@ -399,6 +399,20 @@ impl<S: StorageProvider> Engine<S> {
     /// state, and we surface a typed `PendingCommitRecovered` event so the
     /// application can run a recovery / resync path — if relays accepted the
     /// commit before the crash, this device is now behind and must catch up.
+    ///
+    /// **Member-removing commits are deliberately left untouched.** A surviving
+    /// pending commit is NOT a reliable crash signal on its own: a deferred
+    /// SelfRemove auto-commit (the MIP-03 leave path) legitimately persists a
+    /// staged commit across process boundaries — the proposer's device stages
+    /// the lowest-index commit, projects the departing member out of the Marmot
+    /// record *forward*, and a later run publishes + confirms it. Rolling that
+    /// back re-derives the record from the pre-stage MLS state and so re-adds a
+    /// member who already left, forking convergence (the remaining members
+    /// advance past the leave while this device silently rewinds it). Clearing
+    /// an additive (invite) commit is safe — it only drops an invitee who never
+    /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
+    /// scope crash-recovery to staged commits that remove no members, matching
+    /// the prior (pre-recovery) behaviour for removal-bearing commits.
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -417,11 +431,29 @@ impl<S: StorageProvider> Engine<S> {
                 self.ciphersuite,
             )?;
 
-            // A staged commit that survived process restart means the
+            // A staged commit that survived process restart *may* mean the
             // application crashed mid-publish. Clear it (treat as
             // publish-failed) so the group is not permanently wedged, then
             // re-derive the Marmot record from the post-clear MLS state.
-            if mls_group.pending_commit().is_some() {
+            //
+            // BUT a surviving pending commit is also the normal cross-process
+            // state of a deferred SelfRemove auto-commit, whose Marmot record
+            // is already projected forward past the leave. Rolling back a
+            // commit that removes a member would re-add the departed member and
+            // fork convergence, so we only recover commits that add no
+            // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
+            // staged commits are left exactly as they were before this recovery
+            // path existed.
+            let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
+                staged.queued_proposals().any(|queued| {
+                    matches!(
+                        queued.proposal(),
+                        openmls::prelude::Proposal::Remove(_)
+                            | openmls::prelude::Proposal::SelfRemove
+                    )
+                })
+            });
+            if mls_group.pending_commit().is_some() && !staged_removes_member {
                 mls_group
                     .clear_pending_commit(
                         <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
