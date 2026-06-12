@@ -382,11 +382,23 @@ impl<S: StorageProvider> Engine<S> {
     /// Restore stable epoch state for groups already present in storage.
     ///
     /// This is used by production session startup after opening durable
-    /// storage. Pending publish state is deliberately not reconstructed here:
-    /// v1 sessions require the application to resolve publish success/failure
-    /// before shutdown, and future resumable-pending support should persist a
-    /// dedicated pending-publish record instead of inferring one from group
-    /// rows.
+    /// storage. The application is expected to resolve publish success/failure
+    /// (`confirm_published` / `publish_failed`) before shutdown, but a *crash*
+    /// between transport publish and that resolution violates the
+    /// precondition: OpenMLS durably persists the staged commit
+    /// (`MlsGroupState::PendingCommit`) and `MlsGroup::load` restores it, while
+    /// the in-memory `PendingStateRef` that `confirm_published` /
+    /// `publish_failed` require is gone (the `EpochManager` starts empty on
+    /// every open). Left untouched, the group is stranded: every subsequent
+    /// commit-creating operation fails with a pending-commit error forever.
+    ///
+    /// So at hydrate time we detect a surviving pending commit and clear it,
+    /// treating an unresolved pending publish as publish-failed (the same
+    /// rewind `do_publish_failed` performs). The MLS group returns to its
+    /// pre-stage epoch, we re-derive the Marmot record from that cleared
+    /// state, and we surface a typed `PendingCommitRecovered` event so the
+    /// application can run a recovery / resync path — if relays accepted the
+    /// commit before the crash, this device is now behind and must catch up.
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -394,7 +406,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage.mls_storage(),
             );
             let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-            let mls_group = openmls::group::MlsGroup::load(
+            let mut mls_group = openmls::group::MlsGroup::load(
                 <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
                 &mls_gid,
             )
@@ -404,6 +416,39 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
                 self.ciphersuite,
             )?;
+
+            // A staged commit that survived process restart means the
+            // application crashed mid-publish. Clear it (treat as
+            // publish-failed) so the group is not permanently wedged, then
+            // re-derive the Marmot record from the post-clear MLS state.
+            if mls_group.pending_commit().is_some() {
+                mls_group
+                    .clear_pending_commit(
+                        <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+                    )
+                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                let recovered_epoch = EpochId(mls_group.epoch().as_u64());
+                if let Ok(mut g) = self.storage.get_group(&group_id) {
+                    g.epoch = recovered_epoch;
+                    g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                    g.required_capabilities =
+                        crate::capability_manager::required_capabilities_from_group(&mls_group);
+                    crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+                    self.storage.put_group(&g)?;
+                }
+                self.audit_group(
+                    &group_id,
+                    AuditEventKind::PendingCommitRecoveredOnOpen {
+                        recovered_epoch: recovered_epoch.0,
+                    },
+                );
+                self.events_buf
+                    .push_back(GroupEvent::PendingCommitRecovered {
+                        group_id: group_id.clone(),
+                        recovered_epoch,
+                    });
+            }
+
             let group = self.storage.get_group(&group_id)?;
             self.epoch_manager.set_stable(group_id, group.epoch);
         }
