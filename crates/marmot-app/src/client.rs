@@ -51,6 +51,10 @@ pub struct AppClient {
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) state: AccountState,
+    /// Group-system timeline rows synthesized during the most recent publish
+    /// path. The runtime account worker drains this after each command and
+    /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
+    pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
 }
 
 struct ObservedHumanActionAudit {
@@ -320,6 +324,7 @@ impl AppClient {
         self.add_group(&group_id)?;
         self.sync_runtime_groups().await?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(group_id)
     }
 
@@ -420,6 +425,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         let summary = send_summary_from_effects(&effects);
         self.publish_notification_trigger_best_effort(
             group_id,
@@ -463,6 +469,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -498,6 +505,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -601,6 +609,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -636,6 +645,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -689,6 +699,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -732,6 +743,7 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -899,6 +911,7 @@ impl AppClient {
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         if notification_trigger_for_intent(&intent).is_some() {
             self.publish_notification_trigger_best_effort(
                 group_id,
@@ -953,6 +966,36 @@ impl AppClient {
             }
         }
         Ok(update)
+    }
+
+    /// Apply the audit-logging switch to this live session by swapping the
+    /// recorder in place: a file-backed recorder when `enabled`, or a no-op
+    /// recorder when off. Dropping the prior recorder flushes and closes any
+    /// file it held, so no session reopen is required.
+    pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
+        let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
+        self.runtime.session_mut().set_audit_recorder(recorder);
+    }
+
+    /// Rotate the live forensic recorder iff it is the one appending to
+    /// `path`, returning whether a rotation happened.
+    ///
+    /// Returns `true` only when this session holds a file-backed recorder
+    /// writing exactly `path`: in that case the recorder deletes the file and
+    /// reopens a fresh one, so the held handle is never orphaned and recording
+    /// continues. Returns `false` when no recorder is installed (audit logging
+    /// off) or it appends elsewhere (e.g. a stale file with a different engine
+    /// id), leaving the caller to delete `path` directly.
+    pub(crate) fn rotate_audit_log_if_active(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, AppError> {
+        if self.runtime.session().audit_log_path().as_deref() == Some(path) {
+            self.runtime.session().rotate_audit_log()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub(crate) async fn share_push_registration(&mut self) -> Result<usize, AppError> {
@@ -1352,6 +1395,7 @@ impl AppClient {
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(summary)
     }
 
@@ -1535,6 +1579,7 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -1604,6 +1649,7 @@ impl AppClient {
             GroupConfirmationProjection::Preserve,
         );
         self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
@@ -1827,7 +1873,14 @@ impl AppClient {
                 self.refresh_group_routes()?;
                 self.sync_runtime_groups().await?;
             }
-            if let cgka_traits::engine::GroupEvent::MemberRemoved { group_id, member } = event {
+            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                change:
+                    cgka_traits::engine::GroupStateChange::MemberRemoved { member }
+                    | cgka_traits::engine::GroupStateChange::MemberLeft { member },
+                ..
+            } = event
+            {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let member_id_hex = hex::encode(member.as_slice());
                 let _ = self.app.remove_group_push_tokens_for_member(
@@ -1837,6 +1890,11 @@ impl AppClient {
                 );
             }
         }
+        // Synthesize durable kind-1210 system rows from this delivery's
+        // authenticated state changes (peer commits and auto-commits).
+        let system_updates =
+            self.project_group_system_rows(&effects.effects.events, source_recorded_at);
+        summary.projection_updates.extend(system_updates);
         Ok(())
     }
 
@@ -1899,29 +1957,37 @@ impl AppClient {
                     .with_target_count(1),
                 );
             }
-            cgka_traits::engine::GroupEvent::MemberAdded { group_id, .. } => {
-                self.record_observed_human_action(
-                    group_id,
-                    ObservedHumanActionAudit::source(
-                        "invite_members",
-                        vec!["members"],
-                        Vec::new(),
-                        source_message_id_hex,
-                    )
-                    .with_target_count(1),
-                );
-            }
-            cgka_traits::engine::GroupEvent::MemberRemoved { group_id, .. } => {
-                self.record_observed_human_action(
-                    group_id,
-                    ObservedHumanActionAudit::source(
-                        "remove_members",
-                        vec!["members"],
-                        Vec::new(),
-                        source_message_id_hex,
-                    )
-                    .with_target_count(1),
-                );
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id, change, ..
+            } => {
+                // Keep a self-leave distinct from a moderator removal so the
+                // audit trail preserves the split that GroupStateChanged makes.
+                let membership_action = match change {
+                    cgka_traits::engine::GroupStateChange::MemberAdded { .. } => {
+                        Some(("invite_members", "members"))
+                    }
+                    cgka_traits::engine::GroupStateChange::MemberRemoved { .. } => {
+                        Some(("remove_members", "members"))
+                    }
+                    cgka_traits::engine::GroupStateChange::MemberLeft { .. } => {
+                        Some(("leave_group", "membership"))
+                    }
+                    // Admin/profile changes are audited from the projection
+                    // delta on the accompanying EpochChanged event.
+                    _ => None,
+                };
+                if let Some((action, field)) = membership_action {
+                    self.record_observed_human_action(
+                        group_id,
+                        ObservedHumanActionAudit::source(
+                            action,
+                            vec![field],
+                            Vec::new(),
+                            source_message_id_hex,
+                        )
+                        .with_target_count(1),
+                    );
+                }
             }
             cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
                 if let (Some(previous), Some(updated)) = (previous, updated)
@@ -2378,6 +2444,84 @@ impl AppClient {
         }
     }
 
+    /// Persist and queue kind-1210 system rows for our own authenticated commits.
+    /// Call only after the caller's final fallible persistence step succeeds so
+    /// failed commands do not leave stale buffered timeline updates.
+    fn queue_own_group_system_projection_updates(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        // Gate on having published a commit: own send paths always carry a
+        // report, while reportless paths (e.g. convergence retry) re-emit the
+        // same changes unattributed. Those are already synthesized — attributed —
+        // on the inbound path, so skipping here avoids a duplicate, actor-less row.
+        if effects.reports.is_empty() {
+            return;
+        }
+        self.pending_projection_updates
+            .extend(self.project_group_system_rows(&effects.events, unix_now_seconds()));
+    }
+
+    pub(crate) fn take_pending_projection_updates(&mut self) -> Vec<crate::AppProjectionUpdate> {
+        std::mem::take(&mut self.pending_projection_updates)
+    }
+
+    /// Synthesize a durable kind-1210 group system row for each
+    /// `GroupStateChanged` event and persist it to the timeline. Used by both
+    /// the inbound delivery path (peer commits) and our own send path (local
+    /// commits). Failures are logged, not propagated: a missing system row must
+    /// never fail message delivery.
+    fn project_group_system_rows(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+        recorded_at: u64,
+    ) -> Vec<crate::AppProjectionUpdate> {
+        let mut updates = Vec::new();
+        for event in events {
+            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+            } = event
+            {
+                let projection = match build_group_system_projection(
+                    group_id,
+                    epoch.0,
+                    actor.as_ref(),
+                    change,
+                    recorded_at,
+                ) {
+                    Ok(projection) => projection,
+                    Err(_err) => {
+                        tracing::warn!(
+                            target: "marmot_app::groups",
+                            method = "project_group_system_rows",
+                            error_code = "projection_build_failed",
+                            "failed to build group system row",
+                        );
+                        continue;
+                    }
+                };
+                match self
+                    .app
+                    .record_account_app_event(&self.state.label, &projection)
+                {
+                    Ok(update) => updates.push(update),
+                    Err(_err) => {
+                        tracing::warn!(
+                            target: "marmot_app::groups",
+                            method = "project_group_system_rows",
+                            error_code = "projection_apply_failed",
+                            "failed to project group system row",
+                        );
+                    }
+                }
+            }
+        }
+        updates
+    }
+
     fn nostr_routing_for_group(
         &self,
         group_id: &GroupId,
@@ -2392,6 +2536,135 @@ impl AppClient {
             })?;
         AppGroupNostrRoutingComponent::from_bytes(&bytes)
     }
+}
+
+/// Build the durable kind-1210 group system row projection for one
+/// authenticated [`GroupStateChange`]. The row is synthesized locally
+/// (Approach A) — no kind-1210 message is sent on the wire. The message id is
+/// deterministic over (actor, epoch, system_type, content) so re-processing the
+/// same change upserts instead of duplicating; the `source_message_id_hex` link
+/// lets a commit that is later invalidated on a losing branch invalidate this
+/// row through the same path as any other app event.
+fn build_group_system_projection(
+    group_id: &cgka_traits::types::GroupId,
+    epoch: u64,
+    actor: Option<&cgka_traits::types::MemberId>,
+    change: &cgka_traits::engine::GroupStateChange,
+    recorded_at: u64,
+) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
+    use cgka_traits::app_event::{
+        GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+        GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+        GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, GroupSystemEvent,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, canonical_event_id,
+    };
+    use cgka_traits::engine::GroupStateChange;
+    use cgka_traits::types::MemberId;
+
+    let (system_type, subject, name, text): (&str, Option<&MemberId>, Option<&str>, &str) =
+        match change {
+            GroupStateChange::MemberAdded { member } => (
+                GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+                Some(member),
+                None,
+                "Member added",
+            ),
+            GroupStateChange::MemberRemoved { member } => (
+                GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+                Some(member),
+                None,
+                "Member removed",
+            ),
+            GroupStateChange::MemberLeft { member } => (
+                GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+                Some(member),
+                None,
+                "Member left",
+            ),
+            GroupStateChange::AdminAdded { member } => (
+                GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+                Some(member),
+                None,
+                "Admin added",
+            ),
+            GroupStateChange::AdminRemoved { member } => (
+                GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+                Some(member),
+                None,
+                "Admin removed",
+            ),
+            GroupStateChange::GroupRenamed { name } => (
+                GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+                None,
+                Some(name.as_str()),
+                "Group renamed",
+            ),
+            GroupStateChange::GroupAvatarChanged => (
+                GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
+                None,
+                None,
+                "Group avatar changed",
+            ),
+        };
+
+    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
+    let mut data = serde_json::Map::new();
+    if let Some(actor_hex) = actor_hex.as_ref() {
+        data.insert(
+            GROUP_SYSTEM_DATA_ACTOR.to_owned(),
+            serde_json::Value::String(actor_hex.clone()),
+        );
+    }
+    if let Some(subject) = subject {
+        data.insert(
+            GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
+            serde_json::Value::String(hex::encode(subject.as_slice())),
+        );
+    }
+    if let Some(name) = name {
+        data.insert(
+            GROUP_SYSTEM_DATA_NAME.to_owned(),
+            serde_json::Value::String(name.to_owned()),
+        );
+    }
+    let data = (!data.is_empty()).then_some(serde_json::Value::Object(data));
+    let content = GroupSystemEvent::new(system_type, text, data).to_content()?;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let tags = vec![vec![
+        GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        system_type.to_owned(),
+    ]];
+    let sender = actor_hex.unwrap_or_default();
+    // Deterministic, local-only id. `epoch` (not the wall-clock `recorded_at`)
+    // anchors it so the same change yields the same id on every pass; `group_id`
+    // is folded in so the same change in two groups can't collide (the canonical
+    // id is also used by message-id-keyed ops like reactions/invalidation).
+    let id_preimage = format!("{group_id_hex}\u{1f}{content}");
+    let message_id_hex = canonical_event_id(
+        &sender,
+        epoch,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        &tags,
+        &id_preimage,
+    );
+
+    Ok(AppMessageProjection {
+        message_id_hex,
+        // Synthesized rows carry no source: several rows can come from one
+        // commit, which would collide on the partial unique source index, and
+        // commit ids are never targeted by source-based invalidation anyway.
+        source_message_id_hex: None,
+        direction: "system".to_owned(),
+        group_id_hex,
+        sender,
+        plaintext: content,
+        kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        tags,
+        source_epoch: Some(epoch),
+        recorded_at: Some(recorded_at),
+    })
 }
 
 fn audit_message_ids_from_effects(effects: &marmot_account::AccountDeviceEffects) -> Vec<String> {
