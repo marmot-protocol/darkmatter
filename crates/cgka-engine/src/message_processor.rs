@@ -1332,9 +1332,18 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         // Validate capabilities (same rule as create_group — see Risk #1
-        // capability doc).
+        // capability doc). The group's required capabilities cover required MLS
+        // primitives and required app components; additionally fold in the
+        // per-member role capabilities the agent-text-stream-QUIC component's
+        // `required_member_roles` mask demands (#177,
+        // agent-text-stream-quic-v1.md): a client MUST NOT invite a member whose
+        // KeyPackage does not advertise every required role capability.
         let existing = self.storage.get_group(&group_id)?;
-        let required = existing.required_capabilities.clone();
+        let mut required = existing.required_capabilities.clone();
+        merge_capabilities(
+            &mut required,
+            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+        );
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
         for kp in &key_packages {
             let parsed = self.parse_key_package(kp)?;
@@ -1937,6 +1946,21 @@ fn record_group_id(msg: &TransportMessage) -> GroupId {
 /// envelope maps to one id, independent of the outer ephemeral key / nonce.
 pub(crate) fn content_dedup_id(mls_bytes: &[u8]) -> MessageId {
     MessageId::new(Sha256::digest(mls_bytes).to_vec())
+}
+
+/// Fold every capability in `extra` into `required` (set union). Used to add the
+/// agent-stream `required_member_roles` role capabilities to a group's required
+/// capability set before the per-KeyPackage invite check and the join-time
+/// self-check (#177).
+pub(crate) fn merge_capabilities(
+    required: &mut cgka_traits::capabilities::GroupCapabilities,
+    extra: &cgka_traits::capabilities::GroupCapabilities,
+) {
+    required.proposals.extend(extra.proposals.iter().copied());
+    required.extensions.extend(extra.extensions.iter().copied());
+    for id in &extra.app_components.ids {
+        required.app_components.insert(*id);
+    }
 }
 
 fn route_wrapped_group_message(
