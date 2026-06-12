@@ -1655,6 +1655,87 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
     runtime.shutdown().await;
 }
 
+// Regression for the darkmatter#178 review: a local-signing account must NEVER
+// fall back to a direct `MarmotApp::set_group_archived` write when the account
+// worker is unavailable (e.g. a startup/reconcile failure). The direct write
+// can race a freshly spawned worker holding the pre-archive snapshot and revert
+// the flag again. Only non-local-signing accounts (which can never own a
+// worker) are allowed the direct-write path. Here we make the worker
+// unavailable by stopping the runtime and assert the toggle surfaces the error
+// instead of silently persisting through the bypass.
+#[tokio::test]
+async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    assert!(
+        bob.account.local_signing,
+        "this regression requires a local-signing account that owns a worker"
+    );
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "archive bypass guard",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    assert!(
+        !app.group(&bob_label, &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // Make the worker unavailable for the local-signing account. After shutdown
+    // the runtime is stopping, so `worker_commands` fails before any worker
+    // command can run.
+    runtime.shutdown().await;
+
+    // The archive toggle must propagate the worker error rather than taking the
+    // old `Err(_) => direct write` fallback.
+    let result = runtime
+        .set_group_archived(&bob.account.account_id_hex, &group_id_hex, true)
+        .await;
+    assert!(
+        result.is_err(),
+        "local-signing archive toggle must surface the worker error, not direct-write the DB"
+    );
+
+    // Critically, the database must be untouched: the bypass path is exactly
+    // what reintroduces the stale-snapshot revert this fix eliminates.
+    assert!(
+        !app.group(&bob_label, &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .archived,
+        "archive must not be persisted via the direct-write bypass for a local-signing account"
+    );
+}
+
 #[tokio::test]
 async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     let dir = tempfile::tempdir().unwrap();

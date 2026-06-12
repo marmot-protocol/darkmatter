@@ -3654,30 +3654,35 @@ impl AccountManager {
         // Prefer the account worker so its authoritative in-memory
         // `AccountState` is updated in place; otherwise a later inbound
         // delivery would re-persist the stale `archived = false` snapshot and
-        // silently un-archive the chat (darkmatter#178). When no worker is
-        // running (e.g. a public-only / non-local-signing account that holds no
-        // long-lived in-memory state), fall back to a direct persistence write,
-        // which cannot be clobbered because there is no live snapshot.
-        let group_id_hex = hex::encode(group_id.as_slice());
-        match self.worker_commands(account_ref).await {
-            Ok(command) => {
-                let (respond, response) = oneshot::channel();
-                command
-                    .send(AccountWorkerCommand::SetGroupArchived {
-                        group_id: group_id.clone(),
-                        archived,
-                        respond,
-                    })
-                    .await
-                    .map_err(|_| AppError::TransportClosed)?;
-                account_worker_response(response).await
-            }
-            Err(_) => {
-                let account = self.resolve(account_ref)?;
-                self.app
-                    .set_group_archived(&account.label, &group_id_hex, archived)
-            }
+        // silently un-archive the chat (darkmatter#178).
+        //
+        // Only a non-local-signing (public-only) account can never own a
+        // long-lived worker, so its direct persistence write is safe: there is
+        // no live in-memory snapshot to clobber it. For local-signing accounts
+        // we MUST route through the worker and propagate any worker error. A
+        // transient worker startup / `reconcile()` failure (e.g. an
+        // `APP_RUNTIME_ACCOUNT_READY_WAIT` timeout while the worker is still in
+        // startup sync) must NOT fall back to a direct write, because a freshly
+        // spawned worker may already hold the pre-archive snapshot and would
+        // later re-persist it, reverting the flag again.
+        let account = self.resolve(account_ref)?;
+        if !account.local_signing {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            return self
+                .app
+                .set_group_archived(&account.label, &group_id_hex, archived);
         }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SetGroupArchived {
+                group_id: group_id.clone(),
+                archived,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     pub async fn update_group_image(
@@ -4909,15 +4914,16 @@ async fn run_app_runtime_account_worker(
                         archived,
                         respond,
                     }) => {
+                        // The archive projection events (ArchiveChanged chat-list
+                        // update + GroupStateUpdated) are published by the single
+                        // caller `MarmotAppRuntime::set_group_archived` after this
+                        // command returns. Emitting `GroupStateUpdated` here too
+                        // would race ahead of the ArchiveChanged trigger and get
+                        // fingerprint-deduped by `subscribe_chat_list`, so
+                        // subscribers would see a generic state change instead of
+                        // the archive-specific trigger. Keep this worker handler
+                        // limited to mutating the authoritative in-memory state.
                         let result = client.set_group_archived(&group_id, archived);
-                        if result.is_ok() {
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::PromoteAdmin {

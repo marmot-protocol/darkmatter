@@ -2167,9 +2167,24 @@ impl AppClient {
             .iter_mut()
             .find(|group| group.group_id_hex == group_id_hex)
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        let previous = group.archived;
         group.archived = archived;
         let group = group.clone();
-        self.app.save_state(&self.state)?;
+        // Roll the in-memory flag back if persistence fails so the worker's
+        // authoritative snapshot stays consistent with what is on disk; a later
+        // unrelated `save_state` must not silently re-apply a toggle the caller
+        // was told had failed.
+        if let Err(err) = self.app.save_state(&self.state) {
+            if let Some(group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == group_id_hex)
+            {
+                group.archived = previous;
+            }
+            return Err(err);
+        }
         Ok(group)
     }
 
