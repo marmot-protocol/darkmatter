@@ -541,11 +541,17 @@ pub(crate) async fn fetch_group_image(
 }
 
 fn canonical_media_type(value: &str) -> Result<String, AppError> {
+    // Per encrypted-media.md ("Media Type Canonicalization") sender and
+    // receiver MUST trim ASCII whitespace ONLY. `str::trim` strips every
+    // Unicode White_Space code point (a superset), so a peer sending an `m`
+    // value with a non-ASCII whitespace edge would derive a different file_key
+    // and AAD than this client. The same canonical value feeds the group-image
+    // AAD path, so this trim must stay ASCII-only on both surfaces.
     let media_type = value
         .split(';')
         .next()
         .unwrap_or_default()
-        .trim()
+        .trim_matches(|c: char| c.is_ascii_whitespace())
         .to_ascii_lowercase();
     if media_type.is_empty() || !media_type.contains('/') {
         return Err(AppError::InvalidEncryptedMedia(
@@ -831,5 +837,22 @@ mod tests {
 
         assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
         assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn canonical_media_type_trims_ascii_whitespace_only() {
+        // ASCII whitespace on the edges is stripped per the spec algorithm.
+        assert_eq!(
+            canonical_media_type("  image/png \t").expect("ascii-trimmed type is valid"),
+            "image/png",
+        );
+
+        // A leading U+00A0 (non-breaking space) is Unicode whitespace but NOT
+        // ASCII whitespace, so it MUST be preserved: trimming it would derive a
+        // different file_key/AAD than a spec-conformant peer that keeps it.
+        let canonical =
+            canonical_media_type("\u{00A0}image/png").expect("non-empty MIME type is valid");
+        assert_eq!(canonical, "\u{00A0}image/png");
+        assert!(canonical.starts_with('\u{00A0}'));
     }
 }
