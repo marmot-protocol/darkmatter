@@ -1030,7 +1030,7 @@ impl Marmot {
         Ok(summary.into())
     }
 
-    /// Edit `target_message_id` by publishing a kind-1010 event that
+    /// Edit `target_message_id` by publishing a kind-1009 event that
     /// references it and carries the replacement plaintext in `content`.
     /// Recipients honour the edit only when its authenticated author matches
     /// the target's author; mismatched edits are ignored client-side.
@@ -1038,7 +1038,7 @@ impl Marmot {
     /// The chat-list preview deliberately does not bump on an edit — an edit
     /// to a stale message must not reorder a conversation back to the top of
     /// the list. Host apps that aggregate edit history (e.g. an "(edited · N)"
-    /// affordance) read the kind-1010 versions back from the timeline
+    /// affordance) read the kind-1009 versions back from the timeline
     /// projection and resolve the latest text per target message id.
     pub async fn edit_message(
         &self,
