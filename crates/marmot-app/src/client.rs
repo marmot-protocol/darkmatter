@@ -1120,14 +1120,12 @@ impl AppClient {
                 .iter()
                 .map(|record| record.encrypted_token.clone())
                 .collect::<Vec<_>>();
-            let endpoints = records
-                .iter()
-                .filter_map(|record| record.relay_hint.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .map(TransportEndpoint)
-                .collect::<Vec<_>>();
+            let endpoints =
+                self.notification_trigger_target_relays(&server_pubkey_hex, &records)?;
             if endpoints.is_empty() {
+                // No relay hint and no published kind-10050 inbox list for this
+                // server: it is unreachable, so skip it as the genuine last
+                // resort.
                 continue;
             }
             let event =
@@ -1140,6 +1138,37 @@ impl AppClient {
                 .map_err(AppError::Transport)?;
         }
         Ok(())
+    }
+
+    /// Relays to publish the gift-wrapped trigger to for `server_pubkey_hex`.
+    /// Prefers the relay hints carried in the stored token records; when none
+    /// exist, falls back to the server account's published kind-10050 NIP-17
+    /// inbox relays (cached in the user directory). Returns empty when neither
+    /// is available, i.e. the server is unreachable.
+    fn notification_trigger_target_relays(
+        &self,
+        server_pubkey_hex: &str,
+        records: &[notifications::GroupPushTokenRecord],
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let record_relay_hints = records
+            .iter()
+            .filter_map(|record| record.relay_hint.clone())
+            .collect::<Vec<_>>();
+        let server_inbox_relays = if record_relay_hints.is_empty() {
+            self.app
+                .directory_entry_for_account_id(server_pubkey_hex)?
+                .map(|entry| entry.relay_lists.inbox.relays)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(notifications::select_notification_trigger_relays(
+            &record_relay_hints,
+            &server_inbox_relays,
+        )
+        .into_iter()
+        .map(TransportEndpoint)
+        .collect())
     }
 
     fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {
