@@ -693,7 +693,6 @@ pub(crate) enum GroupConfirmationProjection {
 /// the MLS-authenticated sender. Returns `None` (rejecting the message) when the
 /// canonical id does not match or the inner `pubkey` is not the authenticated
 /// sender — both are integrity failures that must not reach the timeline.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_received_event(
     payload: &[u8],
     sender_hex: &str,
@@ -702,7 +701,6 @@ pub(crate) fn decode_received_event(
     source_epoch: u64,
     source_message_id_hex: &str,
     source_recorded_at: u64,
-    allowed_locator_kinds: &[String],
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
         Ok(event) => event,
@@ -728,15 +726,19 @@ pub(crate) fn decode_received_event(
             .tags
             .iter()
             .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        && !media_imeta_tags_are_valid(&event.tags, allowed_locator_kinds)
+        && !media_imeta_tags_are_valid(&event.tags)
     {
-        // A reference is only invalid when a locator is malformed or its kind is
-        // outside the group policy. A policy-allowed locator this client cannot
-        // fetch is unfetchable, not invalid, so it MUST NOT drop the message.
+        // Ingest is purely STRUCTURAL: a media reference drops the message only
+        // when a locator is structurally malformed (empty kind/value, unparseable
+        // URL) or another required field is missing/invalid. A well-formed locator
+        // whose kind is out of the group policy or unsupported by this client is
+        // UNFETCHABLE, never invalid (media is authenticated by its hashes + AEAD
+        // independent of the locator), so it MUST NOT drop the message. Policy is
+        // applied at fetch time, not here.
         tracing::warn!(
             target: "marmot_app::ingest",
             method = "decode_received_event",
-            "rejecting MLS application message: invalid encrypted media reference",
+            "rejecting MLS application message: structurally invalid encrypted media reference",
         );
         return None;
     }
@@ -806,16 +808,14 @@ pub(crate) fn observe_event(
             }
             let sender_hex = hex::encode(sender.as_slice());
             let sender_display_name = display_names.get(&sender_hex).cloned();
-            // Media locator validity is judged against the group's
-            // `marmot.group.encrypted-media.v1` policy; an empty set falls back
-            // to the `blossom-v1` default inside the validator.
-            let allowed_locator_kinds = group_projection
-                .map(|projection| projection.encrypted_media.allowed_locator_kinds.as_slice())
-                .unwrap_or_default();
             // The MLS layer authenticated `sender`; the inner Nostr-shaped event
             // must (1) carry a valid canonical id and (2) name `sender` as its
             // author. Reject anything that fails either check rather than
-            // rendering an unauthenticated or tampered payload.
+            // rendering an unauthenticated or tampered payload. Media references
+            // are validated structurally only inside `decode_received_event`:
+            // locator-kind policy gates fetchability at download time, never
+            // delivery, so the group's `allowed_locator_kinds` is not consulted
+            // on the ingest path.
             let Some(message) = decode_received_event(
                 payload,
                 &sender_hex,
@@ -824,7 +824,6 @@ pub(crate) fn observe_event(
                 epoch.0,
                 source_message_id_hex,
                 source_recorded_at,
-                allowed_locator_kinds,
             ) else {
                 summary.events.push(event.clone());
                 return None;
