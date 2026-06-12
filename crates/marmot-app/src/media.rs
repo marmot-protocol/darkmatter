@@ -43,7 +43,12 @@ pub struct MediaAttachmentReference {
 }
 
 impl MediaAttachmentReference {
-    pub(crate) fn validate(&self) -> Result<(), AppError> {
+    /// Validate the reference against the group's `allowed_locator_kinds`. A
+    /// locator whose kind is outside the policy (or otherwise malformed)
+    /// invalidates the reference; a policy-allowed locator this client cannot
+    /// fetch is tolerated as unfetchable. Passing an empty `allowed` set falls
+    /// back to the `blossom-v1` default (see `locator_kind_allowed`).
+    pub(crate) fn validate(&self, allowed_locator_kinds: &[String]) -> Result<(), AppError> {
         validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")?;
         validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")?;
         let nonce = hex::decode(&self.nonce_hex)
@@ -59,7 +64,10 @@ impl MediaAttachmentReference {
             ));
         }
         for locator in &self.locators {
-            validate_locator(locator)?;
+            // A malformed or not-allowed locator propagates the error and
+            // invalidates the reference; an allowed-but-unsupported locator
+            // returns `Unfetchable` and is tolerated.
+            validate_locator(locator, allowed_locator_kinds)?;
         }
         if self.file_name.trim().is_empty() {
             return Err(AppError::InvalidAppMessagePayload(
@@ -236,7 +244,9 @@ async fn upload_encrypted_media_attachment(
         dim: request.dim,
         thumbhash: request.thumbhash,
     };
-    reference.validate()?;
+    // The reference we just built carries a single `blossom-v1` locator, so the
+    // default-allowed set is sufficient here.
+    reference.validate(&[])?;
     Ok(MediaUploadAttachmentResult {
         encrypted_size_bytes: encrypted.len() as u64,
         reference,
@@ -247,8 +257,9 @@ pub(crate) async fn download_encrypted_media(
     reference: MediaAttachmentReference,
     media_secret: &[u8],
     fallback_endpoints: &[BlobStoreEndpointV1],
+    allowed_locator_kinds: &[String],
 ) -> Result<MediaDownloadResult, AppError> {
-    reference.validate()?;
+    reference.validate(allowed_locator_kinds)?;
     let encrypted = fetch_encrypted_media_blob(&reference, fallback_endpoints).await?;
     let actual_encrypted_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_encrypted_hash != reference.ciphertext_sha256 {
@@ -334,6 +345,7 @@ async fn fetch_encrypted_media_blob(
 pub(crate) fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
+    allowed_locator_kinds: &[String],
 ) -> Result<MediaAttachmentReference, AppError> {
     if tag.first().map(String::as_str) != Some("imeta") {
         return Err(AppError::InvalidAppMessagePayload(
@@ -411,18 +423,21 @@ pub(crate) fn media_attachment_from_imeta_tag(
         dim,
         thumbhash,
     };
-    reference.validate()?;
+    reference.validate(allowed_locator_kinds)?;
     Ok(reference)
 }
 
-pub(crate) fn media_imeta_tags_are_valid(tags: &[Vec<String>]) -> bool {
+pub(crate) fn media_imeta_tags_are_valid(
+    tags: &[Vec<String>],
+    allowed_locator_kinds: &[String],
+) -> bool {
     let mut found = false;
     for tag in tags
         .iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
     {
         found = true;
-        if media_attachment_from_imeta_tag(tag, None).is_err() {
+        if media_attachment_from_imeta_tag(tag, None, allowed_locator_kinds).is_err() {
             return false;
         }
     }
@@ -575,20 +590,57 @@ fn validate_sha256_hex(value: &str, label: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_locator(locator: &MediaLocator) -> Result<(), AppError> {
+/// Whether `kind` is allowed by the group's `allowed_locator_kinds`. When the
+/// group has no `marmot.group.encrypted-media.v1` component (empty set) the
+/// well-known default of `blossom-v1` applies, matching the policy default and
+/// preserving prior behavior.
+fn locator_kind_allowed(kind: &str, allowed_locator_kinds: &[String]) -> bool {
+    if allowed_locator_kinds.is_empty() {
+        kind == BLOSSOM_LOCATOR_KIND_V1
+    } else {
+        allowed_locator_kinds.iter().any(|allowed| allowed == kind)
+    }
+}
+
+/// Outcome of checking one locator against the group policy.
+enum LocatorSupport {
+    /// Allowed by policy and understood by this client (fetchable).
+    Supported,
+    /// Allowed by policy but this client cannot fetch it; the attachment is
+    /// unfetchable but the reference (and containing message) stay valid.
+    Unfetchable,
+}
+
+/// Validate one locator against the group's `allowed_locator_kinds`.
+///
+/// Per encrypted-media.md Validation a receiver MUST reject a media reference
+/// only when a locator is malformed or its kind is NOT allowed by the group
+/// policy. A well-formed locator whose kind IS policy-allowed but that this
+/// client does not support is unfetchable, not invalid: the attachment is
+/// skipped without invalidating the reference or dropping the containing
+/// message.
+fn validate_locator(
+    locator: &MediaLocator,
+    allowed_locator_kinds: &[String],
+) -> Result<LocatorSupport, AppError> {
     if locator.kind.trim().is_empty() || locator.value.trim().is_empty() {
         return Err(AppError::InvalidAppMessagePayload(
             "media locator kind and value cannot be empty".into(),
         ));
     }
-    if locator.kind != BLOSSOM_LOCATOR_KIND_V1 {
+    if !locator_kind_allowed(&locator.kind, allowed_locator_kinds) {
         return Err(AppError::InvalidAppMessagePayload(
-            "unsupported media locator kind".into(),
+            "media locator kind is not allowed by the group policy".into(),
         ));
+    }
+    if locator.kind != BLOSSOM_LOCATOR_KIND_V1 {
+        // Allowed by policy but unsupported by this client: unfetchable, not a
+        // validation failure.
+        return Ok(LocatorSupport::Unfetchable);
     }
     Url::parse(&locator.value)
         .map_err(|_| AppError::InvalidAppMessagePayload("media locator URL is invalid".into()))?;
-    Ok(())
+    Ok(LocatorSupport::Supported)
 }
 
 fn media_hash_from_reference(reference: &MediaAttachmentReference) -> Result<[u8; 32], AppError> {
@@ -826,8 +878,8 @@ mod tests {
         let mut tag = valid_imeta_tag();
         tag.insert(1, "v legacy-media-v0".to_owned());
 
-        assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(media_attachment_from_imeta_tag(&tag, None, &[]).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag], &[]));
     }
 
     #[test]
@@ -835,8 +887,49 @@ mod tests {
         let mut tag = valid_imeta_tag();
         tag.insert(1, "v encrypted-media-v1".to_owned());
 
-        assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(media_attachment_from_imeta_tag(&tag, None, &[]).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag], &[]));
+    }
+
+    #[test]
+    fn allowed_but_unsupported_locator_is_unfetchable_not_invalidating() {
+        // A message carrying a supported blossom locator plus a second locator
+        // whose kind IS in the group policy but that this client cannot fetch
+        // must still be delivered: the unsupported locator is unfetchable, not a
+        // validation failure that drops the whole kind-9 message.
+        let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned(), "ipfs-v1".to_owned()];
+        let mut tag = valid_imeta_tag();
+        // Insert the policy-allowed-but-unsupported locator alongside the
+        // blossom one already present in the fixture.
+        tag.insert(2, "locator ipfs-v1 ipfs://bafybeigdyrexample".to_owned());
+
+        let reference = media_attachment_from_imeta_tag(&tag, None, &allowed)
+            .expect("policy-allowed sibling locator must not invalidate the reference");
+        assert_eq!(reference.locators.len(), 2);
+        assert!(media_imeta_tags_are_valid(&[tag], &allowed));
+    }
+
+    #[test]
+    fn locator_kind_outside_policy_invalidates_reference() {
+        // A locator whose kind is NOT in the group policy is malformed/not
+        // allowed and MUST invalidate the reference (drop on ingest).
+        let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+        let mut tag = valid_imeta_tag();
+        tag.insert(2, "locator ipfs-v1 ipfs://bafybeigdyrexample".to_owned());
+
+        assert!(media_attachment_from_imeta_tag(&tag, None, &allowed).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag], &allowed));
+    }
+
+    #[test]
+    fn unsupported_locator_falls_back_to_blossom_default_when_policy_empty() {
+        // With no group encrypted-media component (empty allowed set) the
+        // validator falls back to the `blossom-v1` default, so a non-blossom
+        // locator is rejected exactly as before this change.
+        let mut tag = valid_imeta_tag();
+        tag.insert(2, "locator ipfs-v1 ipfs://bafybeigdyrexample".to_owned());
+
+        assert!(media_attachment_from_imeta_tag(&tag, None, &[]).is_err());
     }
 
     #[test]

@@ -189,7 +189,9 @@ pub(crate) fn build_inner_event(
             }
             let source_epoch = attachments[0].source_epoch;
             for attachment in attachments {
-                attachment.validate()?;
+                // Outbound attachments are built locally with `blossom-v1`
+                // locators, so the default-allowed set applies.
+                attachment.validate(&[])?;
                 if attachment.source_epoch != source_epoch {
                     return Err(AppError::InvalidAppMessagePayload(
                         "media attachments in one message must share a source epoch".into(),

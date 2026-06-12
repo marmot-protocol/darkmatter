@@ -7211,6 +7211,7 @@ mod tests {
             0,
             "msg1",
             1_700_000_000,
+            &[],
         )
         .expect("valid event is accepted");
         assert_eq!(message.plaintext, "hi");
@@ -7230,7 +7231,7 @@ mod tests {
         let bytes = serde_json::to_vec(&event).unwrap();
         let group_id = GroupId::new(vec![0x01]);
         assert!(
-            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0)
+            groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0, &[])
                 .is_none()
         );
     }
@@ -7245,8 +7246,17 @@ mod tests {
         let other_sender = "bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66";
         // The inner pubkey is SENDER_HEX, but MLS authenticated `other_sender`.
         assert!(
-            groups::decode_received_event(&bytes, other_sender, None, &group_id, 0, "msg1", 0)
-                .is_none()
+            groups::decode_received_event(
+                &bytes,
+                other_sender,
+                None,
+                &group_id,
+                0,
+                "msg1",
+                0,
+                &[],
+            )
+            .is_none()
         );
     }
 

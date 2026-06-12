@@ -1342,6 +1342,7 @@ impl AppClient {
             reference,
             media_secret.as_ref(),
             &policy.default_blob_endpoints,
+            &policy.allowed_locator_kinds,
         )
         .await
     }
@@ -1820,7 +1821,12 @@ impl AppClient {
                     continue;
                 }
                 if message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                    && media_imeta_tags_are_valid(&message.tags)
+                    && media_imeta_tags_are_valid(
+                        &message.tags,
+                        &self
+                            .encrypted_media_for_group(&message.group_id)
+                            .allowed_locator_kinds,
+                    )
                     && self
                         .remember_current_encrypted_media_secret(&message.group_id)
                         .is_err()
