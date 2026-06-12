@@ -1129,6 +1129,14 @@ mod tests {
     }
 
     #[test]
+    fn imeta_parser_accepts_public_ipv6_media_locator() {
+        let tag = tag_with_locator(format!("https://[2606:4700::]/{}.bin", valid_hash()));
+
+        assert!(media_attachment_from_imeta_tag(&tag, None).is_ok());
+        assert!(media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
     fn imeta_parser_rejects_locator_without_content_hash() {
         let tag = tag_with_locator("https://media.example/download.bin".to_owned());
         let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
