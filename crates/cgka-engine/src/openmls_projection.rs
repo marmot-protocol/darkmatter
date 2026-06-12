@@ -144,6 +144,7 @@ struct StoredOpenMlsCandidatePathResult {
 enum CandidatePathProbeResult {
     Materialized(Option<OpenMlsMaterializedCandidate>),
     UnauthorizedCommit { message_id: String },
+    InvalidCommit { message_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +203,7 @@ pub enum OpenMlsProjectionError {
     Snapshot(String),
     Replay(String),
     UnauthorizedCommit { message_id: String },
+    InvalidCommit { message_id: String, reason: String },
     Serialize(String),
     Storage(String),
     InvalidPolicy(String),
@@ -225,6 +227,9 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
             OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
                 write!(f, "unauthorized admin-gated commit: {message_id}")
+            }
+            OpenMlsProjectionError::InvalidCommit { message_id, reason } => {
+                write!(f, "invalid commit {message_id}: {reason}")
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
@@ -687,6 +692,14 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                         });
                         continue;
                     }
+                    CandidatePathProbeResult::InvalidCommit { message_id, .. } => {
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id,
+                            kind: MessageKind::Commit,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                        });
+                        continue;
+                    }
                 };
 
                 extended = true;
@@ -746,6 +759,10 @@ fn probe_candidate_path<S: StorageProvider>(
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
             Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
         }
+        Err(OpenMlsProjectionError::InvalidCommit {
+            message_id,
+            reason: _,
+        }) => Ok(CandidatePathProbeResult::InvalidCommit { message_id }),
         Err(OpenMlsProjectionError::Replay(_)) => Ok(CandidatePathProbeResult::Materialized(None)),
         Err(err) => Err(err),
     }
@@ -1354,9 +1371,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         crate::DEFAULT_CIPHERSUITE,
                     )
                 {
-                    return Err(OpenMlsProjectionError::Replay(format!(
-                        "invalid credential identity or account proof: {err}"
-                    )));
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: format!("invalid credential identity or account proof: {err}"),
+                    });
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged

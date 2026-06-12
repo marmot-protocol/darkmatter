@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use cgka_engine::app_components::staged_commit_requires_admin;
+use cgka_engine::canonicalization::DroppedMessageReason;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
@@ -302,10 +303,20 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
         &group_id,
     );
 
+    let spoofed_id = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(&spoofed.payload))
+    };
+
     let outcome = alice.ingest(spoofed).await.unwrap();
     assert!(
-        matches!(outcome, IngestOutcome::Buffered { .. }),
-        "convergence should stage same-epoch commits, got {outcome:?}"
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::PeelFailed
+            }
+        ),
+        "terminally invalid same-epoch commits should not remain buffered, got {outcome:?}"
     );
     let result = alice
         .converge_stored_openmls_messages(&group_id, 1_000_000)
@@ -313,6 +324,13 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
     assert!(
         result.accepted_commits.is_empty(),
         "spoofed self-update must not be accepted, got {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == spoofed_id
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "spoofed self-update must be terminally invalidated, got {result:?}"
     );
     assert_eq!(alice.epoch(&group_id).unwrap(), before_epoch);
 }
