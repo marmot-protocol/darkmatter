@@ -123,10 +123,13 @@ dropped under the inbound-processing rules, not applied to group state.
 
 ## Message expiration
 
-When the group's active `marmot.group.message-retention.v1` state enables a retention duration
+The `expiration` tag applies to MLS application messages only. When the group's active
+`marmot.group.message-retention.v1` state enables a retention duration
 ([../app-components/message-retention-v1.md](../app-components/message-retention-v1.md)), the sender of a kind `445`
-group message SHOULD attach a NIP-40 `expiration` tag whose value is the inner app payload `created_at` plus the
-retention duration. A group without retention enabled emits no `expiration` tag.
+event that carries an MLS application message SHOULD attach a NIP-40 `expiration` tag whose value is the inner app
+payload `created_at` plus the retention duration. A kind `445` event that carries a commit or proposal MUST NOT carry
+an `expiration` tag, regardless of the retention policy: group-state history stays fetchable for members catching up.
+A group without retention enabled emits no `expiration` tag.
 
 The `expiration` tag is relay-facing transport metadata that asks relays to delete the event after the expiry time.
 Receivers MUST NOT use the tag for message validity, ordering, or branch selection, and a missing or mismatched tag
@@ -137,8 +140,9 @@ according to the active retention component ([../protocol-core/group-setup.md](.
 Enabling retention is a trade-off the group accepts:
 
 - Privacy: the `expiration` tag reveals the group's retention policy to every relay and reader of the event.
-- Availability: relays delete expired events. A member that stays offline past the expiry of the commits it has not
-  fetched may be unable to fetch the history it needs to catch up and can be permanently locked out of the group.
+- Availability: relays delete expired events. An application message that has expired from every relay is unrecoverable
+  for a member that did not fetch it in time. Commits and proposals never carry the tag, so retention does not block
+  group-state catch-up.
 
 ## Account inbox relays
 
