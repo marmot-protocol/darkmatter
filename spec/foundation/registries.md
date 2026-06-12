@@ -59,6 +59,10 @@ listing the matching extension type in its LeafNode capabilities; the `required_
 `marmot.group.agent-text-stream.quic.v1` is enforced against these ids at invite and join. The bit values (`0x01`,
 `0x02`, `0x04`) are role-mask bits inside the component payload, distinct from these extension type ids.
 
+These three extension types are capability markers only: v1 defines no extension data for them. They appear solely in
+`LeafNode.capabilities.extensions` to advertise role support and are never emitted as LeafNode or GroupContext
+extension bodies.
+
 `0xf2ef` and `0xf2f0` are reserved for the branch-draft multi-device feature (MIP-06) and are not yet implemented;
 confirm the values when that feature lands. `0xf2f1` is implemented and required on every Marmot member LeafNode.
 
