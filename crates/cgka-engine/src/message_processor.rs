@@ -619,27 +619,22 @@ impl<S: StorageProvider> Engine<S> {
                     };
                     let commit_priority =
                         crate::app_components::commit_ordering_priority_for_staged(&staged);
-                    // foundation/identity.md: reject an inbound commit that
-                    // would add a member whose credential identity is not a
-                    // valid x-only secp256k1 public key, before it mutates
-                    // canonical state.
-                    let mut added = Vec::new();
-                    for add in staged.add_proposals() {
-                        let leaf = add.add_proposal().key_package().leaf_node();
-                        match crate::identity::validated_member_id_of_leaf(leaf).and_then(|id| {
-                            crate::account_identity_proof::validate_leaf_account_identity_proof(
-                                leaf,
-                                self.ciphersuite,
-                            )?;
-                            Ok(id)
-                        }) {
-                            Ok(id) => added.push(id),
-                            Err(err) => {
-                                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                                return Err(err);
-                            }
+                    // foundation/identity.md: reject inbound commits that
+                    // introduce or mutate a member LeafNode whose credential
+                    // identity is invalid, lacks a valid account proof, or no
+                    // longer matches the member identity being updated.
+                    let added = match crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                        &staged,
+                        &mls_group,
+                        &commit_committer,
+                        self.ciphersuite,
+                    ) {
+                        Ok(added) => added,
+                        Err(err) => {
+                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                            return Err(err);
                         }
-                    }
+                    };
                     // Classify departures before the merge consumes the staged
                     // commit and the leaving leaves disappear: a SelfRemove is a
                     // member leaving (attributed to themselves); a Remove is an

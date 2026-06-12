@@ -24,11 +24,13 @@ use cgka_traits::transport::{
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{PreSharedKeyProposal, Proposal};
+use openmls::prelude::{BasicCredential, CredentialWithKey, LeafNodeParameters};
 use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
+use tls_codec::Serialize as _;
 
 mod support;
 use support::proof_signer;
@@ -217,6 +219,102 @@ fn requires_admin_for_proposals(
         .clear_pending_commit(provider.storage())
         .expect("clear pending commit");
     requires_admin
+}
+
+fn spoofed_self_update_commit(
+    storage: &SqliteAccountStorage,
+    crypto: &RustCrypto,
+    attacker: &MemberId,
+    victim: &MemberId,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(crypto, storage.mls_storage());
+    let (mut mls_group, signer) = load_group_and_signer(storage, crypto, attacker, group_id);
+    let spoofed_credential = CredentialWithKey {
+        credential: BasicCredential::new(victim.as_slice().to_vec()).into(),
+        signature_key: signer.public().into(),
+    };
+    let leaf_node_parameters = LeafNodeParameters::builder()
+        .with_credential_with_key(spoofed_credential)
+        .build();
+    let commit_bundle = mls_group
+        .self_update(&provider, &signer, leaf_node_parameters)
+        .expect("attacker can build spoofed self-update at OpenMLS layer");
+    let (commit_out, _welcome_opt, _group_info) = commit_bundle.into_contents();
+    let commit_bytes = commit_out
+        .tls_serialize_detached()
+        .expect("serialize spoofed self-update commit");
+
+    TransportMessage {
+        id: hash_id(&commit_bytes),
+        payload: commit_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn inbound_self_update_rejects_account_identity_spoofing() {
+    // A non-admin self-update is an allowed commit shape, but the new update
+    // path leaf must still prove and preserve the committer's account identity.
+    // Without Marmot's per-update validation, OpenMLS accepts a self-update that
+    // keeps Bob's MLS signature key while changing the credential identity to
+    // Alice's admin account pubkey.
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "spoofed-self-update".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let before_epoch = alice.epoch(&group_id).expect("alice has group");
+    let crypto = RustCrypto::default();
+    let spoofed = spoofed_self_update_commit(
+        &bob_storage,
+        &crypto,
+        &bob.self_id(),
+        &alice.self_id(),
+        &group_id,
+    );
+
+    let outcome = alice.ingest(spoofed).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "convergence should stage same-epoch commits, got {outcome:?}"
+    );
+    let result = alice
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence should classify spoofed update");
+    assert!(
+        result.accepted_commits.is_empty(),
+        "spoofed self-update must not be accepted, got {result:?}"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), before_epoch);
 }
 
 #[tokio::test]

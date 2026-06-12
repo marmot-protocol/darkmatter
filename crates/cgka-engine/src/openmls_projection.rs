@@ -1342,23 +1342,21 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
                 let committer = sender.clone();
                 // foundation/identity.md: deferred commits replayed during
-                // convergence are an inbound credential ingress too. Reject a
-                // commit that would add a member with an invalid x-only
-                // secp256k1 credential identity before merging it.
-                for add in staged.add_proposals() {
-                    let leaf = add.add_proposal().key_package().leaf_node();
-                    let validation =
-                        crate::identity::validated_member_id_of_leaf(leaf).and_then(|_| {
-                            crate::account_identity_proof::validate_leaf_account_identity_proof(
-                                leaf,
-                                crate::DEFAULT_CIPHERSUITE,
-                            )
-                        });
-                    if let Err(err) = validation {
-                        return Err(OpenMlsProjectionError::Replay(format!(
-                            "invalid added credential identity or account proof: {err}"
-                        )));
-                    }
+                // convergence are an inbound credential ingress too. Reject
+                // commits that introduce or mutate a member LeafNode whose
+                // credential identity is invalid, lacks a valid account proof,
+                // or no longer matches the member identity being updated.
+                if let Err(err) =
+                    crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                        &staged,
+                        &mls_group,
+                        &sender_id.clone().expect("checked above"),
+                        crate::DEFAULT_CIPHERSUITE,
+                    )
+                {
+                    return Err(OpenMlsProjectionError::Replay(format!(
+                        "invalid credential identity or account proof: {err}"
+                    )));
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
