@@ -36,8 +36,10 @@ A notification server is an ordinary Nostr account. Its inbox relays are the Nos
 ([../transports/nostr.md](../transports/nostr.md)); this feature does not define a server-specific relay-list event
 kind.
 
-Open item: how a client initially learns a notification server's public key — for example an application or build-time
-default — is application provisioning and is out of scope for this version of the feature.
+Each application provides its own notification server's public key, for example as a build-time default. This is
+structural, not provisional: Apple and Google require application-level credentials to trigger native push, so a
+notification server can only wake the application whose platform push credentials it holds. A server's public key is
+therefore tied to the application it serves, and this feature defines no protocol-level server discovery.
 
 ## Token encryption
 
