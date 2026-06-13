@@ -11,9 +11,11 @@
 use crate::engine::Engine;
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
+use crate::identity::{member_id_at_leaf, member_id_of_sender};
 use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
+use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::SnapshotRollbackGuard;
 use cgka_traits::app_components::AppComponentData;
@@ -33,7 +35,7 @@ use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::messages::proposals::{AppDataUpdateOperation, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessage,
-    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, Sender, ValidationError,
+    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -337,6 +339,41 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
             };
+
+            // foundation/wire-envelopes.md + protocol-core/inbound-processing.md:
+            // the canonical dedup/replay id MUST be stable for the carried
+            // protocol bytes and MUST NOT depend on the transport event id. The
+            // transport id only acts as the cheap pre-filter at the top of
+            // `do_ingest`; the same MLS message re-wrapped in a fresh kind-445
+            // envelope (new ephemeral key + nonce -> new transport id, which any
+            // member can produce) MUST collapse to a single duplicate outcome.
+            // Rebind every downstream storage / convergence / fork-recovery row
+            // and the in-memory dedup sets to this content-derived id.
+            let content_id = content_dedup_id(&mls_bytes);
+            if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
+                return Ok(outcome);
+            }
+            if self.seen_message_ids.contains(&content_id) {
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::AlreadySeen,
+                });
+            }
+            if self.sent_message_ids.contains(&content_id) {
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::OwnEcho,
+                });
+            }
+            let content_msg = TransportMessage {
+                id: content_id,
+                ..msg.clone()
+            };
+            // Shadow `msg` for the remainder of the loop body so every
+            // `persist_*`, `update_stored_message_state`, convergence buffer,
+            // and fork-recovery storage id keys on the content-derived id. The
+            // original transport `msg` is only read above the peel, before this
+            // shadow, so a fork-recovery `continue` still re-peels the real
+            // transport bytes.
+            let msg = &content_msg;
             let openmls_msg = TransportMessage {
                 payload: mls_bytes.clone(),
                 ..msg.clone()
@@ -365,10 +402,23 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
-            if pending_recovery.is_none()
-                && msg_content_type == ContentType::Commit
-                && msg_epoch >= current_epoch
-            {
+            let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
+                if msg_epoch >= current_epoch {
+                    true
+                } else {
+                    let policy = self.convergence_policy_for_group(&group_id).map_err(|e| {
+                        EngineError::Backend(format!("load convergence policy: {e}"))
+                    })?;
+                    let within_rewind_horizon = current_epoch.0.saturating_sub(msg_epoch.0)
+                        <= policy.convergence.max_rewind_commits;
+                    within_rewind_horizon
+                        && !self.epoch_manager.we_committed_from(&group_id, msg_epoch)
+                        && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?
+                }
+            } else {
+                false
+            };
+            if pending_recovery.is_none() && commit_should_enter_convergence {
                 let now_ms = self.convergence_now_ms();
                 self.buffer_openmls_convergence_message(&group_id, openmls_msg.clone(), now_ms)
                     .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
@@ -559,6 +609,10 @@ impl<S: StorageProvider> Engine<S> {
                         payload,
                     });
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    // In-memory fast path mirrors the durable record, keyed on
+                    // the content-derived id so a re-wrapped duplicate is caught
+                    // before the durable lookup.
+                    self.seen_message_ids.insert(msg.id.clone());
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
@@ -580,27 +634,22 @@ impl<S: StorageProvider> Engine<S> {
                     };
                     let commit_priority =
                         crate::app_components::commit_ordering_priority_for_staged(&staged);
-                    // foundation/identity.md: reject an inbound commit that
-                    // would add a member whose credential identity is not a
-                    // valid x-only secp256k1 public key, before it mutates
-                    // canonical state.
-                    let mut added = Vec::new();
-                    for add in staged.add_proposals() {
-                        let leaf = add.add_proposal().key_package().leaf_node();
-                        match crate::identity::validated_member_id_of_leaf(leaf).and_then(|id| {
-                            crate::account_identity_proof::validate_leaf_account_identity_proof(
-                                leaf,
-                                self.ciphersuite,
-                            )?;
-                            Ok(id)
-                        }) {
-                            Ok(id) => added.push(id),
-                            Err(err) => {
-                                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                                return Err(err);
-                            }
+                    // foundation/identity.md: reject inbound commits that
+                    // introduce or mutate a member LeafNode whose credential
+                    // identity is invalid, lacks a valid account proof, or no
+                    // longer matches the member identity being updated.
+                    let added = match crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                        &staged,
+                        &mls_group,
+                        &commit_committer,
+                        self.ciphersuite,
+                    ) {
+                        Ok(added) => added,
+                        Err(err) => {
+                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                            return Err(err);
                         }
-                    }
+                    };
                     // Classify departures before the merge consumes the staged
                     // commit and the leaving leaves disappear: a SelfRemove is a
                     // member leaving (attributed to themselves); a Remove is an
@@ -748,6 +797,10 @@ impl<S: StorageProvider> Engine<S> {
                         self.push_group_state_change(&group_id, after, sender_id.clone(), change);
                     }
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    // In-memory fast path mirrors the durable record, keyed on
+                    // the content-derived id so a re-wrapped duplicate commit is
+                    // caught before the durable lookup.
+                    self.seen_message_ids.insert(msg.id.clone());
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ProposalMessage(queued) => {
@@ -817,6 +870,8 @@ impl<S: StorageProvider> Engine<S> {
                         let (commit_out, _welcome_opt, _gi) = mls_group
                             .commit_to_pending_proposals(&provider, &self.identity.signer)
                             .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
+                        let pending_commit_guard =
+                            PendingCommitCleanupGuard::arm(&provider, group_id.clone());
                         let commit_bytes = commit_out
                             .tls_serialize_detached()
                             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -840,6 +895,26 @@ impl<S: StorageProvider> Engine<S> {
                         )?;
 
                         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+
+                        // Match the explicit send paths' projected Marmot
+                        // state before entering PendingPublish. If this storage
+                        // write fails, the guard clears the OpenMLS commit and
+                        // the EpochManager remains Stable.
+                        if let Ok(mut g) = self.storage.get_group(&group_id) {
+                            g.epoch = new_epoch;
+                            g.members
+                                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
+                            self.storage.put_group(&g)?;
+                        }
+
+                        let commit_priority = mls_group
+                            .pending_commit()
+                            .map(crate::app_components::commit_ordering_priority_for_staged)
+                            .ok_or_else(|| {
+                                EngineError::Backend(
+                                    "auto-commit produced no pending commit".into(),
+                                )
+                            })?;
                         let pending_ref = self.epoch_manager.next_pending_ref();
                         let staged = cgka_traits::engine_state::StagedCommitHandle::from_bytes(
                             group_id.as_slice().to_vec(),
@@ -853,14 +928,6 @@ impl<S: StorageProvider> Engine<S> {
                             crate::epoch_manager::PendingKind::GroupEvolution,
                             self.current_audit_context.clone(),
                         )?;
-                        let commit_priority = mls_group
-                            .pending_commit()
-                            .map(crate::app_components::commit_ordering_priority_for_staged)
-                            .ok_or_else(|| {
-                                EngineError::Backend(
-                                    "auto-commit produced no pending commit".into(),
-                                )
-                            })?;
                         self.track_pending_commit_for_recovery(
                             pending_ref,
                             group_id.clone(),
@@ -899,17 +966,7 @@ impl<S: StorageProvider> Engine<S> {
                             msg: wrapped,
                             pending: pending_ref,
                         });
-
-                        // Match the explicit send paths' projected Marmot
-                        // state: callers can see the pending member set, while
-                        // the OpenMLS commit itself is not merged until
-                        // confirm_published.
-                        if let Ok(mut g) = self.storage.get_group(&group_id) {
-                            g.epoch = new_epoch;
-                            g.members
-                                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
-                            self.storage.put_group(&g)?;
-                        }
+                        pending_commit_guard.disarm();
                     }
                     Ok(IngestOutcome::Processed)
                 }
@@ -1289,9 +1346,18 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         // Validate capabilities (same rule as create_group — see Risk #1
-        // capability doc).
+        // capability doc). The group's required capabilities cover required MLS
+        // primitives and required app components; additionally fold in the
+        // per-member role capabilities the agent-text-stream-QUIC component's
+        // `required_member_roles` mask demands (#177,
+        // agent-text-stream-quic-v1.md): a client MUST NOT invite a member whose
+        // KeyPackage does not advertise every required role capability.
         let existing = self.storage.get_group(&group_id)?;
-        let required = existing.required_capabilities.clone();
+        let mut required = existing.required_capabilities.clone();
+        merge_capabilities(
+            &mut required,
+            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+        );
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
         for kp in &key_packages {
             let parsed = self.parse_key_package(kp)?;
@@ -1332,6 +1398,7 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, welcome_out, _gi) = mls_group
             .add_members(&provider, &self.identity.signer, &parsed_kps)
             .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -1411,6 +1478,10 @@ impl<S: StorageProvider> Engine<S> {
         // post-merge epoch is +1.
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
@@ -1423,10 +1494,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
@@ -1452,6 +1519,7 @@ impl<S: StorageProvider> Engine<S> {
             .collect();
         self.pending_state_changes
             .insert(pending_ref, added_changes);
+        pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,
@@ -1562,6 +1630,7 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, _welcome_opt, _gi) = mls_group
             .remove_members(&provider, &self.identity.signer, &leaf_indices)
             .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -1593,6 +1662,10 @@ impl<S: StorageProvider> Engine<S> {
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
@@ -1605,10 +1678,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
@@ -1632,6 +1701,7 @@ impl<S: StorageProvider> Engine<S> {
             .collect();
         self.pending_state_changes
             .insert(pending_ref, removed_changes);
+        pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,
@@ -1847,7 +1917,7 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
 /// "absent" encoding both collapse to `None`, so this inbound diff matches the
 /// own-commit diff in `update_group_data` and a "clear an already-absent
 /// avatar" commit converges to no row on every client.
-fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
+pub(crate) fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
     let snapshot = |component_id| {
         crate::app_components::app_component_data_of_group(mls_group, component_id)
             .filter(|bytes| crate::app_components::avatar_component_present(component_id, bytes))
@@ -1858,28 +1928,40 @@ fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
     ]
 }
 
-fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
-    match sender {
-        Sender::Member(leaf_idx) => member_id_at_leaf(group, *leaf_idx),
-        _ => None,
-    }
-}
-
-fn member_id_at_leaf(
-    group: &MlsGroup,
-    leaf_idx: openmls::prelude::LeafNodeIndex,
-) -> Option<MemberId> {
-    let member = group.member_at(leaf_idx)?;
-    let basic = BasicCredential::try_from(member.credential).ok()?;
-    Some(MemberId::new(basic.identity().to_vec()))
-}
-
 fn record_group_id(msg: &TransportMessage) -> GroupId {
     match &msg.envelope {
         TransportEnvelope::GroupMessage { transport_group_id } => {
             GroupId::new(transport_group_id.clone())
         }
         TransportEnvelope::Welcome { .. } => GroupId::new(Vec::new()),
+    }
+}
+
+/// Canonical, content-derived duplicate-detection / replay id for a recovered
+/// MLS message.
+///
+/// Per foundation/wire-envelopes.md and protocol-core/inbound-processing.md the
+/// dedup id MUST be stable for the carried protocol bytes and MUST NOT depend on
+/// the transport event id. This hashes the peeled MLS wire bytes with the same
+/// `SHA-256(mls_bytes)` convention `CommitOrderingKey::from_commit_bytes` uses
+/// for fork ordering, so the same MLS message re-wrapped in a fresh transport
+/// envelope maps to one id, independent of the outer ephemeral key / nonce.
+pub(crate) fn content_dedup_id(mls_bytes: &[u8]) -> MessageId {
+    MessageId::new(Sha256::digest(mls_bytes).to_vec())
+}
+
+/// Fold every capability in `extra` into `required` (set union). Used to add the
+/// agent-stream `required_member_roles` role capabilities to a group's required
+/// capability set before the per-KeyPackage invite check and the join-time
+/// self-check (#177).
+pub(crate) fn merge_capabilities(
+    required: &mut cgka_traits::capabilities::GroupCapabilities,
+    extra: &cgka_traits::capabilities::GroupCapabilities,
+) {
+    required.proposals.extend(extra.proposals.iter().copied());
+    required.extensions.extend(extra.extensions.iter().copied());
+    for id in &extra.app_components.ids {
+        required.app_components.insert(*id);
     }
 }
 
@@ -2022,7 +2104,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn recorded_message_outcome(
-        &mut self,
+        &self,
         id: &MessageId,
     ) -> Result<Option<IngestOutcome>, EngineError> {
         let record = match self.storage.get_message(id) {
@@ -2134,6 +2216,19 @@ impl<S: StorageProvider> Engine<S> {
         Ok(None)
     }
 
+    fn has_retained_anchor_snapshot(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<bool, EngineError> {
+        for snapshot_name in self.storage.list_group_snapshots(group_id)? {
+            if retained_anchor_epoch_from_snapshot_name(&snapshot_name) == Some(epoch.0) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn available_past_peel_snapshots(
         &self,
         group_id: &GroupId,
@@ -2179,6 +2274,11 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
     ) -> Result<(), EngineError> {
         self.sent_message_ids.insert(msg.id.clone());
+        // Also remember the content-derived id so our own commit / app message
+        // echoed back inside a freshly re-wrapped transport envelope (different
+        // transport id) is still classified `OwnEcho` by the post-peel content
+        // check, not reprocessed.
+        self.sent_message_ids.insert(content_dedup_id(mls_bytes));
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()

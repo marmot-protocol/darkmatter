@@ -40,11 +40,19 @@ use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
+use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
 mod support;
 use support::proof_signer;
+
+/// Content-derived dedup id of a group message (#238). Inbound group messages
+/// are stored and reported under SHA-256 of the recovered MLS bytes, which the
+/// pass-through `MockPeeler` makes equal to `msg.payload`.
+fn content_id(msg: &TransportMessage) -> MessageId {
+    MessageId::new(Sha256::digest(&msg.payload).to_vec())
+}
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -52,7 +60,6 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     // from the ergonomic label so admin/member tracking stays stable across a
     // run while the engine accepts the identity.
     use k256::schnorr::SigningKey;
-    use sha2::{Digest, Sha256};
     let mut counter = 0u64;
     loop {
         let mut material = [0u8; 32];
@@ -519,7 +526,9 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
             data: encode_admin_policy_for_test(&[alice_id.clone(), bob_id]),
         }],
     );
-    let malicious_id = hex::encode(malicious.id.as_slice());
+    // The convergence layer keys the unauthorized commit on its content-derived
+    // dedup id (#238), not the outer transport id.
+    let malicious_id = hex::encode(content_id(&malicious).as_slice());
 
     alice
         .ingest(malicious.clone())
@@ -545,7 +554,7 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
     assert_eq!(alice.admin_pubkeys(&gid).unwrap(), vec![alice_admin]);
     assert_eq!(
         alice_storage
-            .get_message(&malicious.id)
+            .get_message(&content_id(&malicious))
             .expect("malicious message was stored")
             .state,
         MessageState::EpochInvalidated
@@ -745,6 +754,74 @@ async fn convergence_refreshes_recipient_marmot_record_name_and_description() {
     assert_eq!(
         bob_group.description, "new-described",
         "convergence MUST refresh recipient description"
+    );
+}
+
+#[tokio::test]
+async fn convergence_emits_unattributed_profile_change_events() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original-name".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (alice_pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("new-renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, alice_pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+
+    // Bob applies the rename via the convergence path, not the direct seam.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    bob.ingest(routed).await.unwrap();
+    bob.drain_events();
+    converge_buffered_commit(&mut bob, &gid);
+
+    // The reorg seam must surface the same profile diff the direct seam
+    // emits, unattributed — otherwise the rename never becomes a kind-1210
+    // row for members that applied the commit through convergence.
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::GroupRenamed { name },
+                ..
+            } if name == "new-renamed"
+        )),
+        "convergence apply must emit an unattributed GroupRenamed, got: {events:?}",
     );
 }
 

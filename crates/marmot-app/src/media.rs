@@ -1,7 +1,9 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use cgka_traits::app_components::{
-    BLOSSOM_LOCATOR_KIND_V1, BlobStoreEndpointV1, ENCRYPTED_MEDIA_FORMAT_V1,
+    BLOSSOM_LOCATOR_KIND_V1, BlobStoreEndpointV1, ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN,
+    ENCRYPTED_MEDIA_FORMAT_V1,
 };
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -13,7 +15,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use url::Url;
+use url::{Host, Url};
 
 use crate::{AppError, SendSummary, unix_now_seconds};
 
@@ -21,6 +23,10 @@ pub const DEFAULT_BLOSSOM_SERVER_URL: &str = "https://blossom.primal.net";
 pub const ENCRYPTED_MEDIA_VERSION: &str = ENCRYPTED_MEDIA_FORMAT_V1;
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
+const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_ENCRYPTED_MEDIA_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaLocator {
@@ -57,6 +63,7 @@ impl MediaAttachmentReference {
     pub(crate) fn validate(&self) -> Result<(), AppError> {
         validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")?;
         validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")?;
+        let expected_ciphertext_sha256 = self.ciphertext_sha256.to_ascii_lowercase();
         let nonce = hex::decode(&self.nonce_hex)
             .map_err(|_| AppError::InvalidAppMessagePayload("media nonce must be hex".into()))?;
         if nonce.len() != 12 {
@@ -71,6 +78,25 @@ impl MediaAttachmentReference {
         }
         for locator in &self.locators {
             validate_locator(locator)?;
+            // The blossom content-hash binding is Blossom-specific integrity, like
+            // the host-safety check in `validate_locator`: a `blossom-v1` locator
+            // URL MUST carry the ciphertext hash so the fetched blob is the one
+            // this reference commits to. A non-Blossom locator is never fetched by
+            // this client and carries no such URL convention, so it is subject only
+            // to the structural checks above and stays merely unfetchable.
+            if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
+                let locator_hash =
+                    blossom_content_hash_from_url(&locator.value).ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload(
+                            "Blossom locator URL must include the encrypted blob hash".into(),
+                        )
+                    })?;
+                if locator_hash != expected_ciphertext_sha256 {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "Blossom locator hash does not match media reference".into(),
+                    ));
+                }
+            }
         }
         if self.file_name.trim().is_empty() {
             return Err(AppError::InvalidAppMessagePayload(
@@ -385,14 +411,22 @@ async fn fetch_encrypted_media_blob(
         ));
     }
     let mut last_error = None;
+    let expected_hash = reference.ciphertext_sha256.to_ascii_lowercase();
     for candidate in candidates {
-        if let Some(hash) = blossom_content_hash_from_url(&candidate)
-            && hash != reference.ciphertext_sha256
-        {
-            last_error = Some(AppError::InvalidEncryptedMedia(
-                "Blossom locator hash does not match media reference".into(),
-            ));
-            continue;
+        match blossom_content_hash_from_url(&candidate) {
+            Some(hash) if hash == expected_hash => {}
+            Some(_) => {
+                last_error = Some(AppError::InvalidEncryptedMedia(
+                    "Blossom locator hash does not match media reference".into(),
+                ));
+                continue;
+            }
+            None => {
+                last_error = Some(AppError::InvalidEncryptedMedia(
+                    "Blossom locator URL did not include encrypted blob hash".into(),
+                ));
+                continue;
+            }
         }
         match fetch_blossom_blob(&candidate).await {
             Ok(bytes) => return Ok(bytes),
@@ -677,9 +711,137 @@ fn validate_locator(locator: &MediaLocator) -> Result<(), AppError> {
             "media locator kind and value cannot be empty".into(),
         ));
     }
-    Url::parse(&locator.value)
+    // The locator KIND is a fetchability concern, not a validity condition: an
+    // out-of-policy or client-unsupported kind (e.g. a non-Blossom `ipfs://`
+    // locator) is kept and handled at fetch time, never dropped here, because
+    // media is authenticated by its hashes + AEAD independent of the locator.
+    let url = Url::parse(&locator.value)
         .map_err(|_| AppError::InvalidAppMessagePayload("media locator URL is invalid".into()))?;
+    // Host safety is the exception that DOES drop: a Blossom locator is one this
+    // client will fetch over HTTP, so an unsafe host (loopback / non-public /
+    // IPv6-transition) or cleartext scheme is a hostile request vector that
+    // hash-authentication does not neutralize. Only Blossom locators are ever
+    // fetched (`fetch_encrypted_media_blob` filters to them), so a non-Blossom
+    // locator skips this check — it is unfetchable-by-this-client, not unsafe.
+    if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
+        validate_blossom_fetch_url(&url, allow_loopback_media_http()).map_err(|err| {
+            AppError::InvalidAppMessagePayload(format!("media locator URL is unsafe: {err}"))
+        })?;
+    }
     Ok(())
+}
+
+fn allow_loopback_media_http() -> bool {
+    cfg!(debug_assertions)
+}
+
+fn validate_blossom_fetch_url(url: &Url, allow_loopback_http: bool) -> Result<(), String> {
+    if url.as_str().len() > ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN {
+        return Err(format!(
+            "URL exceeds {ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN} bytes"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL must not include credentials".into());
+    }
+    if url.fragment().is_some() {
+        return Err("URL must not include a fragment".into());
+    }
+    let host = url.host().ok_or("URL must include a host")?;
+    match url.scheme() {
+        "https" => validate_public_or_allowed_loopback_host(host, false),
+        "http" if allow_loopback_http && is_loopback_host(host) => Ok(()),
+        "http" => Err("URL scheme must be https".into()),
+        _ => Err("URL scheme must be https".into()),
+    }
+}
+
+fn validate_public_or_allowed_loopback_host(
+    host: Host<&str>,
+    allow_loopback: bool,
+) -> Result<(), String> {
+    match host {
+        Host::Domain(domain) => {
+            let lowered = domain.to_ascii_lowercase();
+            if lowered == "localhost" || lowered.ends_with(".localhost") {
+                return if allow_loopback {
+                    Ok(())
+                } else {
+                    Err("URL must not point at localhost".into())
+                };
+            }
+            Ok(())
+        }
+        Host::Ipv4(addr) => reject_non_public_ip(IpAddr::V4(addr), allow_loopback),
+        Host::Ipv6(addr) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback),
+    }
+}
+
+fn is_loopback_host(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let lowered = domain.to_ascii_lowercase();
+            lowered == "localhost" || lowered.ends_with(".localhost")
+        }
+        Host::Ipv4(addr) => addr.is_loopback(),
+        Host::Ipv6(addr) => addr.is_loopback(),
+    }
+}
+
+fn reject_non_public_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
+    match addr {
+        IpAddr::V4(addr) if allow_loopback && addr.is_loopback() => Ok(()),
+        IpAddr::V6(addr) if allow_loopback && addr.is_loopback() => Ok(()),
+        IpAddr::V4(addr) if is_public_ipv4(addr) => Ok(()),
+        IpAddr::V6(addr) if is_public_ipv6(addr) => Ok(()),
+        _ => Err("URL must not point at a non-public address".into()),
+    }
+}
+
+fn is_public_ipv4(addr: Ipv4Addr) -> bool {
+    let [a, b, c, d] = addr.octets();
+    !matches!(
+        (a, b, c, d),
+        (0, _, _, _)
+            | (10, _, _, _)
+            | (100, 64..=127, _, _)
+            | (127, _, _, _)
+            | (169, 254, _, _)
+            | (172, 16..=31, _, _)
+            | (192, 0, 0, _)
+            | (192, 0, 2, _)
+            | (192, 88, 99, _)
+            | (192, 168, _, _)
+            | (198, 18..=19, _, _)
+            | (198, 51, 100, _)
+            | (203, 0, 113, _)
+            | (224..=255, _, _, _)
+    )
+}
+
+fn is_public_ipv6(addr: Ipv6Addr) -> bool {
+    if let Some(mapped) = addr.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
+        return false;
+    }
+    let segments = addr.segments();
+    let first = segments[0];
+    let second = segments[1];
+    if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // Reject IPv6 transition mechanisms that can route to an embedded IPv4
+    // endpoint through host-local tunnel configuration, bypassing the IPv4
+    // non-public-address checks above.
+    if first == 0x2002 || (first == 0x2001 && second == 0x0000) {
+        return false;
+    }
+    if first == 0x2001 && second == 0x0db8 {
+        return false;
+    }
+    (first & 0xe000) == 0x2000
 }
 
 fn media_hash_from_reference(reference: &MediaAttachmentReference) -> Result<[u8; 32], AppError> {
@@ -748,7 +910,8 @@ async fn upload_blossom_blob(
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
     let authorization =
         blossom_authorization_header(signing_keys, &server_host, encrypted_hash_hex)?;
-    let response = reqwest::Client::new()
+    let client = media_http_client_for_url(&upload_url).await?;
+    let response = client
         .put(upload_url)
         .header(reqwest::header::AUTHORIZATION, authorization)
         .header(reqwest::header::CONTENT_TYPE, BLOSSOM_UPLOAD_CONTENT_TYPE)
@@ -792,18 +955,105 @@ async fn upload_blossom_blob(
 async fn fetch_blossom_blob(url: &str) -> Result<Vec<u8>, AppError> {
     let url = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
-    let response = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(reqwest_blob_error)?;
+    let client = media_http_client_for_url(&url).await?;
+    let response = client.get(url).send().await.map_err(reqwest_blob_error)?;
     if !response.status().is_success() {
         return Err(AppError::BlobStore(format!(
             "download returned HTTP {}",
             response.status().as_u16()
         )));
     }
-    Ok(response.bytes().await.map_err(reqwest_blob_error)?.to_vec())
+    read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await
+}
+
+async fn media_http_client_for_url(url: &Url) -> Result<reqwest::Client, AppError> {
+    validate_blossom_fetch_url(url, allow_loopback_media_http())
+        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(MEDIA_HTTP_CONNECT_TIMEOUT)
+        .read_timeout(MEDIA_HTTP_READ_TIMEOUT)
+        .timeout(MEDIA_HTTP_TOTAL_TIMEOUT)
+        .no_proxy()
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate();
+    if let Some((domain, addrs)) = resolve_media_host(url).await? {
+        builder = builder.resolve_to_addrs(&domain, &addrs);
+    }
+    builder
+        .build()
+        .map_err(|_| AppError::BlobStore("failed to build HTTP client".into()))
+}
+
+async fn resolve_media_host(url: &Url) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
+    let allow_loopback = url.scheme() == "http"
+        && allow_loopback_media_http()
+        && url.host().map(is_loopback_host).unwrap_or(false);
+    match url
+        .host()
+        .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a host".into()))?
+    {
+        Host::Domain(domain) => {
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a fetch port".into()))?;
+            let addrs = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|_| AppError::BlobStore("media host DNS lookup failed".into()))?
+                .collect::<Vec<_>>();
+            if addrs.is_empty() {
+                return Err(AppError::BlobStore(
+                    "media host DNS lookup returned no addresses".into(),
+                ));
+            }
+            for addr in &addrs {
+                reject_non_public_ip(addr.ip(), allow_loopback).map_err(|err| {
+                    AppError::BlobStore(format!("unsafe media host address: {err}"))
+                })?;
+            }
+            Ok(Some((domain.to_ascii_lowercase(), addrs)))
+        }
+        Host::Ipv4(addr) => {
+            reject_non_public_ip(IpAddr::V4(addr), allow_loopback)
+                .map_err(|err| AppError::BlobStore(format!("unsafe media host address: {err}")))?;
+            Ok(None)
+        }
+        Host::Ipv6(addr) => {
+            reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
+                .map_err(|err| AppError::BlobStore(format!("unsafe media host address: {err}")))?;
+            Ok(None)
+        }
+    }
+}
+
+async fn read_limited_blossom_body(
+    response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    if let Some(content_length) = response.content_length()
+        && content_length > max_bytes
+    {
+        return Err(AppError::BlobStore(format!(
+            "download exceeds {max_bytes} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.map_err(reqwest_blob_error)? {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| AppError::BlobStore(format!("download exceeds {max_bytes} bytes")))?;
+        if next_len as u64 > max_bytes {
+            return Err(AppError::BlobStore(format!(
+                "download exceeds {max_bytes} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
@@ -921,18 +1171,47 @@ fn reqwest_blob_error(err: reqwest::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn valid_imeta_tag() -> Vec<String> {
         vec![
             "imeta".to_owned(),
             "v encrypted-media-v1".to_owned(),
-            "locator blossom-v1 https://media.example/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.bin".to_owned(),
+            format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                "11".repeat(32)
+            ),
             format!("ciphertext_sha256 {}", "11".repeat(32)),
             format!("plaintext_sha256 {}", "22".repeat(32)),
             "nonce 333333333333333333333333".to_owned(),
             "m image/png".to_owned(),
             "filename diagram.png".to_owned(),
         ]
+    }
+
+    fn valid_hash() -> String {
+        "11".repeat(32)
+    }
+
+    fn tag_with_locator(locator: String) -> Vec<String> {
+        let mut tag = valid_imeta_tag();
+        tag[2] = format!("locator blossom-v1 {locator}");
+        tag
+    }
+
+    fn spawn_http_response(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        });
+        format!("http://{addr}")
     }
 
     #[test]
@@ -993,6 +1272,15 @@ mod tests {
     }
 
     #[test]
+    fn imeta_parser_rejects_non_https_media_locator() {
+        let tag = tag_with_locator(format!("http://media.example/{}.bin", valid_hash()));
+        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+
+        assert!(err.to_string().contains("scheme must be https"));
+        assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
     fn locator_with_unparseable_url_is_rejected_on_ingest() {
         // A locator value that does not parse as a URL is structural malformation
         // and MUST invalidate the reference even though the kind is `blossom-v1`.
@@ -1010,7 +1298,10 @@ mod tests {
         let mut reference = loopback_reference();
         reference.locators = vec![MediaLocator {
             kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
-            value: "https://media.example/blob.bin".to_owned(),
+            // The blossom locator URL must carry the ciphertext hash (= the
+            // reference's `ciphertext_sha256`, `11`*32) per the merged blossom
+            // content-hash binding.
+            value: format!("https://media.example/{}.bin", "11".repeat(32)),
         }];
         reference
     }
@@ -1069,7 +1360,7 @@ mod tests {
         MediaAttachmentReference {
             locators: vec![MediaLocator {
                 kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
-                value: "http://127.0.0.1:8080/blob.bin".to_owned(),
+                value: format!("http://127.0.0.1:8080/{}.bin", "11".repeat(32)),
             }],
             ciphertext_sha256: "11".repeat(32),
             plaintext_sha256: "22".repeat(32),
@@ -1154,7 +1445,7 @@ mod tests {
         // the only reason it is unfetchable is the out-of-policy locator kind.
         reference.locators = vec![MediaLocator {
             kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
-            value: "https://media.example/blob.bin".to_owned(),
+            value: format!("https://media.example/{}.bin", "11".repeat(32)),
         }];
         // A non-empty policy that allows only a non-blossom kind: blossom is out
         // of policy, so there is no fetchable locator for this client.
@@ -1174,5 +1465,111 @@ mod tests {
         reference
             .validate()
             .expect("an out-of-policy reference is still structurally valid");
+    }
+
+    #[test]
+    fn imeta_parser_rejects_private_ip_media_locator() {
+        let tag = tag_with_locator(format!("https://10.0.0.5/{}.bin", valid_hash()));
+        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+
+        assert!(err.to_string().contains("non-public"));
+        assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn imeta_parser_rejects_ipv6_transition_prefix_media_locators() {
+        for locator in [
+            // 6to4 wraps 10.0.0.5 in the two segments after 2002::/16.
+            format!("https://[2002:a00:5::]/{}.bin", valid_hash()),
+            // Teredo carries the obfuscated client IPv4 in the low 32 bits: !10.0.0.5.
+            format!(
+                "https://[2001:0:4136:e378:8000:63bf:f5ff:fffa]/{}.bin",
+                valid_hash()
+            ),
+        ] {
+            let tag = tag_with_locator(locator);
+            let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+
+            assert!(err.to_string().contains("non-public"));
+            assert!(!media_imeta_tags_are_valid(&[tag]));
+        }
+    }
+
+    #[test]
+    fn imeta_parser_accepts_public_ipv6_media_locator() {
+        let tag = tag_with_locator(format!("https://[2606:4700::]/{}.bin", valid_hash()));
+
+        assert!(media_attachment_from_imeta_tag(&tag, None).is_ok());
+        assert!(media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn imeta_parser_rejects_locator_without_content_hash() {
+        let tag = tag_with_locator("https://media.example/download.bin".to_owned());
+        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must include the encrypted blob hash")
+        );
+        assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn imeta_parser_rejects_locator_hash_mismatch() {
+        let tag = tag_with_locator(format!("https://media.example/{}.bin", "33".repeat(32)));
+        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+
+        assert!(err.to_string().contains("hash does not match"));
+        assert!(!media_imeta_tags_are_valid(&[tag]));
+    }
+
+    #[test]
+    fn media_fetch_url_policy_allows_loopback_http_only_when_explicitly_enabled() {
+        let url = Url::parse(&format!("http://127.0.0.1:3000/{}.bin", valid_hash())).unwrap();
+
+        assert!(validate_blossom_fetch_url(&url, true).is_ok());
+        assert!(validate_blossom_fetch_url(&url, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_blossom_blob_does_not_follow_redirects() {
+        let server = spawn_http_response(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        );
+        let url = format!("{server}/{}.bin", valid_hash());
+        let err = fetch_blossom_blob(&url).await.unwrap_err();
+
+        assert!(err.to_string().contains("HTTP 302"));
+    }
+
+    #[tokio::test]
+    async fn fetch_blossom_blob_rejects_oversized_content_length() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_ENCRYPTED_MEDIA_BLOB_BYTES + 1
+        );
+        let server = spawn_http_response(response.into_bytes());
+        let url = format!("{server}/{}.bin", valid_hash());
+        let err = fetch_blossom_blob(&url).await.unwrap_err();
+
+        assert!(err.to_string().contains("download exceeds"));
+    }
+
+    #[tokio::test]
+    async fn limited_body_reader_rejects_chunked_body_over_cap() {
+        let server = spawn_http_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n"
+                .to_vec(),
+        );
+        let response = reqwest::Client::new()
+            .get(format!("{server}/{}.bin", valid_hash()))
+            .send()
+            .await
+            .expect("fetch chunked test body");
+        let err = read_limited_blossom_body(response, 5).await.unwrap_err();
+
+        assert!(err.to_string().contains("download exceeds 5 bytes"));
     }
 }

@@ -23,8 +23,9 @@ use cgka_engine::{
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
-    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
 pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
@@ -1796,6 +1797,75 @@ impl MarmotApp {
         Ok(status)
     }
 
+    pub async fn fetch_current_account_relay_list_status_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        required_list_kind: Option<&str>,
+    ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let required_list_kind = match required_list_kind {
+            Some("nip65") => Some(KIND_NIP65_RELAY_LIST),
+            Some("inbox") => Some(KIND_MARMOT_INBOX_RELAY_LIST),
+            Some(other) => {
+                return Err(AppError::RelayDirectory(format!(
+                    "unsupported relay list type: {other}"
+                )));
+            }
+            None => None,
+        };
+        let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        let freshness = self.directory_freshness();
+        let records = self
+            .relay_plane
+            .fetch_directory_events(
+                bootstrap_relays.clone(),
+                relay_list_queries(account_id_hex.clone()),
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let observed_nip65 = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_NIP65_RELAY_LIST
+                && freshness.accepts(record)
+        });
+        let observed_inbox = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST
+                && freshness.accepts(record)
+        });
+        let has_required_list = match required_list_kind {
+            Some(KIND_NIP65_RELAY_LIST) => observed_nip65,
+            Some(KIND_MARMOT_INBOX_RELAY_LIST) => observed_inbox,
+            Some(_) => false,
+            None => observed_nip65 || observed_inbox,
+        };
+        if !has_required_list {
+            return Ok(None);
+        }
+        let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
+        let mut status = selection.value;
+        let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+        if !observed_nip65 {
+            status.nip65 = cached.nip65;
+        }
+        if !observed_inbox {
+            status.inbox = cached.inbox;
+        }
+        push_unique_strings(&mut status.bootstrap_relays, cached.bootstrap_relays);
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = bootstrap_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
+        status.refresh();
+        self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        Ok(Some(status))
+    }
+
     pub async fn fetch_latest_key_package_for_account_id(
         &self,
         account_id_hex: &str,
@@ -2489,6 +2559,29 @@ impl MarmotApp {
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
         })
+    }
+
+    pub async fn fetch_current_follow_list_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        let records = self
+            .fetch_events_for_account_ids(
+                std::slice::from_ref(&account_id_hex),
+                KIND_NOSTR_CONTACT_LIST,
+                &source_relays,
+            )
+            .await?;
+        let Some(follow_list) =
+            latest_follow_list_from_records(&account_id_hex, records, self.directory_freshness())
+                .value
+        else {
+            return Ok(None);
+        };
+        self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+        Ok(Some(follow_list.follows))
     }
 
     async fn refresh_directory_profiles(
@@ -4399,24 +4492,34 @@ fn app_feature_registry() -> FeatureRegistry {
             description: "MIP-03 SelfRemove group departure",
         },
     );
-    for (feature, description) in [
+    // Each agent-text-stream-QUIC role maps to its own distinct backing
+    // capability (a private-use MLS extension type), so a member advertises
+    // `receive`/`send`/`fanout` independently and a group's
+    // `required_member_roles` mask is enforceable per role (#177,
+    // agent-text-stream-quic-v1.md). The capability/feature/bit mapping is the
+    // shared `AGENT_TEXT_STREAM_QUIC_ROLES` table so the engine enforcement and
+    // this registration cannot drift.
+    for (feature, capability, description) in [
         (
             AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
             "receive QUIC-backed agent text stream previews",
         ),
         (
             AGENT_TEXT_STREAM_QUIC_SEND_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
             "send QUIC-backed agent text stream frames",
         ),
         (
             AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
             "fan out QUIC-backed agent text stream frames",
         ),
     ] {
         registry.register(
             feature,
             CapabilityRequirement {
-                requires: Capability::AppComponent(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID),
+                requires: capability,
                 level: RequirementLevel::Optional,
                 description,
             },
@@ -6993,7 +7096,7 @@ mod tests {
                 MediaAttachmentReference {
                     locators: vec![MediaLocator {
                         kind: "blossom-v1".to_owned(),
-                        value: "https://media.example/a.png".to_owned(),
+                        value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
                     }],
                     ciphertext_sha256: hex::encode([0x33_u8; 32]),
                     plaintext_sha256: hex::encode([0x11_u8; 32]),
@@ -7008,7 +7111,7 @@ mod tests {
                 MediaAttachmentReference {
                     locators: vec![MediaLocator {
                         kind: "blossom-v1".to_owned(),
-                        value: "https://media.example/b.mp4".to_owned(),
+                        value: format!("https://media.example/{}.bin", hex::encode([0x44_u8; 32])),
                     }],
                     ciphertext_sha256: hex::encode([0x44_u8; 32]),
                     plaintext_sha256: hex::encode([0x55_u8; 32]),
@@ -7031,11 +7134,11 @@ mod tests {
             .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
             .collect::<Vec<_>>();
         assert_eq!(imeta.len(), 2);
-        assert!(
-            imeta[0]
-                .iter()
-                .any(|field| field == "locator blossom-v1 https://media.example/a.png")
-        );
+        assert!(imeta[0].iter().any(|field| field
+            == &format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([0x33_u8; 32])
+            )));
         assert!(imeta[0].iter().any(|field| field == "m image/png"));
         assert!(imeta[0].iter().any(|field| field == "filename a.png"));
         assert!(
@@ -7045,11 +7148,11 @@ mod tests {
         );
         assert!(imeta[0].iter().any(|field| field == "v encrypted-media-v1"));
         assert!(imeta[0].iter().any(|field| field == "thumbhash thumb"));
-        assert!(
-            imeta[1]
-                .iter()
-                .any(|field| field == "locator blossom-v1 https://media.example/b.mp4")
-        );
+        assert!(imeta[1].iter().any(|field| field
+            == &format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([0x44_u8; 32])
+            )));
     }
 
     #[test]

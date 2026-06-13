@@ -2503,7 +2503,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             MediaAttachmentReference {
                 locators: vec![MediaLocator {
                     kind: "blossom-v1".to_owned(),
-                    value: "https://media.example/diagram.png".to_owned(),
+                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
                 }],
                 ciphertext_sha256: hex::encode([0x11_u8; 32]),
                 plaintext_sha256: hex::encode([0x42_u8; 32]),
@@ -2518,7 +2518,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             MediaAttachmentReference {
                 locators: vec![MediaLocator {
                     kind: "blossom-v1".to_owned(),
-                    value: "https://media.example/audio.ogg".to_owned(),
+                    value: format!("https://media.example/{}.bin", hex::encode([0x12_u8; 32])),
                 }],
                 ciphertext_sha256: hex::encode([0x12_u8; 32]),
                 plaintext_sha256: hex::encode([0x43_u8; 32]),
@@ -2546,11 +2546,11 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .collect();
     assert_eq!(imeta_tags.len(), 2);
     let imeta = imeta_tags[0];
-    assert!(
-        imeta
-            .iter()
-            .any(|field| field == "locator blossom-v1 https://media.example/diagram.png")
-    );
+    assert!(imeta.iter().any(|field| field
+        == &format!(
+            "locator blossom-v1 https://media.example/{}.bin",
+            hex::encode([0x11_u8; 32])
+        )));
     assert!(imeta.iter().any(|field| field == "m image/png"));
     assert!(imeta.iter().any(|field| field == "filename diagram.png"));
     assert!(
@@ -2573,7 +2573,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             vec![MediaAttachmentReference {
                 locators: vec![MediaLocator {
                     kind: "blossom-v1".to_owned(),
-                    value: "https://media.example/diagram.png".to_owned(),
+                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
                 }],
                 ciphertext_sha256: hex::encode([0x11_u8; 32]),
                 plaintext_sha256: "not-hex".to_owned(),

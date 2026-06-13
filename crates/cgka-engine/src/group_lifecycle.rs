@@ -15,6 +15,7 @@ use crate::capabilities::{
     required_capabilities_extension_for_features,
 };
 use crate::engine::Engine;
+use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::{PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
 use cgka_traits::TransportEndpoint;
@@ -84,6 +85,17 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // Per-member role capabilities the agent-text-stream-QUIC component's
+        // `required_member_roles` mask demands (#177,
+        // agent-text-stream-quic-v1.md). These are enforced against every
+        // invitee KeyPackage but are NOT folded into the group's
+        // RequiredCapabilities — they are a component-driven per-member
+        // advertisement requirement, not an MLS-level group requirement.
+        let required_role_caps =
+            crate::capability_manager::required_role_capabilities_from_request_components(
+                &req.app_components,
+            );
+
         let mut parsed_kps = Vec::with_capacity(req.members.len());
         let mut negotiated_components =
             desired_components.intersection(&self.supported_app_components);
@@ -94,6 +106,13 @@ impl<S: StorageProvider> Engine<S> {
             if !missing.is_empty() {
                 return Err(EngineError::MissingRequiredCapabilities {
                     required: Box::new(required_caps.clone()),
+                    had: Box::new(had),
+                });
+            }
+            let role_missing = required_role_caps.missing_from(&had);
+            if !role_missing.is_empty() {
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(required_role_caps.clone()),
                     had: Box::new(had),
                 });
             }
@@ -157,25 +176,27 @@ impl<S: StorageProvider> Engine<S> {
             self.identity.credential_with_key.clone(),
         )
         .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
+        let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
         // 3. Add members to produce a staged commit + welcome (skipped for
         //    solo creation). Publish-before-apply keeps the staged commit
         //    attached to `mls_group`; merge happens in `do_confirm_published`.
         //    Welcome bytes are independently serializable from the OpenMLS
         //    return value; they do not require a merged group.
+        let mut pending_commit_guard = None;
         let welcome_bytes: Option<Vec<u8>> = if parsed_kps.is_empty() {
             None
         } else {
             let (_commit_out, welcome_out, _group_info) = mls_group
                 .add_members(&provider, &self.identity.signer, &parsed_kps)
                 .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+            pending_commit_guard =
+                Some(PendingCommitCleanupGuard::arm(&provider, group_id.clone()));
             let bytes = welcome_out
                 .tls_serialize_detached()
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
             Some(bytes)
         };
-
-        let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
         // 4. Persist Marmot-side group record with the PROJECTED
         //    post-merge member set before recording outbound welcomes.
@@ -275,6 +296,10 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::CreateGroup,
             self.current_audit_context.clone(),
         )?;
+
+        if let Some(guard) = pending_commit_guard {
+            guard.disarm();
+        }
 
         let _ = ctx;
 
@@ -399,8 +424,18 @@ impl<S: StorageProvider> Engine<S> {
         // (feature registry + supported app components), so a group requiring
         // more than this client can process is rejected even if a stale or
         // over-broad KeyPackage was consumed.
-        let group_required =
+        //
+        // This also covers the agent-text-stream-QUIC join self-check (#177,
+        // agent-text-stream-quic-v1.md): the group's `required_member_roles`
+        // mask is translated into role-Feature capabilities and folded into
+        // `group_required`, so a joiner that does not advertise every required
+        // role capability is rejected here before it joins.
+        let mut group_required =
             crate::capability_manager::required_capabilities_from_group(&mls_group);
+        crate::message_processor::merge_capabilities(
+            &mut group_required,
+            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+        );
         let had = crate::capabilities::self_supported_capabilities(
             &self.registry,
             self.ciphersuite,

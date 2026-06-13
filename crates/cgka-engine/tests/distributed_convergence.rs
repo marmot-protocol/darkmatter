@@ -27,6 +27,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -38,7 +39,6 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     // from the ergonomic label so admin/member tracking stays stable across a
     // run while the engine accepts the identity.
     use k256::schnorr::SigningKey;
-    use sha2::{Digest, Sha256};
     let mut counter = 0u64;
     loop {
         let mut material = [0u8; 32];
@@ -270,7 +270,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     );
     assert_eq!(
         result.accepted_commits,
-        vec![hex::encode(commit_messages[app_branch_index].id.as_slice())]
+        vec![content_hex(&commit_messages[app_branch_index])]
     );
     assert_message_state(
         &carol_storage,
@@ -501,15 +501,9 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
     assert_eq!(
         result.accepted_commits,
-        vec![
-            hex::encode(commit_david.id.as_slice()),
-            hex::encode(commit_eve.id.as_slice())
-        ]
+        vec![content_hex(&commit_david), content_hex(&commit_eve)]
     );
-    assert_eq!(
-        result.accepted_app_messages,
-        vec![hex::encode(app_msg.id.as_slice())]
-    );
+    assert_eq!(result.accepted_app_messages, vec![content_hex(&app_msg)]);
     assert_message_state(&carol_storage, &commit_david, MessageState::Processed);
     assert_message_state(&carol_storage, &commit_eve, MessageState::Processed);
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
@@ -677,21 +671,119 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_ne!(
-        carol_storage.get_message(&bob_commit.id).unwrap().state,
+        carol_storage
+            .get_message(&content_id(&bob_commit))
+            .unwrap()
+            .state,
         MessageState::Created,
         "late commit should be resolved once the retained anchor is available"
     );
     if bob_wins {
-        assert_eq!(
-            result.accepted_commits,
-            vec![hex::encode(bob_commit.id.as_slice())]
-        );
+        assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
         assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
     } else {
-        assert_eq!(
-            result.accepted_commits,
-            vec![hex::encode(alice_commit.id.as_slice())]
-        );
+        assert_eq!(result.accepted_commits, vec![content_hex(&alice_commit)]);
+        assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
+    }
+    let members = carol.members(&group_id).unwrap();
+    assert_eq!(
+        members.iter().any(|member| member.id == eve.self_id()),
+        bob_wins
+    );
+    assert_eq!(
+        members.iter().any(|member| member.id == david.self_id()),
+        !bob_wins
+    );
+}
+
+#[tokio::test]
+async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-inline-late-commit".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let alice_commit = route(alice_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .expect("alice commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("alice branch applies via convergence");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let bob_commit = route(bob_commit, &group_id);
+    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
+
+    let outcome = carol.ingest(bob_commit.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "past-epoch competing commit inside the rewind horizon must enter convergence, got {outcome:?}"
+    );
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .expect("late same-epoch commit ingested through the inline path converges");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    if bob_wins {
+        assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
+        assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+    } else {
+        assert_eq!(result.accepted_commits, vec![content_hex(&alice_commit)]);
         assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
     }
     let members = carol.members(&group_id).unwrap();
@@ -930,7 +1022,10 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_ne!(
-        carol_storage.get_message(&bob_commit.id).unwrap().state,
+        carol_storage
+            .get_message(&content_id(&bob_commit))
+            .unwrap()
+            .state,
         MessageState::Created,
         "late commit should be resolved after engine rebuild"
     );
@@ -1266,7 +1361,7 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
         .expect("stale commit is resolved without historical replay");
 
     assert!(result.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == hex::encode(stale_bob_commit.id.as_slice())
+        dropped.message_id == content_hex(&stale_bob_commit)
             && dropped.kind == MessageKind::Commit
             && dropped.reason == DroppedMessageReason::BeyondAnchor
     }));
@@ -1390,7 +1485,7 @@ async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
         .expect("rebuilt engine resolves stale commit without historical replay");
 
     assert!(result.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == hex::encode(stale_bob_commit.id.as_slice())
+        dropped.message_id == content_hex(&stale_bob_commit)
             && dropped.kind == MessageKind::Commit
             && dropped.reason == DroppedMessageReason::BeyondAnchor
     }));
@@ -1472,10 +1567,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         .expect("future app witness applies after selected commit");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert_eq!(
-        result.accepted_app_messages,
-        vec![hex::encode(app_msg.id.as_slice())]
-    );
+    assert_eq!(result.accepted_app_messages, vec![content_hex(&app_msg)]);
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
 
     let events = carol.drain_events();
@@ -1488,6 +1580,151 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
             )
         }),
         "expected accepted app message event after canonical convergence, got {events:?}"
+    );
+}
+
+/// Regression for darkmatter#144: a future-epoch app message that is
+/// canonicalized as `UndecryptableInCanonicalState` (the retryable case — the
+/// commit advancing the group to the message's epoch has not been selected
+/// yet) must NOT be persisted as the terminal `EpochInvalidated`, and must not
+/// emit `AppMessageInvalidated`. Otherwise the buffered message can never
+/// re-enter convergence and is silently dropped once that commit arrives.
+///
+/// To reach the stored-convergence persistence path the pass must settle on a
+/// tip: here convergence selects the epoch-2 commit while the app message
+/// lives at epoch 3 (its commit withheld), so the message is classified
+/// `UndecryptableInCanonicalState` and persisted alongside the applied branch.
+///
+/// Note the retryable mapping is scoped to messages whose epoch is *beyond* the
+/// settled tip (here msg epoch 3 > tip 2). An `UndecryptableInCanonicalState`
+/// message at or below the settled tip is instead stranded — the awaited commit
+/// already passed on a branch it does not belong to — and stays terminal
+/// `EpochInvalidated`; mapping that case to `Retryable` would wedge convergence
+/// (it never clears, so the group reports perpetually unsettled and all later
+/// sends stall). That at/below-tip path is covered end-to-end by the CLI test
+/// `three_user_message_lifecycle_covers_invite_remove_and_later_delivery`.
+#[tokio::test]
+async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-future-epoch-retryable".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Alice advances the group epoch 1 -> 2 (invite david).
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch2, pending) = evolution(invite_david);
+    alice.confirm_published(pending).await.unwrap();
+
+    // Alice advances the group epoch 2 -> 3 (invite eve), then sends an app
+    // message at epoch 3.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch3, pending) = evolution(invite_eve);
+    alice.confirm_published(pending).await.unwrap();
+    let app_msg = send_app(&mut alice, &group_id, b"future epoch payload".to_vec()).await;
+
+    // Carol buffers the epoch-2 commit and the epoch-3 app message, but NOT
+    // the epoch-3 commit. Convergence settles on epoch 2; the app message has
+    // no candidate branch that decrypts it (it targets epoch 3), so it is
+    // classified UndecryptableInCanonicalState — the retryable case.
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit_to_epoch2, &group_id), 1_000)
+        .expect("epoch-2 commit buffered");
+    carol
+        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .expect("future app message buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence settles on the epoch-2 commit");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.invalidated_app_messages.iter().any(|invalidated| {
+            invalidated.message_id == hex::encode(app_msg.id.as_slice())
+                && invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
+        }),
+        "future-epoch app message should be UndecryptableInCanonicalState, got {:?}",
+        result.invalidated_app_messages
+    );
+    // The fix: retryable, not terminal. Pre-fix this was EpochInvalidated and
+    // the message could never re-enter convergence.
+    assert_message_state(&carol_storage, &app_msg, MessageState::Retryable);
+
+    // The app must NOT have been told the message is permanently invalidated.
+    let events = carol.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. } if *message_id == app_msg.id
+        )),
+        "retryable future-epoch app message must not emit AppMessageInvalidated, got {events:?}"
+    );
+
+    // Now the awaited epoch-3 commit arrives. Convergence must re-feed the
+    // buffered app message (it was kept Retryable and not marked seen) and
+    // apply it on the canonical branch.
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit_to_epoch3, &group_id), 2_000)
+        .expect("epoch-3 commit buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .expect("convergence applies the re-fed app message after the commit lands");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![hex::encode(app_msg.id.as_slice())]
+    );
+    assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
+
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                    if *event_group == group_id && app_content(payload) == b"future epoch payload"
+            )
+        }),
+        "expected the previously-buffered app message to be delivered after the commit, got {events:?}"
     );
 }
 
@@ -1571,10 +1808,10 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
         result.accepted_app_messages,
-        vec![hex::encode(app_messages[selected_index].id.as_slice())]
+        vec![content_hex(&app_messages[selected_index])]
     );
     assert!(result.invalidated_app_messages.iter().any(|invalidated| {
-        invalidated.message_id == hex::encode(app_messages[losing_index].id.as_slice())
+        invalidated.message_id == content_hex(&app_messages[losing_index])
             && invalidated.reason == InvalidatedAppMessageReason::LosingBranch
     }));
     assert_message_state(
@@ -1614,7 +1851,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
                 reason: AppMessageInvalidationReason::LosingBranch,
                 decrypted_payload_ref: Some(_),
             } if *event_group == group_id
-                && *message_id == app_messages[losing_index].id
+                && *message_id == content_id(&app_messages[losing_index])
                 && *epoch == EpochId(2)
         )
     }));
@@ -1785,13 +2022,14 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
 
     assert_eq!(
         result.accepted_app_messages,
-        vec![hex::encode(app_messages[selected_index].id.as_slice())]
+        vec![content_hex(&app_messages[selected_index])]
     );
     assert_message_state(
         &carol_storage,
         &app_messages[losing_index],
         MessageState::EpochInvalidated,
     );
+    let losing_content_id = content_id(&app_messages[losing_index]);
     let events = restarted.drain_events();
     assert!(events.iter().any(|event| {
         matches!(
@@ -1801,7 +2039,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
                 message_id,
                 reason: AppMessageInvalidationReason::LosingBranch,
                 ..
-            } if *event_group == group_id && *message_id == app_messages[losing_index].id
+            } if *event_group == group_id && *message_id == losing_content_id
         )
     }));
     let received_payloads: Vec<Vec<u8>> = events
@@ -1894,10 +2132,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         .expect("proposal-consuming commit converges");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert_eq!(
-        result.accepted_proposals,
-        vec![hex::encode(proposal.id.as_slice())]
-    );
+    assert_eq!(result.accepted_proposals, vec![content_hex(&proposal)]);
     assert_message_state(&carol_storage, &proposal, MessageState::Processed);
     assert_message_state(&carol_storage, &commit, MessageState::Processed);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
@@ -2559,13 +2794,27 @@ fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     }
 }
 
+/// Content-derived dedup id of a group message (#238). Inbound / buffered
+/// group messages are stored and reported under SHA-256 of the recovered MLS
+/// bytes, not the outer transport id. Under the pass-through `MockPeeler` the
+/// recovered MLS bytes are exactly `msg.payload`.
+fn content_id(msg: &TransportMessage) -> MessageId {
+    MessageId::new(Sha256::digest(&msg.payload).to_vec())
+}
+
+/// Hex form of [`content_id`], for comparing against canonicalization-result
+/// message ids.
+fn content_hex(msg: &TransportMessage) -> String {
+    hex::encode(content_id(msg).as_slice())
+}
+
 fn assert_message_state(
     storage: &SqliteAccountStorage,
     msg: &TransportMessage,
     expected: MessageState,
 ) {
     let record = storage
-        .get_message(&msg.id)
+        .get_message(&content_id(msg))
         .expect("message remains stored");
     assert_eq!(record.state, expected);
 }

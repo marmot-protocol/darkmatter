@@ -4818,6 +4818,16 @@ async fn run_app_runtime_account_worker(
                             .update_group_avatar_url(&group_id, url, dim, thumbhash)
                             .await;
                         if result.is_ok() {
+                            // Drain the kind-1210 row this commit queued, like the
+                            // sibling UpdateGroupProfile / UpdateGroupImage handlers —
+                            // otherwise the avatar-changed caption reaches live
+                            // timeline subscribers only on the next snapshot reload.
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
                             publish_app_runtime_group_state_updated(
                                 &events,
                                 &account_id_hex,
@@ -5794,7 +5804,8 @@ fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUpdateTrigger
             GroupEvent::GroupStateChanged { .. }
             | GroupEvent::EpochChanged { .. }
             | GroupEvent::ForkRecovered { .. }
-            | GroupEvent::GroupUnrecoverable { .. } => ChatListUpdateTrigger::MembershipChanged,
+            | GroupEvent::GroupUnrecoverable { .. }
+            | GroupEvent::PendingCommitRecovered { .. } => ChatListUpdateTrigger::MembershipChanged,
             GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => {
                 ChatListUpdateTrigger::SnapshotRefresh
             }
@@ -5815,7 +5826,8 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::GroupStateChanged { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::ForkRecovered { group_id, .. }
-        | GroupEvent::GroupUnrecoverable { group_id } => group_id,
+        | GroupEvent::GroupUnrecoverable { group_id }
+        | GroupEvent::PendingCommitRecovered { group_id, .. } => group_id,
     }
 }
 
