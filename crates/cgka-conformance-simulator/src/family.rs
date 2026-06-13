@@ -83,7 +83,7 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
         let (scenario, expected_outcomes) = convergence_chaos_case(&mut rng, case_index as u64);
         out.push(GeneratedScenarioCase {
             family_name: "convergence-chaos/v1".into(),
-            generator_version: "1".into(),
+            generator_version: "2".into(),
             seed,
             case_index: case_index as u64,
             scenario,
@@ -203,10 +203,10 @@ fn convergence_chaos_case(
         3 => convergence_chaos_partition_leave(case_index),
         4 => convergence_chaos_delayed_past_epoch_app(case_index),
         5 => convergence_chaos_stable_queue_faults(case_index),
-        6 => convergence_chaos_large_message_storm(case_index),
-        7 => convergence_chaos_large_partitioned_storm(case_index),
-        8 => convergence_chaos_large_commit_storm(case_index),
-        9 => convergence_chaos_large_mixed_message_commit_storm(case_index),
+        6 => convergence_chaos_large_message_storm(rng, case_index),
+        7 => convergence_chaos_large_partitioned_storm(rng, case_index),
+        8 => convergence_chaos_large_commit_storm(rng, case_index),
+        9 => convergence_chaos_large_mixed_message_commit_storm(rng, case_index),
         _ => convergence_chaos_restart_delivery_faults(case_index),
     }
 }
@@ -505,7 +505,10 @@ fn convergence_chaos_delayed_past_epoch_app(
     (scenario, expected)
 }
 
-fn convergence_chaos_large_message_storm(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+fn convergence_chaos_large_message_storm(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = large_clients(21);
     let invitees = clients[1..].to_vec();
     let senders = clients[1..].to_vec();
@@ -513,8 +516,14 @@ fn convergence_chaos_large_message_storm(case_index: u64) -> (ScenarioSpec, Vec<
         .iter()
         .map(|sender| format!("{sender}:large-storm:{case_index}"))
         .collect::<Vec<_>>();
-    let mut expected_payloads = payloads.clone();
-    expected_payloads.reverse();
+    // Drive the delivery schedule from the seed so distinct seeds exercise
+    // distinct reorderings. FIFO delivery makes the observed payload order the
+    // permuted queue order, so recompute the expectation from the same order.
+    let order = shuffled_order(rng, senders.len());
+    let expected_payloads = order
+        .iter()
+        .map(|index| payloads[*index].clone())
+        .collect::<Vec<_>>();
 
     let mut steps = large_group_setup(
         format!("large-message-storm-{case_index}"),
@@ -527,9 +536,7 @@ fn convergence_chaos_large_message_storm(case_index: u64) -> (ScenarioSpec, Vec<
             payload: payload.clone(),
         });
     }
-    steps.push(ScenarioStep::ReorderQueued {
-        order: reversed_order(senders.len()),
-    });
+    steps.push(ScenarioStep::ReorderQueued { order });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(vec!["alice".into()]));
     steps.push(observe_vec(vec!["alice".into()]));
@@ -548,6 +555,7 @@ fn convergence_chaos_large_message_storm(case_index: u64) -> (ScenarioSpec, Vec<
 }
 
 fn convergence_chaos_large_partitioned_storm(
+    rng: &mut StdRng,
     case_index: u64,
 ) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = large_clients(25);
@@ -572,6 +580,15 @@ fn convergence_chaos_large_partitioned_storm(
             payload: payload.clone(),
         });
     }
+    // Vary the seeded delivery schedule. Only alice is un-partitioned, so it
+    // receives every payload; FIFO delivery makes the observed order the
+    // permuted queue order, so recompute the expectation from the same order.
+    let order = shuffled_order(rng, senders.len());
+    let expected_payloads = order
+        .iter()
+        .map(|index| payloads[*index].clone())
+        .collect::<Vec<_>>();
+    steps.push(ScenarioStep::ReorderQueued { order });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(vec!["alice".into()]));
     steps.push(ScenarioStep::ClearPartition);
@@ -585,12 +602,15 @@ fn convergence_chaos_large_partitioned_storm(
     };
     let expected = vec![
         confirmed(1, "alice", "create"),
-        client_state("alice", 1, 25, payloads),
+        client_state("alice", 1, 25, expected_payloads),
     ];
     (scenario, expected)
 }
 
-fn convergence_chaos_large_commit_storm(case_index: u64) -> (ScenarioSpec, Vec<TraceExpectation>) {
+fn convergence_chaos_large_commit_storm(
+    rng: &mut StdRng,
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = large_clients(21);
     let invitees = clients[1..].to_vec();
     let committers = clients[..8].to_vec();
@@ -613,9 +633,15 @@ fn convergence_chaos_large_commit_storm(case_index: u64) -> (ScenarioSpec, Vec<T
             pending: format!("{committer}-update"),
         });
     }
-    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
+    // Vary which queued commit is duplicated and how the queue is reordered
+    // from the seed. Convergence and per-committer confirmation are invariant
+    // under delivery schedule, so the expectations stay fixed while distinct
+    // seeds drive distinct adversarial commit-delivery orders.
+    steps.push(ScenarioStep::DuplicateQueued {
+        index: rng.gen_range(0..committers.len()),
+    });
     steps.push(ScenarioStep::ReorderQueued {
-        order: reversed_order(committers.len() + 1),
+        order: shuffled_order(rng, committers.len() + 1),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(committers.clone()));
@@ -642,6 +668,7 @@ fn convergence_chaos_large_commit_storm(case_index: u64) -> (ScenarioSpec, Vec<T
 }
 
 fn convergence_chaos_large_mixed_message_commit_storm(
+    rng: &mut StdRng,
     case_index: u64,
 ) -> (ScenarioSpec, Vec<TraceExpectation>) {
     let clients = large_clients(21);
@@ -660,6 +687,12 @@ fn convergence_chaos_large_mixed_message_commit_storm(
             payload: format!("{sender}:mixed-storm:{case_index}"),
         });
     }
+    // Vary the message-phase schedule from the seed. These events are cleared
+    // before the observed commit storm, so the schedule changes engine input
+    // ordering without affecting the pinned expectations.
+    steps.push(ScenarioStep::ReorderQueued {
+        order: shuffled_order(rng, senders.len()),
+    });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(clients.clone()));
     steps.push(clear_vec(clients.clone()));
@@ -677,9 +710,13 @@ fn convergence_chaos_large_mixed_message_commit_storm(
             pending: format!("{committer}-mixed-update"),
         });
     }
-    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
+    // Vary the commit-storm duplicate target and reorder from the seed.
+    // Convergence and per-committer confirmation are schedule-invariant.
+    steps.push(ScenarioStep::DuplicateQueued {
+        index: rng.gen_range(0..committers.len()),
+    });
     steps.push(ScenarioStep::ReorderQueued {
-        order: reversed_order(committers.len() + 1),
+        order: shuffled_order(rng, committers.len() + 1),
     });
     steps.push(ScenarioStep::DeliverAll);
     steps.push(tick_vec(committers.clone()));
@@ -697,7 +734,7 @@ fn convergence_chaos_large_mixed_message_commit_storm(
     ];
     for (offset, committer) in committers.iter().enumerate() {
         expected.push(confirmed(
-            36 + offset,
+            37 + offset,
             committer,
             &format!("{committer}-mixed-update"),
         ));
@@ -1086,6 +1123,20 @@ fn reversed_order(len: usize) -> Vec<usize> {
 
 fn rotated_order(len: usize, left_by: usize) -> Vec<usize> {
     (0..len).map(|index| (index + left_by) % len).collect()
+}
+
+/// Seed-driven permutation of `0..len`. Distinct seeds produce distinct
+/// delivery schedules, so the chaos family's queue-fault shapes vary real
+/// behavior with the seed instead of re-running one fixed order. The result is
+/// always a valid permutation, so `ScenarioStep::ReorderQueued` accepts it.
+fn shuffled_order(rng: &mut StdRng, len: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..len).collect();
+    // Fisher-Yates: deterministic for a fixed rng state.
+    for i in (1..len).rev() {
+        let j = rng.gen_range(0..=i);
+        order.swap(i, j);
+    }
+    order
 }
 
 fn send_leave_case(rng: &mut StdRng, case_index: u64) -> ScenarioSpec {
