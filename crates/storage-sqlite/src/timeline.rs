@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const DEFAULT_TIMELINE_LIMIT: usize = 50;
-const MAX_TIMELINE_LIMIT: usize = 200;
+/// Largest number of rows a single timeline cursor query returns. A
+/// materialized window kept above this cannot be re-fetched in one query, so
+/// window owners should not exceed it.
+pub const MAX_TIMELINE_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
