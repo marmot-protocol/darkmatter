@@ -61,6 +61,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added a scrollable TUI messages panel: Tab to the Messages focus and use Up/Down or `j`/`k` to scroll, plus
   PageUp/PageDown and Home/End from any focus. New messages stay pinned to the bottom unless you have scrolled up.
 
+### Fixed
+
+- The TUI composer now accepts a leading `?` instead of swallowing it to toggle help. Previously, typing or pasting a
+  message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
+  impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
+  `/help` and `/?` slash spellings remain available.
+
 ### Security
 
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
