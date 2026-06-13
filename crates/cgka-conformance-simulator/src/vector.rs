@@ -795,4 +795,22 @@ mod tests {
         assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
         assert_eq!(failures[0].kind, "clients_not_converged");
     }
+
+    #[test]
+    fn client_epoch_changes_expectation_uses_latest_observation() {
+        let mut latest = observation("alice", 3, 3);
+        latest.epoch_changes = vec![EpochChangeObservation { from: 2, to: 3 }];
+
+        let observed = trace(vec![observation("alice", 1, 2), latest]);
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientEpochChanges {
+                client: "alice".into(),
+                changes: vec![EpochChangeObservation { from: 2, to: 3 }],
+            }],
+            &observed,
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
 }
