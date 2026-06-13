@@ -201,9 +201,11 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 #### Chaos Class `2`: Rollback Queue Faults
 
-- Setup: Alice rolls back a group-data update. Bob sends after the rollback.
-- Pressure: duplicate and delayed app delivery after rollback.
-- Expected: Alice remains at epoch 1 and receives Bob's post-rollback payload once.
+- Setup: Alice rolls back a group-data update. Bob sends several app messages after the rollback.
+- Pressure: a seed-driven delivery reorder of the post-rollback messages, plus a duplicated and delayed copy of the
+  rolled-back commit redelivered across the rollback.
+- Expected: Alice remains at epoch 1 and receives Bob's post-rollback payloads once each, in the seed-driven delivery
+  order (the redelivered commit is deduped).
 
 #### Chaos Class `3`: Partition Leave
 

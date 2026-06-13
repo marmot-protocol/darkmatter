@@ -298,55 +298,86 @@ fn convergence_chaos_rollback_queue_faults(
     rng: &mut StdRng,
     case_index: u64,
 ) -> (ScenarioSpec, Vec<TraceExpectation>) {
-    let bob_payload = format!("bob-after-rollback-{case_index}-{}", rng.r#gen::<u16>());
+    // After alice's group-data update rolls back, alice's own commit stays on
+    // the bus queue (FailPending only retracts the local pending state) and bob
+    // sends several app messages behind it. Drive the delivery schedule of those
+    // app messages from the seed so distinct seeds exercise distinct adversarial
+    // orderings of the post-rollback queue, not just a different payload string.
+    // FIFO delivery makes the observed payload order the permuted queue order,
+    // so recompute the expectation from the same permutation. The rolled-back
+    // commit is pinned at queue head so the duplicate/delay/release still pins
+    // dedup of the redelivered commit across the rollback (the shape's reason
+    // for existing) regardless of the seeded app order.
+    let payloads = (0..6)
+        .map(|index| format!("bob-after-rollback-{case_index}-{index}"))
+        .collect::<Vec<_>>();
+    let app_order = shuffled_order(rng, payloads.len());
+    let expected_payloads = app_order
+        .iter()
+        .map(|index| payloads[*index].clone())
+        .collect::<Vec<_>>();
+    // Full-queue permutation: the rolled-back commit stays at index 0, the app
+    // messages (queue indices 1..) are permuted per the seed.
+    let order = std::iter::once(0)
+        .chain(app_order.iter().map(|index| index + 1))
+        .collect::<Vec<_>>();
+
+    let mut steps = vec![
+        create_group(
+            "alice",
+            format!("rollback-faults-{case_index}"),
+            ["bob"],
+            "create",
+        ),
+        confirmed_step("alice", "create"),
+        ScenarioStep::DeliverAll,
+        tick(["bob"]),
+        clear(["alice", "bob"]),
+        ScenarioStep::UpdateGroupData {
+            client: "alice".into(),
+            name: format!("rolled back {case_index}"),
+            pending: "update".into(),
+        },
+        ScenarioStep::FailPending {
+            client: "alice".into(),
+            pending: "update".into(),
+        },
+    ];
+    for payload in &payloads {
+        steps.push(ScenarioStep::SendAppMessage {
+            sender: "bob".into(),
+            payload: payload.clone(),
+        });
+    }
+    // Seed-driven delivery schedule for the post-rollback messages.
+    steps.push(ScenarioStep::ReorderQueued { order });
+    // Duplicate the rolled-back commit at the queue head and delay the copy so
+    // the released duplicate is deduped across the rollback regardless of seed.
+    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
+    steps.push(ScenarioStep::DelayQueued {
+        index: 1,
+        delayed: "duplicate-app".into(),
+    });
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick(["alice"]));
+    steps.push(ScenarioStep::ReleaseDelayed {
+        delayed: "duplicate-app".into(),
+    });
+    steps.push(ScenarioStep::DeliverAll);
+    steps.push(tick(["alice"]));
+    steps.push(observe(["alice", "bob"]));
+
     let scenario = ScenarioSpec {
         name: format!("convergence-chaos/v1/case-{case_index}"),
         spec_version: "1".into(),
         clients: labels(["alice", "bob"]),
-        steps: vec![
-            create_group(
-                "alice",
-                format!("rollback-faults-{case_index}"),
-                ["bob"],
-                "create",
-            ),
-            confirmed_step("alice", "create"),
-            ScenarioStep::DeliverAll,
-            tick(["bob"]),
-            clear(["alice", "bob"]),
-            ScenarioStep::UpdateGroupData {
-                client: "alice".into(),
-                name: format!("rolled back {case_index}"),
-                pending: "update".into(),
-            },
-            ScenarioStep::FailPending {
-                client: "alice".into(),
-                pending: "update".into(),
-            },
-            ScenarioStep::SendAppMessage {
-                sender: "bob".into(),
-                payload: bob_payload.clone(),
-            },
-            ScenarioStep::DuplicateQueued { index: 0 },
-            ScenarioStep::DelayQueued {
-                index: 1,
-                delayed: "duplicate-app".into(),
-            },
-            ScenarioStep::DeliverAll,
-            tick(["alice"]),
-            ScenarioStep::ReleaseDelayed {
-                delayed: "duplicate-app".into(),
-            },
-            ScenarioStep::DeliverAll,
-            tick(["alice"]),
-            observe(["alice", "bob"]),
-        ],
+        steps,
     };
     let expected = vec![
         confirmed(1, "alice", "create"),
         rolled_back(6, "alice", "update"),
         clients_converged(["alice", "bob"], Some(1), Some(2)),
-        client_state("alice", 1, 2, vec![bob_payload]),
+        client_state("alice", 1, 2, expected_payloads),
         client_state("bob", 1, 2, vec![]),
     ];
     (scenario, expected)
