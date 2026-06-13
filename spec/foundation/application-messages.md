@@ -59,8 +59,9 @@ Decoders MUST reject a payload that:
 - contains a `sig` member;
 - contains an unknown top-level member;
 - contains duplicate object keys;
-- carries transport routing tags — the matching sender-side prohibition is in
-  [../protocol-core/group-messaging.md](../protocol-core/group-messaging.md) ("App payloads");
+- carries a transport routing tag (for the Nostr binding the `h`, `p`, `relays`, or `expiration` tag; the enumerated
+  set, the general rule, and the matching sender-side prohibition are in
+  [../protocol-core/group-messaging.md](../protocol-core/group-messaging.md), "App payloads");
 - has an `id` that does not match the canonical Nostr event id computed from the other members ("Shape" above).
 
 If a future message kind needs binary content, canonical JSON, or another encoding rule, that rule belongs in the
