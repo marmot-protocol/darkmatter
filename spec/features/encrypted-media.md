@@ -128,6 +128,11 @@ receiver MUST reject a reference if:
   or an IPv6 transition prefix with an unsafe embedded address), or uses cleartext `http` to a non-loopback host (host
   safety; see below)
 - required MIME type, filename, ciphertext hash, plaintext hash, nonce, or version fields are missing
+- a single-occurrence field appears more than once in the `imeta` tag. Exactly the `locator` field repeats (one or
+  more); every other field — `v`, `ciphertext_sha256`, `plaintext_sha256`, `nonce`, `m`, `filename`, `dim`, and
+  `thumbhash` — occurs at most once. A receiver MUST reject a duplicate rather than picking a first or last occurrence,
+  because `m`, `filename`, and `plaintext_sha256` feed the `file_key` derivation and the AEAD AAD: a first-wins decoder
+  and a last-wins decoder would otherwise derive different keys for the same authenticated tag
 - `ciphertext_sha256` or `plaintext_sha256` is not a 32-byte hex SHA-256 value
 - `nonce` is not exactly 12 bytes encoded as 24 hex characters
 - `blurhash` is present
