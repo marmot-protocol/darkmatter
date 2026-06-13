@@ -104,7 +104,10 @@ bytes, not the encoded characters.
 ## Sorting and duplicates
 
 When a Marmot structure says a list is sorted, the default sort order is lexicographic order over the encoded item
-bytes.
+bytes. For an item carried with a length prefix — a variable-length `opaque name<..>` value, or a struct whose payload is
+one such value — the comparison is over the item's content bytes (the value itself), not over the length prefix. For a
+fixed-length item the content bytes are the encoded bytes, so the two readings coincide. A document MAY override this
+with an explicit per-list rule.
 
 When a Marmot structure says a list is unique, duplicates are checked by exact byte equality after the owning document's
 validation rules have run.
