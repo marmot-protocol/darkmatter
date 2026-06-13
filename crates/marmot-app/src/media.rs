@@ -49,7 +49,24 @@ pub struct MediaAttachmentReference {
 }
 
 impl MediaAttachmentReference {
-    pub(crate) fn validate(&self) -> Result<(), AppError> {
+    /// Structurally validate the reference. This is the ingest check: a
+    /// reference is invalid ONLY for structural reasons (bad hashes/nonce, no
+    /// locator, a locator with an empty kind/value or an unparseable URL, empty
+    /// filename, bad MIME type, wrong/absent version). Per encrypted-media.md
+    /// Validation, a well-formed locator whose kind is out of the group policy
+    /// or unsupported by this client makes that locator UNFETCHABLE, not the
+    /// reference invalid: media is authenticated by its `ciphertext_sha256` /
+    /// `plaintext_sha256` + AEAD independent of the locator, so the locator
+    /// cannot forge content and MUST NOT drop the containing message. Policy is
+    /// applied at fetch time (see `fetch_encrypted_media_blob`) and before
+    /// emitting an outbound reference (see `validate_outbound`).
+    ///
+    /// `allow_loopback_http` gates ONLY cleartext-`http` loopback Blossom
+    /// locators (the dev/test escape hatch, driven by
+    /// `MarmotAppConfig::allow_loopback_blob_endpoints`); private, link-local,
+    /// documentation, IPv6-transition, and multicast hosts are rejected
+    /// regardless of its value.
+    pub(crate) fn validate(&self, allow_loopback_http: bool) -> Result<(), AppError> {
         validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")?;
         validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")?;
         let expected_ciphertext_sha256 = self.ciphertext_sha256.to_ascii_lowercase();
@@ -66,16 +83,25 @@ impl MediaAttachmentReference {
             ));
         }
         for locator in &self.locators {
-            validate_locator(locator)?;
-            let locator_hash = blossom_content_hash_from_url(&locator.value).ok_or_else(|| {
-                AppError::InvalidAppMessagePayload(
-                    "Blossom locator URL must include the encrypted blob hash".into(),
-                )
-            })?;
-            if locator_hash != expected_ciphertext_sha256 {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "Blossom locator hash does not match media reference".into(),
-                ));
+            validate_locator(locator, allow_loopback_http)?;
+            // The blossom content-hash binding is Blossom-specific integrity, like
+            // the host-safety check in `validate_locator`: a `blossom-v1` locator
+            // URL MUST carry the ciphertext hash so the fetched blob is the one
+            // this reference commits to. A non-Blossom locator is never fetched by
+            // this client and carries no such URL convention, so it is subject only
+            // to the structural checks above and stays merely unfetchable.
+            if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
+                let locator_hash =
+                    blossom_content_hash_from_url(&locator.value).ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload(
+                            "Blossom locator URL must include the encrypted blob hash".into(),
+                        )
+                    })?;
+                if locator_hash != expected_ciphertext_sha256 {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "Blossom locator hash does not match media reference".into(),
+                    ));
+                }
             }
         }
         if self.file_name.trim().is_empty() {
@@ -88,6 +114,30 @@ impl MediaAttachmentReference {
             return Err(AppError::InvalidAppMessagePayload(format!(
                 "media version must be {ENCRYPTED_MEDIA_VERSION}"
             )));
+        }
+        Ok(())
+    }
+
+    /// Validate an OUTBOUND reference this client is about to emit against the
+    /// group's actual `allowed_locator_kinds`. Unlike ingest validation (which is
+    /// purely structural — an out-of-policy locator only makes the attachment
+    /// unfetchable, never invalid), the sender MUST NOT emit a reference whose
+    /// locator kind its own group policy forbids, since receivers would skip it
+    /// as unfetchable. This enforces structural validity AND policy membership
+    /// for every locator. An empty `allowed` set falls back to the `blossom-v1`
+    /// default (see `locator_kind_allowed`).
+    pub(crate) fn validate_outbound(
+        &self,
+        allowed_locator_kinds: &[String],
+        allow_loopback_http: bool,
+    ) -> Result<(), AppError> {
+        self.validate(allow_loopback_http)?;
+        for locator in &self.locators {
+            if !locator_kind_allowed(&locator.kind, allowed_locator_kinds) {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "media locator kind is not allowed by the group policy".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -171,6 +221,8 @@ pub(crate) async fn upload_encrypted_media(
     media_secret: &[u8],
     signing_keys: &nostr::Keys,
     default_endpoint: &BlobStoreEndpointV1,
+    allowed_locator_kinds: &[String],
+    allow_loopback_http: bool,
 ) -> Result<MediaUploadResult, AppError> {
     if request.attachments.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -190,6 +242,8 @@ pub(crate) async fn upload_encrypted_media(
                 media_secret,
                 signing_keys,
                 server,
+                allowed_locator_kinds,
+                allow_loopback_http,
             )
             .await?,
         );
@@ -206,6 +260,8 @@ async fn upload_encrypted_media_attachment(
     media_secret: &[u8],
     signing_keys: &nostr::Keys,
     server: &str,
+    allowed_locator_kinds: &[String],
+    allow_loopback_http: bool,
 ) -> Result<MediaUploadAttachmentResult, AppError> {
     if request.plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -237,7 +293,14 @@ async fn upload_encrypted_media_attachment(
         )
         .map_err(|_| AppError::InvalidEncryptedMedia("media encryption failed".into()))?;
     let ciphertext_sha256 = hex::encode(Sha256::digest(&encrypted));
-    let url = upload_blossom_blob(server, &encrypted, &ciphertext_sha256, signing_keys).await?;
+    let url = upload_blossom_blob(
+        server,
+        &encrypted,
+        &ciphertext_sha256,
+        signing_keys,
+        allow_loopback_http,
+    )
+    .await?;
     let reference = MediaAttachmentReference {
         locators: vec![MediaLocator {
             kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
@@ -253,7 +316,11 @@ async fn upload_encrypted_media_attachment(
         dim: request.dim,
         thumbhash: request.thumbhash,
     };
-    reference.validate()?;
+    // The reference we just built carries a single `blossom-v1` locator. Validate
+    // it against the group's ACTUAL `allowed_locator_kinds` so an upload to a
+    // group whose policy does not allow `blossom-v1` fails here rather than
+    // emitting a reference its own receivers would reject.
+    reference.validate_outbound(allowed_locator_kinds, allow_loopback_http)?;
     Ok(MediaUploadAttachmentResult {
         encrypted_size_bytes: encrypted.len() as u64,
         reference,
@@ -264,9 +331,20 @@ pub(crate) async fn download_encrypted_media(
     reference: MediaAttachmentReference,
     media_secret: &[u8],
     fallback_endpoints: &[BlobStoreEndpointV1],
+    allowed_locator_kinds: &[String],
+    allow_loopback_blob_endpoints: bool,
 ) -> Result<MediaDownloadResult, AppError> {
-    reference.validate()?;
-    let encrypted = fetch_encrypted_media_blob(&reference, fallback_endpoints).await?;
+    // Structural validation only: an out-of-policy or client-unsupported locator
+    // is judged at fetch time below, where it degrades to an unfetchable outcome
+    // rather than a hard "corrupt reference" error.
+    reference.validate(allow_loopback_blob_endpoints)?;
+    let encrypted = fetch_encrypted_media_blob(
+        &reference,
+        fallback_endpoints,
+        allowed_locator_kinds,
+        allow_loopback_blob_endpoints,
+    )
+    .await?;
     let actual_encrypted_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_encrypted_hash != reference.ciphertext_sha256 {
         return Err(AppError::InvalidEncryptedMedia(
@@ -311,7 +389,19 @@ pub(crate) async fn download_encrypted_media(
 async fn fetch_encrypted_media_blob(
     reference: &MediaAttachmentReference,
     fallback_endpoints: &[BlobStoreEndpointV1],
+    allowed_locator_kinds: &[String],
+    allow_loopback_blob_endpoints: bool,
 ) -> Result<Vec<u8>, AppError> {
+    // Fetchability is judged against CURRENT policy + current client support.
+    // This client only fetches `blossom-v1`, so if the group's current policy
+    // does not allow `blossom-v1` there is no fetchable locator and the
+    // reference degrades to unfetchable (not invalid): the reference may still
+    // be valid and the message delivered, only the blob is unreachable here.
+    if !locator_kind_allowed(BLOSSOM_LOCATOR_KIND_V1, allowed_locator_kinds) {
+        return Err(AppError::InvalidEncryptedMedia(
+            "media reference has no supported locators".into(),
+        ));
+    }
     let mut candidates = reference
         .locators
         .iter()
@@ -325,6 +415,13 @@ async fn fetch_encrypted_media_blob(
             .map(|endpoint| blossom_blob_url(&endpoint.base_url, &reference.ciphertext_sha256)),
     );
     candidates.dedup();
+    if !allow_loopback_blob_endpoints {
+        // A loopback-HTTP candidate is valid component state but unusable in a
+        // production build: skip it rather than GETting the local host. The
+        // candidate may come from a remote-admin policy endpoint or a
+        // sender-chosen locator, so the gate applies to both.
+        candidates.retain(|candidate| !is_loopback_http_endpoint(candidate));
+    }
     if candidates.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "media reference has no supported locators".into(),
@@ -348,7 +445,7 @@ async fn fetch_encrypted_media_blob(
                 continue;
             }
         }
-        match fetch_blossom_blob(&candidate).await {
+        match fetch_blossom_blob(&candidate, allow_loopback_blob_endpoints).await {
             Ok(bytes) => return Ok(bytes),
             Err(err) => last_error = Some(err),
         }
@@ -359,6 +456,7 @@ async fn fetch_encrypted_media_blob(
 pub(crate) fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
+    allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, AppError> {
     if tag.first().map(String::as_str) != Some("imeta") {
         return Err(AppError::InvalidAppMessagePayload(
@@ -436,18 +534,22 @@ pub(crate) fn media_attachment_from_imeta_tag(
         dim,
         thumbhash,
     };
-    reference.validate()?;
+    reference.validate(allow_loopback_http)?;
     Ok(reference)
 }
 
-pub(crate) fn media_imeta_tags_are_valid(tags: &[Vec<String>]) -> bool {
+/// Whether every `imeta` tag in `tags` is a structurally valid media reference.
+/// This is an ingest-time check only: locator-kind policy is NOT consulted here,
+/// because an out-of-policy or client-unsupported locator makes only that
+/// locator unfetchable and MUST NOT drop the containing message.
+pub(crate) fn media_imeta_tags_are_valid(tags: &[Vec<String>], allow_loopback_http: bool) -> bool {
     let mut found = false;
     for tag in tags
         .iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
     {
         found = true;
-        if media_attachment_from_imeta_tag(tag, None).is_err() {
+        if media_attachment_from_imeta_tag(tag, None, allow_loopback_http).is_err() {
             return false;
         }
     }
@@ -516,7 +618,10 @@ pub(crate) async fn upload_group_image(
     let encrypted_hash_hex = hex::encode(Sha256::digest(&encrypted));
     let upload_keys = nostr::Keys::generate();
     let server = server.unwrap_or(DEFAULT_BLOSSOM_SERVER_URL);
-    upload_blossom_blob(server, &encrypted, &encrypted_hash_hex, &upload_keys).await?;
+    // Group images upload to the public default Blossom server and are not part
+    // of the loopback-blob-endpoint dev/test path, so loopback HTTP is never
+    // permitted here.
+    upload_blossom_blob(server, &encrypted, &encrypted_hash_hex, &upload_keys, false).await?;
     Ok(GroupImageUpload {
         image_hash_hex: encrypted_hash_hex,
         image_key_hex: hex::encode(content_key),
@@ -544,7 +649,10 @@ pub(crate) async fn fetch_group_image(
     })?;
     let server = server.unwrap_or(DEFAULT_BLOSSOM_SERVER_URL);
     let url = blossom_blob_url(server, &image_hash_hex.to_ascii_lowercase());
-    let encrypted = fetch_blossom_blob(&url).await?;
+    // Group images are content-addressed over the public default Blossom server
+    // and are not part of the loopback-blob-endpoint dev/test path, so loopback
+    // HTTP is never permitted here.
+    let encrypted = fetch_blossom_blob(&url, false).await?;
     let actual_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_hash != image_hash_hex.to_ascii_lowercase() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -566,11 +674,17 @@ pub(crate) async fn fetch_group_image(
 }
 
 fn canonical_media_type(value: &str) -> Result<String, AppError> {
+    // Per encrypted-media.md ("Media Type Canonicalization") sender and
+    // receiver MUST trim ASCII whitespace ONLY. `str::trim` strips every
+    // Unicode White_Space code point (a superset), so a peer sending an `m`
+    // value with a non-ASCII whitespace edge would derive a different file_key
+    // and AAD than this client. The same canonical value feeds the group-image
+    // AAD path, so this trim must stay ASCII-only on both surfaces.
     let media_type = value
         .split(';')
         .next()
         .unwrap_or_default()
-        .trim()
+        .trim_matches(|c: char| c.is_ascii_whitespace())
         .to_ascii_lowercase();
     if media_type.is_empty() || !media_type.contains('/') {
         return Err(AppError::InvalidEncryptedMedia(
@@ -594,27 +708,51 @@ fn validate_sha256_hex(value: &str, label: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_locator(locator: &MediaLocator) -> Result<(), AppError> {
+/// Whether `kind` is allowed by the group's `allowed_locator_kinds`. When the
+/// group has no `marmot.group.encrypted-media.v1` component (empty set) the
+/// well-known default of `blossom-v1` applies, matching the policy default and
+/// preserving prior behavior. This drives FETCHABILITY (the download path) and
+/// the OUTBOUND emit check; it MUST NOT be used to invalidate a reference at
+/// ingest.
+fn locator_kind_allowed(kind: &str, allowed_locator_kinds: &[String]) -> bool {
+    if allowed_locator_kinds.is_empty() {
+        kind == BLOSSOM_LOCATOR_KIND_V1
+    } else {
+        allowed_locator_kinds.iter().any(|allowed| allowed == kind)
+    }
+}
+
+/// Structurally validate one locator. Per encrypted-media.md Validation a
+/// receiver MUST reject a media reference ONLY for structural reasons: an empty
+/// locator kind or value, or a value that does not parse as a URL. Whether a
+/// well-formed locator is in the group policy or supported by this client is a
+/// FETCHABILITY question, decided at fetch time (see `fetch_encrypted_media_blob`)
+/// and before emitting an outbound reference (see `validate_outbound`); it MUST
+/// NOT invalidate the reference or drop the containing message here.
+fn validate_locator(locator: &MediaLocator, allow_loopback_http: bool) -> Result<(), AppError> {
     if locator.kind.trim().is_empty() || locator.value.trim().is_empty() {
         return Err(AppError::InvalidAppMessagePayload(
             "media locator kind and value cannot be empty".into(),
         ));
     }
-    if locator.kind != BLOSSOM_LOCATOR_KIND_V1 {
-        return Err(AppError::InvalidAppMessagePayload(
-            "unsupported media locator kind".into(),
-        ));
-    }
+    // The locator KIND is a fetchability concern, not a validity condition: an
+    // out-of-policy or client-unsupported kind (e.g. a non-Blossom `ipfs://`
+    // locator) is kept and handled at fetch time, never dropped here, because
+    // media is authenticated by its hashes + AEAD independent of the locator.
     let url = Url::parse(&locator.value)
         .map_err(|_| AppError::InvalidAppMessagePayload("media locator URL is invalid".into()))?;
-    validate_blossom_fetch_url(&url, allow_loopback_media_http()).map_err(|err| {
-        AppError::InvalidAppMessagePayload(format!("media locator URL is unsafe: {err}"))
-    })?;
+    // Host safety is the exception that DOES drop: a Blossom locator is one this
+    // client will fetch over HTTP, so an unsafe host (loopback / non-public /
+    // IPv6-transition) or cleartext scheme is a hostile request vector that
+    // hash-authentication does not neutralize. Only Blossom locators are ever
+    // fetched (`fetch_encrypted_media_blob` filters to them), so a non-Blossom
+    // locator skips this check — it is unfetchable-by-this-client, not unsafe.
+    if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
+        validate_blossom_fetch_url(&url, allow_loopback_http).map_err(|err| {
+            AppError::InvalidAppMessagePayload(format!("media locator URL is unsafe: {err}"))
+        })?;
+    }
     Ok(())
-}
-
-fn allow_loopback_media_http() -> bool {
-    cfg!(debug_assertions)
 }
 
 fn validate_blossom_fetch_url(url: &Url, allow_loopback_http: bool) -> Result<(), String> {
@@ -788,11 +926,12 @@ async fn upload_blossom_blob(
     encrypted: &[u8],
     encrypted_hash_hex: &str,
     signing_keys: &nostr::Keys,
+    allow_loopback_http: bool,
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
     let authorization =
         blossom_authorization_header(signing_keys, &server_host, encrypted_hash_hex)?;
-    let client = media_http_client_for_url(&upload_url).await?;
+    let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
         .put(upload_url)
         .header(reqwest::header::AUTHORIZATION, authorization)
@@ -834,10 +973,10 @@ async fn upload_blossom_blob(
     Ok(url)
 }
 
-async fn fetch_blossom_blob(url: &str) -> Result<Vec<u8>, AppError> {
+async fn fetch_blossom_blob(url: &str, allow_loopback_http: bool) -> Result<Vec<u8>, AppError> {
     let url = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
-    let client = media_http_client_for_url(&url).await?;
+    let client = media_http_client_for_url(&url, allow_loopback_http).await?;
     let response = client.get(url).send().await.map_err(reqwest_blob_error)?;
     if !response.status().is_success() {
         return Err(AppError::BlobStore(format!(
@@ -848,8 +987,11 @@ async fn fetch_blossom_blob(url: &str) -> Result<Vec<u8>, AppError> {
     read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await
 }
 
-async fn media_http_client_for_url(url: &Url) -> Result<reqwest::Client, AppError> {
-    validate_blossom_fetch_url(url, allow_loopback_media_http())
+async fn media_http_client_for_url(
+    url: &Url,
+    allow_loopback_http: bool,
+) -> Result<reqwest::Client, AppError> {
+    validate_blossom_fetch_url(url, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -861,7 +1003,7 @@ async fn media_http_client_for_url(url: &Url) -> Result<reqwest::Client, AppErro
         .no_brotli()
         .no_zstd()
         .no_deflate();
-    if let Some((domain, addrs)) = resolve_media_host(url).await? {
+    if let Some((domain, addrs)) = resolve_media_host(url, allow_loopback_http).await? {
         builder = builder.resolve_to_addrs(&domain, &addrs);
     }
     builder
@@ -869,9 +1011,12 @@ async fn media_http_client_for_url(url: &Url) -> Result<reqwest::Client, AppErro
         .map_err(|_| AppError::BlobStore("failed to build HTTP client".into()))
 }
 
-async fn resolve_media_host(url: &Url) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
+async fn resolve_media_host(
+    url: &Url,
+    allow_loopback_http: bool,
+) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
     let allow_loopback = url.scheme() == "http"
-        && allow_loopback_media_http()
+        && allow_loopback_http
         && url.host().map(is_loopback_host).unwrap_or(false);
     match url
         .host()
@@ -986,6 +1131,29 @@ fn blossom_content_hash_from_url(url: &str) -> Option<String> {
     })
 }
 
+/// Whether `url` is a loopback-HTTP blob endpoint: scheme `http` (cleartext)
+/// AND a loopback host (`localhost`/`*.localhost`, 127.0.0.0/8, or `::1`). Such
+/// endpoints are valid component state but must not be acted on outside dev/test
+/// (see `MarmotAppConfig::allow_loopback_blob_endpoints`). A URL that does not
+/// parse, uses HTTPS, or targets a routable host is not a loopback-HTTP endpoint.
+pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let lowered = domain.to_ascii_lowercase();
+            lowered == "localhost" || lowered.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
 fn blossom_authorization_header(
     keys: &nostr::Keys,
     server_host: &str,
@@ -1078,8 +1246,8 @@ mod tests {
         let mut tag = valid_imeta_tag();
         tag.insert(1, "v legacy-media-v0".to_owned());
 
-        assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
@@ -1087,26 +1255,285 @@ mod tests {
         let mut tag = valid_imeta_tag();
         tag.insert(1, "v encrypted-media-v1".to_owned());
 
-        assert!(media_attachment_from_imeta_tag(&tag, None).is_err());
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
+    }
+
+    #[test]
+    fn out_of_policy_locator_kind_is_kept_not_dropped_on_ingest() {
+        // PR #328 review Finding 2 (the reviewer's "delayed old media message
+        // rejected after a policy update" regression): ingest is purely
+        // structural, so a structurally well-formed locator whose kind is NOT in
+        // the group's current `allowed_locator_kinds` MUST NOT invalidate the
+        // reference or drop the containing kind-9 message. Media is authenticated
+        // by its hashes + AEAD independent of the locator, so an out-of-policy
+        // locator cannot forge content; it only becomes unfetchable at download
+        // time. (The ingest parser no longer takes a policy at all.)
+        let mut tag = valid_imeta_tag();
+        // A non-blossom locator that is not in any default policy. It is
+        // structurally well-formed (parseable URL), so ingest keeps it.
+        tag.insert(2, "locator ipfs-v1 ipfs://bafybeigdyrexample".to_owned());
+
+        let reference = media_attachment_from_imeta_tag(&tag, None, false)
+            .expect("an out-of-policy but well-formed locator must not drop the message");
+        assert_eq!(reference.locators.len(), 2);
+        assert!(media_imeta_tags_are_valid(&[tag], false));
+    }
+
+    #[test]
+    fn structurally_malformed_reference_is_rejected_on_ingest() {
+        // PR #328 review Finding 2: structural malformation (here a non-hex
+        // ciphertext hash) still invalidates the reference and drops the message,
+        // exactly as before. The "never drop" rule applies only to locator-kind
+        // policy, never to structural integrity.
+        let mut tag = valid_imeta_tag();
+        // Replace the valid `ciphertext_sha256` with a non-hex value.
+        let bad = tag
+            .iter_mut()
+            .find(|field| field.starts_with("ciphertext_sha256 "))
+            .expect("fixture has a ciphertext_sha256 field");
+        *bad = "ciphertext_sha256 not-a-valid-hash".to_owned();
+
+        assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
     fn imeta_parser_rejects_non_https_media_locator() {
         let tag = tag_with_locator(format!("http://media.example/{}.bin", valid_hash()));
-        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
         assert!(err.to_string().contains("scheme must be https"));
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
+    }
+
+    #[test]
+    fn locator_with_unparseable_url_is_rejected_on_ingest() {
+        // A locator value that does not parse as a URL is structural malformation
+        // and MUST invalidate the reference even though the kind is `blossom-v1`.
+        let mut tag = valid_imeta_tag();
+        let locator = tag
+            .iter_mut()
+            .find(|field| field.starts_with("locator "))
+            .expect("fixture has a locator field");
+        *locator = "locator blossom-v1 not a url".to_owned();
+
+        assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+    }
+
+    fn blossom_reference() -> MediaAttachmentReference {
+        let mut reference = loopback_reference();
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            // The blossom locator URL must carry the ciphertext hash (= the
+            // reference's `ciphertext_sha256`, `11`*32) per the merged blossom
+            // content-hash binding.
+            value: format!("https://media.example/{}.bin", "11".repeat(32)),
+        }];
+        reference
+    }
+
+    #[test]
+    fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom() {
+        // PR #328 review Finding 1: the sender MUST NOT emit a `blossom-v1`
+        // reference to a group whose policy does not allow `blossom-v1`, since
+        // receivers would treat the locator as unfetchable. A non-empty policy
+        // that omits `blossom-v1` must fail outbound validation.
+        let reference = blossom_reference();
+        let allowed = vec!["ipfs-v1".to_owned()];
+        assert!(
+            reference.validate_outbound(&allowed, false).is_err(),
+            "a blossom reference must be rejected when the policy omits blossom-v1"
+        );
+        // The same reference is valid against a policy that does allow blossom-v1.
+        let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+        reference
+            .validate_outbound(&allowed, false)
+            .expect("a blossom reference is valid when the policy allows blossom-v1");
+    }
+
+    #[test]
+    fn canonical_media_type_trims_ascii_whitespace_only() {
+        // ASCII whitespace on the edges is stripped per the spec algorithm.
+        assert_eq!(
+            canonical_media_type("  image/png \t").expect("ascii-trimmed type is valid"),
+            "image/png",
+        );
+
+        // A leading U+00A0 (non-breaking space) is Unicode whitespace but NOT
+        // ASCII whitespace, so it MUST be preserved: trimming it would derive a
+        // different file_key/AAD than a spec-conformant peer that keeps it.
+        let canonical =
+            canonical_media_type("\u{00A0}image/png").expect("non-empty MIME type is valid");
+        assert_eq!(canonical, "\u{00A0}image/png");
+        assert!(canonical.starts_with('\u{00A0}'));
+    }
+
+    #[test]
+    fn is_loopback_http_endpoint_classifies_only_cleartext_loopback() {
+        // Cleartext loopback hosts are loopback-HTTP endpoints.
+        assert!(is_loopback_http_endpoint("http://127.0.0.1:8080/up"));
+        assert!(is_loopback_http_endpoint("http://localhost:3000"));
+        assert!(is_loopback_http_endpoint("http://sub.localhost/blob"));
+        assert!(is_loopback_http_endpoint("http://[::1]:8080"));
+        // HTTPS (even to loopback) and routable HTTP hosts are not.
+        assert!(!is_loopback_http_endpoint("https://127.0.0.1:8080"));
+        assert!(!is_loopback_http_endpoint("http://media.example/blob"));
+        assert!(!is_loopback_http_endpoint("https://blossom.example"));
+        assert!(!is_loopback_http_endpoint("not a url"));
+    }
+
+    fn loopback_reference() -> MediaAttachmentReference {
+        MediaAttachmentReference {
+            locators: vec![MediaLocator {
+                kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                value: format!("http://127.0.0.1:8080/{}.bin", "11".repeat(32)),
+            }],
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_sha256: "22".repeat(32),
+            nonce_hex: "33".repeat(12),
+            file_name: "diagram.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+            source_epoch: 0,
+            dim: None,
+            thumbhash: None,
+        }
+    }
+
+    #[test]
+    fn loopback_locator_validation_follows_runtime_flag_not_build_profile() {
+        // Issue #341 regression: the runtime `allow_loopback_http` flag (driven by
+        // `MarmotAppConfig::allow_loopback_blob_endpoints`) is now the SOLE
+        // authority for accepting a cleartext-`http` loopback `blossom-v1` locator,
+        // replacing the old compile-time `cfg!(debug_assertions)` gate. The
+        // reference carries a hash-bearing loopback URL so it clears the Blossom
+        // content-hash binding and the loopback host is the only thing under test.
+        // Outcome must depend on the flag in EVERY build profile (this test runs
+        // under `debug_assertions`, where the old gate would have force-allowed it).
+        let reference = loopback_reference();
+        assert!(
+            reference.validate(false).is_err(),
+            "a loopback-HTTP blossom locator must be rejected when the flag is off",
+        );
+        reference
+            .validate(true)
+            .expect("a loopback-HTTP blossom locator must be accepted when the flag is on");
+
+        // The same authority must hold on the ingest parser path
+        // (`media_attachment_from_imeta_tag` / `media_imeta_tags_are_valid`).
+        let tag = reference.imeta_tag();
+        let tags = std::slice::from_ref(&tag);
+        assert!(
+            media_attachment_from_imeta_tag(&tag, None, false).is_err(),
+            "ingest must reject a loopback-HTTP blossom locator when the flag is off",
+        );
+        assert!(!media_imeta_tags_are_valid(tags, false));
+        media_attachment_from_imeta_tag(&tag, None, true)
+            .expect("ingest must accept a loopback-HTTP blossom locator when the flag is on");
+        assert!(media_imeta_tags_are_valid(tags, true));
+    }
+
+    #[tokio::test]
+    async fn production_config_does_not_fetch_loopback_endpoint() {
+        // With the dev/test gate off, a loopback-HTTP locator is dropped from the
+        // candidate set, so no GET is issued and the fetch fails as "no supported
+        // locators" rather than attempting to reach the local host.
+        let reference = loopback_reference();
+        let err = fetch_encrypted_media_blob(&reference, &[], &[], false)
+            .await
+            .expect_err("loopback-only reference must be unfetchable in production");
+        match err {
+            AppError::InvalidEncryptedMedia(message) => {
+                assert!(
+                    message.contains("no supported locators"),
+                    "expected unfetchable error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_fallback_endpoint_is_skipped_in_production() {
+        // The same gate applies to remote-admin policy fallback endpoints. With
+        // no supported locator on the message, a loopback-HTTP fallback is the
+        // only candidate; in production it is filtered out, so the fetch fails as
+        // unfetchable instead of GETting the local host.
+        let mut reference = loopback_reference();
+        // Drop the message-carried locator so the loopback fallback is the only
+        // candidate under test, keeping one policy-allowed-but-unsupported
+        // locator so the reference stays structurally valid.
+        reference.locators.clear();
+        reference.locators.push(MediaLocator {
+            kind: "ipfs-v1".to_owned(),
+            value: "ipfs://bafyexample".to_owned(),
+        });
+        let fallback = [BlobStoreEndpointV1 {
+            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            base_url: "http://127.0.0.1:8080".to_owned(),
+        }];
+        let err = fetch_encrypted_media_blob(&reference, &fallback, &[], false)
+            .await
+            .expect_err("loopback fallback must be unfetchable in production");
+        match err {
+            AppError::InvalidEncryptedMedia(message) => assert!(
+                message.contains("no supported locators"),
+                "expected unfetchable error, got: {message}"
+            ),
+            other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        }
+        // The loopback fallback would survive the candidate filter only when the
+        // dev/test gate is on; assert the classifier agrees so the gate stays the
+        // single decision point.
+        assert!(is_loopback_http_endpoint(&blossom_blob_url(
+            &fallback[0].base_url,
+            &reference.ciphertext_sha256,
+        )));
+    }
+
+    #[tokio::test]
+    async fn out_of_policy_blossom_locator_is_unfetchable_not_a_hard_error() {
+        // PR #328 review Finding 2: when the group's CURRENT policy does not allow
+        // `blossom-v1`, a blossom locator is out of policy and this client cannot
+        // fetch it. The fetch MUST degrade to the unfetchable outcome ("no
+        // supported locators") rather than a hard error that looks like content
+        // corruption. The reference itself stays structurally valid and the
+        // message was already delivered at ingest.
+        let mut reference = loopback_reference();
+        // Use a routable https locator so loopback gating is not what skips it;
+        // the only reason it is unfetchable is the out-of-policy locator kind.
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{}.bin", "11".repeat(32)),
+        }];
+        // A non-empty policy that allows only a non-blossom kind: blossom is out
+        // of policy, so there is no fetchable locator for this client.
+        let allowed = vec!["ipfs-v1".to_owned()];
+        let err = fetch_encrypted_media_blob(&reference, &[], &allowed, true)
+            .await
+            .expect_err("an out-of-policy blossom locator must be unfetchable");
+        match err {
+            AppError::InvalidEncryptedMedia(message) => assert!(
+                message.contains("no supported locators"),
+                "expected unfetchable error, got: {message}"
+            ),
+            other => panic!("expected InvalidEncryptedMedia, got {other:?}"),
+        }
+        // The reference is still structurally valid: out-of-policy is a
+        // fetchability concern, not a structural one.
+        reference
+            .validate(false)
+            .expect("an out-of-policy reference is still structurally valid");
     }
 
     #[test]
     fn imeta_parser_rejects_private_ip_media_locator() {
         let tag = tag_with_locator(format!("https://10.0.0.5/{}.bin", valid_hash()));
-        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
         assert!(err.to_string().contains("non-public"));
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
@@ -1121,10 +1548,10 @@ mod tests {
             ),
         ] {
             let tag = tag_with_locator(locator);
-            let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+            let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
             assert!(err.to_string().contains("non-public"));
-            assert!(!media_imeta_tags_are_valid(&[tag]));
+            assert!(!media_imeta_tags_are_valid(&[tag], false));
         }
     }
 
@@ -1132,29 +1559,29 @@ mod tests {
     fn imeta_parser_accepts_public_ipv6_media_locator() {
         let tag = tag_with_locator(format!("https://[2606:4700::]/{}.bin", valid_hash()));
 
-        assert!(media_attachment_from_imeta_tag(&tag, None).is_ok());
-        assert!(media_imeta_tags_are_valid(&[tag]));
+        assert!(media_attachment_from_imeta_tag(&tag, None, false).is_ok());
+        assert!(media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
     fn imeta_parser_rejects_locator_without_content_hash() {
         let tag = tag_with_locator("https://media.example/download.bin".to_owned());
-        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
         assert!(
             err.to_string()
                 .contains("must include the encrypted blob hash")
         );
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
     fn imeta_parser_rejects_locator_hash_mismatch() {
         let tag = tag_with_locator(format!("https://media.example/{}.bin", "33".repeat(32)));
-        let err = media_attachment_from_imeta_tag(&tag, None).unwrap_err();
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
         assert!(err.to_string().contains("hash does not match"));
-        assert!(!media_imeta_tags_are_valid(&[tag]));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
@@ -1172,7 +1599,7 @@ mod tests {
                 .to_vec(),
         );
         let url = format!("{server}/{}.bin", valid_hash());
-        let err = fetch_blossom_blob(&url).await.unwrap_err();
+        let err = fetch_blossom_blob(&url, true).await.unwrap_err();
 
         assert!(err.to_string().contains("HTTP 302"));
     }
@@ -1185,7 +1612,7 @@ mod tests {
         );
         let server = spawn_http_response(response.into_bytes());
         let url = format!("{server}/{}.bin", valid_hash());
-        let err = fetch_blossom_blob(&url).await.unwrap_err();
+        let err = fetch_blossom_blob(&url, true).await.unwrap_err();
 
         assert!(err.to_string().contains("download exceeds"));
     }

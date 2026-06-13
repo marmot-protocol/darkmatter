@@ -20,7 +20,7 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppMessageQuery, AppMessageRecord, AppStatus, DurationHistogramSnapshot, FetchedKeyPackage,
-    MarmotApp, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, RelayDeliverySpread, RelayDeliveryStats,
     RelayLatencyStats, RelaySyncSnapshot, RelayTelemetrySnapshot, StreamStartView, SyncSummary,
     TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
@@ -31,10 +31,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use transport_quic_broker::{
     BrokerServerTrust, PublishTextToBroker, SubscribeTextFromBroker, publish_text_to_broker,
-    subscribe_text_from_broker_with_updates,
+    subscribe_text_from_broker_with_limits,
 };
 use transport_quic_stream::{
-    QuicTextStreamReceiver, SendTextStream, ServerTrust, send_text_stream,
+    AgentTextStreamReceiveLimits, QuicTextStreamReceiver, SendTextStream, ServerTrust,
+    send_text_stream,
 };
 
 pub mod daemon;
@@ -3964,14 +3965,15 @@ pub(crate) async fn stream_command_app_with_runtime(
             let start_event_id_hex = start_event_id.ok_or(DmError::MissingStreamStart)?;
             let expected_stream_id_hex =
                 stream_id.map(|value| normalize_hex(&value)).transpose()?;
-            let (stream_id, crypto) = stream_crypto_for_start_event(
-                runtime,
-                selected_account_id_hex,
-                None,
-                expected_stream_id_hex.as_deref(),
-                &start_event_id_hex,
-            )
-            .await?;
+            let (stream_id, crypto, policy_max_plaintext_frame_len) =
+                stream_crypto_for_start_event(
+                    runtime,
+                    selected_account_id_hex,
+                    None,
+                    expected_stream_id_hex.as_deref(),
+                    &start_event_id_hex,
+                )
+                .await?;
             let start_event_id = MessageId::new(hex::decode(normalize_hex(&start_event_id_hex)?)?);
             if broker {
                 let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
@@ -3985,7 +3987,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     max_chunk_bytes: chunk_bytes,
                     chunk_delay: Duration::from_millis(chunk_delay_ms),
                     crypto: Some(crypto),
-                    max_plaintext_frame_len: None,
+                    max_plaintext_frame_len: policy_max_plaintext_frame_len,
                 })
                 .await?;
                 return Ok(CommandOutput {
@@ -4018,7 +4020,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 max_chunk_bytes: chunk_bytes,
                 chunk_delay: Duration::from_millis(chunk_delay_ms),
                 crypto: Some(crypto),
-                max_plaintext_frame_len: None,
+                max_plaintext_frame_len: policy_max_plaintext_frame_len,
             })
             .await?;
             Ok(CommandOutput {
@@ -4222,7 +4224,7 @@ where
     let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
-    let (stream_id, crypto) = stream_crypto_for_start_event(
+    let (stream_id, crypto, policy_max_plaintext_frame_len) = stream_crypto_for_start_event(
         runtime,
         Some(&account.account_id_hex),
         Some(&group_id_hex),
@@ -4231,10 +4233,15 @@ where
     )
     .await?;
     let crypto = Some(crypto);
+    let mut limits = AgentTextStreamReceiveLimits::default();
+    if let Some(max_plaintext_frame_len) = policy_max_plaintext_frame_len {
+        limits.max_plaintext_frame_len =
+            max_plaintext_frame_len.min(limits.max_plaintext_frame_len);
+    }
     let delta_account = account_flag.or(Some(account.account_id_hex.clone()));
     let delta_group_id = group_id_hex.clone();
     let delta_stream_id = stream_id_hex.clone();
-    let received = subscribe_text_from_broker_with_updates(
+    let received = subscribe_text_from_broker_with_limits(
         SubscribeTextFromBroker {
             broker_addr: candidate_addr,
             server_name: candidate.server_name.clone(),
@@ -4243,6 +4250,7 @@ where
             start_event_id,
             crypto,
         },
+        limits,
         |chunk| {
             on_delta(AgentStreamDelta {
                 account: delta_account.clone(),
@@ -4322,7 +4330,14 @@ pub(crate) async fn stream_crypto_for_start_event(
     group_id_hex: Option<&str>,
     stream_id_hex: Option<&str>,
     start_message_id_hex: &str,
-) -> Result<(Vec<u8>, transport_quic_stream::AgentTextStreamCrypto), DmError> {
+) -> Result<
+    (
+        Vec<u8>,
+        transport_quic_stream::AgentTextStreamCrypto,
+        Option<u32>,
+    ),
+    DmError,
+> {
     let context = runtime
         .agent_text_stream_crypto_for_start_event(
             resolved_account_id_hex,
@@ -4332,7 +4347,11 @@ pub(crate) async fn stream_crypto_for_start_event(
         )
         .await
         .map_err(map_agent_stream_crypto_error)?;
-    Ok((context.stream_id, context.crypto))
+    Ok((
+        context.stream_id,
+        context.crypto,
+        context.policy_max_plaintext_frame_len,
+    ))
 }
 
 fn map_agent_stream_crypto_error(err: AppError) -> DmError {
@@ -4357,12 +4376,21 @@ struct ParsedQuicCandidate {
     server_name: String,
 }
 
+/// Extract the `host:port` (or `[ipv6]:port`) authority from a `quic://` URL
+/// remainder, ignoring any path, query, or fragment after it. Per
+/// `transports/quic.md` the authority ends at the first `/`, `?`, or `#`. Shared
+/// by both quic-candidate parsers below (and mirrors `marmot_app`'s
+/// `parse_quic_candidate`) so the rule cannot drift.
+fn quic_authority(rest: &str) -> &str {
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
 fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError> {
     let trimmed = candidate.trim();
     let Some(rest) = trimmed.strip_prefix("quic://") else {
         return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = quic_authority(rest);
     if authority.is_empty() {
         return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
     }
@@ -4412,7 +4440,7 @@ pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
 
 fn quic_candidate_host(candidate: &str) -> Option<String> {
     let rest = candidate.trim().strip_prefix("quic://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = quic_authority(rest);
     if let Some(rest) = authority.strip_prefix('[') {
         return rest.split_once(']').map(|(host, _)| host.to_owned());
     }
@@ -5502,7 +5530,25 @@ fn relay_lists_json(status: AccountRelayListStatus) -> Value {
 }
 
 fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
-    MarmotApp::with_relays_and_account_home(home, relay.into_iter().collect(), account_home)
+    // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
+    // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
+    // DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
+    // installs leave it unset.
+    let config = MarmotAppConfig::default()
+        .with_allow_loopback_blob_endpoints(dm_allow_loopback_blob_endpoints());
+    MarmotApp::with_relays_and_account_home_and_config(
+        home,
+        relay.into_iter().collect(),
+        account_home,
+        config,
+    )
+}
+
+fn dm_allow_loopback_blob_endpoints() -> bool {
+    matches!(
+        std::env::var("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn open_account_home(
@@ -6012,7 +6058,8 @@ mod tests {
     use super::{
         AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
         apply_message_cursors, default_home_from_env, first_quic_candidate_is_loopback,
-        relay_endpoints, relay_stats_output, relay_stats_plain, resolve_relay,
+        parse_quic_candidate, quic_candidate_host, relay_endpoints, relay_stats_output,
+        relay_stats_plain, resolve_relay,
     };
     use marmot_app::{
         DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -6212,6 +6259,37 @@ mod tests {
         assert!(!first_quic_candidate_is_loopback(&[
             "quic://quic-broker.ipf.dev:4450".to_owned()
         ]));
+    }
+
+    #[test]
+    fn parse_quic_candidate_ignores_path_query_and_fragment() {
+        // The authority ends at the first `/`, `?`, or `#` (transports/quic.md);
+        // a path/query/fragment after it MUST be ignored, not folded into the
+        // host:port (which would break server_name + host resolution). Mirrors
+        // the marmot-app `parse_quic_candidate` fix (#230).
+        for candidate in [
+            "quic://broker.example:4450/path",
+            "quic://broker.example:4450?x=1",
+            "quic://broker.example:4450#frag",
+            "quic://broker.example:4450/p?x=1#frag",
+        ] {
+            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
+            assert_eq!(
+                parsed.authority, "broker.example:4450",
+                "authority must stop at the first /?#: {candidate}"
+            );
+            assert_eq!(
+                quic_candidate_host(candidate),
+                Some("broker.example".to_owned())
+            );
+        }
+        let parsed =
+            parse_quic_candidate("quic://[2001:db8::1]:4450?x=1").expect("ipv6 candidate parses");
+        assert_eq!(parsed.authority, "[2001:db8::1]:4450");
+        assert_eq!(
+            quic_candidate_host("quic://[2001:db8::1]:4450#frag"),
+            Some("2001:db8::1".to_owned())
+        );
     }
 
     #[test]

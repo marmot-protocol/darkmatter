@@ -67,11 +67,18 @@ versioning through the workspace version in the root `Cargo.toml`.
   message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
   impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
   `/help` and `/?` slash spellings remain available.
+- The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
+  finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
+  status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
 
 ### Security
 
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
   peers, bounding request size, and refusing `reset`/`logout` execution through the daemon socket.
+- Encrypted-media uploads and downloads no longer act on loopback-HTTP blob endpoints (e.g. `http://127.0.0.1:PORT`)
+  unless `DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1` is set for local development. Such endpoints stay valid group state, but
+  a production install treats them as unusable instead of issuing requests at the local host on behalf of a remote
+  group admin.
 
 ### Changed
 
@@ -138,6 +145,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   product flows require relay-backed setup.
 - Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains
   `darkmatter-cli`, and the installed binaries remain `dm` and `dmd`.
+
+### Fixed
+
+- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
+  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
+  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
+  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
 
 ## [0.1.0] - 2026-05-17
 
