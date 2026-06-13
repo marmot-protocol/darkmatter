@@ -14,7 +14,7 @@ use cgka_traits::capabilities::{
 };
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    GroupEvent, KeyPackage, SendIntent, SendResult,
+    GroupEvent, GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -482,6 +482,16 @@ fn snapshot_group_events() {
             group_id: gid(),
             from: EpochId(1),
             to: EpochId(2),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_group_state_changed",
+        GroupEvent::GroupStateChanged {
+            group_id: gid(),
+            epoch: EpochId(2),
+            actor: Some(mem_id()),
+            change: GroupStateChange::MemberAdded { member: mem_id() },
+            origin_commit_id: Some(mid()),
         }
     );
     insta::assert_json_snapshot!(

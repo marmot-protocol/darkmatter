@@ -247,7 +247,7 @@ impl SqliteAccountStorage {
                 tags_json = excluded.tags_json,
                 recorded_at = excluded.recorded_at,
                 received_at = excluded.received_at,
-                origin_commit_id = excluded.origin_commit_id,
+                origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
                 invalidated = 0,
                 invalidation_reason = NULL",
             params![
@@ -1742,6 +1742,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn reupsert_with_none_origin_preserves_existing_commit_link() {
+        // A deterministic kind-1210 row can be written first from direct ingest
+        // with Some(origin_commit_id) and later re-derived through an
+        // unattributed convergence path that passes None. The re-upsert must not
+        // clear the stored commit link, otherwise a later fork recovery can no
+        // longer find/tombstone the row by origin commit.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&group_system_from_commit(
+                "row",
+                "member_added",
+                10,
+                "commit-losing",
+            ))
+            .unwrap();
+        // Re-upsert the same (group_id, message_id) with no attribution.
+        store
+            .record_app_event(&group_system("row", "member_added", 10))
+            .unwrap();
+
+        // The row must still be discoverable and tombstoned by its origin commit.
+        let update = store
+            .invalidate_app_events_by_origin_commit("commit-losing", "LosingBranch")
+            .unwrap()
+            .expect("origin commit link must survive the None re-upsert");
+        let changed_ids: Vec<&str> = update
+            .changes
+            .iter()
+            .map(|change| match change {
+                TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+                TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+            })
+            .collect();
+        assert!(changed_ids.contains(&"row"));
+        let rows = list(&store);
+        let status = rows
+            .iter()
+            .find(|row| row.message_id_hex == "row")
+            .map(|row| row.invalidation_status.clone());
+        assert_eq!(status, Some(Some("LosingBranch".to_owned())));
     }
 
     #[test]

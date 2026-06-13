@@ -2708,9 +2708,11 @@ impl AppClient {
 /// authenticated [`GroupStateChange`]. The row is synthesized locally
 /// (Approach A) — no kind-1210 message is sent on the wire. The message id is
 /// deterministic over (actor, epoch, system_type, content) so re-processing the
-/// same change upserts instead of duplicating; the `source_message_id_hex` link
-/// lets a commit that is later invalidated on a losing branch invalidate this
-/// row through the same path as any other app event.
+/// same change upserts instead of duplicating. The row carries a null
+/// `source_message_id_hex` (one commit can synthesize several rows, which would
+/// collide on the partial unique source index); instead `origin_commit_id`
+/// links the row back to the commit that produced it, so losing-branch fork
+/// recovery can invalidate every row derived from a rolled-back commit (1:N).
 fn build_group_system_projection(
     group_id: &cgka_traits::types::GroupId,
     epoch: u64,
