@@ -861,6 +861,13 @@ fn is_public_ipv6(addr: Ipv6Addr) -> bool {
     if first == 0x2001 && second == 0x0db8 {
         return false;
     }
+    // Documentation 3fff::/20 (RFC 9637). It falls inside global-unicast 2000::/3,
+    // so the terminal rule below would otherwise accept it. Reject to match the
+    // canonical unsafe-host set (spec/foundation/host-safety.md) and the avatar/
+    // endpoint validator in cgka_traits, which already rejects 3fff::/20.
+    if (first & 0xfff0) == 0x3ff0 {
+        return false;
+    }
     (first & 0xe000) == 0x2000
 }
 
@@ -1553,6 +1560,17 @@ mod tests {
             assert!(err.to_string().contains("non-public"));
             assert!(!media_imeta_tags_are_valid(&[tag], false));
         }
+    }
+
+    #[test]
+    fn imeta_parser_rejects_ipv6_documentation_3fff_media_locator() {
+        // 3fff::/20 (RFC 9637) is documentation space that sits inside global-unicast
+        // 2000::/3, so it must be rejected explicitly (canonical unsafe-host set).
+        let tag = tag_with_locator(format!("https://[3fff::1]/{}.bin", valid_hash()));
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+        assert!(err.to_string().contains("non-public"));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]
