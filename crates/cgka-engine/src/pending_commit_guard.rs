@@ -17,6 +17,15 @@
 //! creating the snapshot and attach the snapshot name with
 //! [`PendingCommitCleanupGuard::set_snapshot`] once `create_snapshot` succeeds,
 //! so the create-snapshot-then-stage-commit window is fully covered.
+//!
+//! `Drop` releases the snapshot only after it has *confirmed* the staged
+//! OpenMLS pending commit is gone (the group loads and either has no pending
+//! commit or `clear_pending_commit` returns `Ok`). If cleanup cannot be
+//! confirmed — the group fails to load, is absent, or clearing errors under
+//! transient storage pressure — the snapshot is retained and a warning is
+//! logged. Releasing the recovery snapshot while an orphaned staged commit
+//! remains would strand that commit with no recovery path, which is strictly
+//! worse than the bounded snapshot leak this guard exists to prevent.
 
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -95,33 +104,59 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
         let storage = unsafe { &*self.storage };
         let mls_storage = unsafe { &*self.mls_storage };
 
+        // Confirm the staged OpenMLS pending commit is actually gone before we
+        // release its recovery snapshot. If we cannot prove cleanup succeeded
+        // (group fails to load, is absent, or `clear_pending_commit` errors),
+        // we must KEEP the snapshot: dropping it while a staged pending commit
+        // is still orphaned would strand that commit with no recovery path —
+        // strictly worse than the bounded leak this guard exists to prevent.
         let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
-        match MlsGroup::load(mls_storage, &mls_gid) {
+        let pending_commit_cleared = match MlsGroup::load(mls_storage, &mls_gid) {
             Ok(Some(mut mls_group)) => {
-                if mls_group.pending_commit().is_some()
-                    && let Err(_e) = mls_group.clear_pending_commit(mls_storage)
-                {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "drop",
-                        "pending commit guard could not clear staged commit"
-                    );
+                if mls_group.pending_commit().is_none() {
+                    true
+                } else {
+                    match mls_group.clear_pending_commit(mls_storage) {
+                        Ok(()) => true,
+                        Err(_e) => {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                method = "drop",
+                                "pending commit guard could not clear staged commit"
+                            );
+                            false
+                        }
+                    }
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // No group to clear a pending commit from. We cannot confirm
+                // the staged commit is gone, so treat cleanup as unconfirmed
+                // and retain the snapshot.
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "drop",
+                    "pending commit guard found no group for cleanup"
+                );
+                false
+            }
             Err(_e) => {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "drop",
                     "pending commit guard could not load group for cleanup"
                 );
+                false
             }
-        }
+        };
 
-        // Release the pre-commit fork-recovery snapshot, mirroring
+        // Release the pre-commit fork-recovery snapshot only after confirming
+        // the staged pending commit is gone, mirroring
         // `forget_pending_commit_for_recovery` on the normal failure path. A
-        // missing snapshot is benign (already released, or never created).
-        if let Some(snapshot_name) = self.snapshot_name.as_deref() {
+        // missing snapshot is benign (already released, or never created). If
+        // cleanup is unconfirmed, keep the snapshot so the orphaned commit
+        // remains recoverable.
+        if pending_commit_cleared && let Some(snapshot_name) = self.snapshot_name.as_deref() {
             match storage.release_group_snapshot(&self.group_id, snapshot_name) {
                 Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
                 Err(_e) => {
@@ -132,6 +167,12 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
                     );
                 }
             }
+        } else if self.snapshot_name.is_some() {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "drop",
+                "pending commit guard retained recovery snapshot; staged commit cleanup unconfirmed"
+            );
         }
     }
 }
