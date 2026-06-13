@@ -30,6 +30,12 @@ use crate::{
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
 const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
+/// Upper bound on how long the single accept loop will wait for an authorized
+/// client to send its newline-terminated request frame. A same-UID client that
+/// connects and then stalls (never writing a newline) must not wedge the loop
+/// and starve every other client of `Status`/`Ping`/etc. On timeout the read is
+/// treated like any other per-connection failure: report and `continue`.
+const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
 
@@ -635,25 +641,28 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
             .await;
             continue;
         }
-        let request = match read_daemon_request(&mut stream).await {
-            Ok(request) => request,
-            Err(err) => {
-                // A single bad/abrupt/oversized/malformed connection must not
-                // take down the whole daemon. Mirror the authz-failure path
-                // above: report the error to this client and keep serving.
-                eprintln!("dmd: rejected daemon connection: {err}");
-                write_daemon_output(
-                    &mut stream,
-                    &CliOutput {
-                        code: 1,
-                        stdout: String::new(),
-                        stderr: format!("error: {err}\n"),
-                    },
-                )
-                .await;
-                continue;
-            }
-        };
+        let request =
+            match read_daemon_request_within(&mut stream, DAEMON_REQUEST_READ_TIMEOUT).await {
+                Ok(request) => request,
+                Err(err) => {
+                    // A single bad/abrupt/oversized/malformed/stalled connection
+                    // must not take down the whole daemon or wedge the accept loop.
+                    // Mirror the authz-failure path above: report the error to this
+                    // client and keep serving. The bounded read timeout also stops
+                    // a same-UID client that connects but never sends a request
+                    // frame from blocking every other client indefinitely.
+                    write_daemon_output(
+                        &mut stream,
+                        &CliOutput {
+                            code: 1,
+                            stdout: String::new(),
+                            stderr: format!("error: {err}\n"),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+            };
         match request {
             DaemonRequest::MessagesSubscribe { mut cli } => {
                 apply_defaults(&mut cli, &defaults);
@@ -1002,6 +1011,26 @@ async fn read_daemon_request(
         request.push(byte[0]);
     }
     Ok(serde_json::from_slice(&request)?)
+}
+
+/// Read a daemon request frame, but give up after `timeout` if the client
+/// connects without ever sending a complete newline-terminated frame. This
+/// keeps the single accept loop responsive: a stalled (or slow-loris) same-UID
+/// client cannot wedge the loop and starve other clients. A timeout surfaces as
+/// an `io::Error` of kind `TimedOut`, which the accept loop treats like any
+/// other per-connection read failure.
+async fn read_daemon_request_within(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<DaemonRequest, Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::time::timeout(timeout, read_daemon_request(stream)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "daemon client did not send a request within the read timeout",
+        )
+        .into()),
+    }
 }
 
 async fn handle_messages_subscription(
@@ -4373,6 +4402,50 @@ mod tests {
         assert!(
             err.to_string().contains("daemon request exceeds"),
             "unexpected error: {err}"
+        );
+        writer.await.expect("writer task");
+    }
+
+    #[tokio::test]
+    async fn daemon_request_reader_times_out_on_stalled_client() {
+        // A same-UID client that connects but never sends a newline-terminated
+        // frame must not wedge the accept loop. The bounded read returns a
+        // TimedOut error so the loop reports and continues instead of blocking
+        // every other client indefinitely (regression for #190).
+        let (mut server, _client) = UnixStream::pair().expect("unix stream pair");
+
+        let err = read_daemon_request_within(&mut server, Duration::from_millis(50))
+            .await
+            .expect_err("stalled client should time out");
+
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("timeout should surface as an io::Error");
+        assert_eq!(
+            io_err.kind(),
+            ErrorKind::TimedOut,
+            "unexpected error kind: {io_err:?}"
+        );
+        // `_client` is held open for the duration: the timeout fires precisely
+        // because the peer is connected but silent.
+    }
+
+    #[tokio::test]
+    async fn daemon_request_reader_within_returns_request_before_timeout() {
+        let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
+        let writer = tokio::spawn(async move {
+            let request = DaemonRequest::Ping;
+            let bytes = encode_daemon_request(&request).expect("encode ping");
+            client.write_all(&bytes).await.expect("write ping request");
+            client.shutdown().await.expect("shutdown client");
+        });
+
+        let request = read_daemon_request_within(&mut server, Duration::from_secs(5))
+            .await
+            .expect("a prompt request should be read before the timeout");
+        assert!(
+            matches!(request, DaemonRequest::Ping),
+            "unexpected request variant"
         );
         writer.await.expect("writer task");
     }
