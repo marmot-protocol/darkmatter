@@ -80,12 +80,17 @@ indicate that the row has been edited.
 
 ```json
 {
-  "v": 1,
+  "id": "<hex event id of this edit event>",
+  "pubkey": "<hex account public key of the editor>",
+  "created_at": 1700000000,
   "kind": 1009,
   "tags": [["e", "<hex event id of the edited message>"]],
   "content": "the replacement plaintext"
 }
 ```
+
+A kind `1009` event is an ordinary Marmot app event and carries exactly the six members from "Shape" above (no top-level
+`v`; its `content` is the replacement plaintext, not JSON).
 
 - The original message's projected `kind` does not change; only its rendered body is overlaid.
 - The chat-list preview MUST NOT bump on an edit. An edit to a stale message must not reorder the conversation list.
