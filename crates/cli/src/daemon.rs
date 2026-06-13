@@ -46,6 +46,8 @@ pub enum DaemonClientError {
     Json(#[from] serde_json::Error),
     #[error("daemon closed the connection without responding")]
     EmptyResponse,
+    #[error("daemon request is {size} bytes, exceeding the {limit} byte limit")]
+    RequestTooLarge { size: usize, limit: usize },
 }
 
 #[derive(Parser, Debug)]
@@ -633,7 +635,25 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
             .await;
             continue;
         }
-        let request = read_daemon_request(&mut stream).await?;
+        let request = match read_daemon_request(&mut stream).await {
+            Ok(request) => request,
+            Err(err) => {
+                // A single bad/abrupt/oversized/malformed connection must not
+                // take down the whole daemon. Mirror the authz-failure path
+                // above: report the error to this client and keep serving.
+                eprintln!("dmd: rejected daemon connection: {err}");
+                write_daemon_output(
+                    &mut stream,
+                    &CliOutput {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: format!("error: {err}\n"),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
         match request {
             DaemonRequest::MessagesSubscribe { mut cli } => {
                 apply_defaults(&mut cli, &defaults);
@@ -3534,10 +3554,31 @@ fn daemon_error(json: bool, code: &str, message: String) -> CliOutput {
     }
 }
 
+/// Encode a daemon request as a newline-terminated JSON frame, rejecting
+/// payloads that exceed the daemon's per-request size limit before they hit
+/// the wire. The daemon enforces the same cap on read (see
+/// `read_daemon_request` / `MAX_DAEMON_REQUEST_BYTES`); checking client-side
+/// turns an oversized request (e.g. `messages send` with a huge body) into a
+/// clear local error instead of a connection the daemon must reject.
+fn encode_daemon_request(request: &DaemonRequest) -> Result<Vec<u8>, DaemonClientError> {
+    let mut bytes = serde_json::to_vec(request)?;
+    // The daemon reads up to and excluding the trailing newline, so compare the
+    // JSON payload length (without the framing newline) against the limit.
+    if bytes.len() > MAX_DAEMON_REQUEST_BYTES {
+        return Err(DaemonClientError::RequestTooLarge {
+            size: bytes.len(),
+            limit: MAX_DAEMON_REQUEST_BYTES,
+        });
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 async fn send_request(
     socket: &Path,
     request: &DaemonRequest,
 ) -> Result<CliOutput, DaemonClientError> {
+    let bytes = encode_daemon_request(request)?;
     let mut stream =
         UnixStream::connect(socket)
             .await
@@ -3545,8 +3586,6 @@ async fn send_request(
                 socket: socket.to_owned(),
                 source,
             })?;
-    let mut bytes = serde_json::to_vec(request)?;
-    bytes.push(b'\n');
     stream.write_all(&bytes).await?;
     stream.shutdown().await?;
 
@@ -3563,6 +3602,7 @@ async fn stream_request(
     request: &DaemonRequest,
     json_output: bool,
 ) -> Result<CliOutput, DaemonClientError> {
+    let bytes = encode_daemon_request(request)?;
     let mut stream =
         UnixStream::connect(socket)
             .await
@@ -3570,8 +3610,6 @@ async fn stream_request(
                 socket: socket.to_owned(),
                 source,
             })?;
-    let mut bytes = serde_json::to_vec(request)?;
-    bytes.push(b'\n');
     stream.write_all(&bytes).await?;
 
     let mut reader = BufReader::new(stream);
@@ -4337,6 +4375,42 @@ mod tests {
             "unexpected error: {err}"
         );
         writer.await.expect("writer task");
+    }
+
+    #[test]
+    fn encode_daemon_request_rejects_oversized_payloads() {
+        // Build an Execute request whose serialized form exceeds the limit by
+        // stuffing a huge relay string into the Cli. This mirrors the real
+        // benign trigger: `messages send` with a body over ~1 MiB.
+        let huge = "a".repeat(MAX_DAEMON_REQUEST_BYTES + 1);
+        let mut cli = daemon_test_cli(crate::Command::Whoami);
+        cli.relay = Some(huge);
+        let request = DaemonRequest::Execute { cli: Box::new(cli) };
+
+        let err = encode_daemon_request(&request)
+            .expect_err("oversized request should be rejected before sending");
+
+        match err {
+            DaemonClientError::RequestTooLarge { size, limit } => {
+                assert_eq!(limit, MAX_DAEMON_REQUEST_BYTES);
+                assert!(
+                    size > MAX_DAEMON_REQUEST_BYTES,
+                    "reported size {size} should exceed the limit"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn encode_daemon_request_accepts_normal_payloads() {
+        let request = DaemonRequest::Status;
+        let bytes = encode_daemon_request(&request).expect("status request should encode");
+        assert!(
+            bytes.ends_with(b"\n"),
+            "encoded request must be newline-terminated"
+        );
+        assert!(bytes.len() <= MAX_DAEMON_REQUEST_BYTES + 1);
     }
 
     fn daemon_test_cli(command: crate::Command) -> Cli {
