@@ -621,8 +621,7 @@ async fn admin_policy_update_listing_non_member_is_rejected() {
             }],
         })
         .await
-        .err()
-        .expect("admin-policy listing a non-member must be rejected");
+        .expect_err("admin-policy listing a non-member must be rejected");
 
     assert!(matches!(err, EngineError::Other(_)), "got {err:?}");
 }
