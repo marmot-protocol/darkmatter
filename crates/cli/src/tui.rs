@@ -1427,7 +1427,18 @@ impl TuiApp {
             "--stream-id".to_owned(),
             streaming.stream_id.clone(),
         ];
-        let result = self.client.run_json(Some(&account_id), &args)?;
+        // Restore the composer if compose-finish fails (daemon gone, broker/QUIC
+        // error, relay publish rejection — the failure class from #194). Without
+        // this, `self.streaming` stays `None` while `self.input` still holds the
+        // draft, so the caught error keeps the TUI alive but the next Enter sends
+        // the stream draft through the normal composer path as a regular message.
+        let result = match self.client.run_json(Some(&account_id), &args) {
+            Ok(result) => result,
+            Err(err) => {
+                self.streaming = Some(streaming);
+                return Err(err);
+            }
+        };
         self.input.clear();
         let group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
         remove_live_stream_preview(
@@ -5462,6 +5473,18 @@ mod tests {
             app.status.contains("daemon gone"),
             "error must surface in the status line, got: {}",
             app.status
+        );
+        // The compose-finish call consumes the composer before running the
+        // fallible `dm stream compose-finish`. On failure it must be restored so
+        // the draft text in `self.input` is not silently re-sent as a normal
+        // message through the non-streaming Enter path on the next keypress.
+        assert!(
+            app.streaming.is_some(),
+            "composer must be restored after a compose-finish failure so Enter/Esc retries the stream"
+        );
+        assert_eq!(
+            app.input, "hello",
+            "draft text must be preserved for retry after a compose-finish failure"
         );
     }
 
