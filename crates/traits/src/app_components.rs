@@ -514,9 +514,7 @@ pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, Stri
         return Err("group avatar component has trailing bytes".into());
     }
     let url = String::from_utf8(url).map_err(|e| format!("group avatar URL is not UTF-8: {e}"))?;
-    let dim = String::from_utf8(dim).map_err(|e| format!("group avatar dim is not UTF-8: {e}"))?;
-    let thumbhash = String::from_utf8(thumbhash)
-        .map_err(|e| format!("group avatar thumbhash is not UTF-8: {e}"))?;
+    // Presence is decided on the raw bytes: an absent state carries no hints.
     if url.is_empty() && (!dim.is_empty() || !thumbhash.is_empty()) {
         return Err("group avatar absent state must not include hints".into());
     }
@@ -527,10 +525,24 @@ pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, Stri
             return Err("group avatar URL is not normalized".into());
         }
     }
+    // `dim` and `thumbhash` are opaque length-bounded hints: a decoder validates
+    // only their length (done above by decode_var_bytes) and interprets the bytes
+    // as UTF-8 only for rendering. A non-UTF-8 hint is treated as ABSENT and MUST
+    // NOT invalidate otherwise-valid state (spec/app-components/group-avatar-url-v1.md
+    // and spec/foundation/canonical-encoding.md, "opaque hints"). Rejecting it
+    // here would make the same commit accepted by some clients and not others.
     Ok(GroupAvatarUrlV1 {
         url,
-        dim: (!dim.is_empty()).then_some(dim),
-        thumbhash: (!thumbhash.is_empty()).then_some(thumbhash),
+        dim: if dim.is_empty() {
+            None
+        } else {
+            String::from_utf8(dim).ok()
+        },
+        thumbhash: if thumbhash.is_empty() {
+            None
+        } else {
+            String::from_utf8(thumbhash).ok()
+        },
     })
 }
 
@@ -1376,6 +1388,32 @@ mod tests {
         let mut bytes = encode_group_avatar_url_v1(&avatar).unwrap();
         bytes.push(0);
         assert!(decode_group_avatar_url_v1(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_decode_treats_non_utf8_hint_as_absent() {
+        // dim/thumbhash are opaque length-bounded hints: a non-UTF-8 hint MUST NOT
+        // invalidate the component (else the same commit forks accept/reject across
+        // clients). It is interpreted as absent.
+        let url = validate_and_normalize_group_avatar_url("https://cdn.example.com/a.png").unwrap();
+        let mut bytes = Vec::new();
+        encode_var_bytes(url.as_bytes(), &mut bytes);
+        encode_var_bytes(&[0xff, 0xfe], &mut bytes); // non-UTF-8 dim
+        encode_var_bytes(&[0x80, 0x81, 0x82], &mut bytes); // non-UTF-8 thumbhash
+
+        let decoded = decode_group_avatar_url_v1(&bytes)
+            .expect("non-UTF-8 opaque hints must not invalidate the avatar component");
+        assert_eq!(decoded.url, url);
+        assert_eq!(decoded.dim, None);
+        assert_eq!(decoded.thumbhash, None);
+
+        // A within-bounds UTF-8 hint is still surfaced for rendering.
+        let mut bytes = Vec::new();
+        encode_var_bytes(url.as_bytes(), &mut bytes);
+        encode_var_bytes(b"512x512", &mut bytes);
+        encode_var_bytes(b"", &mut bytes);
+        let decoded = decode_group_avatar_url_v1(&bytes).unwrap();
+        assert_eq!(decoded.dim.as_deref(), Some("512x512"));
     }
 
     #[test]
