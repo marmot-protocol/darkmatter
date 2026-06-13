@@ -157,8 +157,8 @@ MLS group state, so it cannot independently read or enforce the group's `replay_
 operators configure a per-room/operator replay TTL instead; deployments that advertise brokered replay for a group MUST
 configure that operator TTL no greater than the group's `replay_ttl_secs` in
 [../app-components/agent-text-stream-quic-v1.md](../app-components/agent-text-stream-quic-v1.md) (at most 300 seconds in
-the first profile; `0` disables retained replay). A broker MUST NOT retain records beyond its configured operator TTL
-and MUST bound total retained bytes per room.
+the first profile; `0` disables retained replay). A broker MUST NOT retain records beyond its configured operator TTL,
+MUST bound per-room backlog depth, and MUST bound total retained bytes across the broker.
 
 Replay is a transport convenience only. Retained records remain provisional preview data; they do not become durable
 history and do not change the authority of the final MLS message.
@@ -177,7 +177,8 @@ change record ordering or the transcript: ordering comes from `seq`, never from 
 A broker enforces resource bounds so a relay cannot be used to exhaust memory. The first-profile defaults are:
 
 - per-subscriber queue depth: `32` records;
-- per-room backlog depth: `1024` records, and at most `64 MiB` retained per the replay window;
+- per-room backlog depth: `1024` records;
+- total retained backlog bytes across all rooms: at most `64 MiB` (a broker-wide budget, not per room);
 - maximum rooms: `512`;
 - maximum connections: `256`, and at most `64` concurrent streams per connection;
 - read timeout `15s`, idle timeout `30s`, keep-alive interval `10s`.
