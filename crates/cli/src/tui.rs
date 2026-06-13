@@ -1007,7 +1007,16 @@ impl TuiApp {
             return Ok(());
         }
         if self.streaming.is_some() {
-            return self.handle_streaming_key(key);
+            // Streaming key handling (finish/cancel/append) performs fallible
+            // daemon/relay operations. Mirror the non-streaming Enter path and
+            // tick(): catch errors into the status line instead of propagating
+            // them out of run() and tearing down the whole TUI session. The
+            // composer state is preserved on failures that keep `self.streaming`
+            // set, so the user can retry Enter/Esc.
+            if let Err(err) = self.handle_streaming_key(key) {
+                self.status = format!("error: {err}");
+            }
+            return Ok(());
         }
 
         match key.code {
@@ -5422,6 +5431,72 @@ mod tests {
             child,
             rx,
         }
+    }
+
+    #[test]
+    fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
+        // Regression for issue #194: a fallible streaming finish (daemon gone,
+        // broker/QUIC error, relay publish ok=false) must not propagate out of
+        // handle_key and tear down the whole TUI. It should be caught into the
+        // status line, mirroring the non-streaming Enter path and tick().
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_tempdir, client) =
+            test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+        let mut app = test_tui_app(client, account_id);
+        app.streaming = Some(StreamComposer {
+            stream_id: "stream-194".to_owned(),
+            pending_text: String::new(),
+            last_flush: Instant::now(),
+        });
+        app.input = "hello".to_owned();
+
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The key handler must succeed so run() keeps looping instead of exiting.
+        assert!(outcome.is_ok(), "handle_key must not propagate the error");
+        assert!(
+            app.running,
+            "TUI must stay running after a streaming failure"
+        );
+        assert!(
+            app.status.contains("daemon gone"),
+            "error must surface in the status line, got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn streaming_enter_failure_before_finish_preserves_composer() {
+        // When the failure occurs before the compose-finish call consumes the
+        // composer (here: empty input short-circuits, then a pending append
+        // flush fails), the composer state is kept so the user can retry.
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_tempdir, client) =
+            test_json_client(r#"{"ok":false,"error":{"message":"broker offline"}}"#);
+        let mut app = test_tui_app(client, account_id);
+        app.streaming = Some(StreamComposer {
+            stream_id: "stream-194".to_owned(),
+            pending_text: "queued".to_owned(),
+            last_flush: Instant::now(),
+        });
+        app.input = "queued".to_owned();
+
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(outcome.is_ok(), "handle_key must not propagate the error");
+        assert!(
+            app.running,
+            "TUI must stay running after a streaming failure"
+        );
+        assert!(
+            app.status.contains("broker offline"),
+            "error must surface in the status line, got: {}",
+            app.status
+        );
+        assert!(
+            app.streaming.is_some(),
+            "composer must be preserved on a pre-finish failure so Enter/Esc can retry"
+        );
     }
 
     fn test_message_subscription(account_id: &str) -> MessageSubscription {
