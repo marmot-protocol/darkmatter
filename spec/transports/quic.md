@@ -80,6 +80,11 @@ In the direct mode, a receiver exposes a QUIC endpoint and the sender dials it, 
 writes the stream's records. This is the point-to-point primitive; it carries no control envelope because the dialed
 endpoint already corresponds to one receiver.
 
+Direct-path connections negotiate ALPN `marmot.quic_stream.v1`. ALPN is a mandatory TLS 1.3 parameter, so both peers
+MUST offer exactly this protocol; a direct-path endpoint MUST reject a connection that does not negotiate it. This is the
+direct-path counterpart to the broker path's `marmot.quic_broker.v1` and gives the direct path its own incompatible
+change hook (see "Versioning").
+
 ### Broker-relayed
 
 In the broker mode, a group-approved broker is the rendezvous. The sender (publisher) and each receiver (subscriber)
@@ -204,6 +209,7 @@ component document is a forward-compatibility reservation.
 This binding is `marmot.transport.quic`, version 1, used only for the first agent text stream text profile. Interop
 visible changes use the narrowest hook:
 
+- the direct-path ALPN `marmot.quic_stream.v1` (a new value for an incompatible direct-path change);
 - the broker control protocol string `marmot.quic_broker.v1` (a new value for an incompatible control change);
 - a new record version in `AgentTextStreamRecordV1` (owned by the feature document) for an incompatible record change;
 - a new `route` value or candidate scheme for an incompatible discovery change;
