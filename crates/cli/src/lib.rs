@@ -1258,20 +1258,28 @@ where
     }
 
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
+        let explicit_daemon_socket =
+            cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some();
         match daemon::send_execute(&socket, cli.clone()).await {
             Ok(output) => return output,
             // An oversized request is a client-side limit violation, not a
-            // daemon-unavailable condition: the encoder rejects it before it
-            // ever reaches `dmd`. Surface it as a terminal error even on the
-            // implicit-socket path, otherwise the request silently falls
-            // through to `run_cli_local` and masks the size cap (see #190).
+            // daemon-unavailable or lost-response condition: the encoder rejects
+            // it before it ever reaches `dmd`. Surface it as a terminal error
+            // even on the implicit-socket path, otherwise the request silently
+            // falls through to `run_cli_local` and masks the size cap (see #190).
             Err(err @ daemon::DaemonClientError::RequestTooLarge { .. }) => {
                 return daemon_client_error(cli.json, err);
             }
-            Err(err) if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() => {
-                return daemon_client_error(cli.json, err);
-            }
-            Err(_) => {}
+            // Only fall back to local execution when the client could not reach
+            // `dmd` over an auto-discovered socket. If the daemon accepted the
+            // command but the response was lost/malformed, do NOT re-run locally
+            // (that would double-execute); report it via `daemon_execute_error`.
+            Err(err)
+                if should_fallback_to_local_after_daemon_execute_error(
+                    explicit_daemon_socket,
+                    &err,
+                ) => {}
+            Err(err) => return daemon_execute_error(cli.json, err),
         }
     }
 
@@ -1630,6 +1638,51 @@ fn daemon_socket_path_for_client(cli: &Cli, home: &Path) -> PathBuf {
         .clone()
         .or(env_socket.clone())
         .unwrap_or_else(|| daemon::default_socket_path(home))
+}
+
+fn should_fallback_to_local_after_daemon_execute_error(
+    explicit_daemon_socket: bool,
+    err: &daemon::DaemonClientError,
+) -> bool {
+    !explicit_daemon_socket && matches!(err, daemon::DaemonClientError::Connect { .. })
+}
+
+fn daemon_execute_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
+    match err {
+        err @ daemon::DaemonClientError::Connect { .. } => daemon_client_error(json_output, err),
+        err => daemon_execute_state_unknown_error(json_output, err),
+    }
+}
+
+fn daemon_execute_state_unknown_error(
+    json_output: bool,
+    err: daemon::DaemonClientError,
+) -> CliOutput {
+    let message = format!(
+        "daemon response was lost after the request was sent; command state is unknown: {err}"
+    );
+    if json_output {
+        return CliOutput {
+            code: 1,
+            stdout: format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "ok": false,
+                    "error": {
+                        "code": "daemon_state_unknown",
+                        "message": message,
+                    }
+                }))
+                .expect("JSON response serialization cannot fail")
+            ),
+            stderr: String::new(),
+        };
+    }
+    CliOutput {
+        code: 1,
+        stdout: String::new(),
+        stderr: format!("error: {message}\n"),
+    }
 }
 
 fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
@@ -6227,11 +6280,12 @@ mod tests {
 
     use super::{
         AppMessageRecord, Cli, Command, DmError, GlobalRelayDefaults, StreamCommand,
-        apply_global_relay_defaults, apply_message_cursors, daemon_socket_for_client,
+        apply_global_relay_defaults, apply_message_cursors, daemon, daemon_socket_for_client,
         default_home_from_env, first_quic_candidate_is_loopback, parse_quic_candidate,
         quic_candidate_host, relay_endpoints, relay_stats_output, relay_stats_plain, resolve_relay,
-        validate_message_list_cursors,
+        run_from, validate_message_list_cursors,
     };
+
     use marmot_app::{
         DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
         RelayDeliveryStats, RelayLatencyStats, RelayPlaneHealth, RelaySyncSnapshot,
@@ -6386,6 +6440,59 @@ mod tests {
                 Some(socket)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_discovered_daemon_empty_response_reports_unknown_state_without_local_fallback() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let socket = daemon::default_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().expect("socket parent")).expect("socket dir");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon request");
+            let mut request = Vec::new();
+            use tokio::io::AsyncReadExt;
+            stream
+                .read_to_end(&mut request)
+                .await
+                .expect("read daemon request");
+            assert!(
+                !request.is_empty(),
+                "client must send an execute request before daemon disappears"
+            );
+            // Drop without writing a response. This simulates a daemon crash after
+            // the request was delivered and possibly executed.
+        });
+
+        let output = run_from(vec![
+            OsString::from("dm"),
+            OsString::from("--home"),
+            home.path().as_os_str().to_owned(),
+            OsString::from("--secret-store"),
+            OsString::from("file"),
+            OsString::from("--json"),
+            OsString::from("account"),
+            OsString::from("list"),
+        ])
+        .await;
+
+        server.await.expect("daemon task");
+        assert_eq!(
+            output.code, 1,
+            "post-delivery daemon loss must not run the command locally"
+        );
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json error");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "daemon_state_unknown");
+        let message = value["error"]["message"].as_str().expect("message");
+        assert!(message.contains("state is unknown"), "{message}");
+        assert!(
+            message.contains("daemon closed the connection without responding"),
+            "{message}"
+        );
     }
 
     #[test]
