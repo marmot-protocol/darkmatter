@@ -1260,7 +1260,15 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let recovery_query = query.clone();
+        // Lag recovery must NOT inherit the caller's initial-replay `limit`.
+        // That limit caps the *initial* snapshot to the latest N rows; reusing
+        // it here would reload only the latest N stored rows on lag, so a slow
+        // subscriber with e.g. `limit: Some(1)` could still permanently lose
+        // any messages between the last delivered id and that latest row. The
+        // live path delivers every post-subscription message, so recovery must
+        // reload the full group history (keeping the group filter) and rely on
+        // `seen_message_ids` to dedupe what was already delivered. See #180.
+        let recovery_query = messages_recovery_query(&query);
         let snapshot = self.messages_with_query(&account.account_id_hex, query)?;
         let mut seen_message_ids = snapshot
             .iter()
@@ -5736,6 +5744,20 @@ pub(crate) fn broker_trust_for_addr(
         .unwrap_or(BrokerServerTrust::Platform)
 }
 
+/// Build the lag-recovery query for `subscribe_messages` from the caller's
+/// initial-replay `query`. Recovery keeps the group filter but drops `limit`:
+/// the caller's `limit` is an *initial replay* cap on the latest N rows, while
+/// recovery must reload the full group history so the existing
+/// `seen_message_ids` set can re-emit every message missed during broadcast
+/// lag — not just the latest N. Reusing the limit here would reintroduce #180
+/// for any limited subscriber. See `subscribe_messages`.
+fn messages_recovery_query(query: &AppMessageQuery) -> AppMessageQuery {
+    AppMessageQuery {
+        group_id_hex: query.group_id_hex.clone(),
+        limit: None,
+    }
+}
+
 /// Re-read the message projection on broadcast lag and rebuild the runtime
 /// message updates a subscriber would have received. The caller filters these
 /// through its `seen_message_ids` set so only genuinely-missed messages are
@@ -6495,6 +6517,44 @@ mod tests {
             &HashMap::new(),
         );
         assert!(update.is_none());
+    }
+
+    #[test]
+    fn messages_recovery_query_drops_initial_replay_limit() {
+        // Regression for darkmatter#180 follow-up: the caller's `limit` is an
+        // initial-replay cap (latest N rows). Reusing it on lag recovery would
+        // reload only the latest N stored rows, so a limited subscriber could
+        // still permanently lose messages between the last delivered id and
+        // that latest row after broadcast lag. Recovery must drop the limit and
+        // lean on `seen_message_ids` to dedupe.
+        let group_id_hex = "cd".repeat(32);
+        let query = AppMessageQuery {
+            group_id_hex: Some(group_id_hex.clone()),
+            limit: Some(1),
+        };
+        let recovery = messages_recovery_query(&query);
+        assert_eq!(
+            recovery.limit, None,
+            "lag recovery must not inherit the initial replay limit"
+        );
+        assert_eq!(
+            recovery.group_id_hex,
+            Some(group_id_hex),
+            "lag recovery must keep the caller's group filter"
+        );
+    }
+
+    #[test]
+    fn messages_recovery_query_preserves_absent_group_filter() {
+        // An all-groups subscription (group_id_hex == None) must recover across
+        // all groups, still without a limit.
+        let query = AppMessageQuery {
+            group_id_hex: None,
+            limit: Some(10),
+        };
+        let recovery = messages_recovery_query(&query);
+        assert_eq!(recovery.group_id_hex, None);
+        assert_eq!(recovery.limit, None);
     }
 
     #[test]
