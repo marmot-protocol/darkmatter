@@ -3866,9 +3866,9 @@ fn shorten(value: &str, max_len: usize) -> String {
 
 fn composer_display_text(input: &str) -> String {
     let trimmed = input.trim();
-    if trimmed.starts_with('/')
-        && let Ok(words) = split_slash_command_words(trimmed)
-        && words.first().map(String::as_str) == Some("/login")
+    if let Some(command_input) = trimmed.strip_prefix('/')
+        && let Ok(words) = split_slash_command_words(command_input)
+        && words.first().map(String::as_str) == Some("login")
         && words.iter().skip(1).any(|word| word.starts_with("nsec"))
     {
         return "/login <hidden nsec>".to_owned();
@@ -5211,7 +5211,27 @@ mod tests {
             composer_display_text("/login\tnsec1secret"),
             "/login <hidden nsec>"
         );
+        assert_eq!(
+            composer_display_text("/ login nsec1secret"),
+            "/login <hidden nsec>"
+        );
+        assert_eq!(
+            composer_display_text("/  login nsec1secret"),
+            "/login <hidden nsec>"
+        );
+        assert_eq!(
+            composer_display_text("/\tlogin nsec1secret"),
+            "/login <hidden nsec>"
+        );
+        assert_eq!(
+            composer_display_text(" / login nsec1secret"),
+            "/login <hidden nsec>"
+        );
         assert_eq!(composer_display_text("/login npub1bob"), "/login npub1bob");
+        assert_eq!(
+            composer_display_text("/ login npub1bob"),
+            "/ login npub1bob"
+        );
     }
 
     #[test]
