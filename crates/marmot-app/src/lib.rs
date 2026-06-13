@@ -5104,11 +5104,33 @@ fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {
     Ok(trimmed.to_owned())
 }
 
+/// Per spec/transports/nostr.md, each KeyPackage id-list tag is exactly one
+/// tag. A consumer MUST reject an event that repeats an id-list tag name rather
+/// than silently reading the first occurrence (two consumers could otherwise
+/// pick different occurrences and disagree on advertised capabilities).
+fn reject_duplicate_key_package_tag(
+    event: &NostrTransportEvent,
+    name: &str,
+) -> Result<(), AppError> {
+    let count = event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+        .count();
+    if count > 1 {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "duplicate {name} tag"
+        )));
+    }
+    Ok(())
+}
+
 fn require_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
     predicate: impl FnOnce(&str) -> bool,
 ) -> Result<(), AppError> {
+    reject_duplicate_key_package_tag(event, name)?;
     match event.tag_value(name) {
         Some(value) if predicate(value) => Ok(()),
         Some(value) => Err(AppError::InvalidKeyPackageEvent(format!(
@@ -5124,6 +5146,7 @@ fn require_multi_value_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
 ) -> Result<(), AppError> {
+    reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
         .tags
         .iter()
@@ -5147,6 +5170,7 @@ fn require_multi_value_key_package_tag_contains(
     name: &str,
     required: &str,
 ) -> Result<(), AppError> {
+    reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
         .tags
         .iter()
@@ -5762,6 +5786,37 @@ mod tests {
                 subscription_id: None,
             },
         }
+    }
+
+    #[test]
+    fn key_package_id_list_tag_must_be_exactly_one() {
+        let make = |tags: Vec<Vec<String>>| NostrTransportEvent {
+            id: "00".repeat(32),
+            pubkey: "11".repeat(32),
+            created_at: 1,
+            kind: 30443,
+            tags,
+            content: String::new(),
+            sig: None,
+        };
+        // A single id-list tag is accepted.
+        let one = make(vec![vec!["mls_extensions".into(), "0x0006".into()]]);
+        assert!(require_multi_value_key_package_tag(&one, "mls_extensions").is_ok());
+        // Two tags with the same id-list name MUST be rejected, not first-match read.
+        let two = make(vec![
+            vec!["mls_extensions".into(), "0x0006".into()],
+            vec!["mls_extensions".into(), "0xf2f1".into()],
+        ]);
+        assert!(require_multi_value_key_package_tag(&two, "mls_extensions").is_err());
+        assert!(
+            require_multi_value_key_package_tag_contains(&two, "mls_extensions", "0x0006").is_err()
+        );
+        // The single-value consumer (mls_ciphersuite) also rejects a duplicate.
+        let two_cs = make(vec![
+            vec!["mls_ciphersuite".into(), "0x0001".into()],
+            vec!["mls_ciphersuite".into(), "0x0002".into()],
+        ]);
+        assert!(require_key_package_tag(&two_cs, "mls_ciphersuite", |_| true).is_err());
     }
 
     #[test]
