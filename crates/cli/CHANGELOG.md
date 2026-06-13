@@ -79,6 +79,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Security
 
+- Redacted TUI `/login` `nsec` composer input when users type leading whitespace, repeated whitespace, or tabs before
+  submitting the import.
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
   peers, bounding request size, and refusing `reset`/`logout` execution through the daemon socket.
 - Encrypted-media uploads and downloads no longer act on loopback-HTTP blob endpoints (e.g. `http://127.0.0.1:PORT`)
