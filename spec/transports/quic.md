@@ -85,6 +85,14 @@ MUST offer exactly this protocol; a direct-path endpoint MUST reject a connectio
 direct-path counterpart to the broker path's `marmot.quic_broker.v1` and gives the direct path its own incompatible
 change hook (see "Versioning").
 
+In the first profile the direct path has no start-payload discovery: the `route` and `broker` start-payload tags
+advertise broker candidates only, and there is no start-payload candidate by which a direct-path receiver advertises its
+own endpoint to the sender. The direct path is therefore usable in v1 only when the sender already knows the receiver's
+endpoint out of band (for example a dev/test or preconfigured peer). Broker-relayed delivery is the v1 discovery
+mechanism. A start-payload candidate format for direct-path discovery is deferred to a future profile, which will also
+settle the connection direction (the natural form mirrors the broker path: the sender advertises a direct `quic://`
+endpoint and the receiver dials it).
+
 ### Broker-relayed
 
 In the broker mode, a group-approved broker is the rendezvous. The sender (publisher) and each receiver (subscriber)
