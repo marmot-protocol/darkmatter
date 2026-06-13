@@ -19,9 +19,10 @@ A host is unsafe if it is any of:
 - an IPv4 literal inside any range in "Unsafe IPv4 ranges" below;
 - an IPv6 literal inside any range in "Unsafe IPv6 ranges" below;
 - an IPv4-mapped IPv6 address (`::ffff:0:0/96`) whose embedded IPv4 address is unsafe;
-- a 6to4 (`2002::/16`) or Teredo (`2001:0000::/32`) IPv6 address whose embedded IPv4 address is unsafe — these
-  transition prefixes can route to an embedded IPv4 endpoint, so the embedded IPv4 address is checked against the unsafe
-  IPv4 ranges as well.
+- any IPv6 address outside global unicast `2000::/3` that is not otherwise listed below. Only `2000::/3` carries
+  globally-routable IPv6 today; addresses outside it (and not covered by another rule) are unallocated or special-use,
+  so they are unsafe. The 6to4 (`2002::/16`) and Teredo (`2001:0000::/32`) transition prefixes are inside `2000::/3`
+  but are rejected entirely (they tunnel to an embedded IPv4 endpoint), as listed below.
 
 A surface that resolves a hostname to IP addresses before connecting MUST apply these checks to every resolved address,
 not only to literals in the URL.
@@ -58,13 +59,14 @@ These are the not-globally-reachable entries of the IANA IPv6 Special-Purpose Ad
 | `::1/128` | loopback |
 | `::/128` | unspecified |
 | `::ffff:0:0/96` | IPv4-mapped (check the embedded IPv4 address) |
-| `2001:0000::/32` | Teredo (check the embedded IPv4 address) |
+| `2001:0000::/32` | Teredo (rejected entirely) |
 | `2001:db8::/32` | documentation |
-| `2002::/16` | 6to4 (check the embedded IPv4 address) |
+| `2002::/16` | 6to4 (rejected entirely) |
 | `3fff::/20` | documentation ([RFC 9637](https://www.rfc-editor.org/rfc/rfc9637)) |
 | `fc00::/7` | unique local (ULA) |
 | `fe80::/10` | link-local unicast |
 | `ff00::/8` | multicast |
+| outside `2000::/3` | not global unicast (unallocated / special-use) |
 
 ## Use
 
