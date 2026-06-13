@@ -6275,8 +6275,7 @@ fn engine_error_json(err: &EngineError) -> Value {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::Path;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         AppMessageRecord, Cli, Command, DmError, GlobalRelayDefaults, StreamCommand,
@@ -6443,13 +6442,27 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn auto_discovered_daemon_empty_response_reports_unknown_state_without_local_fallback() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let socket = daemon::default_socket_path(home.path());
+    fn account_list_args(home: &Path, socket: Option<&Path>) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("dm"),
+            OsString::from("--home"),
+            home.as_os_str().to_owned(),
+            OsString::from("--secret-store"),
+            OsString::from("file"),
+            OsString::from("--json"),
+        ];
+        if let Some(socket) = socket {
+            args.extend([OsString::from("--socket"), socket.as_os_str().to_owned()]);
+        }
+        args.extend([OsString::from("account"), OsString::from("list")]);
+        args
+    }
+
+    #[cfg(unix)]
+    fn spawn_empty_response_daemon(socket: &Path) -> tokio::task::JoinHandle<()> {
         std::fs::create_dir_all(socket.parent().expect("socket parent")).expect("socket dir");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
-        let server = tokio::spawn(async move {
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind daemon socket");
+        tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon request");
             let mut request = Vec::new();
             use tokio::io::AsyncReadExt;
@@ -6463,21 +6476,11 @@ mod tests {
             );
             // Drop without writing a response. This simulates a daemon crash after
             // the request was delivered and possibly executed.
-        });
+        })
+    }
 
-        let output = run_from(vec![
-            OsString::from("dm"),
-            OsString::from("--home"),
-            home.path().as_os_str().to_owned(),
-            OsString::from("--secret-store"),
-            OsString::from("file"),
-            OsString::from("--json"),
-            OsString::from("account"),
-            OsString::from("list"),
-        ])
-        .await;
-
-        server.await.expect("daemon task");
+    #[cfg(unix)]
+    fn assert_daemon_state_unknown(output: &super::CliOutput, expected_detail: &str) {
         assert_eq!(
             output.code, 1,
             "post-delivery daemon loss must not run the command locally"
@@ -6489,10 +6492,61 @@ mod tests {
         assert_eq!(value["error"]["code"], "daemon_state_unknown");
         let message = value["error"]["message"].as_str().expect("message");
         assert!(message.contains("state is unknown"), "{message}");
-        assert!(
-            message.contains("daemon closed the connection without responding"),
-            "{message}"
+        assert!(message.contains(expected_detail), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_discovered_daemon_connect_error_falls_back_to_local_execution() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let socket = daemon::default_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().expect("socket parent")).expect("socket dir");
+        std::fs::write(&socket, b"stale socket path").expect("stale socket file");
+
+        let output = run_from(account_list_args(home.path(), None)).await;
+
+        assert_eq!(
+            output.code, 0,
+            "stale auto-discovered socket should fall back to local execution: stdout={} stderr={}",
+            output.stdout, output.stderr
         );
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json output");
+        assert_eq!(value["ok"], true);
+        assert_eq!(
+            value["result"]["accounts"]
+                .as_array()
+                .expect("accounts array")
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_discovered_daemon_empty_response_reports_unknown_state_without_local_fallback() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let socket = daemon::default_socket_path(home.path());
+        let server = spawn_empty_response_daemon(&socket);
+
+        let output = run_from(account_list_args(home.path(), None)).await;
+
+        server.await.expect("daemon task");
+        assert_daemon_state_unknown(&output, "daemon closed the connection without responding");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_socket_empty_response_reports_unknown_state_without_local_fallback() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let socket = home.path().join("explicit.sock");
+        let server = spawn_empty_response_daemon(&socket);
+
+        let output = run_from(account_list_args(home.path(), Some(&socket))).await;
+
+        server.await.expect("daemon task");
+        assert_daemon_state_unknown(&output, "daemon closed the connection without responding");
     }
 
     #[test]
