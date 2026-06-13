@@ -76,6 +76,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
   finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
   status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
+- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
+  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
+  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
+  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
 
 ### Security
 
@@ -153,13 +157,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   product flows require relay-backed setup.
 - Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains
   `darkmatter-cli`, and the installed binaries remain `dm` and `dmd`.
-
-### Fixed
-
-- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
-  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
-  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
-  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
 
 ## [0.1.0] - 2026-05-17
 
