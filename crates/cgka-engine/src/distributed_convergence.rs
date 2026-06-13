@@ -349,7 +349,7 @@ impl<S: StorageProvider> Engine<S> {
             (previous_components, self.reorg_component_snapshot(group_id))
         {
             for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
-                self.push_group_state_change(group_id, selected_tip, None, change);
+                self.push_group_state_change(group_id, selected_tip, None, change, None);
             }
             for change in crate::group_state_changes::profile_changes(
                 Some(previous_name),
@@ -357,7 +357,7 @@ impl<S: StorageProvider> Engine<S> {
                 &before_avatar,
                 &after_avatar,
             ) {
-                self.push_group_state_change(group_id, selected_tip, None, change);
+                self.push_group_state_change(group_id, selected_tip, None, change, None);
             }
         }
         let previous_ids: HashSet<MemberId> = previous_members
@@ -381,6 +381,7 @@ impl<S: StorageProvider> Engine<S> {
                     selected_tip,
                     None,
                     GroupStateChange::MemberAdded { member: member.id },
+                    None,
                 );
             }
         }
@@ -392,6 +393,7 @@ impl<S: StorageProvider> Engine<S> {
                 GroupStateChange::MemberRemoved {
                     member: member_id.clone(),
                 },
+                None,
             );
         }
 

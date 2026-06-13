@@ -326,6 +326,14 @@ pub enum GroupEvent {
         epoch: EpochId,
         actor: Option<MemberId>,
         change: GroupStateChange,
+        /// Transport-layer `MessageId` of the commit that produced this change,
+        /// when it can be attributed to a single commit. The application stamps
+        /// it onto the synthesized kind-1210 system row so that, if the commit
+        /// later loses a fork and is rolled back, the row can be invalidated by
+        /// origin commit (one commit → many rows, 1:N). `None` for changes whose
+        /// origin commit is not resolvable cheaply (e.g. a convergence reorg that
+        /// re-derives state without replaying a single attributable commit).
+        origin_commit_id: Option<MessageId>,
     },
     EpochChanged {
         group_id: GroupId,
@@ -338,6 +346,11 @@ pub enum GroupEvent {
         recovered_epoch: EpochId,
         winner: CommitOrderingKey,
         invalidated: CommitOrderingKey,
+        /// Transport-layer `MessageId` of the rolled-back (losing) commit. The
+        /// application uses it to invalidate any kind-1210 group system rows that
+        /// commit synthesized (matched by `origin_commit_id`), so a losing
+        /// branch's "Alice added Bob"-style rows do not persist as stale history.
+        invalidated_commit_id: MessageId,
     },
     /// The group entered the `Unrecoverable` state: convergence reported a
     /// `MissingRetainedAnchor` inside the rollback horizon, so the client

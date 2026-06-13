@@ -502,6 +502,7 @@ fn snapshot_group_events() {
                 committer: MemberId::new(b"bob".to_vec()),
                 commit_digest: [0xBB; 32],
             },
+            invalidated_commit_id: mid(),
         }
     );
     insta::assert_json_snapshot!(

@@ -949,6 +949,9 @@ impl AppClient {
             tags: event.tags.clone(),
             source_epoch,
             recorded_at: Some(event.created_at),
+            // Only synthesized kind-1210 system rows carry an origin commit;
+            // ordinary sent app events do not.
+            origin_commit_id: None,
         };
         let update = self
             .app
@@ -1934,6 +1937,8 @@ impl AppClient {
                     tags: message.tags.clone(),
                     source_epoch: Some(message.source_epoch),
                     recorded_at: Some(source_recorded_at),
+                    // Received app messages are not synthesized system rows.
+                    origin_commit_id: None,
                 };
                 let projection_update = self
                     .app
@@ -1956,6 +1961,23 @@ impl AppClient {
                     &self.state.label,
                     &hex::encode(message_id.as_slice()),
                     &format!("{reason:?}"),
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
+            // A rolled-back commit on a losing branch invalidates any kind-1210
+            // group system rows it synthesized (one commit → many rows). The
+            // winning branch's fresh rows are synthesized below from this
+            // delivery's `GroupStateChanged` events, so the timeline converges
+            // to the canonical branch without stale losing-branch rows.
+            if let cgka_traits::engine::GroupEvent::ForkRecovered {
+                invalidated_commit_id,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    "LosingBranch",
                 )?
             {
                 summary.projection_updates.push(projection_update);
@@ -2623,6 +2645,7 @@ impl AppClient {
                 epoch,
                 actor,
                 change,
+                origin_commit_id,
             } = event
             {
                 let projection = match build_group_system_projection(
@@ -2631,6 +2654,9 @@ impl AppClient {
                     actor.as_ref(),
                     change,
                     recorded_at,
+                    origin_commit_id
+                        .as_ref()
+                        .map(|id| hex::encode(id.as_slice())),
                 ) {
                     Ok(projection) => projection,
                     Err(_err) => {
@@ -2691,6 +2717,7 @@ fn build_group_system_projection(
     actor: Option<&cgka_traits::types::MemberId>,
     change: &cgka_traits::engine::GroupStateChange,
     recorded_at: u64,
+    origin_commit_id: Option<String>,
 ) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
     use cgka_traits::app_event::{
         GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
@@ -2804,6 +2831,9 @@ fn build_group_system_projection(
         tags,
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
+        // Non-unique link to the origin commit so a losing-branch rollback can
+        // invalidate every row this commit synthesized (1:N).
+        origin_commit_id,
     })
 }
 
