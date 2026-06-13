@@ -18,7 +18,6 @@ use cgka_engine::{
         ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, AccountIdentityProofRequest,
         AccountIdentityProofSigner,
     },
-    canonicalization::CanonicalizationPolicy,
     key_package::key_package_metadata,
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
@@ -2773,11 +2772,7 @@ impl MarmotApp {
             keys: keys.clone(),
         }))
         .feature_registry(app_feature_registry())
-        .supported_app_components(self.supported_app_component_ids())
-        .convergence_policy(CanonicalizationPolicy {
-            settlement_quiescence_ms: 0,
-            ..CanonicalizationPolicy::default()
-        });
+        .supported_app_components(self.supported_app_component_ids());
         let audit_log_enabled = match self.audit_log_settings() {
             Ok(settings) => settings.enabled,
             Err(e) => {
