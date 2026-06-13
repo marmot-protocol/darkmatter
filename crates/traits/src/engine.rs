@@ -352,6 +352,23 @@ pub enum GroupEvent {
         /// branch's "Alice added Bob"-style rows do not persist as stale history.
         invalidated_commit_id: MessageId,
     },
+    /// A previously-applied commit lost a same-epoch fork during a stored
+    /// distributed-convergence reorg and was rolled back off the canonical
+    /// branch. Unlike [`GroupEvent::ForkRecovered`] (which fires on the direct
+    /// staged-commit seam), this fires from the convergence path, where a
+    /// commit routed through stored convergence — not the direct seam — is
+    /// later superseded by a sibling commit that wins branch selection.
+    ///
+    /// The application uses `invalidated_commit_id` to invalidate any kind-1210
+    /// group system rows that commit synthesized (matched by `origin_commit_id`),
+    /// so a losing branch's "Alice added Bob"-style rows do not persist as stale
+    /// history. This is the convergence-path analog of the `invalidated_commit_id`
+    /// carried on [`GroupEvent::ForkRecovered`].
+    CommitRolledBack {
+        group_id: GroupId,
+        /// Transport-layer `MessageId` of the rolled-back (losing) commit.
+        invalidated_commit_id: MessageId,
+    },
     /// The group entered the `Unrecoverable` state: convergence reported a
     /// `MissingRetainedAnchor` inside the rollback horizon, so the client
     /// stopped applying group-state changes and now needs a verified repair

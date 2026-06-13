@@ -516,6 +516,13 @@ fn snapshot_group_events() {
         }
     );
     insta::assert_json_snapshot!(
+        "event_commit_rolled_back",
+        GroupEvent::CommitRolledBack {
+            group_id: gid(),
+            invalidated_commit_id: mid(),
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_pending_commit_recovered",
         GroupEvent::PendingCommitRecovered {
             group_id: gid(),

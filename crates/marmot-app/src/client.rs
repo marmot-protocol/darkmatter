@@ -1982,6 +1982,24 @@ impl AppClient {
             {
                 summary.projection_updates.push(projection_update);
             }
+            // Convergence-path analog of `ForkRecovered`: a commit first applied
+            // through stored convergence (so its synthesized kind-1210 rows carry
+            // `origin_commit_id`) later lost a same-epoch fork and was rolled
+            // back. `ForkRecovered` only fires on the direct staged-commit seam,
+            // so without this the convergence-born losing rows would survive.
+            // Invalidate every row whose origin commit matches.
+            if let cgka_traits::engine::GroupEvent::CommitRolledBack {
+                invalidated_commit_id,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    "LosingBranch",
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;
                 self.sync_runtime_groups().await?;
