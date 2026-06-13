@@ -30,8 +30,13 @@ A Marmot app event has the same fields as a Nostr event, except `sig`:
 - `content`
 
 `id` is the Nostr event id for the rest of the event shape. It is computed from the canonical Nostr event serialization
-of `[0, pubkey, created_at, kind, tags, content]`. This is the same hash preimage Nostr uses before signing, even though
-Marmot does not produce a Nostr signature for the inner Marmot app event.
+of `[0, pubkey, created_at, kind, tags, content]` as defined by
+[NIP-01](https://github.com/nostr-protocol/nips/blob/master/01.md) and pinned in
+[canonical-encoding.md](./canonical-encoding.md) ("Nostr-shaped values"): the lowercase-hex `SHA-256` of that
+whitespace-free UTF-8 JSON serialization. This is the same hash preimage Nostr uses before signing, even though Marmot
+does not produce a Nostr signature for the inner Marmot app event. Because decoders MUST reject a payload whose `id`
+does not match (see "Encoding"), every implementation MUST produce byte-identical serialization; the exact rules are
+NIP-01's, not implementation-defined.
 
 The payload is not signed as a Nostr relay event. Relays MUST NOT be able to accept it as a standalone event. MLS
 authenticates the sender as a group member, and the `pubkey` field identifies the Marmot account that authored the
