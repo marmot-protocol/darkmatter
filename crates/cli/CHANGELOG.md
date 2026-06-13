@@ -69,6 +69,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   Supplying a message-id cursor without its timestamp (or vice versa), or combining `--before*` with `--after*`, now
   returns a clear error (`message_pagination_cursor_mismatch` / `message_pagination_conflicting_cursors`), matching the
   `dm messages timeline list` behavior.
+- `dm logout` now works while `dmd` is running. The daemon executes forwarded logout requests and refreshes runtime
+  state instead of rejecting them with unusable "run directly without --socket" guidance.
 - The TUI composer now accepts a leading `?` instead of swallowing it to toggle help. Previously, typing or pasting a
   message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
   impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
@@ -80,7 +82,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Security
 
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
-  peers, bounding request size, and refusing `reset`/`logout` execution through the daemon socket.
+  peers, bounding request size, and refusing `reset` execution through the daemon socket.
 - Encrypted-media uploads and downloads no longer act on loopback-HTTP blob endpoints (e.g. `http://127.0.0.1:PORT`)
   unless `DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1` is set for local development. Such endpoints stay valid group state, but
   a production install treats them as unusable instead of issuing requests at the local host on behalf of a remote
