@@ -103,13 +103,23 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
   here. Modules: `account` (create-identity/login/whoami/account(s) + account-setup output), `key_package` (keys),
   `chats`, `media`, `groups` (group + groups), `messages` (incl. the `timeline` subgroup), `follows`, `profile`,
   `relays`, `settings`, `users`, `notifications`, `stream` (QUIC agent text stream previews + quic-candidate/trust
-  helpers), `debug`, `sync`, and `relay_stats`. Handlers and helpers reached from the lib dispatch, from `daemon.rs`,
-  or across namespaces are `pub(crate)`.
+  helpers), `debug`, `sync`, and `relay_stats`. Handlers and helpers reached from the lib dispatch, from the `daemon`
+  module, or across namespaces are `pub(crate)`.
 - `src/args.rs`: clap argument/command enums (`Cli`, `Command`, and the per-namespace `*Command` types).
 - `src/error.rs`: `DmError` and the `--json` error rendering.
-- `src/daemon.rs`: `dmd` runtime, socket-backed execution, subscription workers; calls
+- `src/daemon/`: `dmd` runtime, socket-backed execution, subscription workers; calls
   `commands::<namespace>::*_with_runtime` handlers and shared `commands::stream` / `commands::account` helpers.
-- `src/tui.rs`: Ratatui shell over the `dm --json` surface.
+  `mod.rs` keeps the accept loop / request dispatch (`run_server`, `handle_connection`) and re-exports the
+  submodules: `protocol` (request/response wire types, framing, `DaemonClient`), `responses` (stream-response
+  construction + subscription matching), `subscriptions` (the streaming `handle_*_subscription` handlers),
+  `stream_workers` (background stream-watch and stream-compose workers), `runtime_host` (app-runtime reconciliation,
+  event bridge, hosted command dispatch), and `lifecycle` (start/stop/status, pid/log/socket files). `tests.rs`
+  holds the daemon unit tests.
+- `src/tui/`: Ratatui shell over the `dm --json` surface. `mod.rs` keeps the `run_tui` entry plus shared constants
+  and re-exports the submodules: `model` (row/view/state types, JSON parsers, pure helpers), `view` (`TuiApp` draw
+  methods + Ratatui line/style helpers), `slash` (slash-command parsing), `client` (`DmClient` subprocess wrapper,
+  subscription readers, and the `dm`/subscription-driving `TuiApp` methods), and `app` (`TuiApp` state plus the
+  event loop, key handling, and selection methods). `tests.rs` holds the TUI unit tests.
 - `tests/cli.rs`: end-to-end CLI/daemon integration tests asserting real `dm`/`dmd` behavior and JSON shapes.
 
 ## Verification
