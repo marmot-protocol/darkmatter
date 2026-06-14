@@ -241,13 +241,13 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 - Setup: Alice creates a 21-member group. Eight members race group-data commits.
 - Pressure: multi-committer same-epoch commit storm plus a seed-driven duplicate and reorder.
-- Expected: the committers converge at epoch 2 with 21 members.
+- Expected: the committers converge at epoch 2 with 21 members **and agree on a single group name**. Because every competing branch reaches epoch 2 with 21 members by construction, the `clients_converged` oracle also compares the signed group-data name across committers, so a permanent fork that strands committers on different branches fails the check.
 
 #### Chaos Class `9`: Mixed Large Storm
 
 - Setup: Alice creates a 21-member group. Members send app messages, then eight members race group-data commits.
 - Pressure: large app-message load (seed-driven reorder) followed by a commit storm with a seed-driven duplicate and reorder.
-- Expected: the committers converge at epoch 2 with 21 members.
+- Expected: the committers converge at epoch 2 with 21 members **and agree on a single group name** (see Class `8` — the convergence oracle compares the group-data name so divergent branches are detected).
 
 #### Chaos Class `10`: Restart Delivery Faults
 

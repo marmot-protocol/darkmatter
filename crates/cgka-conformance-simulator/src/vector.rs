@@ -275,9 +275,11 @@ impl TraceExpectation {
 
                 let first_epoch = observations[0].epoch;
                 let first_member_count = observations[0].member_count;
+                let first_group_name = &observations[0].group_name;
                 let converged = observations.iter().all(|observation| {
                     observation.epoch == first_epoch
                         && observation.member_count == first_member_count
+                        && &observation.group_name == first_group_name
                 });
                 let epoch_matches = epoch.is_none_or(|expected| expected == first_epoch);
                 let member_count_matches =
@@ -286,7 +288,8 @@ impl TraceExpectation {
                     mismatches.push(ExpectationFailure {
                         kind: "clients_not_converged".into(),
                         message: format!(
-                            "clients {:?} did not converge to epoch {:?}, member_count {:?}",
+                            "clients {:?} did not converge to epoch {:?}, member_count {:?} \
+                             (group_name agreement across branches is also required)",
                             clients, epoch, member_count
                         ),
                         expected: json!({
@@ -480,6 +483,13 @@ pub struct ClientObservation {
     pub client: String,
     pub epoch: u64,
     pub member_count: usize,
+    /// The group's signed display name (`marmot.group.profile.v1`) as this client
+    /// currently sees it. This is the branch-sensitive observable that lets a
+    /// convergence oracle distinguish competing `UpdateGroupData` branches that are
+    /// otherwise identical on epoch and member count. `None` when the client has no
+    /// group yet, or for legacy traces recorded before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
     #[serde(default)]
     pub event_counts: ClientEventCounts,
     pub received_payloads: Vec<String>,
@@ -605,6 +615,7 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
         client: label.into(),
         epoch: client.epoch().0,
         member_count: client.members().len(),
+        group_name: client.group_name(),
         event_counts,
         received_payloads: events
             .iter()
@@ -732,6 +743,7 @@ mod tests {
             client: client.into(),
             epoch,
             member_count,
+            group_name: None,
             event_counts: ClientEventCounts::default(),
             received_payloads: Vec::new(),
             added_members: Vec::new(),
@@ -794,6 +806,54 @@ mod tests {
 
         assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
         assert_eq!(failures[0].kind, "clients_not_converged");
+    }
+
+    #[test]
+    fn clients_converged_expectation_rejects_divergent_group_names() {
+        // Both clients reach the same epoch and member count, but they settled
+        // on different group-data branches (distinct names). This is exactly the
+        // multi-committer group-data storm fork that the epoch/member-count pair
+        // cannot see; the group-name observable must catch it.
+        let mut alice = observation("alice", 2, 21);
+        alice.group_name = Some("alice branch".into());
+        let mut bob = observation("bob", 2, 21);
+        bob.group_name = Some("bob branch".into());
+
+        let observed = trace(vec![alice, bob]);
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsConverged {
+                clients: vec!["alice".into(), "bob".into()],
+                epoch: Some(2),
+                member_count: Some(21),
+            }],
+            &observed,
+        );
+
+        assert_eq!(failures.len(), 1, "expected one failure: {failures:#?}");
+        assert_eq!(failures[0].kind, "clients_not_converged");
+    }
+
+    #[test]
+    fn clients_converged_expectation_accepts_agreed_group_name() {
+        // Same epoch, member count, and group name => genuine convergence.
+        let mut alice = observation("alice", 2, 21);
+        alice.group_name = Some("winning branch".into());
+        let mut bob = observation("bob", 2, 21);
+        bob.group_name = Some("winning branch".into());
+
+        let observed = trace(vec![alice, bob]);
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ClientsConverged {
+                clients: vec!["alice".into(), "bob".into()],
+                epoch: Some(2),
+                member_count: Some(21),
+            }],
+            &observed,
+        );
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
     }
 
     #[test]
