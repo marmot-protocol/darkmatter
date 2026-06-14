@@ -3,6 +3,11 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
+use url::Url;
+
+use super::blossom::{MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body};
+use super::host_safety::validate_blossom_fetch_url;
+
 fn valid_imeta_tag() -> Vec<String> {
     vec![
         "imeta".to_owned(),
