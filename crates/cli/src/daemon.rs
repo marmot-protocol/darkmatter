@@ -939,10 +939,6 @@ fn blocked_daemon_execute_command(
             "reset",
             "it deletes the daemon home; run dm reset directly after stopping the daemon",
         )),
-        crate::Command::Logout { .. } => Some((
-            "logout",
-            "it removes a local account; run dm logout directly without --socket",
-        )),
         _ => None,
     }
 }
@@ -4275,7 +4271,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_execute_commands_are_refused_over_daemon() {
+    fn reset_execute_command_is_refused_over_daemon() {
         let reset = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Reset {
             confirm: true,
         }))
@@ -4285,16 +4281,18 @@ mod tests {
         assert_eq!(reset.code, 1);
         assert_eq!(reset_json["error"]["code"], "daemon_forbidden");
         assert_eq!(reset_json["error"]["command"], "reset");
+    }
 
+    #[test]
+    fn logout_execute_command_is_allowed_over_daemon() {
         let logout = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Logout {
             pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        }))
-        .expect("logout should be blocked");
-        let logout_json: serde_json::Value =
-            serde_json::from_str(logout.stdout.trim()).expect("logout error JSON");
-        assert_eq!(logout.code, 1);
-        assert_eq!(logout_json["error"]["code"], "daemon_forbidden");
-        assert_eq!(logout_json["error"]["command"], "logout");
+        }));
+
+        assert!(
+            logout.is_none(),
+            "logout should execute inside dmd so automatic daemon forwarding can refresh runtime state"
+        );
     }
 
     #[tokio::test]
