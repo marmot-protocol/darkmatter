@@ -446,8 +446,25 @@ async fn run_scenario_report_inner(
             ScenarioStep::DeliverAll => bus.deliver_all(),
             ScenarioStep::Tick { clients: labels } => {
                 for label in labels {
+                    let client_label = label.clone();
                     let client = client_mut(&mut clients, label, step_index)?;
-                    client.tick().await;
+                    // tick() returns one ingest outcome per delivered message.
+                    // Surface ingest errors (e.g. ForkedEpoch raised while a
+                    // client drains a competing branch during a commit storm)
+                    // as observable scenario errors. Previously these outcomes
+                    // were discarded, which hid divergence that never reached
+                    // the per-client convergence observation.
+                    for outcome in client.tick().await {
+                        if let Err(error) = outcome {
+                            let observed = observe_engine_error(&error);
+                            error_observations.push(ScenarioErrorObservation {
+                                step_index,
+                                client: client_label.clone(),
+                                operation: "tick".into(),
+                                error: observed,
+                            });
+                        }
+                    }
                 }
             }
             ScenarioStep::Observe { clients: labels } => {

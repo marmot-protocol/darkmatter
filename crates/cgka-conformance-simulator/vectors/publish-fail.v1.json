@@ -59,7 +59,8 @@
         },
         "received_payloads": [],
         "removed_members": [],
-        "recoveries": []
+        "recoveries": [],
+        "group_name": "publish-fail"
       }
     ]
   }

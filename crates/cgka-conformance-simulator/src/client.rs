@@ -639,6 +639,20 @@ impl HarnessClient {
         self.engine.members(&gid).expect("members")
     }
 
+    /// The group's current display name, read from the signed `marmot.group.profile.v1`
+    /// app component mirrored into the local group record. `None` when this client
+    /// has not yet joined or created a group.
+    ///
+    /// This is a *branch-sensitive* observable: competing `UpdateGroupData` commits
+    /// change only the group name, which is otherwise invisible in a `ScenarioTrace`.
+    /// Two clients stranded on different convergence branches report different names,
+    /// so a convergence oracle that compares this catches a permanent fork that the
+    /// epoch/member-count pair alone cannot distinguish.
+    pub fn group_name(&self) -> Option<String> {
+        let gid = self.default_group.clone()?;
+        self.engine.group_record(&gid).ok().map(|group| group.name)
+    }
+
     pub fn group_id(&self) -> GroupId {
         self.default_group.clone().expect("group")
     }
