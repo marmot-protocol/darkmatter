@@ -1,5 +1,5 @@
 use crate::openmls_storage::SqliteOpenMlsStorage;
-use crate::{SqliteResultExt, migrations};
+use crate::{SqliteResultExt, migrations, storage};
 use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
 use cgka_traits::types::Backend;
 use std::fmt;
@@ -144,10 +144,12 @@ impl SqliteAccountStorage {
         migrations::run_all(&mut connection)?;
         let connection = Arc::new(Mutex::new(connection));
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
-        Ok(Self {
+        let store = Self {
             connection,
             openmls,
-        })
+        };
+        storage::recover_transition_intents(&store)?;
+        Ok(store)
     }
 
     pub(crate) fn lock(&self) -> StorageResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {

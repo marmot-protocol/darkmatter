@@ -49,6 +49,15 @@ pub trait GroupStorage {
 
 // ── MessageStorage ──────────────────────────────────────────────────────────
 
+/// Durable marker for a storage transition that must be rolled back to a
+/// pre-transition group snapshot if the process exits before the marker is
+/// cleared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupTransitionIntent {
+    pub group_id: GroupId,
+    pub snapshot_name: String,
+}
+
 /// Messages + epoch-scoped snapshot/rollback hooks.
 ///
 /// Snapshots are name-keyed per-group: the engine's `EpochManager` creates
@@ -72,6 +81,18 @@ pub trait MessageStorage {
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
+
+    fn record_group_transition_intent(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+    ) -> StorageResult<()>;
+    fn clear_group_transition_intent(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+    ) -> StorageResult<()>;
+    fn list_group_transition_intents(&self) -> StorageResult<Vec<GroupTransitionIntent>>;
 }
 
 // ── OutboundIntentStorage ──────────────────────────────────────────────────

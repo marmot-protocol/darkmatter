@@ -4,7 +4,7 @@ use crate::{
     serialize,
 };
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::{MessageStorage, StorageError, StorageResult};
+use cgka_traits::storage::{GroupTransitionIntent, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, params};
 
@@ -114,6 +114,26 @@ impl MessageStorage for SqliteAccountStorage {
 
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::release(self, group_id, name)
+    }
+
+    fn record_group_transition_intent(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+    ) -> StorageResult<()> {
+        snapshots::record_transition_intent(self, group_id, snapshot_name)
+    }
+
+    fn clear_group_transition_intent(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+    ) -> StorageResult<()> {
+        snapshots::clear_transition_intent(self, group_id, snapshot_name)
+    }
+
+    fn list_group_transition_intents(&self) -> StorageResult<Vec<GroupTransitionIntent>> {
+        snapshots::list_transition_intents(self)
     }
 }
 
