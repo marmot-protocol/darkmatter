@@ -641,7 +641,10 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
 
 #[tokio::test]
 async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
-    let stream_id = "abcd";
+    // Canonical 32-byte (64 hex char) stream id so the test always reaches the
+    // marker-publish-failure branch and never short-circuits on stream-id
+    // normalization (which would otherwise let it pass for the wrong reason).
+    let stream_id = "abababababababababababababababababababababababababababababababab";
     // `relay: None` disables the hosted runtime, so the finish-marker command
     // returns an error without any live runtime — the deterministic stand-in for
     // a marker publish failure.
