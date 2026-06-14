@@ -1406,7 +1406,7 @@ fn app_message_record_json(
     message: marmot_app::AppMessageRecord,
     from_display_name: Option<String>,
 ) -> serde_json::Value {
-    crate::message_record_json(message, from_display_name)
+    crate::commands::messages::message_record_json(message, from_display_name)
 }
 
 fn runtime_message_update_stream_response(
@@ -1576,7 +1576,7 @@ async fn handle_group_state_subscription(
         .group_mls_state(&account_ref, &group_id_value)
         .await
         .ok()
-        .map(crate::group_mls_state_json);
+        .map(crate::commands::groups::group_mls_state_json);
     if !write_stream_response(
         stream,
         &group_state_stream_response(
@@ -1594,7 +1594,7 @@ async fn handle_group_state_subscription(
             .group_mls_state(&account_ref, &group_id_value)
             .await
             .ok()
-            .map(crate::group_mls_state_json);
+            .map(crate::commands::groups::group_mls_state_json);
         if !write_stream_response(
             stream,
             &group_state_stream_response(group, "GroupStateUpdated", mls),
@@ -1798,7 +1798,7 @@ fn timeline_page_stream_response(
         .into_iter()
         .map(|message| {
             let display_name = runtime.display_name_for_account_id(&message.sender);
-            crate::timeline_message_record_json(message, display_name)
+            crate::commands::messages::timeline_message_record_json(message, display_name)
         })
         .collect::<Vec<_>>();
     DaemonStreamResponse::ok(serde_json::json!({
@@ -1826,7 +1826,7 @@ fn timeline_projection_stream_response(
         .into_iter()
         .map(|message| {
             let display_name = runtime.display_name_for_account_id(&message.sender);
-            crate::timeline_message_record_json(message, display_name)
+            crate::commands::messages::timeline_message_record_json(message, display_name)
         })
         .collect::<Vec<_>>();
     DaemonStreamResponse::ok(serde_json::json!({
@@ -1852,7 +1852,7 @@ fn timeline_message_change_json(
             serde_json::json!({
                 "type": "upsert",
                 "trigger": trigger,
-                "message": crate::timeline_message_record_json(*message, display_name),
+                "message": crate::commands::messages::timeline_message_record_json(*message, display_name),
             })
         }
         marmot_app::TimelineMessageChange::Remove {
@@ -2077,7 +2077,7 @@ fn spawn_stream_watch(
         };
         let output = crate::command_output_result(
             json,
-            crate::stream_watch_command_app_with_runtime(
+            crate::commands::stream::stream_watch_command_app_with_runtime(
                 &account_home,
                 &app,
                 &runtime,
@@ -2107,7 +2107,7 @@ fn new_stream_watch_start(cli: &Cli) -> Result<marmot_app::AgentStreamWatchStart
     let group_id = crate::normalize_group_id_hex(group).map_err(|err| err.to_string())?;
     let stream_id = stream_id
         .as_deref()
-        .map(crate::normalize_hex)
+        .map(crate::commands::stream::normalize_hex)
         .transpose()
         .map_err(|err| err.to_string())?;
     let started_at = unix_now();
@@ -2291,7 +2291,7 @@ async fn open_stream_compose(
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
     let stream_id = match stream_id
-        .map(|stream_id| crate::normalize_hex(&stream_id))
+        .map(|stream_id| crate::commands::stream::normalize_hex(&stream_id))
         .transpose()
     {
         Ok(Some(stream_id)) => stream_id,
@@ -2309,15 +2309,16 @@ async fn open_stream_compose(
             "stream compose requires a quic:// candidate".to_owned(),
         );
     };
-    let parsed_candidate = match crate::parse_quic_candidate(&candidate) {
+    let parsed_candidate = match crate::commands::stream::parse_quic_candidate(&candidate) {
         Ok(candidate) => candidate,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
-    let candidate_addr = match crate::resolve_quic_candidate_addr(&parsed_candidate).await {
-        Ok(addr) => addr,
-        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
-    };
-    let trust = match crate::broker_trust(candidate_addr, None, insecure_local) {
+    let candidate_addr =
+        match crate::commands::stream::resolve_quic_candidate_addr(&parsed_candidate).await {
+            Ok(addr) => addr,
+            Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
+        };
+    let trust = match crate::commands::stream::broker_trust(candidate_addr, None, insecure_local) {
         Ok(trust) => trust,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
@@ -2378,7 +2379,7 @@ async fn open_stream_compose(
                 "app runtime is not available for stream crypto".to_owned(),
             );
         };
-        match crate::stream_crypto_for_start_event(
+        match crate::commands::stream::stream_crypto_for_start_event(
             runtime,
             Some(&start_account_id),
             Some(group_id.as_str()),
@@ -2453,7 +2454,7 @@ async fn append_stream_compose(
     stream_id: &str,
     text: String,
 ) -> CliOutput {
-    let stream_id = match crate::normalize_hex(stream_id) {
+    let stream_id = match crate::commands::stream::normalize_hex(stream_id) {
         Ok(stream_id) => stream_id,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
@@ -2499,7 +2500,7 @@ async fn finish_stream_compose(
     workers: &mut StreamComposeWorkers,
     stream_id: &str,
 ) -> CliOutput {
-    let stream_id = match crate::normalize_hex(stream_id) {
+    let stream_id = match crate::commands::stream::normalize_hex(stream_id) {
         Ok(stream_id) => stream_id,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
@@ -2574,7 +2575,7 @@ fn cancel_stream_compose(
     workers: &mut StreamComposeWorkers,
     stream_id: &str,
 ) -> CliOutput {
-    let stream_id = match crate::normalize_hex(stream_id) {
+    let stream_id = match crate::commands::stream::normalize_hex(stream_id) {
         Ok(stream_id) => stream_id,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
@@ -2664,8 +2665,8 @@ async fn handle_app_runtime_account_setup_request(
     let output = runtime
         .create_or_import_account(request)
         .await
-        .map_err(crate::map_account_setup_error)
-        .and_then(crate::account_setup_command_output);
+        .map_err(crate::commands::account::map_account_setup_error)
+        .and_then(crate::commands::account::account_setup_command_output);
     Some(crate::command_output_result(cli.json, output))
 }
 
@@ -2705,7 +2706,7 @@ async fn handle_app_runtime_command_request(
 
     let output = match cli.command.clone() {
         crate::Command::Group { command } => {
-            crate::group_command_with_runtime(
+            crate::commands::groups::group_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2715,7 +2716,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Chats { command } => {
-            crate::chats_command_with_runtime(
+            crate::commands::chats::chats_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2725,7 +2726,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Groups { command } => {
-            crate::groups_command_with_runtime(
+            crate::commands::groups::groups_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2735,7 +2736,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Message { command } | crate::Command::Messages { command } => {
-            crate::message_command_with_runtime(
+            crate::commands::messages::message_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2745,7 +2746,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Stream { command } => {
-            crate::stream_command_app_with_runtime(
+            crate::commands::stream::stream_command_app_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2755,7 +2756,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Keys { command } => {
-            crate::key_package_command_with_runtime(
+            crate::commands::key_package::key_package_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2765,7 +2766,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Follows { command } => {
-            crate::follows_command_with_runtime(
+            crate::commands::follows::follows_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2776,7 +2777,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Profile { command } => {
-            crate::profile_command_with_runtime(
+            crate::commands::profile::profile_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2787,7 +2788,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Relays { command } => {
-            crate::relays_command_with_runtime(
+            crate::commands::relays::relays_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2798,7 +2799,7 @@ async fn handle_app_runtime_command_request(
             .await
         }
         crate::Command::Media { command } => {
-            crate::media_command_with_runtime(
+            crate::commands::media::media_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
@@ -2807,7 +2808,9 @@ async fn handle_app_runtime_command_request(
             )
             .await
         }
-        crate::Command::RelayStats => crate::relay_stats_command_with_runtime(runtime).await,
+        crate::Command::RelayStats => {
+            crate::commands::relay_stats::relay_stats_command_with_runtime(runtime).await
+        }
         _ => return None,
     };
     Some(crate::command_output_result(cli.json, output))
@@ -3247,7 +3250,8 @@ async fn auto_watch_agent_stream_starts(
             continue;
         }
         let group_id = hex::encode(message.group_id.as_slice());
-        let insecure_local = crate::first_quic_candidate_is_loopback(&start.quic_candidates);
+        let insecure_local =
+            crate::commands::stream::first_quic_candidate_is_loopback(&start.quic_candidates);
         let stream_id = start.stream_id_hex;
         if stream_manager.watch_exists(Some(account_id), &group_id, Some(stream_id.as_str())) {
             continue;

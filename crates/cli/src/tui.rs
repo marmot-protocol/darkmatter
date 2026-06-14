@@ -1289,7 +1289,8 @@ impl TuiApp {
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let preview_group_id = group_id.clone();
-        let insecure_local = crate::first_quic_candidate_is_loopback(&quic_candidates);
+        let insecure_local =
+            crate::commands::stream::first_quic_candidate_is_loopback(&quic_candidates);
         let mut args = vec!["stream".to_owned(), "compose-open".to_owned(), group_id];
         if insecure_local {
             args.push("--insecure-local".to_owned());
