@@ -13,12 +13,12 @@ use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
 use crate::identity::{member_id_at_leaf, member_id_of_sender};
 use crate::openmls_projection::{
-    OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
+    OpenMlsContentKind, process_commit_with_app_data_updates, project_mls_message,
+    retained_anchor_epoch_from_snapshot_name,
 };
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::SnapshotRollbackGuard;
-use cgka_traits::app_components::AppComponentData;
 use cgka_traits::engine::{
     AutoPublish, CommitOrderingKey, CommitOrderingPriority, GroupEvent, GroupStateChange,
     SendIntent, SendResult,
@@ -30,12 +30,10 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use openmls::component::ComponentData;
 use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
-use openmls::messages::proposals::{AppDataUpdateOperation, ProposalOrRef};
 use openmls::prelude::{
-    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessage,
-    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, ValidationError,
+    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    ProcessedMessageContent, Proposal, ProtocolMessage, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -1908,72 +1906,6 @@ impl<S: StorageProvider> Engine<S> {
 
         Ok(SendResult::ApplicationMessage { msg: wrapped })
     }
-}
-
-fn process_commit_with_app_data_updates<S: StorageProvider>(
-    mls_group: &mut MlsGroup,
-    provider: &EngineOpenMlsProvider<'_, S>,
-    proto: ProtocolMessage,
-) -> Result<
-    ProcessedMessage,
-    ProcessMessageError<
-        <<S as StorageProvider>::Mls as openmls_traits::storage::StorageProvider<
-            { openmls_traits::storage::CURRENT_VERSION },
-        >>::Error,
-    >,
-> {
-    let unverified = mls_group.unprotect_message(provider, proto)?;
-    let mut updater = mls_group.app_data_dictionary_updater();
-    if let Some(committed_proposals) = unverified.committed_proposals() {
-        for proposal_or_ref in committed_proposals {
-            let validated = proposal_or_ref.clone().validate(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(provider),
-                mls_group.ciphersuite(),
-                ProtocolVersion::Mls10,
-            )?;
-            let proposal = match validated {
-                ProposalOrRef::Proposal(proposal) => proposal,
-                ProposalOrRef::Reference(reference) => mls_group
-                    .proposal_store()
-                    .proposals()
-                    .find(|p| p.proposal_reference_ref() == &*reference)
-                    .map(|p| Box::new(p.proposal().clone()))
-                    .ok_or(ProcessMessageError::FoundAppDataUpdateProposal)?,
-            };
-            if let Proposal::AppDataUpdate(update) = proposal.as_ref() {
-                match update.operation() {
-                    AppDataUpdateOperation::Update(data) => {
-                        crate::app_components::validate_app_component_update(&AppComponentData {
-                            component_id: update.component_id(),
-                            data: data.as_slice().to_vec(),
-                        })
-                        .map_err(|_| {
-                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
-                        })?;
-                        updater.set(ComponentData::from_parts(
-                            update.component_id(),
-                            data.clone(),
-                        ));
-                    }
-                    AppDataUpdateOperation::Remove => {
-                        crate::app_components::validate_app_component_remove(
-                            mls_group,
-                            update.component_id(),
-                        )
-                        .map_err(|_| {
-                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
-                        })?;
-                        updater.remove(&update.component_id());
-                    }
-                }
-            }
-        }
-    }
-    mls_group.process_unverified_message_with_app_data_updates(
-        provider,
-        unverified,
-        updater.changes(),
-    )
 }
 
 /// Snapshot the two avatar-bearing component byte blobs (avatar-url and
