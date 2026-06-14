@@ -6,6 +6,7 @@ use agent_control::AgentControlResponse;
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::AgentTextStreamFinishRequest;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::OpenBrokerTextPublisher;
 
@@ -258,12 +259,14 @@ impl AgentConnector {
         // online subscribers observe the cancellation) and shuts itself down.
         // The cancel signal is its own bounded channel that cannot be starved by
         // queued append/status/progress commands, so it always lands. Do NOT
-        // abort the task on a full *command* queue — only fall back to a forced
-        // abort if the dedicated cancel channel itself is gone (session not
-        // running), which is the only case where the session can no longer
-        // publish an Abort.
-        if session.cancel_tx.try_send(()).is_err() {
-            session.abort.abort();
+        // abort the task on a full *cancel* queue — a `Full` cancel channel means
+        // a cancel is already pending, so the session will still publish its
+        // Abort. Only fall back to a forced abort if the dedicated cancel channel
+        // itself is gone (session not running), the only case where the session
+        // can no longer publish an Abort.
+        match session.cancel_tx.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Closed(())) => session.abort.abort(),
         }
         Ok(AgentControlResponse::Ack)
     }

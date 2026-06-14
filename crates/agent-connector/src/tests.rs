@@ -898,6 +898,151 @@ fn allowlist_store_atomic_write_replaces_stale_temp_file() {
     );
 }
 
+#[test]
+fn allowlist_store_ignores_record_whose_account_id_does_not_match_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AllowlistStore::new(dir.path());
+    let requested_account_id_hex = format!("{:064x}", 1);
+    let other_account_id_hex = format!("{:064x}", 99);
+    let welcomer_account_id_hex = format!("{:064x}", 2);
+    std::fs::create_dir_all(&store.dir).unwrap();
+
+    // A well-formed record placed at account #1's path, but whose embedded
+    // `account_id_hex` claims to belong to account #99 (tampered/relocated file).
+    let forged = serde_json::to_vec(&AllowlistRecord {
+        account_id_hex: other_account_id_hex.clone(),
+        welcomer_account_ids_hex: vec![welcomer_account_id_hex.clone()],
+    })
+    .unwrap();
+    std::fs::write(store.record_path(&requested_account_id_hex), &forged).unwrap();
+
+    // The mismatched record must not be served as account #1's allowlist: its
+    // forged welcomer must not appear and the record reads back as empty.
+    let record = store.read_record(&requested_account_id_hex).unwrap();
+    assert_eq!(record.account_id_hex, requested_account_id_hex);
+    assert_eq!(record.welcomer_account_ids_hex, Vec::<String>::new());
+    assert_eq!(
+        store.list(&requested_account_id_hex).unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(
+        !store
+            .contains(&requested_account_id_hex, &welcomer_account_id_hex)
+            .unwrap()
+    );
+
+    // A subsequent write for account #1 must land at account #1's own path and
+    // leave account #99's file untouched (no redirected write).
+    store
+        .add(&requested_account_id_hex, &welcomer_account_id_hex)
+        .unwrap();
+    assert_eq!(
+        store
+            .read_record(&requested_account_id_hex)
+            .unwrap()
+            .welcomer_account_ids_hex,
+        vec![welcomer_account_id_hex]
+    );
+    assert!(!store.record_path(&other_account_id_hex).exists());
+}
+
+#[tokio::test]
+async fn stream_session_store_resolves_non_canonical_stream_id() {
+    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
+    use agent_stream_compose::StreamComposeCommand;
+    use cgka_traits::GroupId;
+    use std::time::Instant;
+
+    let store = StreamSessionStore::default();
+    // Sessions are always inserted under a lowercase-canonical hex key
+    // (`hex::encode`), as `stream_begin_response` does.
+    let canonical_stream_id_hex = "aabb".to_owned();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    store.insert(
+        canonical_stream_id_hex.clone(),
+        ActiveStreamSession {
+            account_label: "agent".to_owned(),
+            group_id: GroupId::new(vec![1]),
+            stream_id: vec![0xaa, 0xbb],
+            start_message_id_hex: "00".to_owned(),
+            tx,
+            cancel_tx,
+            abort: handle.abort_handle(),
+            last_activity: Instant::now(),
+        },
+    );
+
+    // A non-canonical (uppercase) but valid hex id must resolve the same session
+    // through both the lookup and the removal paths, because the store
+    // normalizes the query key before matching.
+    assert!(
+        store.get("AABB").is_ok(),
+        "uppercase stream id should resolve the canonically stored session"
+    );
+    assert!(
+        store.remove("AABB").is_ok(),
+        "uppercase stream id should remove the canonically stored session"
+    );
+    assert!(
+        store.get("aabb").is_err(),
+        "session should be gone after removal via the non-canonical id"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() {
+    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
+    use agent_stream_compose::StreamComposeCommand;
+    use cgka_traits::GroupId;
+    use std::time::{Duration, Instant};
+
+    let store = StreamSessionStore::default();
+    // Depth-1 cancel channel that we pre-fill so the sweeper's `try_send`
+    // observes `TrySendError::Full` rather than a closed channel. The receiver
+    // is kept alive (held in `_cancel_rx`) but never drained, modeling a session
+    // that already has a cancel pending.
+    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+    cancel_tx.try_send(()).expect("prime the cancel channel");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+    // A live task whose abort would set the AbortHandle's finished flag; if the
+    // sweeper force-aborts on `Full`, this task would be cancelled.
+    let handle = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+    });
+    let abort = handle.abort_handle();
+    store.insert(
+        "aa".to_owned(),
+        ActiveStreamSession {
+            account_label: "agent".to_owned(),
+            group_id: GroupId::new(vec![1]),
+            stream_id: vec![0xaa],
+            start_message_id_hex: "00".to_owned(),
+            tx,
+            cancel_tx,
+            abort,
+            last_activity: Instant::now() - Duration::from_secs(3600),
+        },
+    );
+
+    let swept = store.sweep_idle(Duration::from_secs(300));
+    assert_eq!(swept, 1, "the idle session is still swept from the store");
+
+    // A `Full` cancel channel means a cancel is already pending, so the sweeper
+    // must NOT force-abort the task — it is left to drain its cancel and emit a
+    // live `Abort`. Give the runtime a moment, then confirm the task was not
+    // cancelled out from under us.
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !handle.is_finished(),
+        "a Full cancel channel must not trigger a forced abort"
+    );
+    handle.abort();
+}
+
 #[tokio::test]
 async fn connector_policy_accepts_allowed_welcomer() {
     let agent_dir = tempfile::tempdir().unwrap();

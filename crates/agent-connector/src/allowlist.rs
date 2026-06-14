@@ -84,8 +84,21 @@ impl AllowlistStore {
     ) -> Result<AllowlistRecord, ConnectorError> {
         let path = self.record_path(account_id_hex);
         match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(record) => Ok(record),
+            Ok(bytes) => match serde_json::from_slice::<AllowlistRecord>(&bytes) {
+                Ok(record) if record.account_id_hex == account_id_hex => Ok(record),
+                Ok(_mismatched) => {
+                    tracing::warn!(
+                        target: "agent_connector",
+                        method = "allowlist_read_record",
+                        error_code = "mismatched_allowlist_record",
+                        "ignoring allowlist record whose account id does not match its path"
+                    );
+                    // The on-disk `account_id_hex` disagrees with the path it was read
+                    // from (tampered or relocated file). Treat it like a missing record:
+                    // never return it as this account's allowlist, so a forged id field
+                    // cannot redirect add/remove writes to a different account's file.
+                    Ok(Self::empty_record(account_id_hex))
+                }
                 Err(_err) => {
                     tracing::warn!(
                         target: "agent_connector",

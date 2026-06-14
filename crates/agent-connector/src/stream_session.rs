@@ -8,6 +8,7 @@ use agent_control::AgentControlDebugFinalSend;
 use agent_stream_compose::StreamComposeCommand;
 use cgka_traits::GroupId;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
@@ -62,8 +63,14 @@ impl StreamSessionStore {
             // session emit its live Abort and self-terminate. The cancel signal
             // can't be starved by a full command queue, so only force-abort if
             // the cancel channel itself is gone.
-            if previous.cancel_tx.try_send(()).is_err() {
-                previous.abort.abort();
+            match previous.cancel_tx.try_send(()) {
+                // Delivered, or a cancel is already queued (`Full`): the session
+                // will still observe a cancel and emit its `Abort`, so leave it
+                // to self-terminate gracefully.
+                Ok(()) | Err(TrySendError::Full(())) => {}
+                // The receiver is gone: the session can no longer publish an
+                // `Abort`, so force-abort the task to reclaim its resources.
+                Err(TrySendError::Closed(())) => previous.abort.abort(),
             }
         }
     }
@@ -115,8 +122,13 @@ impl StreamSessionStore {
                 // cancel channel is gone. The forced abort is intentionally NOT
                 // unconditional here: a successful cancel lets the session flush
                 // its Abort and shut itself down.
-                if session.cancel_tx.try_send(()).is_err() {
-                    session.abort.abort();
+                match session.cancel_tx.try_send(()) {
+                    // Delivered, or a cancel is already queued (`Full`): the
+                    // session will still drain a cancel and emit its `Abort`.
+                    Ok(()) | Err(TrySendError::Full(())) => {}
+                    // The receiver is gone, so no `Abort` can be published:
+                    // force-abort to release the held resources.
+                    Err(TrySendError::Closed(())) => session.abort.abort(),
                 }
             }
         }

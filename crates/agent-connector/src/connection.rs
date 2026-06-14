@@ -12,7 +12,7 @@ use crate::socket::current_effective_uid;
 use crate::validation::{auth_token_matches, unsupported_request_message};
 
 impl AgentConnector {
-    pub async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
+    pub(crate) async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
         let peer_uid = stream.peer_cred()?.uid();
         let peer_authorized_by_uid = peer_uid == current_effective_uid();
         let (read_half, mut write_half) = tokio::io::split(stream);
