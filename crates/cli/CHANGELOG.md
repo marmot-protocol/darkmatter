@@ -63,12 +63,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `dm stream receive`, unanchored `dm stream send`, and foreground `dm stream watch` now stay client-hosted when a
+  daemon socket is configured, and direct daemon Execute requests for those long-running stream commands return
+  `daemon_forbidden` instead of blocking `dmd`'s accept loop.
 - `dm messages list` now validates its pagination cursor flags instead of silently mishandling them. Previously,
   `--before-message-id`/`--after-message-id` were ignored unless the matching `--before`/`--after` timestamp was also
   supplied, and any lone cursor flag combined with `--limit` returned the oldest N messages instead of the newest.
   Supplying a message-id cursor without its timestamp (or vice versa), or combining `--before*` with `--after*`, now
   returns a clear error (`message_pagination_cursor_mismatch` / `message_pagination_conflicting_cursors`), matching the
   `dm messages timeline list` behavior.
+- Fixed TUI live message subscription gating so highlighted-chat navigation cannot append another chat's incoming
+  messages into the loaded conversation or count the visible chat as unread.
 - The TUI composer now accepts a leading `?` instead of swallowing it to toggle help. Previously, typing or pasting a
   message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
   impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
@@ -76,9 +81,30 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
   finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
   status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
+- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
+  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
+  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
+  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
+- `dm profile update` no longer wipes the rest of your published Nostr profile. It previously published a fresh kind-0
+  metadata event built only from the flags you passed, so e.g. `dm profile update --picture URL` erased
+  name/display_name/about/nip05/lud16, and `dm profile update` with no flags published an empty profile that wiped
+  everything. It now fetches your current published profile from the selected relay, overlays only the provided
+  fields, and publishes the merged result. A no-flags invocation is rejected with `empty_profile_update`, and when the
+  selected relay holds no current profile event the command refuses with `profile_update_inconclusive` (retry with a
+  `--relay` that has your current profile) instead of clobbering it.
+- `dmd` no longer exits when a single client connection is abrupt, empty, oversized, malformed, or stalled.
+  Per-connection read failures (a client that closes before sending, a mid-write interrupt, a request over the 1 MiB
+  cap, or invalid JSON) are now reported to that client and skipped like authorization failures, instead of propagating
+  out of the accept loop and killing the daemon (which left a stale socket and pid file). The accept loop also bounds
+  how long it waits for a client to send its request frame, so a same-UID client that connects but never sends data can
+  no longer wedge the loop and starve other clients. `dm` rejects oversized requests client-side before sending — even
+  on the default implicit daemon socket — so e.g. `dm messages send` with a body over the limit fails locally with a
+  clear size-limit error instead of silently falling back to local execution or reaching the daemon.
 
 ### Security
 
+- Redacted TUI `/login` `nsec` composer input when users type leading whitespace, repeated whitespace, or tabs before
+  submitting the import.
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
   peers, bounding request size, and refusing `reset`/`logout` execution through the daemon socket.
 - Encrypted-media uploads and downloads no longer act on loopback-HTTP blob endpoints (e.g. `http://127.0.0.1:PORT`)
@@ -151,13 +177,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   product flows require relay-backed setup.
 - Moved the CLI crate source directory from `crates/dm` to `crates/cli`. The Cargo package remains
   `darkmatter-cli`, and the installed binaries remain `dm` and `dmd`.
-
-### Fixed
-
-- TUI stream compose now pins the live preview to the group the stream was opened on instead of the
-  currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
-  (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
-  text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
 
 ## [0.1.0] - 2026-05-17
 

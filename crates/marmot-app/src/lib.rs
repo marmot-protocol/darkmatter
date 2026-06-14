@@ -1392,8 +1392,16 @@ impl MarmotApp {
     pub fn with_relays_and_config(
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
-        config: MarmotAppConfig,
+        mut config: MarmotAppConfig,
     ) -> Self {
+        // These relay-only constructors are dev/test entry points (production
+        // opens through `with_relays_and_account_home*`). Default them to instant
+        // convergence settlement so multi-client tests are deterministic and do
+        // not wait on the pinned 1000 ms quiescence window; a caller may still
+        // set an explicit value.
+        if config.dev_settlement_quiescence_ms.is_none() {
+            config.dev_settlement_quiescence_ms = Some(0);
+        }
         let root = root.as_ref().to_path_buf();
         Self {
             account_home: AccountHome::open(&root),
@@ -1872,6 +1880,43 @@ impl MarmotApp {
         status.refresh();
         self.remember_directory_relay_lists(&account_id_hex, &status)?;
         Ok(Some(status))
+    }
+
+    /// Fetch the account's own current published kind:0 profile metadata from
+    /// the selected relays.
+    ///
+    /// kind:0 is a replaceable event, so a fresh publish overwrites the prior
+    /// one entirely. Callers that perform partial updates (CLI `profile
+    /// update`) must read the current value here and overlay only the fields
+    /// they intend to change, otherwise unset fields are silently wiped. The
+    /// shape mirrors [`Self::fetch_current_account_relay_list_status_for_account_id`]:
+    /// returns `Ok(None)` when the selected relays hold no fresh profile event
+    /// for the account so the caller can refuse to clobber an unconfirmed
+    /// remote state instead of publishing a partial replacement. The fetched
+    /// profile is cached in the local directory on success.
+    pub async fn fetch_current_user_profile_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<UserProfileMetadata>, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let source_relays = self.directory_source_relays(&bootstrap_relays);
+        let records = self
+            .fetch_events_for_account_ids(
+                std::slice::from_ref(&account_id_hex),
+                KIND_NOSTR_METADATA,
+                &source_relays,
+            )
+            .await?;
+        let profiles =
+            latest_fresh_profiles_from_records(records, self.directory_freshness()).value;
+        let Some(profile) = profiles.get(&account_id_hex).cloned() else {
+            return Ok(None);
+        };
+        self.remember_directory_profile(&account_id_hex, &profile)?;
+        Ok(Some(profile))
     }
 
     pub async fn fetch_latest_key_package_for_account_id(
@@ -2773,11 +2818,16 @@ impl MarmotApp {
             keys: keys.clone(),
         }))
         .feature_registry(app_feature_registry())
-        .supported_app_components(self.supported_app_component_ids())
-        .convergence_policy(CanonicalizationPolicy {
-            settlement_quiescence_ms: 0,
-            ..CanonicalizationPolicy::default()
-        });
+        .supported_app_components(self.supported_app_component_ids());
+        // Production uses the protocol-pinned convergence policy (SessionConfig's
+        // default). Only a dev/test override changes it — never shipped (see
+        // spec/implementation-model.md, "Convergence Policy Overrides").
+        if let Some(ms) = self.config.dev_settlement_quiescence_ms {
+            session_config = session_config.convergence_policy(CanonicalizationPolicy {
+                settlement_quiescence_ms: ms,
+                ..CanonicalizationPolicy::default()
+            });
+        }
         let audit_log_enabled = match self.audit_log_settings() {
             Ok(settings) => settings.enabled,
             Err(e) => {
@@ -5104,11 +5154,33 @@ fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {
     Ok(trimmed.to_owned())
 }
 
+/// Per spec/transports/nostr.md, each KeyPackage id-list tag is exactly one
+/// tag. A consumer MUST reject an event that repeats an id-list tag name rather
+/// than silently reading the first occurrence (two consumers could otherwise
+/// pick different occurrences and disagree on advertised capabilities).
+fn reject_duplicate_key_package_tag(
+    event: &NostrTransportEvent,
+    name: &str,
+) -> Result<(), AppError> {
+    let count = event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+        .count();
+    if count > 1 {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "duplicate {name} tag"
+        )));
+    }
+    Ok(())
+}
+
 fn require_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
     predicate: impl FnOnce(&str) -> bool,
 ) -> Result<(), AppError> {
+    reject_duplicate_key_package_tag(event, name)?;
     match event.tag_value(name) {
         Some(value) if predicate(value) => Ok(()),
         Some(value) => Err(AppError::InvalidKeyPackageEvent(format!(
@@ -5124,6 +5196,7 @@ fn require_multi_value_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
 ) -> Result<(), AppError> {
+    reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
         .tags
         .iter()
@@ -5147,6 +5220,7 @@ fn require_multi_value_key_package_tag_contains(
     name: &str,
     required: &str,
 ) -> Result<(), AppError> {
+    reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
         .tags
         .iter()
@@ -5762,6 +5836,37 @@ mod tests {
                 subscription_id: None,
             },
         }
+    }
+
+    #[test]
+    fn key_package_id_list_tag_must_be_exactly_one() {
+        let make = |tags: Vec<Vec<String>>| NostrTransportEvent {
+            id: "00".repeat(32),
+            pubkey: "11".repeat(32),
+            created_at: 1,
+            kind: 30443,
+            tags,
+            content: String::new(),
+            sig: None,
+        };
+        // A single id-list tag is accepted.
+        let one = make(vec![vec!["mls_extensions".into(), "0x0006".into()]]);
+        assert!(require_multi_value_key_package_tag(&one, "mls_extensions").is_ok());
+        // Two tags with the same id-list name MUST be rejected, not first-match read.
+        let two = make(vec![
+            vec!["mls_extensions".into(), "0x0006".into()],
+            vec!["mls_extensions".into(), "0xf2f1".into()],
+        ]);
+        assert!(require_multi_value_key_package_tag(&two, "mls_extensions").is_err());
+        assert!(
+            require_multi_value_key_package_tag_contains(&two, "mls_extensions", "0x0006").is_err()
+        );
+        // The single-value consumer (mls_ciphersuite) also rejects a duplicate.
+        let two_cs = make(vec![
+            vec!["mls_ciphersuite".into(), "0x0001".into()],
+            vec!["mls_ciphersuite".into(), "0x0002".into()],
+        ]);
+        assert!(require_key_package_tag(&two_cs, "mls_ciphersuite", |_| true).is_err());
     }
 
     #[test]

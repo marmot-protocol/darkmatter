@@ -69,9 +69,14 @@ pub(crate) fn app_data_dictionary_extension_for_group(
         );
     }
     if required.contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) {
+        // The spec's "absent image" encoding is five empty var-bytes fields
+        // (group-blossom-image-v1.md), not zero bytes. `encode_component_vectors(&[])`
+        // yields an empty Vec, which `validate_group_image` rejects (its first
+        // `decode_var_bytes` fails on an empty cursor). Write the canonical
+        // five-empty-fields absent state so the created GroupContext validates.
         dict.insert(
             GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-            encode_component_vectors(&[]),
+            encode_component_vectors(&[&[], &[], &[], &[], &[]]),
         );
     }
     if required.contains(GROUP_ADMIN_POLICY_COMPONENT_ID) {
@@ -196,6 +201,112 @@ pub(crate) fn require_admin_for_staged_commit(
         });
     };
     require_admin(mls_group, group_id, sender)
+}
+
+fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
+    let basic = BasicCredential::try_from(cred).ok()?;
+    <[u8; 32]>::try_from(basic.identity()).ok()
+}
+
+/// Enforce the admin-policy resulting-epoch invariant
+/// (spec/app-components/admin-policy-v1.md): in the resulting epoch every admin
+/// key MUST correspond to an account with at least one member leaf. A commit
+/// that removes an account's last member leaf without dropping that account from
+/// `admins` (or otherwise leaves an admin with no leaf) is invalid.
+///
+/// Validated PRE-merge from the staged commit's resulting GroupContext and its
+/// membership changes: no transaction wraps `merge_staged_commit`, so a
+/// post-merge rejection could not be rolled back.
+pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    staged: &StagedCommit,
+) -> Result<(), EngineError> {
+    // Resulting admins come from the staged (provisional) app_data_dictionary, so
+    // an admin-policy update in this same commit is already reflected.
+    let Some(dict) = staged.group_context().extensions().app_data_dictionary() else {
+        return Ok(());
+    };
+    let Some(admin_bytes) = dict.dictionary().get(&GROUP_ADMIN_POLICY_COMPONENT_ID) else {
+        return Ok(());
+    };
+    let resulting_admins = decode_admin_policy(admin_bytes)?;
+    if resulting_admins.is_empty() {
+        return Ok(());
+    }
+
+    // Leaves this commit removes: by-reference Remove proposals plus SelfRemove.
+    let mut removed_leaves: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for remove in staged.remove_proposals() {
+        removed_leaves.insert(remove.remove_proposal().removed().u32());
+    }
+    for queued in staged.queued_proposals() {
+        if matches!(queued.proposal(), Proposal::SelfRemove)
+            && let Sender::Member(leaf) = queued.sender()
+        {
+            removed_leaves.insert(leaf.u32());
+        }
+    }
+
+    // Resulting member accounts: an account remains a member if ANY of its leaves
+    // survives (multi-device), so collect surviving current leaves plus added
+    // leaves by account.
+    let mut accounts: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for member in mls_group.members() {
+        if removed_leaves.contains(&member.index.u32()) {
+            continue;
+        }
+        if let Some(pk) = credential_account_pubkey(member.credential) {
+            accounts.insert(pk);
+        }
+    }
+    for add in staged.add_proposals() {
+        if let Some(pk) = credential_account_pubkey(
+            add.add_proposal()
+                .key_package()
+                .leaf_node()
+                .credential()
+                .clone(),
+        ) {
+            accounts.insert(pk);
+        }
+    }
+
+    if resulting_admins
+        .iter()
+        .any(|admin| !accounts.contains(admin))
+    {
+        return Err(EngineError::Other(format!(
+            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch (group {group_id:?})"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an admin set that lists an admin with no member leaf in the CURRENT
+/// epoch (admin-policy-v1.md). Used on the outbound `UpdateAppComponents` path,
+/// where the commit changes only component bytes and not membership, so the
+/// resulting member set equals the current one.
+pub(crate) fn reject_admins_without_member_leaf(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    admins: &[[u8; 32]],
+) -> Result<(), EngineError> {
+    if admins.is_empty() {
+        return Ok(());
+    }
+    let mut accounts: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for member in mls_group.members() {
+        if let Some(pk) = credential_account_pubkey(member.credential) {
+            accounts.insert(pk);
+        }
+    }
+    if admins.iter().any(|admin| !accounts.contains(admin)) {
+        return Err(EngineError::Other(format!(
+            "admin-policy update is invalid: an admin key has no member leaf (group {group_id:?})"
+        )));
+    }
+    Ok(())
 }
 
 fn reject_admin_self_remove_proposals(
@@ -575,4 +686,74 @@ fn decode_var_bytes(
     let bytes = cursor[prefix_len..end].to_vec();
     *cursor = &cursor[end..];
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the group-creation `app_data_dictionary` for `required` with no
+    /// initial component bytes, then assert that every entry the engine writes
+    /// passes the engine's own `validate_app_component_update`. Regression for
+    /// darkmatter#174: the engine wrote zero bytes for a required blossom-image
+    /// at creation, which its own `validate_group_image` rejects.
+    fn assert_creation_state_self_validates(required: AppComponentSet) {
+        let initial = InitialComponentState {
+            name: "name".to_string(),
+            description: "desc".to_string(),
+            admins: vec![[7u8; 32]],
+            app_components: Vec::new(),
+        };
+        let ext = app_data_dictionary_extension_for_group(&required, &initial)
+            .expect("creation dictionary should build");
+        let Extension::AppDataDictionary(ext) = ext else {
+            panic!("expected an AppDataDictionary extension");
+        };
+        for entry in ext.dictionary().entries() {
+            // `app_components` itself is the negotiated id list, validated via
+            // the update path's APP_COMPONENTS_COMPONENT_ID arm — include it.
+            let component = AppComponentData {
+                component_id: entry.id(),
+                data: entry.data().to_vec(),
+            };
+            let component_id = component.component_id;
+            validate_app_component_update(&component).unwrap_or_else(|e| {
+                panic!(
+                    "engine wrote component {component_id:#06x} at creation that its own \
+                     validator rejects: {e:?}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn group_creation_blossom_image_state_self_validates() {
+        let mut ids = BTreeSet::new();
+        ids.insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        assert_creation_state_self_validates(AppComponentSet::from(ids));
+    }
+
+    #[test]
+    fn group_creation_full_required_set_self_validates() {
+        let ids: BTreeSet<AppComponentId> = [
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+        ]
+        .into_iter()
+        .collect();
+        assert_creation_state_self_validates(AppComponentSet::from(ids));
+    }
+
+    #[test]
+    fn absent_blossom_image_is_five_empty_fields() {
+        // The canonical absent encoding is five zero-length var-bytes fields:
+        // 5 bytes of 0x00, not an empty Vec.
+        let absent = encode_component_vectors(&[&[], &[], &[], &[], &[]]);
+        assert_eq!(absent, vec![0u8; 5]);
+        // It must round-trip through the image validator as "absent".
+        validate_group_image(&absent).expect("five-empty-fields is the absent state");
+        // The previous (buggy) zero-byte encoding must NOT validate.
+        assert!(validate_group_image(&[]).is_err());
+    }
 }

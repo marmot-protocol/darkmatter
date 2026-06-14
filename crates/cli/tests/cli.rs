@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::transport_adapter::TransportEndpoint;
 use marmot_account::AccountHome;
-use marmot_app::{AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp};
+use marmot_app::{
+    AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
+};
 use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
@@ -250,6 +252,9 @@ fn dm(home: &std::path::Path) -> Command {
     // CLI tests exercise encrypted media against a loopback Blossom server,
     // which is the dev/test scenario the loopback-HTTP gate is for.
     command.env("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
+    // Instant convergence settlement so multi-client tests do not wait on the
+    // pinned 1000 ms quiescence window (dev/test only).
+    command.env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
     command
 }
 
@@ -827,6 +832,22 @@ fn fetch_remote_relay_status(
         ))
         .expect("fetch relay status")
         .expect("current relay status")
+}
+
+fn fetch_remote_profile(
+    home: &std::path::Path,
+    account_id: &str,
+    relay: &str,
+) -> UserProfileMetadata {
+    let app = MarmotApp::with_relay(home, relay.to_owned());
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    runtime
+        .block_on(app.fetch_current_user_profile_for_account_id(
+            account_id,
+            vec![TransportEndpoint(relay.to_owned())],
+        ))
+        .expect("fetch profile")
+        .expect("current profile")
 }
 
 fn assert_string_list(mut actual: Vec<String>, expected: &[&str]) {
@@ -2272,6 +2293,117 @@ fn relays_add_refuses_when_selected_relay_has_no_current_list_event() {
 }
 
 #[test]
+fn profile_update_merges_provided_flags_with_current_published_profile() {
+    let relay = TestRelay::new();
+    let home = tempfile::tempdir().expect("tempdir");
+
+    // Account creation with a fresh key publishes a default pseudonym profile
+    // (name + display_name). A partial `profile update` must preserve those
+    // fields while setting only the flag the caller passed.
+    let created = create_account_with_relays(home.path(), relay.url(), relay.url());
+    let account = created["account_id"]
+        .as_str()
+        .expect("created account id")
+        .to_owned();
+    let original_name = created["profile"]["name"]
+        .as_str()
+        .expect("seeded profile name")
+        .to_owned();
+    let original_display_name = created["profile"]["display_name"]
+        .as_str()
+        .expect("seeded display name")
+        .to_owned();
+
+    let updated = run_json_with_relay(
+        home.path(),
+        relay.url(),
+        &["profile", "update", "--about", "hello world"],
+    );
+    assert_eq!(updated["profile"]["about"], "hello world");
+    assert_eq!(updated["profile"]["name"], original_name);
+    assert_eq!(updated["profile"]["display_name"], original_display_name);
+
+    // The merged result is what actually lands on the relay, not a profile
+    // containing only the --about field.
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    let persisted = fetch_remote_profile(verify_home.path(), &account, relay.url());
+    assert_eq!(persisted.about.as_deref(), Some("hello world"));
+    assert_eq!(persisted.name.as_deref(), Some(original_name.as_str()));
+    assert_eq!(
+        persisted.display_name.as_deref(),
+        Some(original_display_name.as_str())
+    );
+}
+
+#[test]
+fn profile_update_rejects_when_no_field_flags_are_provided() {
+    let relay = TestRelay::new();
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let created = create_account_with_relays(home.path(), relay.url(), relay.url());
+    let account = created["account_id"]
+        .as_str()
+        .expect("created account id")
+        .to_owned();
+    let original_name = created["profile"]["name"]
+        .as_str()
+        .expect("seeded profile name")
+        .to_owned();
+
+    // A no-flags `profile update` would otherwise publish an empty {} and wipe
+    // the profile. It must be rejected without publishing anything.
+    let error = run_json_error_with_relay(home.path(), relay.url(), &["profile", "update"]);
+    assert_eq!(error["code"], "empty_profile_update");
+
+    // The published profile is untouched.
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    let persisted = fetch_remote_profile(verify_home.path(), &account, relay.url());
+    assert_eq!(persisted.name.as_deref(), Some(original_name.as_str()));
+}
+
+#[test]
+fn profile_update_refuses_when_selected_relay_has_no_current_profile() {
+    let seed_relay = TestRelay::new();
+    let empty_relay = TestRelay::new();
+    let home = tempfile::tempdir().expect("tempdir");
+
+    // The default profile is published to seed_relay during account creation.
+    let created = create_account_with_relays(home.path(), seed_relay.url(), seed_relay.url());
+    let account = created["account_id"]
+        .as_str()
+        .expect("created account id")
+        .to_owned();
+    let original_name = created["profile"]["name"]
+        .as_str()
+        .expect("seeded profile name")
+        .to_owned();
+
+    // Updating against a relay that has no current profile event must refuse
+    // rather than clobber the profile with a partial replacement.
+    let error = run_json_error_with_relay(
+        home.path(),
+        empty_relay.url(),
+        &["profile", "update", "--about", "from empty relay"],
+    );
+    assert_eq!(error["code"], "profile_update_inconclusive");
+
+    // Retrying against the relay that holds the current profile succeeds and
+    // merges correctly.
+    let safe_update = run_json_with_relay(
+        home.path(),
+        seed_relay.url(),
+        &["profile", "update", "--about", "from seed relay"],
+    );
+    assert_eq!(safe_update["profile"]["about"], "from seed relay");
+    assert_eq!(safe_update["profile"]["name"], original_name);
+
+    let verify_home = tempfile::tempdir().expect("verify tempdir");
+    let persisted = fetch_remote_profile(verify_home.path(), &account, seed_relay.url());
+    assert_eq!(persisted.about.as_deref(), Some("from seed relay"));
+    assert_eq!(persisted.name.as_deref(), Some(original_name.as_str()));
+}
+
+#[test]
 fn account_import_requires_explicit_repair_before_publishing_missing_relay_lists() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = TestRelay::new();
@@ -2934,6 +3066,9 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3044,6 +3179,9 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3193,6 +3331,9 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3375,6 +3516,9 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3934,6 +4078,9 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3997,6 +4144,9 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

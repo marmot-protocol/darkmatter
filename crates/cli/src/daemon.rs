@@ -29,9 +29,60 @@ use crate::{
 };
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
+const MESSAGE_SUBSCRIPTION_DEDUP_LIMIT: usize = DAEMON_EVENT_REPLAY_LIMIT;
 const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
+/// Upper bound on how long the single accept loop will wait for an authorized
+/// client to send its newline-terminated request frame. A same-UID client that
+/// connects and then stalls (never writing a newline) must not wedge the loop
+/// and starve every other client of `Status`/`Ping`/etc. On timeout the read is
+/// treated like any other per-connection failure: report and `continue`.
+const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
+
+#[derive(Debug)]
+struct BoundedMessageSubscriptionIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    limit: usize,
+}
+
+impl BoundedMessageSubscriptionIds {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            limit,
+        }
+    }
+
+    fn insert(&mut self, id: String) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        if !self.ids.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.ids.len() > self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.ids.remove(&oldest);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonClientError {
@@ -46,6 +97,8 @@ pub enum DaemonClientError {
     Json(#[from] serde_json::Error),
     #[error("daemon closed the connection without responding")]
     EmptyResponse,
+    #[error("daemon request is {size} bytes, exceeding the {limit} byte limit")]
+    RequestTooLarge { size: usize, limit: usize },
 }
 
 #[derive(Parser, Debug)]
@@ -633,7 +686,28 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
             .await;
             continue;
         }
-        let request = read_daemon_request(&mut stream).await?;
+        let request =
+            match read_daemon_request_within(&mut stream, DAEMON_REQUEST_READ_TIMEOUT).await {
+                Ok(request) => request,
+                Err(err) => {
+                    // A single bad/abrupt/oversized/malformed/stalled connection
+                    // must not take down the whole daemon or wedge the accept loop.
+                    // Mirror the authz-failure path above: report the error to this
+                    // client and keep serving. The bounded read timeout also stops
+                    // a same-UID client that connects but never sends a request
+                    // frame from blocking every other client indefinitely.
+                    write_daemon_output(
+                        &mut stream,
+                        &CliOutput {
+                            code: 1,
+                            stdout: String::new(),
+                            stderr: format!("error: {err}\n"),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+            };
         match request {
             DaemonRequest::MessagesSubscribe { mut cli } => {
                 apply_defaults(&mut cli, &defaults);
@@ -943,6 +1017,7 @@ fn blocked_daemon_execute_command(
             "logout",
             "it removes a local account; run dm logout directly without --socket",
         )),
+        crate::Command::Stream { command } => crate::client_hosted_stream_command(command),
         _ => None,
     }
 }
@@ -982,6 +1057,26 @@ async fn read_daemon_request(
         request.push(byte[0]);
     }
     Ok(serde_json::from_slice(&request)?)
+}
+
+/// Read a daemon request frame, but give up after `timeout` if the client
+/// connects without ever sending a complete newline-terminated frame. This
+/// keeps the single accept loop responsive: a stalled (or slow-loris) same-UID
+/// client cannot wedge the loop and starve other clients. A timeout surfaces as
+/// an `io::Error` of kind `TimedOut`, which the accept loop treats like any
+/// other per-connection read failure.
+async fn read_daemon_request_within(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<DaemonRequest, Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::time::timeout(timeout, read_daemon_request(stream)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "daemon client did not send a request within the read timeout",
+        )
+        .into()),
+    }
 }
 
 async fn handle_messages_subscription(
@@ -1036,8 +1131,10 @@ async fn handle_messages_subscription(
             return Ok(());
         }
     };
-    let mut seen_messages = HashSet::new();
-    let mut seen_stream_previews = HashSet::new();
+    let mut seen_messages =
+        BoundedMessageSubscriptionIds::with_limit(MESSAGE_SUBSCRIPTION_DEDUP_LIMIT);
+    let mut seen_stream_previews =
+        BoundedMessageSubscriptionIds::with_limit(MESSAGE_SUBSCRIPTION_DEDUP_LIMIT);
     let mut event_rx = events.subscribe_messages();
     let mut stream_rx = stream_manager.subscribe();
     if !write_stream_response(
@@ -1368,8 +1465,8 @@ async fn write_message_subscription_event(
     response: DaemonStreamResponse,
     group_id: Option<&str>,
     account_id: &str,
-    seen_messages: &mut HashSet<String>,
-    seen_stream_previews: &mut HashSet<String>,
+    seen_messages: &mut BoundedMessageSubscriptionIds,
+    seen_stream_previews: &mut BoundedMessageSubscriptionIds,
 ) -> bool {
     if !stream_response_matches_subscription(&response, group_id, account_id) {
         return true;
@@ -1864,8 +1961,8 @@ fn value_matches_group_and_account(
 
 fn mark_stream_response_seen(
     response: &DaemonStreamResponse,
-    seen_messages: &mut HashSet<String>,
-    seen_stream_previews: &mut HashSet<String>,
+    seen_messages: &mut BoundedMessageSubscriptionIds,
+    seen_stream_previews: &mut BoundedMessageSubscriptionIds,
 ) -> bool {
     let Some(result) = &response.result else {
         return true;
@@ -3534,10 +3631,31 @@ fn daemon_error(json: bool, code: &str, message: String) -> CliOutput {
     }
 }
 
+/// Encode a daemon request as a newline-terminated JSON frame, rejecting
+/// payloads that exceed the daemon's per-request size limit before they hit
+/// the wire. The daemon enforces the same cap on read (see
+/// `read_daemon_request` / `MAX_DAEMON_REQUEST_BYTES`); checking client-side
+/// turns an oversized request (e.g. `messages send` with a huge body) into a
+/// clear local error instead of a connection the daemon must reject.
+fn encode_daemon_request(request: &DaemonRequest) -> Result<Vec<u8>, DaemonClientError> {
+    let mut bytes = serde_json::to_vec(request)?;
+    // The daemon reads up to and excluding the trailing newline, so compare the
+    // JSON payload length (without the framing newline) against the limit.
+    if bytes.len() > MAX_DAEMON_REQUEST_BYTES {
+        return Err(DaemonClientError::RequestTooLarge {
+            size: bytes.len(),
+            limit: MAX_DAEMON_REQUEST_BYTES,
+        });
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 async fn send_request(
     socket: &Path,
     request: &DaemonRequest,
 ) -> Result<CliOutput, DaemonClientError> {
+    let bytes = encode_daemon_request(request)?;
     let mut stream =
         UnixStream::connect(socket)
             .await
@@ -3545,8 +3663,6 @@ async fn send_request(
                 socket: socket.to_owned(),
                 source,
             })?;
-    let mut bytes = serde_json::to_vec(request)?;
-    bytes.push(b'\n');
     stream.write_all(&bytes).await?;
     stream.shutdown().await?;
 
@@ -3563,6 +3679,7 @@ async fn stream_request(
     request: &DaemonRequest,
     json_output: bool,
 ) -> Result<CliOutput, DaemonClientError> {
+    let bytes = encode_daemon_request(request)?;
     let mut stream =
         UnixStream::connect(socket)
             .await
@@ -3570,8 +3687,6 @@ async fn stream_request(
                 socket: socket.to_owned(),
                 source,
             })?;
-    let mut bytes = serde_json::to_vec(request)?;
-    bytes.push(b'\n');
     stream.write_all(&bytes).await?;
 
     let mut reader = BufReader::new(stream);
@@ -4297,6 +4412,61 @@ mod tests {
         assert_eq!(logout_json["error"]["command"], "logout");
     }
 
+    #[test]
+    fn long_running_stream_execute_commands_are_refused_over_daemon() {
+        let receive = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
+            command: crate::StreamCommand::Receive {
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
+                start_event_id: None,
+            },
+        }))
+        .expect("stream receive should be blocked");
+        let receive_json: serde_json::Value =
+            serde_json::from_str(receive.stdout.trim()).expect("receive error JSON");
+        assert_eq!(receive.code, 1);
+        assert_eq!(receive_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(receive_json["error"]["command"], "stream receive");
+
+        let unanchored_send =
+            blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
+                command: crate::StreamCommand::Send {
+                    broker: false,
+                    connect: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
+                    server_name: "localhost".to_owned(),
+                    server_cert_der_hex: None,
+                    insecure_local: true,
+                    stream_id: None,
+                    start_event_id: None,
+                    chunk_bytes: 1024,
+                    chunk_delay_ms: 0,
+                    text: vec!["hello".to_owned()],
+                },
+            }))
+            .expect("unanchored stream send should be blocked");
+        let unanchored_send_json: serde_json::Value =
+            serde_json::from_str(unanchored_send.stdout.trim()).expect("send error JSON");
+        assert_eq!(unanchored_send.code, 1);
+        assert_eq!(unanchored_send_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(unanchored_send_json["error"]["command"], "stream send");
+
+        let foreground_watch =
+            blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
+                command: crate::StreamCommand::Watch {
+                    group: "aa".repeat(32),
+                    stream_id: None,
+                    server_cert_der_hex: None,
+                    insecure_local: true,
+                    background: false,
+                },
+            }))
+            .expect("foreground stream watch should be blocked");
+        let foreground_watch_json: serde_json::Value =
+            serde_json::from_str(foreground_watch.stdout.trim()).expect("watch error JSON");
+        assert_eq!(foreground_watch.code, 1);
+        assert_eq!(foreground_watch_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(foreground_watch_json["error"]["command"], "stream watch");
+    }
+
     #[tokio::test]
     async fn daemon_peer_authorization_accepts_current_uid() {
         let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
@@ -4337,6 +4507,86 @@ mod tests {
             "unexpected error: {err}"
         );
         writer.await.expect("writer task");
+    }
+
+    #[tokio::test]
+    async fn daemon_request_reader_times_out_on_stalled_client() {
+        // A same-UID client that connects but never sends a newline-terminated
+        // frame must not wedge the accept loop. The bounded read returns a
+        // TimedOut error so the loop reports and continues instead of blocking
+        // every other client indefinitely (regression for #190).
+        let (mut server, _client) = UnixStream::pair().expect("unix stream pair");
+
+        let err = read_daemon_request_within(&mut server, Duration::from_millis(50))
+            .await
+            .expect_err("stalled client should time out");
+
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("timeout should surface as an io::Error");
+        assert_eq!(
+            io_err.kind(),
+            ErrorKind::TimedOut,
+            "unexpected error kind: {io_err:?}"
+        );
+        // `_client` is held open for the duration: the timeout fires precisely
+        // because the peer is connected but silent.
+    }
+
+    #[tokio::test]
+    async fn daemon_request_reader_within_returns_request_before_timeout() {
+        let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
+        let writer = tokio::spawn(async move {
+            let request = DaemonRequest::Ping;
+            let bytes = encode_daemon_request(&request).expect("encode ping");
+            client.write_all(&bytes).await.expect("write ping request");
+            client.shutdown().await.expect("shutdown client");
+        });
+
+        let request = read_daemon_request_within(&mut server, Duration::from_secs(5))
+            .await
+            .expect("a prompt request should be read before the timeout");
+        assert!(
+            matches!(request, DaemonRequest::Ping),
+            "unexpected request variant"
+        );
+        writer.await.expect("writer task");
+    }
+
+    #[test]
+    fn encode_daemon_request_rejects_oversized_payloads() {
+        // Build an Execute request whose serialized form exceeds the limit by
+        // stuffing a huge relay string into the Cli. This mirrors the real
+        // benign trigger: `messages send` with a body over ~1 MiB.
+        let huge = "a".repeat(MAX_DAEMON_REQUEST_BYTES + 1);
+        let mut cli = daemon_test_cli(crate::Command::Whoami);
+        cli.relay = Some(huge);
+        let request = DaemonRequest::Execute { cli: Box::new(cli) };
+
+        let err = encode_daemon_request(&request)
+            .expect_err("oversized request should be rejected before sending");
+
+        match err {
+            DaemonClientError::RequestTooLarge { size, limit } => {
+                assert_eq!(limit, MAX_DAEMON_REQUEST_BYTES);
+                assert!(
+                    size > MAX_DAEMON_REQUEST_BYTES,
+                    "reported size {size} should exceed the limit"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn encode_daemon_request_accepts_normal_payloads() {
+        let request = DaemonRequest::Status;
+        let bytes = encode_daemon_request(&request).expect("status request should encode");
+        assert!(
+            bytes.ends_with(b"\n"),
+            "encoded request must be newline-terminated"
+        );
+        assert!(bytes.len() <= MAX_DAEMON_REQUEST_BYTES + 1);
     }
 
     fn daemon_test_cli(command: crate::Command) -> Cli {
@@ -4476,6 +4726,68 @@ mod tests {
             None,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+    }
+
+    #[test]
+    fn message_subscription_seen_message_ids_are_bounded_to_recent_ids() {
+        let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
+        let mut seen_stream_previews = BoundedMessageSubscriptionIds::with_limit(3);
+
+        for index in 0..5 {
+            let response = DaemonStreamResponse::ok(serde_json::json!({
+                "type": "message",
+                "message": { "message_id": format!("message-{index}") }
+            }));
+            assert!(mark_stream_response_seen(
+                &response,
+                &mut seen_messages,
+                &mut seen_stream_previews
+            ));
+        }
+
+        assert_eq!(seen_messages.len(), 3);
+        assert!(!seen_messages.contains("message-0"));
+        assert!(!seen_messages.contains("message-1"));
+        assert!(seen_messages.contains("message-2"));
+        assert!(seen_messages.contains("message-4"));
+
+        let duplicate = DaemonStreamResponse::ok(serde_json::json!({
+            "type": "message",
+            "message": { "message_id": "message-2" }
+        }));
+        assert!(!mark_stream_response_seen(
+            &duplicate,
+            &mut seen_messages,
+            &mut seen_stream_previews
+        ));
+    }
+
+    #[test]
+    fn message_subscription_seen_stream_previews_are_bounded_to_recent_ids() {
+        let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
+        let mut seen_stream_previews = BoundedMessageSubscriptionIds::with_limit(3);
+
+        for index in 0..5 {
+            let response = DaemonStreamResponse::ok(serde_json::json!({
+                "type": "stream_preview",
+                "stream_preview": {
+                    "watch_id": format!("watch-{index}"),
+                    "status": "running",
+                    "text": format!("chunk-{index}")
+                }
+            }));
+            assert!(mark_stream_response_seen(
+                &response,
+                &mut seen_messages,
+                &mut seen_stream_previews
+            ));
+        }
+
+        assert_eq!(seen_stream_previews.len(), 3);
+        assert!(!seen_stream_previews.contains("watch-0:running:chunk-0::"));
+        assert!(!seen_stream_previews.contains("watch-1:running:chunk-1::"));
+        assert!(seen_stream_previews.contains("watch-2:running:chunk-2::"));
+        assert!(seen_stream_previews.contains("watch-4:running:chunk-4::"));
     }
 
     #[test]
