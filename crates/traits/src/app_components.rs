@@ -608,9 +608,15 @@ pub fn validate_and_normalize_blob_endpoint_url(
     if url.fragment().is_some() {
         return Err("encrypted media endpoint URL must not include a fragment".into());
     }
-    if url.query().is_some() {
-        return Err("encrypted media endpoint URL must not include a query".into());
-    }
+    // A query string is NOT an invalidity per group-encrypted-media-v1.md
+    // (its invalidity list names userinfo, fragments, and missing hosts only),
+    // and WHATWG parse+serialize preserves queries. Rejecting a query-bearing
+    // endpoint here is an undocumented extra MUST that the sibling avatar
+    // validator does not impose, so a spec-conformant peer producing
+    // `https://blossom.example/?x=1` would have its commit accepted by
+    // spec-literal clients and rejected here, forking commit acceptance.
+    // The canonicalization check below still rejects any URL whose query is
+    // not byte-equal to its WHATWG re-serialization.
     let host = url
         .host()
         .ok_or("encrypted media endpoint URL must include a host")?;
@@ -1028,6 +1034,30 @@ mod tests {
         assert_eq!(
             validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
             Err("encrypted media endpoint URL must not point at a non-routable address".into())
+        );
+    }
+
+    /// A query string is valid endpoint state. group-encrypted-media-v1.md's
+    /// invalidity list names only userinfo, fragments, and missing hosts; it
+    /// does not name queries, and WHATWG parse+serialize preserves them. The
+    /// validator must accept a normalized query-bearing endpoint so commit
+    /// acceptance does not fork against a spec-literal producer (darkmatter#374).
+    #[test]
+    fn encrypted_media_endpoint_url_allows_query_string() {
+        // Already-normalized query URL round-trips unchanged.
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url("https://blossom.example/?x=1", false),
+            Ok("https://blossom.example/?x=1".to_owned())
+        );
+        // It is accepted through the full policy/commit-acceptance path too.
+        let policy = EncryptedMediaPolicyV1::blossom_default(
+            vec!["https://blossom.example/?x=1".to_owned()],
+            false,
+        )
+        .expect("query-bearing endpoint is valid component state");
+        assert_eq!(
+            policy.default_blob_endpoints[0].base_url,
+            "https://blossom.example/?x=1"
         );
     }
 
