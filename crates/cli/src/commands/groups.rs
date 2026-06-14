@@ -154,6 +154,48 @@ pub(crate) async fn group_command_with_runtime(
                 }),
             })
         }
+        GroupCommand::SetAvatarUrl {
+            group,
+            url,
+            dim,
+            thumbhash,
+            clear,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
+            // `--clear` (or simply omitting `--url`) clears the URL avatar;
+            // otherwise the provided HTTPS URL is set. Validation/normalization
+            // (https-only, length bound, reject localhost/private hosts) is
+            // enforced in the codec, so the CLI passes the URL through.
+            let url = if clear { None } else { url };
+            let summary = runtime
+                .update_group_avatar_url(&account.label, &group_id, url, dim, thumbhash)
+                .await?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let group = app
+                .group(&account.label, &group_id_hex)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+            let action = if group.avatar_url.present {
+                "set"
+            } else {
+                "cleared"
+            };
+            Ok(CommandOutput {
+                plain: format!(
+                    "{action} avatar-url for group {group_id_hex} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group": group_json(group),
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
     }
 }
 
@@ -339,6 +381,28 @@ pub(crate) async fn groups_command_with_runtime(
                     group: group_id,
                     name: Some(name),
                     description: None,
+                },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::SetAvatarUrl {
+            group_id,
+            url,
+            dim,
+            thumbhash,
+            clear,
+        } => {
+            group_command_with_runtime(
+                account_home,
+                app,
+                runtime,
+                GroupCommand::SetAvatarUrl {
+                    group: group_id,
+                    url,
+                    dim,
+                    thumbhash,
+                    clear,
                 },
                 account_flag,
             )
