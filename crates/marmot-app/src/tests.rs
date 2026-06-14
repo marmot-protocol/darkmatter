@@ -16,8 +16,10 @@ use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
 use crate::conversions::{app_group_from_stored_group, stored_group_from_app_group};
+use crate::directory::records::public_directory_user_record;
+use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
-    require_key_package_tag, require_multi_value_key_package_tag,
+    relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag,
     require_multi_value_key_package_tag_contains,
 };
 use crate::messages::STREAM_ROUTE_QUIC;

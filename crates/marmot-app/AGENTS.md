@@ -33,14 +33,21 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
   the upload client, and the `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path
   validation/resolution/removal, and HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
-- Keep stateless directory-record helpers (cached <-> shared record conversion, recency selection, Nostr profile
-  parsing, search-match ranking) in `src/directory_records.rs`; they complement the stateful `directory/` cache/sync
-  modules and hold no `MarmotApp` state.
+- Keep the user-directory domain in the `src/directory/` module instead of regrowing `src/lib.rs`. It splits along these
+  seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
+  `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
+  Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
+  state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
+  public `directory_*`/`*_user_directory` API, directory-cache lifecycle, and in-memory directory-record hydration),
+  `cache.rs` (the per-account SQLCipher directory cache), and `sync.rs` (the directory-subscription sync worker and
+  plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
+  files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
 - Keep stateless account relay-list and KeyPackage parsing/validation (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, record merge, publish-endpoint selection) in
   `src/key_package_records.rs`. They hold no `MarmotApp` state.
-- Keep the crate root focused on app construction, shared state, storage/projector wiring, directory bootstrap, account
-  relay-list helpers, and public re-exports.
+- Keep the crate root focused on app construction, shared state, storage/projector wiring, account relay-list helpers,
+  the shared directory-record selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`)
+  reused by `key_package_records.rs`, and public re-exports.
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
   lists, relay lists, and KeyPackages, but it must not become an unbounded Nostr social-graph crawler.
