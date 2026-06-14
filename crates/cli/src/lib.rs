@@ -774,6 +774,12 @@ fn group_plain(group: &AppGroupRecord) -> String {
     );
     if group.avatar_url.present {
         line.push_str(&format!(" avatar_url={}", group.avatar_url.url));
+        if let Some(dim) = &group.avatar_url.dim {
+            line.push_str(&format!(" avatar_dim={dim}"));
+        }
+        if let Some(thumbhash) = &group.avatar_url.thumbhash {
+            line.push_str(&format!(" avatar_thumbhash={thumbhash}"));
+        }
     }
     line
 }

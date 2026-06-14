@@ -5138,6 +5138,52 @@ fn groups_set_avatar_url_round_trips_through_sync_and_show() {
         ],
     );
     assert_eq!(err["code"], "invalid_group_avatar_url");
+
+    // An explicitly empty `--url ""` is rejected as a malformed URL rather than
+    // silently clearing the avatar.
+    let empty_err = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--url",
+            "",
+        ],
+    );
+    assert_eq!(empty_err["code"], "invalid_group_avatar_url");
+
+    // Omitting both --url and --clear is a usage error (no silent clear).
+    assert!(
+        !dm(home.path())
+            .args(["--account", &alice, "groups", "set-avatar-url", group_id])
+            .output()
+            .expect("dm command should start")
+            .status
+            .success(),
+        "set-avatar-url without --url/--clear should fail"
+    );
+
+    // --dim without --url is a usage error.
+    assert!(
+        !dm(home.path())
+            .args([
+                "--account",
+                &alice,
+                "groups",
+                "set-avatar-url",
+                group_id,
+                "--dim",
+                "512x512",
+            ])
+            .output()
+            .expect("dm command should start")
+            .status
+            .success(),
+        "set-avatar-url --dim without --url should fail"
+    );
 }
 
 #[test]

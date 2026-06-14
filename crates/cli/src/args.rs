@@ -450,11 +450,11 @@ pub(crate) enum GroupCommand {
     #[command(name = "set-avatar-url")]
     SetAvatarUrl {
         group: String,
-        #[arg(long, conflicts_with = "clear")]
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
         url: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "url")]
         dim: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "url")]
         thumbhash: Option<String>,
         #[arg(long)]
         clear: bool,
@@ -535,11 +535,16 @@ pub(crate) enum GroupsCommand {
     SetAvatarUrl {
         #[arg(help = "Group id to update")]
         group_id: String,
-        #[arg(long, conflicts_with = "clear", help = "HTTPS avatar URL")]
+        #[arg(
+            long,
+            conflicts_with = "clear",
+            required_unless_present = "clear",
+            help = "HTTPS avatar URL"
+        )]
         url: Option<String>,
-        #[arg(long, help = "Optional avatar dimensions as WxH")]
+        #[arg(long, requires = "url", help = "Optional avatar dimensions as WxH")]
         dim: Option<String>,
-        #[arg(long, help = "Optional thumbhash hex")]
+        #[arg(long, requires = "url", help = "Optional thumbhash hex")]
         thumbhash: Option<String>,
         #[arg(long, help = "Clear the group URL avatar")]
         clear: bool,

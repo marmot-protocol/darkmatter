@@ -165,11 +165,26 @@ pub(crate) async fn group_command_with_runtime(
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            // `--clear` (or simply omitting `--url`) clears the URL avatar;
-            // otherwise the provided HTTPS URL is set. Validation/normalization
-            // (https-only, length bound, reject localhost/private hosts) is
-            // enforced in the codec, so the CLI passes the URL through.
-            let url = if clear { None } else { url };
+            // clap guarantees exactly one of `--url` / `--clear` is present, and
+            // that `--dim` / `--thumbhash` only accompany `--url`. An explicit
+            // empty `--url ""` is a malformed URL, not a clear — surface it as the
+            // typed `invalid_group_avatar_url` error rather than silently clearing.
+            // Validation/normalization (https-only, length bound, reject
+            // localhost/private hosts) is enforced in the codec; the CLI passes
+            // the URL through.
+            let url = if clear {
+                None
+            } else {
+                match url {
+                    Some(url) if url.is_empty() => {
+                        return Err(AppError::InvalidGroupAvatarUrl(
+                            "group avatar URL must not be empty".to_owned(),
+                        )
+                        .into());
+                    }
+                    other => other,
+                }
+            };
             let summary = runtime
                 .update_group_avatar_url(&account.label, &group_id, url, dim, thumbhash)
                 .await?;
