@@ -174,19 +174,14 @@ fn account_info_from_setup(account: marmot_account::AccountSummary) -> AccountIn
 }
 
 fn random_stream_id() -> Vec<u8> {
-    // 32 bytes of OS randomness via getrandom (pulled in transitively); use a
-    // simple, dependency-light source to avoid adding a new crate just for this.
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let mut out = Vec::with_capacity(32);
-    while out.len() < 32 {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(unix_now_seconds().wrapping_add(out.len() as u64));
-        h.write_usize(out.as_ptr() as usize);
-        out.extend_from_slice(&h.finish().to_le_bytes());
-    }
-    out.truncate(32);
-    out
+    // 32 bytes of CSPRNG randomness via OsRng, matching the UniFFI agent-stream
+    // surface (`marmot-uniffi`'s `random_agent_stream_id`) and the workspace
+    // `transport_quic_stream::random_stream_id` generator.
+    use rand::RngCore;
+    use rand::rngs::OsRng;
+    let mut stream_id = vec![0u8; 32];
+    OsRng.fill_bytes(&mut stream_id);
+    stream_id
 }
 
 // ---------------------------------------------------------------------------
