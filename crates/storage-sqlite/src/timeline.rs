@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{
+    SqliteAccountStorage, SqliteResultExt, optional_u64_to_i64, tags_from_json, u64_to_i64,
+};
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
@@ -1507,10 +1509,6 @@ fn tags_json(tags: &[Vec<String>]) -> StorageResult<String> {
     serde_json::to_string(tags).map_err(|err| StorageError::Serialization(err.to_string()))
 }
 
-fn tags_from_json(json: String) -> Result<Vec<Vec<String>>, serde_json::Error> {
-    serde_json::from_str(&json)
-}
-
 fn optional_value_json(value: &Option<Value>) -> StorageResult<Option<String>> {
     value
         .as_ref()
@@ -1529,16 +1527,6 @@ fn reaction_summary_json(summary: &TimelineReactionSummary) -> StorageResult<Str
 
 fn reaction_summary_from_json(json: String) -> Result<TimelineReactionSummary, serde_json::Error> {
     serde_json::from_str(&json)
-}
-
-fn u64_to_i64(value: u64) -> StorageResult<i64> {
-    i64::try_from(value).map_err(|_| {
-        StorageError::Serialization(format!("value does not fit in sqlite INTEGER: {value}"))
-    })
-}
-
-fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
-    value.map(u64_to_i64).transpose()
 }
 
 #[cfg(test)]

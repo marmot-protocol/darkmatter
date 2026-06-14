@@ -1,6 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{
+    SqliteAccountStorage, SqliteResultExt, bool_i64, tags_from_json, u64_to_i64, unix_now_ms,
+    unix_now_seconds_i64, usize_to_i64,
+};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
     OptionalExtension, Transaction, params, params_from_iter,
@@ -158,7 +159,7 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         let seen_events = seen_statement
-            .query_map(params![usize_to_i64(max_seen_events)], |row| {
+            .query_map(params![usize_to_i64(max_seen_events)?], |row| {
                 row.get::<_, String>(0)
             })
             .storage()?
@@ -270,7 +271,7 @@ impl SqliteAccountStorage {
                 ORDER BY seen_at DESC, rowid DESC
                 LIMIT ?1
              )",
-            params![usize_to_i64(max_seen_events)],
+            params![usize_to_i64(max_seen_events)?],
         )
         .storage()?;
 
@@ -408,7 +409,7 @@ impl SqliteAccountStorage {
         let rows = match (&query.group_id_hex, query.limit) {
             (Some(group_id_hex), Some(limit)) => statement
                 .query_map(
-                    params![group_id_hex, usize_to_i64(limit)],
+                    params![group_id_hex, usize_to_i64(limit)?],
                     app_message_from_row,
                 )
                 .storage()?,
@@ -416,7 +417,7 @@ impl SqliteAccountStorage {
                 .query_map(params![group_id_hex], app_message_from_row)
                 .storage()?,
             (None, Some(limit)) => statement
-                .query_map(params![usize_to_i64(limit)], app_message_from_row)
+                .query_map(params![usize_to_i64(limit)?], app_message_from_row)
                 .storage()?,
             (None, None) => statement.query_map([], app_message_from_row).storage()?,
         };
@@ -928,44 +929,8 @@ fn group_push_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Accoun
     })
 }
 
-fn tags_from_json(json: String) -> Result<Vec<Vec<String>>, serde_json::Error> {
-    serde_json::from_str(&json)
-}
-
-fn unix_now_seconds_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .try_into()
-        .unwrap_or(i64::MAX)
-}
-
-fn unix_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX)
-}
-
-fn usize_to_i64(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn u64_to_i64(value: u64) -> StorageResult<i64> {
-    i64::try_from(value).map_err(|_| {
-        StorageError::Serialization(format!("value does not fit in sqlite INTEGER: {value}"))
-    })
-}
-
 fn u32_to_i64(value: u32) -> i64 {
     i64::from(value)
-}
-
-fn bool_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
 }
 
 fn i64_to_u8(value: i64, column: usize) -> rusqlite::Result<u8> {

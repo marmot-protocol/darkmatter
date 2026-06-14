@@ -1,4 +1,7 @@
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{
+    SqliteAccountStorage, SqliteResultExt, bool_i64, optional_u64_to_i64, u64_to_i64,
+    unix_now_seconds,
+};
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -847,30 +850,9 @@ fn timeline_tuple_after(left_at: u64, left_id: &str, right_at: u64, right_id: &s
     left_at > right_at || (left_at == right_at && left_id > right_id)
 }
 
-fn bool_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
-}
-
-fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
-    value.map(u64_to_i64).transpose()
-}
-
-fn u64_to_i64(value: u64) -> StorageResult<i64> {
-    i64::try_from(value).map_err(|_| {
-        StorageError::Serialization(format!("value does not fit in sqlite INTEGER: {value}"))
-    })
-}
-
 fn i64_to_u64(value: i64) -> StorageResult<u64> {
     u64::try_from(value)
         .map_err(|_| StorageError::Serialization(format!("value does not fit in u64: {value}")))
-}
-
-fn unix_now_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
