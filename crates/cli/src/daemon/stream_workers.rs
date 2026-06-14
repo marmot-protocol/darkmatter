@@ -583,7 +583,10 @@ pub(crate) async fn finish_stream_compose(
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
     let key = stream_compose_key(cli.account.as_deref(), &stream_id);
-    let Some(session) = workers.remove(&key) else {
+    // Keep the session in the workers map until the MLS finish marker is durably
+    // published below. Borrow only the command sender (clonable) so the session
+    // entry stays intact and the transcript stays retryable if the marker fails.
+    let Some(tx) = workers.get(&key).map(|session| session.tx.clone()) else {
         return daemon_error(
             cli.json,
             "stream_compose_not_found",
@@ -591,8 +594,7 @@ pub(crate) async fn finish_stream_compose(
         );
     };
     let (respond, response) = oneshot::channel();
-    if session
-        .tx
+    if tx
         .send(StreamComposeCommand::Finish { respond })
         .await
         .is_err()
@@ -638,8 +640,12 @@ pub(crate) async fn finish_stream_compose(
     if let Err(err) =
         run_hosted_stream_marker_cli_json(&finish_cli, defaults, state, events, runtime_host).await
     {
+        // The finish marker did not publish: leave the session in the workers
+        // map so the transcript can be retried instead of being lost.
         return daemon_error(cli.json, "stream_compose_failed", err);
     }
+    // Marker published: now it is safe to drop the session.
+    workers.remove(&key);
     daemon_output(
         cli.json,
         &format!("finished stream {}", short_id(&report.stream_id)),

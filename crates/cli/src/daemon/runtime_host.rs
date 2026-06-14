@@ -588,13 +588,7 @@ pub(crate) async fn handle_app_runtime_event(
             );
         }
         marmot_app::MarmotAppEvent::AccountError(error) => {
-            record_runtime_activity_error(
-                &state,
-                format!(
-                    "app runtime account {} failed: {}",
-                    error.account_id_hex, error.message
-                ),
-            );
+            record_runtime_activity_error(&state, account_error_activity_message(&error));
         }
     }
 }
@@ -697,6 +691,15 @@ pub(crate) fn runtime_activity_report_from_summary(
     report.joined_groups = summary.joined_groups.len();
     report.messages = summary.messages.len();
     report
+}
+
+/// Builds the diagnostic string recorded for a runtime account error.
+///
+/// Privacy: the result is persisted into `DaemonRuntimeActivityReport.errors`
+/// and exposed via `dm daemon status --json` / the TUI, so it must never carry
+/// the account id or label — only the upstream (already id-free) error message.
+pub(crate) fn account_error_activity_message(error: &marmot_app::RuntimeAccountError) -> String {
+    format!("app runtime account error: {}", error.message)
 }
 
 pub(crate) fn record_runtime_activity_error(state: &Arc<Mutex<DaemonState>>, error: String) {

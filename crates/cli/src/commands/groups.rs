@@ -44,6 +44,7 @@ pub(crate) async fn group_command_with_runtime(
             let group = app
                 .group(&account.label, &group_id_hex)?
                 .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+            let members = runtime.group_members(&account.label, &group_id).await?;
             Ok(CommandOutput {
                 plain: format!("created group {group_id_hex}"),
                 json: json!({
@@ -55,7 +56,7 @@ pub(crate) async fn group_command_with_runtime(
                     "image": group.image,
                     "admin_policy": group.admin_policy,
                     "agent_text_stream": group.agent_text_stream,
-                    "members": members,
+                    "members": group_members_json(members),
                 }),
             })
         }

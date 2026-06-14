@@ -1606,6 +1606,32 @@ mod tests {
         assert!(matches!(err, DmError::MessagePaginationConflictingCursors));
     }
 
+    // `chats subscribe` / `chats subscribe-archived` without a daemon must surface
+    // a chat-specific message, not the messages-namespace text, while keeping the
+    // shared `daemon_required` JSON code and repair hint so the TUI/scripts that
+    // branch on `code` keep working.
+    #[test]
+    fn chats_subscribe_requires_daemon_renders_chat_specific_message() {
+        let chats = super::dm_error_json(&DmError::ChatsSubscribeRequiresDaemon);
+        assert_eq!(chats["code"], "daemon_required");
+        assert_eq!(chats["repair"]["start"], "dm daemon start");
+        let message = chats["message"].as_str().expect("chats message");
+        assert!(
+            message.starts_with("chats subscribe"),
+            "expected chat-specific subscribe message, got {message:?}"
+        );
+
+        // The messages variant must stay messages-specific so the two namespaces
+        // do not drift back into the same text.
+        let messages = super::dm_error_json(&DmError::MessagesSubscribeRequiresDaemon);
+        let messages_message = messages["message"].as_str().expect("messages message");
+        assert!(
+            messages_message.starts_with("messages subscribe"),
+            "expected messages-specific subscribe message, got {messages_message:?}"
+        );
+        assert_ne!(message, messages_message);
+    }
+
     // Regression for #190: an oversized request on the *implicit* daemon socket
     // path (default socket merely exists, no `--socket`/`DM_SOCKET`) must surface
     // the client-side size-limit error instead of silently falling through to

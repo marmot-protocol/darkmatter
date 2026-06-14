@@ -52,8 +52,8 @@ pub(crate) struct Cli {
     pub(crate) keychain_service: Option<String>,
     #[arg(
         long,
-        value_name = "ACCOUNT",
-        help = "Select the local account label, npub, or hex pubkey"
+        value_name = "NPUB_OR_HEX",
+        help = "Select the account by npub or hex pubkey"
     )]
     pub(crate) account: Option<String>,
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
@@ -274,7 +274,10 @@ pub(crate) enum AccountCommand {
     List,
     #[command(about = "Show account readiness, relay-list, and KeyPackage status")]
     Status {
-        #[arg(help = "Optional account label, npub, or hex pubkey")]
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "Optional account npub or hex pubkey"
+        )]
         account: Option<String>,
     },
     #[command(
@@ -974,6 +977,12 @@ pub(crate) enum DaemonCommand {
             help = "Comma-separated default account relays used when creating identities"
         )]
         default_account_relays: Vec<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Write daemon logs in this directory"
+        )]
+        logs_dir: Option<PathBuf>,
     },
     #[command(about = "Stop the background dmd daemon")]
     Stop,

@@ -56,7 +56,8 @@ pub(crate) async fn message_command_with_runtime(
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
-            let group_id = GroupId::new(hex::decode(group)?);
+            let group_id_hex = normalize_group_id_hex(&group)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
             let payload = text.join(" ");
             let summary = runtime
                 .send_message(&account.label, &group_id, payload.into_bytes())

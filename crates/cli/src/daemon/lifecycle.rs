@@ -81,6 +81,7 @@ pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliO
         DaemonCommand::Start {
             discovery_relays,
             default_account_relays,
+            logs_dir,
         } => {
             let home = resolve_home(cli.home.clone());
             let socket = cli
@@ -94,6 +95,7 @@ pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliO
                 &socket,
                 discovery_relays,
                 default_account_relays,
+                logs_dir,
             )
             .await
         }
@@ -211,6 +213,7 @@ pub(crate) async fn start_daemon(
     socket: &Path,
     mut discovery_relays: Vec<String>,
     mut default_account_relays: Vec<String>,
+    logs_dir: Option<PathBuf>,
 ) -> CliOutput {
     if let Ok(status) = DaemonClient::new(socket).status().await {
         return daemon_output(
@@ -279,8 +282,21 @@ pub(crate) async fn start_daemon(
     if let Some(keychain_service) = &cli.keychain_service {
         command.arg("--keychain-service").arg(keychain_service);
     }
+    if let Some(logs_dir) = &logs_dir {
+        command.arg("--logs-dir").arg(logs_dir);
+    }
     detach_daemon_command(&mut command);
-    let log_path = default_log_path(home);
+    // Mirror dmd's run_server log-path derivation so the captured stdout/stderr
+    // and the readiness hint point at the requested directory, not the default.
+    let log_path = match &logs_dir {
+        Some(dir) => {
+            if let Err(err) = std::fs::create_dir_all(dir) {
+                return daemon_error(cli.json, "daemon_start_failed", err.to_string());
+            }
+            dir.join("dmd.log")
+        }
+        None => default_log_path(home),
+    };
     let log = match open_daemon_log(&log_path) {
         Ok(log) => log,
         Err(err) => return daemon_error(cli.json, "daemon_start_failed", err.to_string()),

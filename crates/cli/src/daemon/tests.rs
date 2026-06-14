@@ -607,6 +607,88 @@ async fn stream_watch_workers_reap_finished_handles_on_replace() {
     handles["running"].abort();
 }
 
+fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
+    let report = StreamComposeReport {
+        account: None,
+        group_id: "abcd".to_owned(),
+        stream_id: stream_id.to_owned(),
+        start_message_id: "ef01".to_owned(),
+        candidate: "quic://127.0.0.1:9000".to_owned(),
+        status: "streaming".to_owned(),
+        text: "hello transcript".to_owned(),
+        transcript_hash: Some("aa".to_owned()),
+        chunk_count: 1,
+        error: None,
+    };
+    let (tx, mut rx) = mpsc::channel::<StreamComposeCommand>(4);
+    let (cancel_tx, _cancel_rx) = mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async move {
+        // Minimal stand-in for the compose worker: answer a single Finish with a
+        // completed report, then exit like the real session does.
+        while let Some(command) = rx.recv().await {
+            if let StreamComposeCommand::Finish { respond } = command {
+                let _ = respond.send(Ok(report.clone()));
+                return;
+            }
+        }
+    });
+    StreamComposeSession {
+        tx,
+        cancel_tx,
+        handle,
+    }
+}
+
+#[tokio::test]
+async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
+    let stream_id = "abcd";
+    // `relay: None` disables the hosted runtime, so the finish-marker command
+    // returns an error without any live runtime — the deterministic stand-in for
+    // a marker publish failure.
+    let defaults = DaemonDefaults {
+        home: PathBuf::from("/tmp/dm-daemon-home"),
+        socket: PathBuf::from("/tmp/dm-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
+        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 0,
+        started_at: 0,
+        last_runtime_activity: None,
+    }));
+    let events = DaemonEventHub::new();
+    let mut runtime_host = AppRuntimeHost::default();
+    let mut workers = StreamComposeWorkers::default();
+    let key = stream_compose_key(None, stream_id);
+    workers.insert(key.clone(), stub_compose_session(stream_id));
+
+    let cli = daemon_test_cli(crate::Command::Sync);
+    let output = finish_stream_compose(
+        &cli,
+        &defaults,
+        state,
+        events,
+        &mut runtime_host,
+        &mut workers,
+        stream_id,
+    )
+    .await;
+
+    assert_ne!(
+        output.code, 0,
+        "marker publish failure should surface as an error"
+    );
+    assert!(
+        workers.get(&key).is_some(),
+        "the compose session must be retained so the transcript stays retryable"
+    );
+}
+
 #[test]
 fn runtime_message_json_carries_named_peer_display_name() {
     let message = marmot_app::ReceivedMessage {
@@ -638,6 +720,93 @@ fn runtime_message_json_carries_named_peer_display_name() {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
     assert_eq!(value["from_display_name"], "Bob Example");
+}
+
+#[test]
+fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
+    // Live payloads must echo the message's own source timestamp under
+    // `recorded_at` (so they match replay/snapshot payloads) while stamping
+    // `received_at` with the live delivery time.
+    let source_recorded_at = 1_700_000_000;
+    let before = unix_now();
+    let message = marmot_app::ReceivedMessage {
+        message_id_hex: "03".to_owned(),
+        source_message_id_hex: "source-03".to_owned(),
+        sender: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        sender_display_name: Some("Bob Example".to_owned()),
+        group_id: GroupId::new(vec![0xcd; 32]),
+        source_epoch: 0,
+        plaintext: "hello back".to_owned(),
+        kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        recorded_at: source_recorded_at,
+    };
+
+    let value = runtime_message_json(
+        &message,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "Alice Example",
+    );
+    let after = unix_now();
+
+    assert_eq!(value["recorded_at"], source_recorded_at);
+    let received_at = value["received_at"]
+        .as_u64()
+        .expect("received_at should be a unix timestamp");
+    assert!(
+        (before..=after).contains(&received_at),
+        "received_at {received_at} should be a live timestamp in [{before}, {after}]"
+    );
+    assert_ne!(
+        value["recorded_at"], value["received_at"],
+        "recorded_at must track source time, not the live received_at"
+    );
+}
+
+#[test]
+fn account_error_activity_message_excludes_account_identity() {
+    let account_id_hex =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned();
+    let account_label = "Dana Example".to_owned();
+    let error = marmot_app::RuntimeAccountError {
+        account_id_hex: account_id_hex.clone(),
+        account_label: account_label.clone(),
+        message: "relay handshake timed out".to_owned(),
+    };
+
+    let recorded = account_error_activity_message(&error);
+
+    assert!(
+        recorded.contains("relay handshake timed out"),
+        "the upstream error message should be preserved: {recorded}"
+    );
+    assert!(
+        !recorded.contains(&account_id_hex),
+        "the stored error string must not expose the account id: {recorded}"
+    );
+    assert!(
+        !recorded.contains(&account_label),
+        "the stored error string must not expose the account label: {recorded}"
+    );
+
+    // The recorded string is stored verbatim into the report exposed via
+    // `dm daemon status --json` / the TUI, so the privacy guarantee carries
+    // through to the surfaced `errors` field.
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 0,
+        started_at: 0,
+        last_runtime_activity: None,
+    }));
+    record_runtime_activity_error(&state, recorded.clone());
+    let exposed = state
+        .lock()
+        .expect("state lock")
+        .last_runtime_activity
+        .clone()
+        .expect("activity recorded");
+    assert_eq!(exposed.errors, vec![recorded]);
+    assert!(!exposed.errors[0].contains(&account_id_hex));
+    assert!(!exposed.errors[0].contains(&account_label));
 }
 
 #[test]

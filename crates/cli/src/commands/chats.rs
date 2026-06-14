@@ -52,7 +52,7 @@ pub(crate) async fn chats_command_with_runtime(
             ensure_local_signing(&account)?;
             group_show_output(app, account, group, None)
         }
-        ChatsCommand::Subscribe => Err(DmError::MessagesSubscribeRequiresDaemon),
+        ChatsCommand::Subscribe => Err(DmError::ChatsSubscribeRequiresDaemon),
         ChatsCommand::Archive { group } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -81,7 +81,7 @@ pub(crate) async fn chats_command_with_runtime(
                 }),
             })
         }
-        ChatsCommand::SubscribeArchived => Err(DmError::MessagesSubscribeRequiresDaemon),
+        ChatsCommand::SubscribeArchived => Err(DmError::ChatsSubscribeRequiresDaemon),
         ChatsCommand::Mute { .. } => unsupported_command(
             "chats mute",
             "chat notification mute state is not modeled in marmot-app yet",

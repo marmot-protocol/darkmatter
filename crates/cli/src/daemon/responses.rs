@@ -389,7 +389,7 @@ pub(crate) fn runtime_message_json(
         "plaintext": message.plaintext,
         "kind": message.kind,
         "tags": message.tags,
-        "recorded_at": now,
+        "recorded_at": message.recorded_at,
         "received_at": now,
     });
     if let Some(agent_text_stream) =

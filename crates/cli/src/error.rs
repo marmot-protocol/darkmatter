@@ -74,6 +74,8 @@ pub(crate) enum DmError {
     InsecureLocalRequiresLoopback(SocketAddr),
     #[error("messages subscribe requires the daemon; start it with `dm daemon start`")]
     MessagesSubscribeRequiresDaemon,
+    #[error("chats subscribe requires the daemon; start it with `dm daemon start`")]
+    ChatsSubscribeRequiresDaemon,
     #[error("login requires --nsec-stdin or an npub identity")]
     MissingLoginIdentity,
     #[error(
@@ -255,6 +257,13 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
             "addr": addr.to_string(),
         }),
         DmError::MessagesSubscribeRequiresDaemon => json!({
+            "code": "daemon_required",
+            "message": err.to_string(),
+            "repair": {
+                "start": "dm daemon start",
+            },
+        }),
+        DmError::ChatsSubscribeRequiresDaemon => json!({
             "code": "daemon_required",
             "message": err.to_string(),
             "repair": {

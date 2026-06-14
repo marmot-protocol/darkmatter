@@ -35,12 +35,13 @@ pub(crate) async fn key_package_command_with_runtime(
             let fetched = if relay_lists.nip65.relays.is_empty() {
                 None
             } else {
-                app.fetch_latest_key_package_for_account_id(
-                    &account.account_id_hex,
-                    relay_endpoints(relay_lists.nip65.relays.clone())?,
+                Some(
+                    app.fetch_latest_key_package_for_account_id(
+                        &account.account_id_hex,
+                        relay_endpoints(relay_lists.nip65.relays.clone())?,
+                    )
+                    .await?,
                 )
-                .await
-                .ok()
             };
             let keys = fetched
                 .into_iter()
