@@ -15,8 +15,16 @@ App runtime bridge for the first real Marmot app surfaces.
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `audit_tracker.rs` (the forensic audit-log
   tracker upload worker), and `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers). Keep `mod.rs`
   re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
-- Keep app-client commands and query methods in `src/client.rs`; the crate root should construct clients but not absorb
-  their behavior again.
+- Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
+  not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
+  (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
+  send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
+  `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
+  the cursor unit tests), `projection.rs` (timeline/group projection accessors, the `*_for_group` component reads, the
+  kind-1210 group-system row synthesis, and the local-send projection helpers), `push.rs` (push-token registration and
+  notification-trigger publishing), and `audit.rs` (audit-context construction, the local/observed `human_action`
+  recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files are widened to
+  `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in `src/media.rs`.
 - Keep the mechanical `storage_sqlite` `Stored*` <-> app-DTO mapper free functions (account state, groups, components,
