@@ -949,6 +949,9 @@ impl AppClient {
             tags: event.tags.clone(),
             source_epoch,
             recorded_at: Some(event.created_at),
+            // Only synthesized kind-1210 system rows carry an origin commit;
+            // ordinary sent app events do not.
+            origin_commit_id: None,
         };
         let update = self
             .app
@@ -1173,27 +1176,14 @@ impl AppClient {
 
     fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {
         let local_account = self.app.account_home().account(&self.state.label)?;
-        // TODO(#305 leaf_index): per features/push-notifications.md the gossip
-        // entry `leaf_index` is the device's MLS leaf index, but this is the
-        // member-roster enumeration position, which only equals the MLS leaf
-        // index while no leaves are blanked. BLOCKED: the MLS leaf index is not
-        // exposed through the public engine/session API to marmot-app. The
-        // engine `CgkaEngine` trait surfaces only `members()` (returning
-        // `cgka_traits::Member`, which by documented invariant omits the leaf
-        // index because it changes as the tree mutates) and `self_id()`; the
-        // own leaf index lives only inside OpenMLS (`own_leaf_index()`), which
-        // is engine-internal. Reaching into engine internals from here is
-        // disallowed. Resolve by adding a leaf-index accessor (e.g. an own
-        // leaf-index method on the engine/session) and threading it here, then
-        // drop the enumeration position.
+        let leaf_index = self.runtime.own_leaf_index(group_id)?;
         self.runtime
             .members(group_id)?
             .into_iter()
-            .enumerate()
-            .find_map(|(index, member)| {
+            .find_map(|member| {
                 let member_id_hex = hex::encode(member.id.as_slice());
                 (member_id_hex == local_account.account_id_hex)
-                    .then_some((member_id_hex, index as u32))
+                    .then_some((member_id_hex, leaf_index))
             })
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
@@ -1934,6 +1924,8 @@ impl AppClient {
                     tags: message.tags.clone(),
                     source_epoch: Some(message.source_epoch),
                     recorded_at: Some(source_recorded_at),
+                    // Received app messages are not synthesized system rows.
+                    origin_commit_id: None,
                 };
                 let projection_update = self
                     .app
@@ -1956,6 +1948,41 @@ impl AppClient {
                     &self.state.label,
                     &hex::encode(message_id.as_slice()),
                     &format!("{reason:?}"),
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
+            // A rolled-back commit on a losing branch invalidates any kind-1210
+            // group system rows it synthesized (one commit → many rows). The
+            // winning branch's fresh rows are synthesized below from this
+            // delivery's `GroupStateChanged` events, so the timeline converges
+            // to the canonical branch without stale losing-branch rows.
+            if let cgka_traits::engine::GroupEvent::ForkRecovered {
+                invalidated_commit_id,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    "LosingBranch",
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
+            // Convergence-path analog of `ForkRecovered`: a commit first applied
+            // through stored convergence (so its synthesized kind-1210 rows carry
+            // `origin_commit_id`) later lost a same-epoch fork and was rolled
+            // back. `ForkRecovered` only fires on the direct staged-commit seam,
+            // so without this the convergence-born losing rows would survive.
+            // Invalidate every row whose origin commit matches.
+            if let cgka_traits::engine::GroupEvent::CommitRolledBack {
+                invalidated_commit_id,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    "LosingBranch",
                 )?
             {
                 summary.projection_updates.push(projection_update);
@@ -2623,6 +2650,7 @@ impl AppClient {
                 epoch,
                 actor,
                 change,
+                origin_commit_id,
             } = event
             {
                 let projection = match build_group_system_projection(
@@ -2631,6 +2659,9 @@ impl AppClient {
                     actor.as_ref(),
                     change,
                     recorded_at,
+                    origin_commit_id
+                        .as_ref()
+                        .map(|id| hex::encode(id.as_slice())),
                 ) {
                     Ok(projection) => projection,
                     Err(_err) => {
@@ -2682,15 +2713,18 @@ impl AppClient {
 /// authenticated [`GroupStateChange`]. The row is synthesized locally
 /// (Approach A) — no kind-1210 message is sent on the wire. The message id is
 /// deterministic over (actor, epoch, system_type, content) so re-processing the
-/// same change upserts instead of duplicating; the `source_message_id_hex` link
-/// lets a commit that is later invalidated on a losing branch invalidate this
-/// row through the same path as any other app event.
+/// same change upserts instead of duplicating. The row carries a null
+/// `source_message_id_hex` (one commit can synthesize several rows, which would
+/// collide on the partial unique source index); instead `origin_commit_id`
+/// links the row back to the commit that produced it, so losing-branch fork
+/// recovery can invalidate every row derived from a rolled-back commit (1:N).
 fn build_group_system_projection(
     group_id: &cgka_traits::types::GroupId,
     epoch: u64,
     actor: Option<&cgka_traits::types::MemberId>,
     change: &cgka_traits::engine::GroupStateChange,
     recorded_at: u64,
+    origin_commit_id: Option<String>,
 ) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
     use cgka_traits::app_event::{
         GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
@@ -2804,6 +2838,9 @@ fn build_group_system_projection(
         tags,
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
+        // Non-unique link to the origin commit so a losing-branch rollback can
+        // invalidate every row this commit synthesized (1:N).
+        origin_commit_id,
     })
 }
 

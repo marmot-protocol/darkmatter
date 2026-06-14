@@ -1181,6 +1181,15 @@ pub(crate) enum DmError {
     },
     #[error("message pagination cannot use before and after cursors together")]
     MessagePaginationConflictingCursors,
+    #[error("profile update requires at least one field flag (e.g. --name, --about, --picture)")]
+    EmptyProfileUpdate,
+    #[error(
+        "cannot safely update profile for {account_id}: no current profile event found on the selected relays"
+    )]
+    ProfileUpdateInconclusive {
+        account_id: String,
+        source_relays: Vec<String>,
+    },
 }
 
 pub async fn run_from<I, T>(args: I) -> CliOutput
@@ -1251,6 +1260,14 @@ where
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         match daemon::send_execute(&socket, cli.clone()).await {
             Ok(output) => return output,
+            // An oversized request is a client-side limit violation, not a
+            // daemon-unavailable condition: the encoder rejects it before it
+            // ever reaches `dmd`. Surface it as a terminal error even on the
+            // implicit-socket path, otherwise the request silently falls
+            // through to `run_cli_local` and masks the size cap (see #190).
+            Err(err @ daemon::DaemonClientError::RequestTooLarge { .. }) => {
+                return daemon_client_error(cli.json, err);
+            }
             Err(err) if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() => {
                 return daemon_client_error(cli.json, err);
             }
@@ -3393,18 +3410,57 @@ pub(crate) async fn profile_command_with_runtime(
             nip05,
             lud16,
         } => {
+            // A flag-per-field update is partial by intent: the user names the
+            // fields they want to change and expects the rest of their kind:0
+            // profile to survive. kind:0 is a *replaceable* event, though, so a
+            // naive publish of just the passed flags overwrites the whole
+            // profile and silently wipes every unset field. Reject the
+            // no-flags call outright (it would publish an empty {} and erase
+            // everything), then fetch the current published profile, overlay
+            // only the provided fields, and publish the merged result. This
+            // mirrors the relays-add replaceable-list flow (fetch current,
+            // merge, refuse to clobber when the relay has no current event).
+            if name.is_none()
+                && display_name.is_none()
+                && about.is_none()
+                && picture.is_none()
+                && nip05.is_none()
+                && lud16.is_none()
+            {
+                return Err(DmError::EmptyProfileUpdate);
+            }
             let relay = relay.ok_or(DmError::MissingRelay)?;
             let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
-            let profile = UserProfileMetadata {
-                name,
-                display_name,
-                about,
-                picture,
-                nip05,
-                lud16,
-                created_at: unix_now_seconds(),
-                source_relays: Vec::new(),
-            };
+            let mut profile = app
+                .fetch_current_user_profile_for_account_id(
+                    &account.account_id_hex,
+                    vec![endpoint.clone()],
+                )
+                .await?
+                .ok_or_else(|| DmError::ProfileUpdateInconclusive {
+                    account_id: account.account_id_hex.clone(),
+                    source_relays: vec![endpoint.0.clone()],
+                })?;
+            if let Some(name) = name {
+                profile.name = Some(name);
+            }
+            if let Some(display_name) = display_name {
+                profile.display_name = Some(display_name);
+            }
+            if let Some(about) = about {
+                profile.about = Some(about);
+            }
+            if let Some(picture) = picture {
+                profile.picture = Some(picture);
+            }
+            if let Some(nip05) = nip05 {
+                profile.nip05 = Some(nip05);
+            }
+            if let Some(lud16) = lud16 {
+                profile.lud16 = Some(lud16);
+            }
+            profile.created_at = unix_now_seconds();
+            profile.source_relays = Vec::new();
             runtime
                 .publish_user_profile(
                     &account.label,
@@ -5571,8 +5627,15 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
     // installs leave it unset.
-    let config = MarmotAppConfig::default()
+    let mut config = MarmotAppConfig::default()
         .with_allow_loopback_blob_endpoints(dm_allow_loopback_blob_endpoints());
+    // Dev/test only: DM_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
+    // convergence settlement window (e.g. `0` for instant settlement in
+    // integration tests). Production installs leave it unset and use the pinned
+    // default.
+    if let Some(ms) = dm_dev_settlement_quiescence_ms() {
+        config = config.with_dev_settlement_quiescence_ms(ms);
+    }
     MarmotApp::with_relays_and_account_home_and_config(
         home,
         relay.into_iter().collect(),
@@ -5586,6 +5649,12 @@ fn dm_allow_loopback_blob_endpoints() -> bool {
         std::env::var("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+fn dm_dev_settlement_quiescence_ms() -> Option<u64> {
+    std::env::var("DM_DEV_SETTLEMENT_QUIESCENCE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 fn open_account_home(
@@ -5744,6 +5813,22 @@ fn dm_error_json(err: &DmError) -> Value {
         DmError::MessagePaginationConflictingCursors => json!({
             "code": "message_pagination_conflicting_cursors",
             "message": err.to_string(),
+        }),
+        DmError::EmptyProfileUpdate => json!({
+            "code": "empty_profile_update",
+            "message": err.to_string(),
+        }),
+        DmError::ProfileUpdateInconclusive {
+            account_id,
+            source_relays,
+        } => json!({
+            "code": "profile_update_inconclusive",
+            "message": err.to_string(),
+            "account_id": account_id,
+            "source_relays": source_relays,
+            "repair": {
+                "retry_with_relay": "--relay <relay-that-has-the-current-profile>",
+            },
         }),
         DmError::AccountHome(err) => account_home_error_json(err),
         DmError::App(err) => app_error_json(err),
@@ -6435,5 +6520,51 @@ mod tests {
         let err = validate_message_list_cursors(Some(101), Some("d"), Some(100), Some("a"))
             .expect_err("before and after cursors cannot be combined");
         assert!(matches!(err, DmError::MessagePaginationConflictingCursors));
+    }
+
+    // Regression for #190: an oversized request on the *implicit* daemon socket
+    // path (default socket merely exists, no `--socket`/`DM_SOCKET`) must surface
+    // the client-side size-limit error instead of silently falling through to
+    // local execution. Without the terminal `RequestTooLarge` arm in `run_from`,
+    // the encoder rejects the request and the request silently runs locally,
+    // masking the cap.
+    #[tokio::test]
+    async fn run_from_oversized_request_on_implicit_socket_fails_locally() {
+        // DM_SOCKET would force the explicit-socket branch and invalidate the
+        // implicit-path assertion; only run the check when it is unset.
+        if std::env::var_os("DM_SOCKET").is_some() {
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        // Materialize the default socket path so `daemon_socket_for_client`
+        // takes the implicit-socket branch without us passing `--socket`.
+        let socket = crate::daemon::default_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().expect("socket parent"))
+            .expect("create socket dir");
+        std::fs::File::create(&socket).expect("create placeholder socket file");
+
+        // A message body over the 1 MiB request cap; the encoder rejects this
+        // before any connection attempt.
+        let huge_text = "a".repeat(2 * 1024 * 1024);
+        let args: Vec<OsString> = vec![
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("--home"),
+            home.path().as_os_str().to_owned(),
+            OsString::from("messages"),
+            OsString::from("send"),
+            OsString::from("group-1"),
+            OsString::from(huge_text),
+        ];
+
+        let output = super::run_from(args).await;
+
+        assert_eq!(output.code, 1, "oversized request must fail");
+        assert!(
+            output.stdout.contains("byte limit"),
+            "expected a client-side size-limit error, got stdout: {}",
+            output.stdout
+        );
     }
 }

@@ -80,6 +80,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   currently-selected chat. Previously, if a background subscription tick shifted the chat selection while streaming
   (e.g. the streamed-into chat was archived or removed by another member/device), each keystroke upserted the streamed
   text under the wrong group and finishing/cancelling left a permanent ghost "streaming" row under the original group.
+- `dm profile update` no longer wipes the rest of your published Nostr profile. It previously published a fresh kind-0
+  metadata event built only from the flags you passed, so e.g. `dm profile update --picture URL` erased
+  name/display_name/about/nip05/lud16, and `dm profile update` with no flags published an empty profile that wiped
+  everything. It now fetches your current published profile from the selected relay, overlays only the provided
+  fields, and publishes the merged result. A no-flags invocation is rejected with `empty_profile_update`, and when the
+  selected relay holds no current profile event the command refuses with `profile_update_inconclusive` (retry with a
+  `--relay` that has your current profile) instead of clobbering it.
+- `dmd` no longer exits when a single client connection is abrupt, empty, oversized, malformed, or stalled.
+  Per-connection read failures (a client that closes before sending, a mid-write interrupt, a request over the 1 MiB
+  cap, or invalid JSON) are now reported to that client and skipped like authorization failures, instead of propagating
+  out of the accept loop and killing the daemon (which left a stale socket and pid file). The accept loop also bounds
+  how long it waits for a client to send its request frame, so a same-UID client that connects but never sends data can
+  no longer wedge the loop and starve other clients. `dm` rejects oversized requests client-side before sending — even
+  on the default implicit daemon socket — so e.g. `dm messages send` with a body over the limit fails locally with a
+  clear size-limit error instead of silently falling back to local execution or reaching the daemon.
 
 ### Security
 
