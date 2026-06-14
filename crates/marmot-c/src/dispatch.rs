@@ -173,6 +173,15 @@ fn account_info_from_setup(account: marmot_account::AccountSummary) -> AccountIn
     }
 }
 
+fn account_info_from_managed(account: marmot_app::ManagedAccount) -> AccountInfo {
+    AccountInfo {
+        label: account.label,
+        account_id_hex: account.account_id_hex,
+        local_signing: account.local_signing,
+        running: account.running,
+    }
+}
+
 fn random_stream_id() -> Vec<u8> {
     // 32 bytes of CSPRNG randomness via OsRng, matching the UniFFI agent-stream
     // surface (`marmot-uniffi`'s `random_agent_stream_id`) and the workspace
@@ -198,6 +207,10 @@ pub fn dispatch(kit: &MarmotC, method: &str, request_json: &str) -> Result<Strin
         // -------------------------------------------------------------------
         "account.list" => {
             let accounts = kit.runtime.accounts().managed_accounts()?;
+            let accounts: Vec<AccountInfo> = accounts
+                .into_iter()
+                .map(account_info_from_managed)
+                .collect();
             Ok(serde_json::to_string(&accounts)?)
         }
         "account.create_identity" => {
