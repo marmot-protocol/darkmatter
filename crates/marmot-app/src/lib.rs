@@ -5,10 +5,9 @@
 //! transport publishing, and relay-backed app projections.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -44,15 +43,12 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::{GroupEvent, KeyPackage};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
-    TransportPublishTarget,
+    GroupId, MemberId, TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountSummary, KeyPackagePublication,
     KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
 };
-use nostr::base64::Engine as _;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_sdk::prelude::{Client as NostrSdkClient, PublicKey};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -60,13 +56,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage_sqlite::{
-    AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
-    AccountStoredPushRegistration, PublicDirectoryUserRecord, SqliteAccountStorage,
-    SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, StoredAuditLogSettings,
-    StoredRelayTelemetrySettings, TimelineProjectionUpdate,
+    PublicDirectoryUserRecord, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
+    TimelineProjectionUpdate,
 };
-use tokio_util::io::ReaderStream;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrKeyPackagePublication,
@@ -76,12 +68,16 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod agent_streams;
 mod app_telemetry;
+mod audit_log;
 mod client;
 mod config;
+mod conversions;
 mod directory;
+mod directory_records;
 mod error;
 mod groups;
 mod ids;
+mod key_package_records;
 mod media;
 mod messages;
 mod notifications;
@@ -113,6 +109,10 @@ pub use agent_streams::{
 };
 pub use app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
+};
+pub use audit_log::{
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
+    AuditLogUploadResult,
 };
 pub use client::AppClient;
 pub use config::{
@@ -165,8 +165,29 @@ pub use transport_nostr_adapter::{
     RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
 };
 
+use conversions::{
+    account_group_push_token_from_app, account_push_registration_from_app,
+    account_state_from_stored, app_message_record_from_stored, group_push_token_from_account,
+    normalize_relay_telemetry_settings, notification_settings_from_account,
+    relay_telemetry_settings_from_storage, relay_telemetry_settings_to_storage,
+    stored_app_event_from_message_record, stored_app_event_from_projection,
+    stored_push_registration_from_account, stored_state_from_account_state,
+};
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
+use directory_records::{
+    field_rank, match_quality_rank, profile_from_record, public_directory_user_record,
+    select_newer_directory_entry, source_relays_from_record, upsert_newer_directory_entry,
+    user_directory_record_from_public, user_record_match,
+};
 use ids::{normalize_account_ids, npub_for_account_id_lossy, parse_account_id_hex};
+use key_package_records::{
+    account_key_package_record_from_fetched, fill_missing_relay_lists_from_cached,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records,
+    key_package_from_hex_with_optional_source, key_package_from_record,
+    latest_fresh_key_package_from_records, merge_key_package_records,
+    parse_key_package_event_id_hex, publish_endpoints_from_bootstrap, relay_list_queries,
+    relay_lists_have_any_relays, validated_cached_key_package,
+};
 use projection::LegacyAccountProjectionDb;
 use relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
@@ -174,19 +195,6 @@ const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
-const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
-const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
-const AUDIT_ID_BYTES: usize = 16;
-const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-static AUDIT_LOG_UPLOAD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
-        .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
-        .build()
-        .expect("audit log upload client configuration should be valid")
-});
 const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
@@ -410,44 +418,6 @@ pub struct ReceivedMessage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLogFile {
-    pub account_ref: String,
-    pub path: String,
-    pub file_name: String,
-    pub size_bytes: u64,
-    pub modified_at_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLogUploadResult {
-    pub path: String,
-    pub status: u16,
-    pub bytes_sent: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLogTrackerUpdateResult {
-    pub enabled: bool,
-    pub uploaded: Vec<AuditLogUploadResult>,
-    pub skipped_reason: Option<String>,
-}
-
-/// Outcome of deleting a single audit log file.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLogDeleteOutcome {
-    /// `true` when a live recorder owned the file and was rotated, so a fresh
-    /// file is already being recorded; `false` when the file was simply removed
-    /// because no live recorder was writing it (account session closed, or
-    /// audit logging off).
-    pub still_recording: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct AuditLogSettings {
-    pub enabled: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppProjectionUpdate {
     pub group_id_hex: String,
     pub timeline_messages: Vec<TimelineMessageRecord>,
@@ -635,305 +605,32 @@ pub struct AccountKeyPackageRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct AccountState {
-    label: String,
+pub(crate) struct AccountState {
+    pub(crate) label: String,
     #[serde(default)]
-    seen_events: Vec<String>,
+    pub(crate) seen_events: Vec<String>,
     #[serde(default)]
-    last_transport_timestamp: Option<u64>,
+    pub(crate) last_transport_timestamp: Option<u64>,
     #[serde(default)]
-    groups: Vec<AppGroupRecord>,
+    pub(crate) groups: Vec<AppGroupRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AppMessageProjection {
-    message_id_hex: String,
-    source_message_id_hex: Option<String>,
-    direction: String,
-    group_id_hex: String,
-    sender: String,
-    plaintext: String,
-    kind: u64,
-    tags: Vec<Vec<String>>,
-    source_epoch: Option<u64>,
-    recorded_at: Option<u64>,
+pub(crate) struct AppMessageProjection {
+    pub(crate) message_id_hex: String,
+    pub(crate) source_message_id_hex: Option<String>,
+    pub(crate) direction: String,
+    pub(crate) group_id_hex: String,
+    pub(crate) sender: String,
+    pub(crate) plaintext: String,
+    pub(crate) kind: u64,
+    pub(crate) tags: Vec<Vec<String>>,
+    pub(crate) source_epoch: Option<u64>,
+    pub(crate) recorded_at: Option<u64>,
     /// Transport id of the originating commit for a synthesized kind-1210 group
     /// system row, so the row can be invalidated by origin commit if that commit
     /// loses a fork. `None` for all other projections.
-    origin_commit_id: Option<String>,
-}
-
-fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
-    StoredAccountState {
-        label: state.label.clone(),
-        seen_events: state.seen_events.clone(),
-        last_transport_timestamp: state.last_transport_timestamp,
-        groups: state
-            .groups
-            .iter()
-            .map(stored_group_from_app_group)
-            .collect(),
-    }
-}
-
-fn account_state_from_stored(stored: StoredAccountState) -> Result<AccountState, AppError> {
-    Ok(AccountState {
-        label: stored.label,
-        seen_events: stored.seen_events,
-        last_transport_timestamp: stored.last_transport_timestamp,
-        groups: stored
-            .groups
-            .into_iter()
-            .map(app_group_from_stored_group)
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccountGroup {
-    StoredAccountGroup {
-        group_id_hex: group.group_id_hex.clone(),
-        endpoint: group.endpoint.clone(),
-        profile_name: group.profile.name.clone(),
-        profile_description: group.profile.description.clone(),
-        image_hash_hex: group.image.image_hash_hex.clone(),
-        image_key_hex: group.image.image_key_hex.clone(),
-        image_nonce_hex: group.image.image_nonce_hex.clone(),
-        image_upload_key_hex: group.image.image_upload_key_hex.clone(),
-        image_media_type: group.image.media_type.clone(),
-        admin_keys_hex: group.admin_policy.admins.join(","),
-        archived: group.archived,
-        pending_confirmation: group.pending_confirmation,
-        welcomer_account_id_hex: group.welcomer_account_id_hex.clone(),
-        via_welcome_message_id_hex: group.via_welcome_message_id_hex.clone(),
-        components: stored_components_from_app_group(group),
-    }
-}
-
-fn stored_components_from_app_group(group: &AppGroupRecord) -> Vec<StoredAccountGroupComponent> {
-    let mut components = vec![
-        StoredAccountGroupComponent {
-            component_id: group.profile.component_id,
-            component_name: group.profile.component.clone(),
-            component_data_hex: group.profile.data_hex.clone(),
-        },
-        StoredAccountGroupComponent {
-            component_id: group.image.component_id,
-            component_name: group.image.component.clone(),
-            component_data_hex: group.image.data_hex.clone(),
-        },
-        StoredAccountGroupComponent {
-            component_id: group.admin_policy.component_id,
-            component_name: group.admin_policy.component.clone(),
-            component_data_hex: group.admin_policy.data_hex.clone(),
-        },
-        StoredAccountGroupComponent {
-            component_id: group.message_retention.component_id,
-            component_name: group.message_retention.component.clone(),
-            component_data_hex: group.message_retention.data_hex.clone(),
-        },
-        StoredAccountGroupComponent {
-            component_id: group.nostr_routing.component_id,
-            component_name: group.nostr_routing.component.clone(),
-            component_data_hex: group.nostr_routing.data_hex.clone(),
-        },
-    ];
-    if group.agent_text_stream.required {
-        components.push(StoredAccountGroupComponent {
-            component_id: group.agent_text_stream.component_id,
-            component_name: group.agent_text_stream.component.clone(),
-            component_data_hex: group.agent_text_stream.data_hex.clone(),
-        });
-    }
-    if group.avatar_url.present {
-        components.push(StoredAccountGroupComponent {
-            component_id: group.avatar_url.component_id,
-            component_name: group.avatar_url.component.clone(),
-            component_data_hex: group.avatar_url.data_hex.clone(),
-        });
-    }
-    if group.encrypted_media.required {
-        components.push(StoredAccountGroupComponent {
-            component_id: group.encrypted_media.component_id,
-            component_name: group.encrypted_media.component.clone(),
-            component_data_hex: group.encrypted_media.data_hex.clone(),
-        });
-    }
-    components
-}
-
-fn app_group_from_stored_group(stored: StoredAccountGroup) -> Result<AppGroupRecord, AppError> {
-    let routing_bytes = hex::decode(
-        account_component_data_hex(&stored.components, NOSTR_ROUTING_COMPONENT_ID).ok_or_else(
-            || AppError::InvalidNostrRouting("stored group is missing routing".into()),
-        )?,
-    )?;
-    let retention =
-        account_component_data_hex(&stored.components, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
-            .map(hex::decode)
-            .transpose()?
-            .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
-            .unwrap_or_else(AppGroupMessageRetentionComponent::disabled);
-    let mut group = AppGroupRecord::new(
-        stored.group_id_hex,
-        AppGroupNostrRoutingComponent::from_bytes(&routing_bytes)?,
-        stored.profile_name,
-        stored.profile_description,
-        AppGroupImageInput {
-            image_hash_hex: stored.image_hash_hex,
-            image_key_hex: stored.image_key_hex,
-            image_nonce_hex: stored.image_nonce_hex,
-            image_upload_key_hex: stored.image_upload_key_hex,
-            media_type: stored.image_media_type,
-        },
-        AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&stored.admin_keys_hex)),
-        retention,
-    );
-    if let Some(agent_hex) =
-        account_component_data_hex(&stored.components, AGENT_TEXT_STREAM_COMPONENT_ID)
-        && !agent_hex.is_empty()
-    {
-        let agent_bytes = hex::decode(agent_hex)?;
-        group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&agent_bytes);
-    }
-    if let Some(avatar_hex) =
-        account_component_data_hex(&stored.components, GROUP_AVATAR_URL_COMPONENT_ID)
-        && !avatar_hex.is_empty()
-    {
-        let avatar_bytes = hex::decode(avatar_hex)?;
-        group.avatar_url = AppGroupAvatarUrlComponent::from_bytes(&avatar_bytes);
-    }
-    if let Some(media_hex) =
-        account_component_data_hex(&stored.components, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)
-        && !media_hex.is_empty()
-    {
-        let media_bytes = hex::decode(media_hex)?;
-        group.encrypted_media = AppGroupEncryptedMediaComponent::from_bytes(&media_bytes);
-    }
-    group.archived = stored.archived;
-    group.pending_confirmation = stored.pending_confirmation;
-    group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
-    group.via_welcome_message_id_hex = stored.via_welcome_message_id_hex;
-    Ok(group)
-}
-
-fn account_component_data_hex(
-    components: &[StoredAccountGroupComponent],
-    component_id: u16,
-) -> Option<&str> {
-    components
-        .iter()
-        .find(|component| component.component_id == component_id)
-        .map(|component| component.component_data_hex.as_str())
-}
-
-fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
-    value
-        .split(',')
-        .filter_map(|key| {
-            let bytes = hex::decode(key).ok()?;
-            let array: [u8; 32] = bytes.try_into().ok()?;
-            Some(array)
-        })
-        .collect()
-}
-
-fn app_message_record_from_stored(record: StoredAppMessageRecord) -> AppMessageRecord {
-    AppMessageRecord {
-        message_id_hex: record.message_id_hex,
-        direction: record.direction,
-        group_id_hex: record.group_id_hex,
-        sender: record.sender,
-        plaintext: record.plaintext,
-        kind: record.kind,
-        tags: record.tags,
-        source_epoch: record.source_epoch,
-        recorded_at: record.recorded_at,
-        received_at: record.received_at,
-    }
-}
-
-fn stored_app_event_from_projection(
-    message: &AppMessageProjection,
-    received_at: u64,
-) -> StoredAppEvent {
-    StoredAppEvent {
-        group_id_hex: message.group_id_hex.clone(),
-        message_id_hex: message.message_id_hex.clone(),
-        source_message_id_hex: message.source_message_id_hex.clone(),
-        direction: message.direction.clone(),
-        sender: message.sender.clone(),
-        plaintext: message.plaintext.clone(),
-        kind: message.kind,
-        tags: message.tags.clone(),
-        source_epoch: message.source_epoch,
-        recorded_at: message.recorded_at.unwrap_or(received_at),
-        received_at,
-        origin_commit_id: message.origin_commit_id.clone(),
-    }
-}
-
-fn stored_app_event_from_message_record(record: &AppMessageRecord) -> StoredAppEvent {
-    StoredAppEvent {
-        group_id_hex: record.group_id_hex.clone(),
-        message_id_hex: record.message_id_hex.clone(),
-        source_message_id_hex: None,
-        direction: record.direction.clone(),
-        sender: record.sender.clone(),
-        plaintext: record.plaintext.clone(),
-        kind: record.kind,
-        tags: record.tags.clone(),
-        source_epoch: record.source_epoch,
-        recorded_at: record.recorded_at,
-        received_at: record.received_at,
-        origin_commit_id: None,
-    }
-}
-
-fn notification_settings_from_account(
-    settings: AccountNotificationSettings,
-) -> NotificationSettings {
-    NotificationSettings {
-        account_ref: settings.account_label,
-        account_id_hex: settings.account_id_hex,
-        local_notifications_enabled: settings.local_notifications_enabled,
-        native_push_enabled: settings.native_push_enabled,
-    }
-}
-
-fn audit_account_ref_hex(account_id: &MemberId) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"marmot-audit-account-ref/v1");
-    hasher.update(account_id.as_slice());
-    let digest = hasher.finalize();
-    hex::encode(&digest[..AUDIT_ID_BYTES])
-}
-
-fn audit_engine_id_hex(account_id: &MemberId, device_id_hex: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"marmot-audit-engine-id/v2");
-    hasher.update(account_id.as_slice());
-    hasher.update(device_id_hex.as_bytes());
-    let digest = hasher.finalize();
-    hex::encode(&digest[..AUDIT_ID_BYTES])
-}
-
-fn parse_audit_device_id_hex(value: &str) -> Result<String, AppError> {
-    let value = value.trim();
-    let bytes = hex::decode(value).map_err(|_| {
-        AppError::InvalidAuditLogFile("audit device id must be hex encoded".to_owned())
-    })?;
-    if bytes.len() != AUDIT_ID_BYTES {
-        return Err(AppError::InvalidAuditLogFile(format!(
-            "audit device id must be {AUDIT_ID_BYTES} bytes"
-        )));
-    }
-    Ok(value.to_owned())
-}
-
-fn generate_audit_device_id_hex() -> String {
-    let mut bytes = [0u8; AUDIT_ID_BYTES];
-    OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    pub(crate) origin_commit_id: Option<String>,
 }
 
 fn generate_telemetry_install_id() -> String {
@@ -950,182 +647,6 @@ fn generate_telemetry_install_id() -> String {
         &encoded[16..20],
         &encoded[20..32]
     )
-}
-
-fn audit_device_id_hex(account_dir: &Path) -> Result<String, AppError> {
-    let path = account_dir.join(AUDIT_DEVICE_ID_FILE);
-    match fs::read_to_string(&path) {
-        Ok(value) => return parse_audit_device_id_hex(&value),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-
-    let device_id = generate_audit_device_id_hex();
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(device_id.as_bytes())?;
-            file.write_all(b"\n")?;
-            Ok(device_id)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            parse_audit_device_id_hex(&fs::read_to_string(&path)?)
-        }
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn relay_telemetry_settings_from_storage(
-    settings: StoredRelayTelemetrySettings,
-) -> RelayTelemetrySettings {
-    RelayTelemetrySettings {
-        export_enabled: settings.export_enabled,
-        export_interval_seconds: settings.export_interval_seconds,
-    }
-}
-
-fn relay_telemetry_settings_to_storage(
-    settings: RelayTelemetrySettings,
-) -> StoredRelayTelemetrySettings {
-    StoredRelayTelemetrySettings {
-        export_enabled: settings.export_enabled,
-        export_interval_seconds: settings.export_interval_seconds,
-    }
-}
-
-fn audit_log_settings_from_storage(settings: StoredAuditLogSettings) -> AuditLogSettings {
-    AuditLogSettings {
-        enabled: settings.enabled,
-    }
-}
-
-fn audit_log_settings_to_storage(settings: AuditLogSettings) -> StoredAuditLogSettings {
-    StoredAuditLogSettings {
-        enabled: settings.enabled,
-    }
-}
-
-fn normalize_relay_telemetry_settings(
-    settings: RelayTelemetrySettings,
-) -> Result<RelayTelemetrySettings, AppError> {
-    settings
-        .validate()
-        .map_err(AppError::InvalidRelayTelemetrySettings)?;
-    Ok(settings)
-}
-
-fn audit_log_file_name(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_string_lossy();
-    (file_name.starts_with("audit-") && file_name.ends_with(".jsonl"))
-        .then(|| file_name.into_owned())
-}
-
-fn system_time_ms(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-}
-
-fn validate_audit_upload_endpoint(
-    endpoint: &str,
-    authorization_bearer_token: Option<&str>,
-) -> Result<String, AppError> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint is empty".to_owned(),
-        ));
-    }
-    if !config::endpoint_transport_allowed(endpoint) {
-        return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint must be https, or loopback http for local testing".to_owned(),
-        ));
-    }
-    if !config::endpoint_host_is_loopback(endpoint)
-        && authorization_bearer_token.is_none_or(|token| token.trim().is_empty())
-    {
-        return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint requires an authorization bearer token unless it is loopback"
-                .to_owned(),
-        ));
-    }
-    Ok(endpoint.to_owned())
-}
-
-fn audit_log_reqwest_error(err: reqwest::Error) -> AppError {
-    if let Some(status) = err.status() {
-        AppError::AuditLogUpload(format!("HTTP {}", status.as_u16()))
-    } else if err.is_timeout() {
-        AppError::AuditLogUpload("request timed out".into())
-    } else if err.is_connect() {
-        AppError::AuditLogUpload("connection failed".into())
-    } else if err.is_body() {
-        AppError::AuditLogUpload("invalid response body".into())
-    } else {
-        AppError::AuditLogUpload("request failed".into())
-    }
-}
-
-fn account_push_registration_from_app(registration: PushRegistration) -> AccountPushRegistration {
-    AccountPushRegistration {
-        account_label: registration.account_ref,
-        account_id_hex: registration.account_id_hex,
-        platform: registration.platform.platform_byte(),
-        token_fingerprint: registration.token_fingerprint,
-        server_pubkey_hex: registration.server_pubkey_hex,
-        relay_hint: registration.relay_hint,
-        created_at_ms: registration.created_at_ms,
-        updated_at_ms: registration.updated_at_ms,
-        last_shared_at_ms: registration.last_shared_at_ms,
-    }
-}
-
-fn stored_push_registration_from_account(
-    stored: AccountStoredPushRegistration,
-) -> Result<notifications::StoredPushRegistration, AppError> {
-    Ok(notifications::StoredPushRegistration {
-        registration: PushRegistration {
-            account_ref: stored.registration.account_label,
-            account_id_hex: stored.registration.account_id_hex,
-            platform: PushPlatform::from_platform_byte(stored.registration.platform)?,
-            token_fingerprint: stored.registration.token_fingerprint,
-            server_pubkey_hex: stored.registration.server_pubkey_hex,
-            relay_hint: stored.registration.relay_hint,
-            created_at_ms: stored.registration.created_at_ms,
-            updated_at_ms: stored.registration.updated_at_ms,
-            last_shared_at_ms: stored.registration.last_shared_at_ms,
-        },
-        token_bytes: stored.token_bytes,
-    })
-}
-
-fn account_group_push_token_from_app(token: &GroupPushTokenRecord) -> AccountGroupPushToken {
-    AccountGroupPushToken {
-        group_id_hex: token.group_id_hex.clone(),
-        member_id_hex: token.member_id_hex.clone(),
-        leaf_index: token.leaf_index,
-        platform: token.platform.platform_byte(),
-        token_fingerprint: token.token_fingerprint.clone(),
-        server_pubkey_hex: token.server_pubkey_hex.clone(),
-        relay_hint: token.relay_hint.clone(),
-        encrypted_token: token.encrypted_token.clone(),
-        updated_at_ms: token.updated_at_ms,
-    }
-}
-
-fn group_push_token_from_account(
-    token: AccountGroupPushToken,
-) -> Result<GroupPushTokenRecord, AppError> {
-    Ok(GroupPushTokenRecord {
-        group_id_hex: token.group_id_hex,
-        member_id_hex: token.member_id_hex,
-        leaf_index: token.leaf_index,
-        platform: PushPlatform::from_platform_byte(token.platform)?,
-        token_fingerprint: token.token_fingerprint,
-        server_pubkey_hex: token.server_pubkey_hex,
-        relay_hint: token.relay_hint,
-        encrypted_token: token.encrypted_token,
-        updated_at_ms: token.updated_at_ms,
-    })
 }
 
 #[derive(Clone)]
@@ -1222,131 +743,6 @@ impl MarmotApp {
         let install_id = generate_telemetry_install_id();
         storage.set_telemetry_install_id(&install_id)?;
         Ok(install_id)
-    }
-
-    pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
-        Ok(audit_log_settings_from_storage(
-            self.shared_storage()?.audit_log_settings()?,
-        ))
-    }
-
-    pub fn set_audit_log_settings(
-        &self,
-        settings: AuditLogSettings,
-    ) -> Result<AuditLogSettings, AppError> {
-        self.shared_storage()?
-            .set_audit_log_settings(&audit_log_settings_to_storage(settings.clone()))?;
-        Ok(settings)
-    }
-
-    pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
-        let mut files = Vec::new();
-        for account in self.account_home().accounts()? {
-            let account_dir = self.account_dir(&account.label);
-            if !account_dir.exists() {
-                continue;
-            }
-            for entry in fs::read_dir(account_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                let Some(file_name) = audit_log_file_name(&path) else {
-                    continue;
-                };
-                let metadata = entry.metadata()?;
-                if !metadata.is_file() {
-                    continue;
-                }
-                files.push(AuditLogFile {
-                    account_ref: account.label.clone(),
-                    path: path.to_string_lossy().into_owned(),
-                    file_name,
-                    size_bytes: metadata.len(),
-                    modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
-                });
-            }
-        }
-        files.sort_by(|left, right| {
-            left.account_ref
-                .cmp(&right.account_ref)
-                .then_with(|| left.file_name.cmp(&right.file_name))
-        });
-        Ok(files)
-    }
-
-    pub async fn post_audit_log_file(
-        &self,
-        path: &str,
-        endpoint: &str,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        let config = config::AuditLogTrackerConfig {
-            endpoint: Some(endpoint.to_owned()),
-            ..Default::default()
-        };
-        self.post_audit_log_file_with_tracker_config(path, &config)
-            .await
-    }
-
-    pub async fn post_audit_log_file_with_tracker_config(
-        &self,
-        path: &str,
-        config: &config::AuditLogTrackerConfig,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        let path = self.validate_audit_log_path(path)?;
-        let config = config
-            .clone()
-            .normalize()
-            .map_err(AppError::AuditLogUpload)?;
-        let endpoint = config
-            .resolved_endpoint(self.service_endpoints())
-            .ok_or_else(|| AppError::AuditLogUpload("forensic upload endpoint is empty".into()))
-            .and_then(|endpoint| {
-                validate_audit_upload_endpoint(
-                    &endpoint,
-                    config.authorization_bearer_token.as_deref(),
-                )
-            })?;
-        let file = tokio::fs::File::open(&path).await?;
-        let bytes_sent = file.metadata().await?.len();
-        if bytes_sent > AUDIT_LOG_UPLOAD_MAX_BYTES {
-            return Err(AppError::AuditLogUpload(format!(
-                "audit log exceeds {} byte upload limit",
-                AUDIT_LOG_UPLOAD_MAX_BYTES
-            )));
-        }
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let mut request = AUDIT_LOG_UPLOAD_CLIENT
-            .post(endpoint)
-            .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
-            .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
-            .body(body);
-        if let Some(token) = config.authorization_bearer_token.as_deref() {
-            request = request.bearer_auth(token);
-        }
-        if let Some(value) = config.source.account_label.as_deref() {
-            request = request.header("X-Goggles-Account-Label", value);
-        }
-        if let Some(value) = config.source.device_label.as_deref() {
-            request = request.header("X-Goggles-Device-Label", value);
-        }
-        if let Some(value) = config.source.platform.as_deref() {
-            request = request.header("X-Goggles-Platform", value);
-        }
-        if let Some(value) = config.source.app_version.as_deref() {
-            request = request.header("X-Goggles-App-Version", value);
-        }
-        let response = request.send().await.map_err(audit_log_reqwest_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AppError::AuditLogUpload(format!(
-                "upload returned HTTP {}",
-                status.as_u16()
-            )));
-        }
-        Ok(AuditLogUploadResult {
-            path: path.to_string_lossy().into_owned(),
-            status: status.as_u16(),
-            bytes_sent,
-        })
     }
 
     pub fn with_relay_and_config(
@@ -2680,89 +2076,6 @@ impl MarmotApp {
         self.relay_endpoints()
     }
 
-    /// Open the file-backed forensic recorder for `label`, or `None` if it
-    /// could not be prepared.
-    ///
-    /// Best-effort and privacy-safe: every failure is logged and swallowed so
-    /// callers can continue without audit logging, matching how the recorder is
-    /// treated everywhere else. Shared by `open_account` (session construction)
-    /// and the live audit-toggle path ([`build_audit_recorder`]).
-    fn open_audit_recorder(
-        &self,
-        label: &str,
-        account_id: &MemberId,
-    ) -> Option<Box<dyn marmot_forensics::ForensicRecorder>> {
-        let account_dir = self.account_dir(label);
-        let device_id_hex = match audit_device_id_hex(&account_dir) {
-            Ok(device_id_hex) => device_id_hex,
-            Err(e) => {
-                tracing::warn!(
-                    target: "marmot_app",
-                    method = "open_audit_recorder",
-                    error = %e,
-                    "failed to prepare forensic audit identity; continuing without it"
-                );
-                return None;
-            }
-        };
-        let account_ref_hex = audit_account_ref_hex(account_id);
-        let engine_id_hex = audit_engine_id_hex(account_id, &device_id_hex);
-        // Canonicalize the directory so the recorder stores the same path that
-        // `delete_audit_log_file` derives (it canonicalizes its input). A
-        // non-canonical app root — relative, or reached through a symlinked
-        // prefix like macOS `/var` -> `/private/var` — would otherwise make the
-        // live-recorder match fail, so a delete would remove the visible file
-        // while the recorder kept appending to the orphaned inode.
-        let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
-        let audit_path = account_dir.join(format!("audit-{engine_id_hex}.jsonl"));
-        match marmot_forensics::JsonlRecorder::open_with_account_ref(
-            &audit_path,
-            engine_id_hex,
-            Some(account_ref_hex),
-        ) {
-            Ok(recorder) => Some(Box::new(recorder)),
-            Err(e) => {
-                tracing::warn!(
-                    target: "marmot_app",
-                    method = "open_audit_recorder",
-                    error = %e,
-                    "failed to open forensic audit log; continuing without it"
-                );
-                None
-            }
-        }
-    }
-
-    /// Build the recorder to install on a live session for the given audit
-    /// switch value: a file-backed recorder when `enabled` (and openable), or a
-    /// [`marmot_forensics::NoopRecorder`] when off or on failure.
-    ///
-    /// Used to apply an audit-setting change to an already-running session
-    /// in place, without reopening it.
-    pub(crate) fn build_audit_recorder(
-        &self,
-        label: &str,
-        enabled: bool,
-    ) -> Box<dyn marmot_forensics::ForensicRecorder> {
-        if !enabled {
-            return Box::new(marmot_forensics::NoopRecorder);
-        }
-        let account_id = match self.member_id(label) {
-            Ok(account_id) => account_id,
-            Err(e) => {
-                tracing::warn!(
-                    target: "marmot_app",
-                    method = "build_audit_recorder",
-                    error = %e,
-                    "failed to resolve account identity for audit logging; continuing without it"
-                );
-                return Box::new(marmot_forensics::NoopRecorder);
-            }
-        };
-        self.open_audit_recorder(label, &account_id)
-            .unwrap_or_else(|| Box::new(marmot_forensics::NoopRecorder))
-    }
-
     fn open_account(
         &self,
         label: &str,
@@ -4016,84 +3329,6 @@ impl MarmotApp {
         Ok(shared.get_or_insert_with(|| storage.clone()).clone())
     }
 
-    fn validate_audit_log_path(&self, path: &str) -> Result<PathBuf, AppError> {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(AppError::InvalidAuditLogFile(
-                "audit log path is empty".to_owned(),
-            ));
-        }
-        let path = PathBuf::from(path);
-        if audit_log_file_name(&path).is_none() {
-            return Err(AppError::InvalidAuditLogFile(
-                "audit log file must be named audit-*.jsonl".to_owned(),
-            ));
-        }
-        // Refuse a symlinked final component. `canonicalize` below resolves it
-        // to its target, so without this an `audit-*.jsonl` symlink could make
-        // us delete (or upload) an unrelated file that merely sits under the app
-        // root — e.g. the shared storage database.
-        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            return Err(AppError::InvalidAuditLogFile(
-                "audit log file must not be a symlink".to_owned(),
-            ));
-        }
-        let path = fs::canonicalize(path)?;
-        let root = fs::canonicalize(&self.root)?;
-        if !path.starts_with(&root) {
-            return Err(AppError::InvalidAuditLogFile(
-                "audit log file must be inside the app root".to_owned(),
-            ));
-        }
-        // The resolved target must itself be an audit log file: defense in
-        // depth against a symlinked parent component redirecting us elsewhere.
-        if audit_log_file_name(&path).is_none() {
-            return Err(AppError::InvalidAuditLogFile(
-                "resolved audit log file must be named audit-*.jsonl".to_owned(),
-            ));
-        }
-        Ok(path)
-    }
-
-    /// Validate `path` as an audit log file and resolve which local account
-    /// owns it.
-    ///
-    /// Returns the canonical path plus the owning account's `account_id_hex`
-    /// (the audit file lives directly in that account's directory). The owner
-    /// is `None` for a valid-but-unclaimed file, e.g. one left behind by a
-    /// since-removed account.
-    pub(crate) fn resolve_audit_log_path(
-        &self,
-        path: &str,
-    ) -> Result<(PathBuf, Option<String>), AppError> {
-        let path = self.validate_audit_log_path(path)?;
-        let mut owner_account_id_hex = None;
-        for account in self.account_home().accounts()? {
-            let Ok(dir) = fs::canonicalize(self.account_dir(&account.label)) else {
-                continue;
-            };
-            if path.parent() == Some(dir.as_path()) {
-                owner_account_id_hex = Some(account.account_id_hex);
-                break;
-            }
-        }
-        Ok((path, owner_account_id_hex))
-    }
-
-    /// Remove an audit log file from disk.
-    ///
-    /// Safe only when no live recorder holds the file open; a caller with a
-    /// running account worker must rotate the live recorder instead (see
-    /// `AppClient::rotate_audit_log_if_active`) so the held handle is never
-    /// orphaned. A missing file is treated as success.
-    pub(crate) fn remove_audit_log_file(&self, path: &Path) -> Result<(), AppError> {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
-        }
-    }
-
     fn legacy_directory_cache_path(&self) -> PathBuf {
         self.root.join(APP_CACHE_DB_FILE)
     }
@@ -4320,124 +3555,6 @@ impl MarmotApp {
         OsRng.fill_bytes(&mut nostr_group_id);
         let relays = self.relay_urls.clone();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
-    }
-}
-
-fn public_directory_user_record(
-    entry: &UserDirectoryRecord,
-) -> Result<PublicDirectoryUserRecord, AppError> {
-    let mut relay_lists = entry.relay_lists.clone();
-    relay_lists.bootstrap_relays.clear();
-
-    let profile_json = entry
-        .profile
-        .clone()
-        .map(|mut profile| {
-            profile.source_relays.clear();
-            serde_json::to_string(&profile)
-        })
-        .transpose()?;
-    let key_package_json = entry
-        .key_package
-        .clone()
-        .map(|mut key_package| {
-            key_package.source_relays.clear();
-            serde_json::to_string(&key_package)
-        })
-        .transpose()?;
-
-    Ok(PublicDirectoryUserRecord {
-        account_id_hex: entry.account_id_hex.clone(),
-        npub: entry.npub.clone(),
-        profile_json,
-        relay_lists_json: serde_json::to_string(&relay_lists)?,
-        key_package_json,
-        event_id_hex: entry.key_package.as_ref().and_then(|key_package| {
-            (!key_package.key_package_event_id.is_empty())
-                .then_some(key_package.key_package_event_id.clone())
-        }),
-        event_kind: None,
-        event_created_at: entry
-            .profile
-            .as_ref()
-            .map(|profile| profile.created_at)
-            .or_else(|| {
-                entry
-                    .key_package
-                    .as_ref()
-                    .map(|key_package| key_package.created_at)
-            }),
-        follows: entry.follows.clone(),
-    })
-}
-
-fn user_directory_record_from_public(
-    record: PublicDirectoryUserRecord,
-) -> Result<UserDirectoryRecord, AppError> {
-    Ok(UserDirectoryRecord {
-        account_id_hex: record.account_id_hex,
-        npub: record.npub,
-        local_account: None,
-        profile: record
-            .profile_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?,
-        follows: record.follows,
-        follow_source_relays: Vec::new(),
-        relay_lists: serde_json::from_str(&record.relay_lists_json)?,
-        key_package: record
-            .key_package_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()?,
-    })
-}
-
-fn directory_record_recency(entry: &UserDirectoryRecord) -> u64 {
-    entry
-        .profile
-        .as_ref()
-        .map(|profile| profile.created_at)
-        .into_iter()
-        .chain(
-            entry
-                .key_package
-                .as_ref()
-                .map(|key_package| key_package.created_at),
-        )
-        .max()
-        .unwrap_or_default()
-}
-
-fn select_newer_directory_entry(
-    cached: Option<UserDirectoryRecord>,
-    shared: Option<UserDirectoryRecord>,
-) -> Option<UserDirectoryRecord> {
-    match (cached, shared) {
-        (Some(cached), Some(shared)) => {
-            if directory_record_recency(&shared) > directory_record_recency(&cached) {
-                Some(shared)
-            } else {
-                Some(cached)
-            }
-        }
-        (Some(entry), None) | (None, Some(entry)) => Some(entry),
-        (None, None) => None,
-    }
-}
-
-fn upsert_newer_directory_entry(
-    entries_by_id: &mut BTreeMap<String, UserDirectoryRecord>,
-    entry: UserDirectoryRecord,
-) {
-    match entries_by_id.entry(entry.account_id_hex.clone()) {
-        std::collections::btree_map::Entry::Vacant(slot) => {
-            slot.insert(entry);
-        }
-        std::collections::btree_map::Entry::Occupied(mut slot) => {
-            if directory_record_recency(&entry) > directory_record_recency(slot.get()) {
-                *slot.get_mut() = entry;
-            }
-        }
     }
 }
 
@@ -4686,457 +3803,6 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
     }
 }
 
-fn relay_list_status_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-) -> AccountRelayListStatus {
-    sort_directory_records(&mut records);
-    let mut status = AccountRelayListStatus::empty();
-    for record in records {
-        if record.event.pubkey != account_id_hex {
-            continue;
-        }
-        let relays = relays_from_relay_list_event(&record.event);
-        if relays.is_empty() {
-            continue;
-        }
-        match record.event.kind {
-            KIND_NIP65_RELAY_LIST => status.nip65.relays = relays,
-            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox.relays = relays,
-            _ => continue,
-        }
-        push_unique_strings(
-            &mut status.bootstrap_relays,
-            record
-                .endpoints
-                .iter()
-                .map(|endpoint| endpoint.0.clone())
-                .collect::<Vec<_>>(),
-        );
-    }
-    status.refresh();
-    status
-}
-
-fn fresh_relay_list_status_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-    freshness: DirectoryFreshness,
-) -> DirectorySelection<AccountRelayListStatus> {
-    let mut rejected_future = false;
-    records.retain(|record| {
-        if record.event.pubkey != account_id_hex
-            || !matches!(
-                record.event.kind,
-                KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST
-            )
-        {
-            return true;
-        }
-        let accepted = freshness.accepts(record);
-        rejected_future |= !accepted;
-        accepted
-    });
-    DirectorySelection {
-        value: relay_list_status_from_records(account_id_hex, records),
-        rejected_future,
-    }
-}
-
-fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
-    [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
-        .into_iter()
-        .map(|kind| DirectoryEventQuery::new(kind, vec![account_id_hex.clone()], 12))
-        .collect()
-}
-
-fn latest_key_package_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-) -> Result<FetchedKeyPackage, AppError> {
-    sort_directory_records(&mut records);
-    let mut latest = None;
-    for record in records {
-        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            continue;
-        }
-        latest = Some(key_package_from_record(record)?);
-    }
-    latest.ok_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned()))
-}
-
-fn latest_fresh_key_package_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-    freshness: DirectoryFreshness,
-) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
-    let mut rejected_future = false;
-    records.retain(|record| {
-        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            return true;
-        }
-        let accepted = freshness.accepts(record);
-        rejected_future |= !accepted;
-        accepted
-    });
-    match latest_key_package_from_records(account_id_hex, records) {
-        Ok(value) => Ok(DirectorySelection {
-            value: Some(value),
-            rejected_future,
-        }),
-        Err(AppError::MissingKeyPackage(_)) => Ok(DirectorySelection {
-            value: None,
-            rejected_future,
-        }),
-        Err(err) => Err(err),
-    }
-}
-
-fn cached_key_package_from_entry(
-    entry: UserDirectoryRecord,
-) -> Result<Option<FetchedKeyPackage>, AppError> {
-    let Some(key_package) = entry.key_package else {
-        return Ok(None);
-    };
-    let (decoded, key_package_ref_hex) =
-        validated_cached_key_package_with_ref(&entry.account_id_hex, &key_package)?;
-    Ok(Some(FetchedKeyPackage {
-        account_id_hex: entry.account_id_hex,
-        key_package: decoded,
-        key_package_id: key_package.key_package_id,
-        key_package_ref_hex,
-        key_package_event_id: key_package.key_package_event_id,
-        created_at: key_package.created_at,
-        source_relays: key_package.source_relays,
-        relay_lists: entry.relay_lists,
-    }))
-}
-
-fn validated_cached_key_package(
-    account_id_hex: &str,
-    key_package: &DirectoryKeyPackage,
-) -> Result<KeyPackage, AppError> {
-    validated_cached_key_package_with_ref(account_id_hex, key_package)
-        .map(|(key_package, _)| key_package)
-}
-
-fn validated_cached_key_package_with_ref(
-    account_id_hex: &str,
-    key_package: &DirectoryKeyPackage,
-) -> Result<(KeyPackage, String), AppError> {
-    let decoded = key_package_from_hex_with_optional_source(
-        &key_package.key_package_hex,
-        &key_package.key_package_event_id,
-    )?;
-    let metadata = key_package_metadata(&decoded)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
-    if metadata.credential_identity_hex != account_id_hex {
-        return Err(AppError::InvalidKeyPackageEvent(
-            "cached KeyPackage credential identity does not match directory account".into(),
-        ));
-    }
-    if !key_package.key_package_ref_hex.is_empty()
-        && key_package.key_package_ref_hex != metadata.key_package_ref_hex
-    {
-        return Err(AppError::InvalidKeyPackageEvent(
-            "cached KeyPackage ref does not match decoded KeyPackageRef".into(),
-        ));
-    }
-    Ok((decoded, metadata.key_package_ref_hex))
-}
-
-fn key_package_from_hex_with_optional_source(
-    key_package_hex: &str,
-    event_id_hex: &str,
-) -> Result<KeyPackage, AppError> {
-    let bytes = hex::decode(key_package_hex)?;
-    if event_id_hex.is_empty() {
-        return Ok(KeyPackage::new(bytes));
-    }
-    Ok(KeyPackage::with_source_event_id(
-        bytes,
-        key_package_event_id_from_hex(event_id_hex)?,
-    ))
-}
-
-fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppError> {
-    let bytes = hex::decode(event_id_hex)?;
-    if bytes.len() != 32 {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
-            "KeyPackage event id must be 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    Ok(MessageId::new(bytes))
-}
-
-fn relay_lists_have_any_relays(status: &AccountRelayListStatus) -> bool {
-    !status.nip65.relays.is_empty() || !status.inbox.relays.is_empty()
-}
-
-fn fill_missing_relay_lists_from_cached(
-    status: &mut AccountRelayListStatus,
-    cached: &AccountRelayListStatus,
-) {
-    if status.nip65.relays.is_empty() {
-        status.nip65.relays = cached.nip65.relays.clone();
-    }
-    if status.inbox.relays.is_empty() {
-        status.inbox.relays = cached.inbox.relays.clone();
-    }
-    if status.bootstrap_relays.is_empty() {
-        status.bootstrap_relays = cached.bootstrap_relays.clone();
-    }
-    status.refresh();
-}
-
-fn fresh_or_cached_key_package(
-    account_id_hex: &str,
-    selection: DirectorySelection<Option<FetchedKeyPackage>>,
-    cached_entry: Option<UserDirectoryRecord>,
-) -> Result<FetchedKeyPackage, AppError> {
-    if let Some(fetched) = selection.value {
-        return Ok(fetched);
-    }
-    if selection.rejected_future
-        && let Some(cached) = cached_entry
-            .map(cached_key_package_from_entry)
-            .transpose()?
-            .flatten()
-    {
-        return Ok(cached);
-    }
-    Err(AppError::MissingKeyPackage(account_id_hex.to_owned()))
-}
-
-fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage, AppError> {
-    let event = record.event;
-    require_key_package_tag(&event, "mls_protocol_version", |value| value == "1.0")?;
-    let key_package_id = event
-        .tag_value("d")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing d tag".into()))?
-        .to_owned();
-    let key_package_ref = event
-        .tag_value("i")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing i tag".into()))?
-        .to_owned();
-    require_key_package_tag(&event, "mls_ciphersuite", |value| !value.is_empty())?;
-    require_multi_value_key_package_tag(&event, "mls_extensions")?;
-    require_multi_value_key_package_tag_contains(
-        &event,
-        "mls_extensions",
-        &format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
-    )?;
-    require_multi_value_key_package_tag(&event, "mls_proposals")?;
-    require_multi_value_key_package_tag(&event, "app_components")?;
-    let key_package_bytes = BASE64_STANDARD
-        .decode(event.content.as_bytes())
-        .map_err(|e| AppError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}")))?;
-    if key_package_bytes.is_empty() {
-        return Err(AppError::InvalidKeyPackageEvent(
-            "empty key package content".into(),
-        ));
-    }
-    let key_package = KeyPackage::with_source_event_id(
-        key_package_bytes,
-        key_package_event_id_from_hex(&event.id)?,
-    );
-    let metadata = key_package_metadata(&key_package)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
-    if metadata.credential_identity_hex != event.pubkey {
-        return Err(AppError::InvalidKeyPackageEvent(
-            "transport author does not match KeyPackage credential identity".into(),
-        ));
-    }
-    if metadata.key_package_ref_hex != key_package_ref {
-        return Err(AppError::InvalidKeyPackageEvent(
-            "i tag does not match decoded KeyPackageRef".into(),
-        ));
-    }
-    let mut source_relays = Vec::new();
-    push_unique_strings(
-        &mut source_relays,
-        record
-            .endpoints
-            .into_iter()
-            .map(|endpoint| endpoint.0)
-            .collect::<Vec<_>>(),
-    );
-    Ok(FetchedKeyPackage {
-        account_id_hex: event.pubkey,
-        key_package,
-        key_package_id,
-        key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id,
-        created_at: event.created_at,
-        source_relays,
-        relay_lists: AccountRelayListStatus::empty(),
-    })
-}
-
-fn account_key_package_record_from_fetched(fetched: FetchedKeyPackage) -> AccountKeyPackageRecord {
-    AccountKeyPackageRecord {
-        account_label: None,
-        account_id_hex: fetched.account_id_hex,
-        key_package_id: fetched.key_package_id,
-        key_package_ref_hex: fetched.key_package_ref_hex,
-        key_package_event_id: fetched.key_package_event_id,
-        published_at: fetched.created_at,
-        key_package_bytes: fetched.key_package.bytes().len(),
-        source_relays: fetched.source_relays,
-        local: false,
-        relay: true,
-    }
-}
-
-fn merge_key_package_records(
-    records: Vec<AccountKeyPackageRecord>,
-) -> Vec<AccountKeyPackageRecord> {
-    let mut merged: BTreeMap<String, AccountKeyPackageRecord> = BTreeMap::new();
-    for record in records {
-        let key = if !record.key_package_event_id.is_empty() {
-            record.key_package_event_id.clone()
-        } else if !record.key_package_ref_hex.is_empty() {
-            record.key_package_ref_hex.clone()
-        } else {
-            record.key_package_id.clone()
-        };
-        merged
-            .entry(key)
-            .and_modify(|existing| {
-                existing.local |= record.local;
-                existing.relay |= record.relay;
-                existing.published_at = existing.published_at.max(record.published_at);
-                if existing.account_label.is_none() {
-                    existing.account_label = record.account_label.clone();
-                }
-                push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
-            })
-            .or_insert(record);
-    }
-    let mut records = merged.into_values().collect::<Vec<_>>();
-    records.sort_by(|left, right| {
-        right
-            .published_at
-            .cmp(&left.published_at)
-            .then_with(|| left.key_package_event_id.cmp(&right.key_package_event_id))
-    });
-    records
-}
-
-fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {
-    let trimmed = value.trim();
-    let bytes = hex::decode(trimmed)?;
-    if bytes.len() != 32 {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
-            "KeyPackage event id must be 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    Ok(trimmed.to_owned())
-}
-
-/// Per spec/transports/nostr.md, each KeyPackage id-list tag is exactly one
-/// tag. A consumer MUST reject an event that repeats an id-list tag name rather
-/// than silently reading the first occurrence (two consumers could otherwise
-/// pick different occurrences and disagree on advertised capabilities).
-fn reject_duplicate_key_package_tag(
-    event: &NostrTransportEvent,
-    name: &str,
-) -> Result<(), AppError> {
-    let count = event
-        .tags
-        .iter()
-        .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
-        .count();
-    if count > 1 {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
-            "duplicate {name} tag"
-        )));
-    }
-    Ok(())
-}
-
-fn require_key_package_tag(
-    event: &NostrTransportEvent,
-    name: &str,
-    predicate: impl FnOnce(&str) -> bool,
-) -> Result<(), AppError> {
-    reject_duplicate_key_package_tag(event, name)?;
-    match event.tag_value(name) {
-        Some(value) if predicate(value) => Ok(()),
-        Some(value) => Err(AppError::InvalidKeyPackageEvent(format!(
-            "invalid {name} tag: {value}"
-        ))),
-        None => Err(AppError::InvalidKeyPackageEvent(format!(
-            "missing {name} tag"
-        ))),
-    }
-}
-
-fn require_multi_value_key_package_tag(
-    event: &NostrTransportEvent,
-    name: &str,
-) -> Result<(), AppError> {
-    reject_duplicate_key_package_tag(event, name)?;
-    let Some(tag) = event
-        .tags
-        .iter()
-        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
-    else {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
-            "missing {name} tag"
-        )));
-    };
-    if tag.iter().skip(1).any(|value| !value.trim().is_empty()) {
-        Ok(())
-    } else {
-        Err(AppError::InvalidKeyPackageEvent(format!(
-            "empty {name} tag"
-        )))
-    }
-}
-
-fn require_multi_value_key_package_tag_contains(
-    event: &NostrTransportEvent,
-    name: &str,
-    required: &str,
-) -> Result<(), AppError> {
-    reject_duplicate_key_package_tag(event, name)?;
-    let Some(tag) = event
-        .tags
-        .iter()
-        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
-    else {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
-            "missing {name} tag"
-        )));
-    };
-    if tag
-        .iter()
-        .skip(1)
-        .any(|value| value.eq_ignore_ascii_case(required))
-    {
-        Ok(())
-    } else {
-        Err(AppError::InvalidKeyPackageEvent(format!(
-            "{name} tag missing required value {required}"
-        )))
-    }
-}
-
-fn publish_endpoints_from_bootstrap(
-    bootstrap: &AccountRelayListBootstrap,
-) -> Vec<TransportEndpoint> {
-    if bootstrap.bootstrap_relays.is_empty() {
-        bootstrap.default_relays.clone()
-    } else {
-        bootstrap.bootstrap_relays.clone()
-    }
-}
-
 fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
     let mut value = serde_json::Map::new();
     if let Some(name) = profile.name.as_ref().filter(|value| !value.is_empty()) {
@@ -5201,7 +3867,7 @@ fn unix_now_seconds() -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DirectoryFreshness {
+pub(crate) struct DirectoryFreshness {
     max_created_at: u64,
 }
 
@@ -5212,15 +3878,15 @@ impl DirectoryFreshness {
         }
     }
 
-    fn accepts(self, record: &RelayEventRecord) -> bool {
+    pub(crate) fn accepts(self, record: &RelayEventRecord) -> bool {
         record.event.created_at <= self.max_created_at
     }
 }
 
 #[derive(Debug)]
-struct DirectorySelection<T> {
-    value: T,
-    rejected_future: bool,
+pub(crate) struct DirectorySelection<T> {
+    pub(crate) value: T,
+    pub(crate) rejected_future: bool,
 }
 
 fn sort_directory_records(records: &mut [RelayEventRecord]) {
@@ -5308,124 +3974,6 @@ fn latest_fresh_profiles_from_records(
     DirectorySelection {
         value: latest_profiles_from_records(records),
         rejected_future,
-    }
-}
-
-fn profile_from_record(record: RelayEventRecord) -> Option<(String, UserProfileMetadata)> {
-    let content = serde_json::from_str::<serde_json::Value>(&record.event.content).ok()?;
-    Some((
-        record.event.pubkey.clone(),
-        UserProfileMetadata {
-            name: string_field(&content, "name"),
-            display_name: string_field(&content, "display_name")
-                .or_else(|| string_field(&content, "displayName")),
-            about: string_field(&content, "about"),
-            picture: string_field(&content, "picture"),
-            nip05: string_field(&content, "nip05"),
-            lud16: string_field(&content, "lud16"),
-            created_at: record.event.created_at,
-            source_relays: source_relays_from_record(&record),
-        },
-    ))
-}
-
-/// Defensive cap on any single ingested profile field. Nostr kind:0 content
-/// is attacker-controlled (anyone can publish any metadata to a relay), so we
-/// bound each field to keep a malicious multi-megabyte value from bloating the
-/// directory cache and downstream consumers. 4096 chars is generous for any
-/// legitimate name/about/url. Char-based (not byte) truncation keeps the
-/// result valid UTF-8.
-const MAX_PROFILE_FIELD_CHARS: usize = 4096;
-
-fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(MAX_PROFILE_FIELD_CHARS).collect())
-}
-
-fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
-    let mut relays = record
-        .endpoints
-        .iter()
-        .map(|endpoint| endpoint.0.clone())
-        .collect::<Vec<_>>();
-    relays.sort();
-    relays.dedup();
-    relays
-}
-
-#[derive(Clone, Debug)]
-struct UserRecordMatch {
-    field: String,
-    quality: String,
-}
-
-fn user_record_match(record: &UserDirectoryRecord, query: &str) -> Option<UserRecordMatch> {
-    let mut candidates = vec![
-        ("npub", record.npub.as_str()),
-        ("pubkey", record.account_id_hex.as_str()),
-    ];
-    if let Some(profile) = &record.profile {
-        if let Some(name) = profile.name.as_deref() {
-            candidates.push(("name", name));
-        }
-        if let Some(nip05) = profile.nip05.as_deref() {
-            candidates.push(("nip05", nip05));
-        }
-        if let Some(display_name) = profile.display_name.as_deref() {
-            candidates.push(("display_name", display_name));
-        }
-        if let Some(about) = profile.about.as_deref() {
-            candidates.push(("about", about));
-        }
-    }
-
-    candidates
-        .into_iter()
-        .filter_map(|(field, value)| {
-            let value = value.to_lowercase();
-            let quality = if value == query {
-                "exact"
-            } else if value.starts_with(query) {
-                "prefix"
-            } else if value.contains(query) {
-                "contains"
-            } else {
-                return None;
-            };
-            Some(UserRecordMatch {
-                field: field.to_owned(),
-                quality: quality.to_owned(),
-            })
-        })
-        .min_by(|a, b| {
-            match_quality_rank(&a.quality)
-                .cmp(&match_quality_rank(&b.quality))
-                .then_with(|| field_rank(&a.field).cmp(&field_rank(&b.field)))
-        })
-}
-
-fn match_quality_rank(quality: &str) -> u8 {
-    match quality {
-        "exact" => 0,
-        "prefix" => 1,
-        "contains" => 2,
-        _ => 3,
-    }
-}
-
-fn field_rank(field: &str) -> u8 {
-    match field {
-        "name" => 0,
-        "nip05" => 1,
-        "display_name" => 2,
-        "about" => 3,
-        "npub" => 4,
-        "pubkey" => 5,
-        _ => 6,
     }
 }
 

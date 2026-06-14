@@ -12,6 +12,18 @@ App runtime bridge for the first real Marmot app surfaces.
   their behavior again.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in `src/media.rs`.
+- Keep the mechanical `storage_sqlite` `Stored*` <-> app-DTO mapper free functions (account state, groups, components,
+  messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
+  state.
+- Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
+  the upload client, and the `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path
+  validation/resolution/removal, and HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+- Keep stateless directory-record helpers (cached <-> shared record conversion, recency selection, Nostr profile
+  parsing, search-match ranking) in `src/directory_records.rs`; they complement the stateful `directory/` cache/sync
+  modules and hold no `MarmotApp` state.
+- Keep stateless account relay-list and KeyPackage parsing/validation (relay-list status, KeyPackage tag/metadata
+  validation, fresh-vs-cached reconciliation, record merge, publish-endpoint selection) in
+  `src/key_package_records.rs`. They hold no `MarmotApp` state.
 - Keep the crate root focused on app construction, shared state, storage/projector wiring, directory bootstrap, account
   relay-list helpers, and public re-exports.
 - Keep CLI/TUI presentation out of this crate.

@@ -11,8 +11,15 @@ use cgka_traits::app_event::{
     STREAM_TYPE_TAG,
 };
 use marmot_account::AccountHomeError;
+use storage_sqlite::StoredRelayTelemetrySettings;
 use transport_quic_broker::BrokerServerTrust;
 
+use crate::audit_log::AUDIT_ID_BYTES;
+use crate::conversions::{app_group_from_stored_group, stored_group_from_app_group};
+use crate::key_package_records::{
+    require_key_package_tag, require_multi_value_key_package_tag,
+    require_multi_value_key_package_tag_contains,
+};
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
@@ -1512,53 +1519,6 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
 }
 
 #[test]
-fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {
-    let account_id = MemberId::new(vec![0xab; 32]);
-
-    let engine_id = audit_engine_id_hex(&account_id, "01".repeat(16).as_str());
-
-    assert_eq!(engine_id.len(), 32);
-    assert_eq!(
-        engine_id,
-        audit_engine_id_hex(&account_id, "01".repeat(16).as_str())
-    );
-    assert_ne!(engine_id, hex::encode(&account_id.as_slice()[..16]));
-}
-
-#[test]
-fn audit_identity_hashes_separate_account_and_device_scope() {
-    let account_id = MemberId::new(vec![0xab; 32]);
-    let first_device = "01".repeat(16);
-    let second_device = "02".repeat(16);
-
-    let account_ref = audit_account_ref_hex(&account_id);
-    let first_engine = audit_engine_id_hex(&account_id, &first_device);
-    let second_engine = audit_engine_id_hex(&account_id, &second_device);
-
-    assert_eq!(account_ref.len(), 32);
-    assert_eq!(account_ref, audit_account_ref_hex(&account_id));
-    assert_ne!(account_ref, hex::encode(&account_id.as_slice()[..16]));
-    assert_ne!(first_engine, second_engine);
-}
-
-#[test]
-fn audit_device_id_is_generated_once_per_account_dir() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let first = audit_device_id_hex(dir.path()).unwrap();
-    let second = audit_device_id_hex(dir.path()).unwrap();
-
-    assert_eq!(first.len(), 32);
-    assert_eq!(first, second);
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join(AUDIT_DEVICE_ID_FILE))
-            .unwrap()
-            .trim(),
-        first
-    );
-}
-
-#[test]
 fn telemetry_install_id_is_stable_uuid_per_app_root() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -1647,168 +1607,4 @@ fn relay_telemetry_settings_reject_invalid_persisted_interval() {
         .expect_err("invalid persisted interval should be rejected");
 
     assert!(matches!(err, AppError::InvalidRelayTelemetrySettings(_)));
-}
-
-#[test]
-fn audit_log_settings_persist_in_shared_storage() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    assert_eq!(
-        app.audit_log_settings().unwrap(),
-        AuditLogSettings::default()
-    );
-
-    let stored = app
-        .set_audit_log_settings(AuditLogSettings { enabled: true })
-        .unwrap();
-
-    assert_eq!(stored, AuditLogSettings { enabled: true });
-
-    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    assert_eq!(reopened.audit_log_settings().unwrap(), stored);
-}
-
-#[test]
-fn resolve_audit_log_path_maps_file_to_owning_account() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    let audit_path = app.account_dir("alice").join("audit-deadbeef.jsonl");
-    std::fs::write(&audit_path, b"{}\n").unwrap();
-
-    let (resolved, owner) = app
-        .resolve_audit_log_path(&audit_path.to_string_lossy())
-        .unwrap();
-    assert_eq!(resolved, std::fs::canonicalize(&audit_path).unwrap());
-    assert_eq!(owner.as_deref(), Some(account.account_id_hex.as_str()));
-}
-
-#[test]
-fn resolve_audit_log_path_has_no_owner_outside_account_dirs() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    // A valid audit file directly under the app root belongs to no account.
-    let orphan = dir.path().join("audit-orphan.jsonl");
-    std::fs::write(&orphan, b"{}\n").unwrap();
-
-    let (_, owner) = app
-        .resolve_audit_log_path(&orphan.to_string_lossy())
-        .unwrap();
-    assert_eq!(owner, None);
-}
-
-#[test]
-fn remove_audit_log_file_deletes_and_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    let audit_path = app.account_dir("alice").join("audit-deadbeef.jsonl");
-    std::fs::write(&audit_path, b"{}\n").unwrap();
-    assert!(audit_path.exists());
-
-    app.remove_audit_log_file(&audit_path).unwrap();
-    assert!(!audit_path.exists());
-    // A missing file is treated as success.
-    app.remove_audit_log_file(&audit_path).unwrap();
-}
-
-#[test]
-fn build_audit_recorder_reflects_enabled_flag() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    // Off -> no-op recorder with no file backing.
-    assert!(
-        app.build_audit_recorder("alice", false)
-            .audit_log_path()
-            .is_none()
-    );
-
-    // On -> file-backed recorder; the backing file is created in the
-    // account directory so the live session records to it immediately.
-    let recorder = app.build_audit_recorder("alice", true);
-    let path = recorder
-        .audit_log_path()
-        .expect("file-backed recorder when enabled");
-    assert!(path.exists());
-    // The recorder stores the canonical path (see below); compare against
-    // the canonical account dir.
-    assert_eq!(
-        path.parent(),
-        Some(
-            std::fs::canonicalize(app.account_dir("alice"))
-                .unwrap()
-                .as_path()
-        )
-    );
-}
-
-#[test]
-fn live_recorder_path_matches_resolved_delete_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    let recorder = app.build_audit_recorder("alice", true);
-    let recorder_path = recorder
-        .audit_log_path()
-        .expect("file-backed recorder when enabled");
-
-    // The live recorder must store the exact path that delete derives from
-    // the host-supplied (dir-relative) path it gets back from
-    // `audit_log_files`. If these differ — e.g. macOS `/var` vs
-    // `/private/var` — the worker would not recognize the live recorder and
-    // a delete would orphan its open append handle.
-    let listed = app
-        .audit_log_files()
-        .unwrap()
-        .into_iter()
-        .find(|file| file.account_ref == "alice")
-        .expect("audit file is listed");
-    let (resolved, owner) = app.resolve_audit_log_path(&listed.path).unwrap();
-    assert_eq!(resolved, recorder_path);
-    assert_eq!(
-        owner.as_deref(),
-        Some(
-            app.account_home()
-                .account("alice")
-                .unwrap()
-                .account_id_hex
-                .as_str()
-        )
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn validate_audit_log_path_rejects_symlinked_audit_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-
-    // A sensitive non-audit file under the app root.
-    let secret = app.account_dir("alice").join("shared-storage.db");
-    std::fs::write(&secret, b"do-not-delete").unwrap();
-
-    // A symlink with an audit-looking name pointing at it.
-    let link = app.account_dir("alice").join("audit-evil.jsonl");
-    std::os::unix::fs::symlink(&secret, &link).unwrap();
-
-    // Resolution (and therefore delete) refuses the symlink outright, so the
-    // target is never followed and never removed.
-    assert!(matches!(
-        app.resolve_audit_log_path(&link.to_string_lossy()),
-        Err(AppError::InvalidAuditLogFile(_))
-    ));
-    assert!(secret.exists(), "symlink target must be untouched");
 }
