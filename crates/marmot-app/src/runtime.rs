@@ -996,8 +996,9 @@ impl TimelineWindow {
         query.pagination = match self.page.messages.last() {
             // Detached, with a non-saturating newest timestamp: `before` is
             // exclusive, so `+ 1` with an empty id selects every row at or below
-            // the newest message (including the newest itself), preserving the
-            // scrolled-back window.
+            // the newest *timestamp* (including the newest message itself). This
+            // over-includes same-second rows that sort after the newest message;
+            // `install_refresh` trims them back to the canonical boundary.
             Some(newest) if !self.anchored_to_head() && newest.timeline_at != u64::MAX => {
                 TimelinePagination {
                     before: Some(newest.timeline_at + 1),
@@ -1106,14 +1107,43 @@ impl TimelineWindowHandle {
         apply_projection_to_window(&mut window.page, update, limit);
     }
 
-    /// Read the store handle and the refresh cursor for the current window.
-    fn refresh_request(&self) -> (Arc<TimelineQueryFn>, TimelineMessageQuery) {
+    /// Read the store handle, the refresh cursor, and (for a detached window)
+    /// the canonical upper bound the refreshed page must not exceed.
+    fn refresh_request(
+        &self,
+    ) -> (
+        Arc<TimelineQueryFn>,
+        TimelineMessageQuery,
+        Option<(u64, String)>,
+    ) {
         let window = self.lock();
-        (window.query.clone(), window.refresh_query())
+        let upper = if window.anchored_to_head() {
+            None
+        } else {
+            window
+                .page
+                .messages
+                .last()
+                .map(|message| (message.timeline_at, message.message_id_hex.clone()))
+        };
+        (window.query.clone(), window.refresh_query(), upper)
     }
 
-    /// Replace the window with a freshly-materialized page and return it.
-    fn install_refresh(&self, page: TimelinePage) -> TimelinePage {
+    /// Replace the window with a freshly-materialized page and return it. For a
+    /// detached window, `upper` is the canonical `(timeline_at, message_id_hex)`
+    /// boundary: the `before` cursor over-includes same-second rows that sort
+    /// after it (they belong to the unseen head), so trim them to keep the
+    /// scrolled-back boundary exactly where it was.
+    fn install_refresh(
+        &self,
+        mut page: TimelinePage,
+        upper: Option<(u64, String)>,
+    ) -> TimelinePage {
+        if let Some((at, id)) = upper.as_ref() {
+            page.messages.retain(|message| {
+                (message.timeline_at, message.message_id_hex.as_str()) <= (*at, id.as_str())
+            });
+        }
         let mut window = self.lock();
         window.page = page;
         window.page.clone()
@@ -1172,10 +1202,10 @@ impl RuntimeTimelineMessagesSubscription {
                     return Some(RuntimeTimelineMessageUpdate::Projection(*update));
                 }
                 TimelineSubscriptionSignal::Refresh => {
-                    let (query_fn, query) = self.window.refresh_request();
+                    let (query_fn, query, upper) = self.window.refresh_request();
                     match blocking_app_task(move || query_fn(query)).await {
                         Ok(page) => {
-                            let page = self.window.install_refresh(page);
+                            let page = self.window.install_refresh(page, upper);
                             return Some(RuntimeTimelineMessageUpdate::Page { page });
                         }
                         // Transient store error on refresh: keep the existing
@@ -1248,10 +1278,22 @@ fn apply_projection_to_window(
     limit: usize,
 ) {
     let anchored = !window.has_more_after;
-    let newest_at = window.messages.last().map(|message| message.timeline_at);
+    // Canonical upper bound of the window is the pair `(timeline_at,
+    // message_id_hex)`, not just the timestamp. A detached window must suppress
+    // anything sorting strictly after this — including same-second messages with
+    // a larger id, which `timeline_at`-only comparison would have admitted.
+    let newest_key = window
+        .messages
+        .last()
+        .map(|message| (message.timeline_at, message.message_id_hex.clone()));
     if update.timeline_changes.is_empty() {
         for message in &update.timeline_messages {
-            insert_live_message(&mut window.messages, message.clone(), anchored, newest_at);
+            insert_live_message(
+                &mut window.messages,
+                message.clone(),
+                anchored,
+                newest_key.as_ref(),
+            );
         }
     } else {
         for change in &update.timeline_changes {
@@ -1261,7 +1303,7 @@ fn apply_projection_to_window(
                         &mut window.messages,
                         (**message).clone(),
                         anchored,
-                        newest_at,
+                        newest_key.as_ref(),
                     );
                 }
                 TimelineMessageChange::Remove { message_id_hex, .. } => {
@@ -1283,14 +1325,17 @@ fn apply_projection_to_window(
 }
 
 /// Apply one live upsert. Existing messages are replaced in place (edits,
-/// reactions, delivery-state changes). A new message is appended only when the
-/// window is anchored to the head, or when it falls at or below the newest
-/// message of a detached window.
+/// reactions, delivery-state changes). A brand-new message is appended only when
+/// the window is anchored to the head, or when it sorts at or below the detached
+/// window's newest message in canonical `(timeline_at, message_id_hex)` order.
+/// `newest_key` is `None` only for an empty window, where a detached window has
+/// nothing in range and therefore suppresses (an anchored empty window still
+/// appends, as the head).
 fn insert_live_message(
     messages: &mut Vec<TimelineMessageRecord>,
     message: TimelineMessageRecord,
     anchored: bool,
-    newest_at: Option<u64>,
+    newest_key: Option<&(u64, String)>,
 ) {
     if let Some(existing) = messages
         .iter_mut()
@@ -1299,7 +1344,9 @@ fn insert_live_message(
         *existing = message;
         return;
     }
-    let within_window = newest_at.is_none_or(|newest| message.timeline_at <= newest);
+    let within_window = newest_key.is_some_and(|(at, id)| {
+        (message.timeline_at, message.message_id_hex.as_str()) <= (*at, id.as_str())
+    });
     if anchored || within_window {
         messages.push(message);
     }
@@ -6737,6 +6784,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_projection_suppresses_same_second_head_when_detached() {
+        // Newest is ("b", 20); a brand-new message shares the second but sorts
+        // after it by id. Timestamp-only comparison would admit it; canonical
+        // `(timeline_at, message_id_hex)` comparison correctly suppresses it.
+        let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
+        let update = projection_for(vec![timeline_test_record("c", 20)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b"]);
+        assert!(window.has_more_after);
+    }
+
+    #[test]
+    fn apply_projection_applies_same_second_in_range_message_when_detached() {
+        // Newest is ("c", 20); a same-second message that sorts *before* it is
+        // genuinely inside the window and must be applied.
+        let mut window = timeline_test_page(&[("a", 10), ("c", 20)], true, true);
+        let update = projection_for(vec![timeline_test_record("b", 20)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn apply_projection_suppresses_new_message_when_detached_window_empty() {
+        // An emptied detached window (every row removed) has nothing in range, so
+        // a head message must be suppressed rather than absorbed.
+        let mut window = timeline_test_page(&[], true, true);
+        let update = projection_for(vec![timeline_test_record("a", 10)]);
+
+        apply_projection_to_window(&mut window, &update, 300);
+
+        assert!(window.messages.is_empty());
+        assert!(window.has_more_after);
+    }
+
+    #[test]
     fn apply_projection_removes_message() {
         let mut window = timeline_test_page(&[("a", 10), ("b", 20)], false, false);
         let update = AppProjectionUpdate {
@@ -6953,6 +7039,42 @@ mod tests {
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].pagination.before, None);
         assert_eq!(queries[0].pagination.after, None);
+    }
+
+    #[tokio::test]
+    async fn recv_refresh_trims_same_second_head_leak_when_detached() {
+        let lifecycle = RuntimeLifecycle::new();
+        // The detached `before = newest.timeline_at + 1` cursor over-fetches a
+        // same-second row ("c", 20) that sorts after the window's newest
+        // ("b", 20); the refresh must trim it back to the canonical boundary.
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20), ("c", 20)],
+            true,
+            true,
+        )]);
+        let (tx, updates) = mpsc::channel(1);
+        let mut subscription = timeline_subscription_with(
+            &store,
+            timeline_test_page(&[("a", 10), ("b", 20)], true, true),
+            300,
+            updates,
+            lifecycle.subscribe_shutdown(),
+        );
+        tx.send(TimelineSubscriptionSignal::Refresh)
+            .await
+            .expect("send refresh");
+
+        let update = subscription.recv().await.expect("recv");
+
+        match update {
+            RuntimeTimelineMessageUpdate::Page { page } => {
+                assert_eq!(timeline_ids(&page), vec!["a", "b"]);
+            }
+            other => panic!("expected refreshed page, got {other:?}"),
+        }
+        // Detached refresh anchors at the newest timestamp + 1.
+        let queries = store.recorded_queries();
+        assert_eq!(queries[0].pagination.before, Some(21));
     }
 
     #[test]
