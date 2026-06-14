@@ -303,15 +303,33 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                         .await;
                 }));
             }
-            request => {
+            DaemonRequest::StreamWatch { cli } => {
                 let defaults = defaults.clone();
                 let state = state.clone();
                 let events = events.clone();
                 let workers = workers.clone();
                 worker_tasks.push(tokio::spawn(async move {
                     let mut workers_guard = workers.lock().await;
-                    let _ = handle_connection(
-                        request,
+                    let _ = handle_stream_watch_connection(
+                        cli,
+                        &mut stream,
+                        &defaults,
+                        state,
+                        events,
+                        &mut workers_guard,
+                    )
+                    .await;
+                }));
+            }
+            DaemonRequest::Execute { cli } => {
+                let defaults = defaults.clone();
+                let state = state.clone();
+                let events = events.clone();
+                let workers = workers.clone();
+                worker_tasks.push(tokio::spawn(async move {
+                    let mut workers_guard = workers.lock().await;
+                    let _ = handle_execute_connection(
+                        cli,
                         &mut stream,
                         &defaults,
                         state,
@@ -355,151 +373,99 @@ async fn daemon_status_output(
     }
 }
 
-async fn handle_connection(
-    request: DaemonRequest,
+async fn handle_stream_watch_connection(
+    mut cli: Box<Cli>,
     stream: &mut UnixStream,
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     workers: &mut DaemonWorkers,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let (shutdown, output) = match request {
-        DaemonRequest::Ping => (
-            false,
-            CliOutput {
-                code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-        ),
-        DaemonRequest::Status => {
-            let status = server_status(
-                defaults,
-                &state,
-                workers.runtime.runtime.as_ref(),
-                &workers.runtime.stream_watch,
-            )
-            .await;
-            (
-                false,
-                CliOutput {
-                    code: 0,
-                    stdout: serde_json::to_string(&status)?,
-                    stderr: String::new(),
-                },
-            )
-        }
-        DaemonRequest::Shutdown => (
-            true,
-            CliOutput {
-                code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-        ),
-        DaemonRequest::StreamWatch { mut cli } => {
-            apply_defaults(&mut cli, defaults);
-            reconcile_app_runtime(
-                defaults,
-                state.clone(),
-                events.clone(),
-                &mut workers.runtime,
-            )
-            .await;
-            let output = start_stream_watch(
-                *cli,
-                defaults,
-                workers.runtime.runtime.as_ref(),
-                &workers.runtime.stream_watch,
-            )
-            .await;
-            (false, output)
-        }
-        DaemonRequest::MessagesSubscribe { .. } => (
-            false,
-            daemon_error(
-                false,
-                "invalid_daemon_request",
-                "messages subscribe must use the streaming daemon path".to_owned(),
-            ),
-        ),
-        DaemonRequest::ChatsSubscribe { .. } => (
-            false,
-            daemon_error(
-                false,
-                "invalid_daemon_request",
-                "chats subscribe must use the streaming daemon path".to_owned(),
-            ),
-        ),
-        DaemonRequest::GroupStateSubscribe { .. } => (
-            false,
-            daemon_error(
-                false,
-                "invalid_daemon_request",
-                "groups subscribe-state must use the streaming daemon path".to_owned(),
-            ),
-        ),
-        DaemonRequest::Execute { mut cli } => {
-            apply_defaults(&mut cli, defaults);
-            if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
-                write_daemon_output(stream, &output).await;
-                return Ok(false);
-            }
-            if let Some(output) = handle_stream_compose_request(
-                &cli,
-                defaults,
-                state.clone(),
-                events.clone(),
-                &mut workers.runtime,
-                &mut workers.stream_compose,
-            )
-            .await
-            {
-                write_daemon_output(stream, &output).await;
-                return Ok(false);
-            }
-            let refresh = app_runtime_refresh_after_execute(&cli);
-            if let Some(output) = handle_app_runtime_account_setup_request(
-                &cli,
-                defaults,
-                state.clone(),
-                events.clone(),
-                &mut workers.runtime,
-            )
-            .await
-            {
-                write_daemon_output(stream, &output).await;
-                return Ok(false);
-            }
-            if let Some(output) = handle_app_runtime_command_request(
-                &cli,
-                defaults,
-                state.clone(),
-                events.clone(),
-                &mut workers.runtime,
-            )
-            .await
-            {
-                write_daemon_output(stream, &output).await;
-                return Ok(false);
-            }
-            let output = crate::run_cli_local(*cli).await;
-            if output.code == 0 {
-                refresh_app_runtime(
-                    defaults,
-                    state.clone(),
-                    events.clone(),
-                    &mut workers.runtime,
-                    refresh,
-                )
-                .await;
-            }
-            (false, output)
-        }
-    };
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    apply_defaults(&mut cli, defaults);
+    reconcile_app_runtime(
+        defaults,
+        state.clone(),
+        events.clone(),
+        &mut workers.runtime,
+    )
+    .await;
+    let output = start_stream_watch(
+        *cli,
+        defaults,
+        workers.runtime.runtime.as_ref(),
+        &workers.runtime.stream_watch,
+    )
+    .await;
 
     write_daemon_output(stream, &output).await;
-    Ok(shutdown)
+    Ok(())
+}
+
+async fn handle_execute_connection(
+    mut cli: Box<Cli>,
+    stream: &mut UnixStream,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: &mut DaemonWorkers,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    apply_defaults(&mut cli, defaults);
+    if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
+        write_daemon_output(stream, &output).await;
+        return Ok(());
+    }
+    if let Some(output) = handle_stream_compose_request(
+        &cli,
+        defaults,
+        state.clone(),
+        events.clone(),
+        &mut workers.runtime,
+        &mut workers.stream_compose,
+    )
+    .await
+    {
+        write_daemon_output(stream, &output).await;
+        return Ok(());
+    }
+    let refresh = app_runtime_refresh_after_execute(&cli);
+    if let Some(output) = handle_app_runtime_account_setup_request(
+        &cli,
+        defaults,
+        state.clone(),
+        events.clone(),
+        &mut workers.runtime,
+    )
+    .await
+    {
+        write_daemon_output(stream, &output).await;
+        return Ok(());
+    }
+    if let Some(output) = handle_app_runtime_command_request(
+        &cli,
+        defaults,
+        state.clone(),
+        events.clone(),
+        &mut workers.runtime,
+    )
+    .await
+    {
+        write_daemon_output(stream, &output).await;
+        return Ok(());
+    }
+    let output = crate::run_cli_local(*cli).await;
+    if output.code == 0 {
+        refresh_app_runtime(
+            defaults,
+            state.clone(),
+            events.clone(),
+            &mut workers.runtime,
+            refresh,
+        )
+        .await;
+    }
+
+    write_daemon_output(stream, &output).await;
+    Ok(())
 }
 
 #[cfg(test)]
