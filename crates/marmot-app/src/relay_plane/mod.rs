@@ -7,20 +7,19 @@ use cgka_traits::transport::Timestamp;
 use cgka_traits::{
     MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportDelivery, TransportEndpoint, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest, TransportPublishTarget,
+    TransportPublishRequest,
 };
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
     RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    DurationHistogramSnapshot, NostrAdapterMetrics, NostrPublishOutcome, NostrRelayClient,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrTransportAdapter, RelayDeliverySpread,
-    RelayExportConsent, RelayLabelResolution, RelaySyncSnapshot,
+    NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
+    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -28,11 +27,35 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
 
+mod directory;
+mod safety;
+mod telemetry;
+
+pub use telemetry::{
+    EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+};
+
+pub(crate) use directory::{
+    DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
+    DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionSyncSummary,
+    NostrSdkDirectoryRelayFetcher,
+};
+pub(crate) use safety::RelaySafetyPolicy;
+pub(crate) use telemetry::rollup_from_snapshots;
+
+// Re-exported so the in-tree `tests` module (which uses `super::*`) keeps
+// reaching these names unchanged after the split moved their only non-test
+// uses into the submodules above.
+#[cfg(test)]
+pub(crate) use cgka_traits::TransportPublishTarget;
+#[cfg(test)]
+pub(crate) use transport_nostr_adapter::{
+    DurationHistogramSnapshot, NostrAdapterMetrics, RelayDeliverySpread, RelaySyncSnapshot,
+};
+
 const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const DIRECTORY_EVENT_BUFFER: usize = 1024;
-const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
-const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
-const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
+pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 
@@ -46,19 +69,6 @@ struct MarmotRelayPlaneInner {
     relay_safety: RelaySafetyPolicy,
     transport: Arc<RelayPlaneTransport>,
     directory: DirectoryRelayPlane,
-}
-
-#[derive(Clone, Debug)]
-struct RelaySafetyPolicy {
-    max_endpoints_per_route: usize,
-}
-
-impl Default for RelaySafetyPolicy {
-    fn default() -> Self {
-        Self {
-            max_endpoints_per_route: MAX_RELAY_ENDPOINTS_PER_ROUTE,
-        }
-    }
 }
 
 struct RelayPlaneTransport {
@@ -100,266 +110,6 @@ pub struct RelayPlaneHealth {
     pub directory_completed_subscription_syncs: usize,
     pub directory_subscriptions_created: usize,
     pub directory_subscriptions_removed: usize,
-}
-
-/// Device-local relay telemetry bundled for local inspection.
-///
-/// This is the read model behind `dm relay-stats`: it surfaces the adapter's
-/// existing aggregate, privacy-safe snapshots (lifecycle counters, cross-relay
-/// arrival spread, subscription sync timing) alongside redacted relay health.
-///
-/// Per-relay attribution stays behind opaque [`transport_nostr_adapter::RelayIndex`]
-/// values here — resolving an index to a relay URL is reserved for the opt-in
-/// export boundary, never for this local read path.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RelayTelemetrySnapshot {
-    /// Adapter lifecycle counters (accounts, subscriptions, inbound, publish).
-    pub metrics: NostrAdapterMetrics,
-    /// Cross-relay arrival spread and per-relay first-deliverer attribution.
-    pub delivery_spread: RelayDeliverySpread,
-    /// First-event / EOSE subscription sync timing, aggregate and per relay.
-    pub sync: RelaySyncSnapshot,
-    /// Redacted relay-pool and directory health.
-    pub health: RelayPlaneHealth,
-}
-
-/// Export-ready rollup of device-local relay telemetry.
-///
-/// This is the aggregation home for the export path. There is a single shared
-/// adapter per device, so the per-relay series are already merged across every
-/// local account; this rollup reorganizes them into the export shape and is the
-/// one place additional per-account dedup would live if telemetry ever became
-/// per-account. It stays keyed by the opaque [`transport_nostr_adapter::RelayIndex`];
-/// resolving an index to a relay URL is the exporter's job, behind opt-in.
-///
-/// Privacy-safe: counts, fixed-bucket millisecond histograms, and opaque relay
-/// indices only — no account, group, subscription, or URL fields.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RelayTelemetryRollup {
-    /// Per-relay export records, ascending by opaque relay index.
-    pub relays: Vec<RelayRollupEntry>,
-    /// Population-level cross-relay arrival spread (inherently no relay label).
-    pub cross_relay_spread: DurationHistogramSnapshot,
-    /// Distinct logical messages observed within the tracking window.
-    pub messages_observed: u64,
-    /// Messages corroborated by at least a second distinct relay.
-    pub messages_corroborated: u64,
-    /// Messages seen on exactly one relay within the window.
-    pub messages_single_source: u64,
-    /// Device-wide relay connection attempts (for connection success rate).
-    pub connection_attempts: u64,
-    /// Device-wide successful relay connections.
-    pub connection_successes: u64,
-    /// Device-wide publish attempts (aggregate; per-relay/per-kind publish
-    /// attribution is a future adapter enhancement, see `relay-observability.md`).
-    pub publish_attempts: u64,
-    /// Device-wide accepted publishes.
-    pub publish_successes: u64,
-    /// Device-wide failed publishes.
-    pub publish_failures: u64,
-    /// Optional engine-side reorg metrics, folded in once the parallel
-    /// `observed_reorg_rate` workstream lands. `None` until then.
-    pub engine: Option<EngineReorgMetrics>,
-}
-
-impl RelayTelemetryRollup {
-    /// Derived `observed_reorg_rate = post_settle_reorgs / settles` from the
-    /// folded-in engine metrics, if present and non-empty.
-    pub fn observed_reorg_rate(&self) -> Option<f64> {
-        let engine = self.engine.as_ref()?;
-        (engine.settles > 0).then(|| engine.post_settle_reorgs as f64 / engine.settles as f64)
-    }
-}
-
-/// One relay's export-ready record, keyed by opaque device-local index.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RelayRollupEntry {
-    /// Opaque device-local relay index (resolved to a URL only at export).
-    pub relay_index: u32,
-    /// First-event latency from subscribe time, in local-time milliseconds.
-    pub first_event_latency: DurationHistogramSnapshot,
-    /// EOSE latency from subscribe time, in local-time milliseconds.
-    pub eose_latency: DurationHistogramSnapshot,
-    /// Copies this relay surfaced first (delivery + first-deliverer signal).
-    pub delivered_first: u64,
-    /// Copies this relay corroborated after another relay surfaced first.
-    pub delivered_later: u64,
-}
-
-impl RelayRollupEntry {
-    /// Total copies this relay delivered (`relay_delivery_count`).
-    pub fn delivery_count(&self) -> u64 {
-        self.delivered_first + self.delivered_later
-    }
-
-    /// Copies that corroborated a message another relay surfaced first
-    /// (`relay_redundant_count`).
-    pub fn redundant_count(&self) -> u64 {
-        self.delivered_later
-    }
-
-    /// Fraction of this relay's copies that arrived first, in `0.0..=1.0`.
-    /// `None` when the relay has delivered nothing.
-    pub fn first_deliverer_rate(&self) -> Option<f64> {
-        let total = self.delivery_count();
-        (total > 0).then(|| self.delivered_first as f64 / total as f64)
-    }
-}
-
-/// Engine-side relay-tuning metrics folded into the export rollup.
-///
-/// Owned by the engine (the parallel `observed_reorg_rate` workstream), not the
-/// adapter. This is the seam: [`MarmotRelayPlane::telemetry_rollup`] accepts it
-/// as an optional input and the exporter ships it over the same OTLP path.
-/// `None` until the engine metric lands. Shapes mirror `relay-delivery-telemetry.md`
-/// "Validation: post-settle reorg rate"; the engine session may extend it
-/// (for example with `reorg_rewind_depth`) without disturbing the seam.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct EngineReorgMetrics {
-    /// Settle episodes, summed across groups (denominator).
-    pub settles: u64,
-    /// Settles later superseded by a diverging branch (numerator).
-    pub post_settle_reorgs: u64,
-    /// Local time from a superseded settle to the reorg, in milliseconds — the
-    /// extra quiescence that would have avoided each reorg.
-    pub reorg_lateness_ms: DurationHistogramSnapshot,
-}
-
-/// Reshape the adapter snapshots into the export-ready rollup. Pure so the
-/// aggregation is unit-testable without a live relay plane.
-fn rollup_from_snapshots(
-    spread: RelayDeliverySpread,
-    sync: RelaySyncSnapshot,
-    metrics: NostrAdapterMetrics,
-    health: RelayPlaneHealth,
-    engine: Option<EngineReorgMetrics>,
-) -> RelayTelemetryRollup {
-    let mut indices: Vec<u32> = spread
-        .per_relay
-        .iter()
-        .map(|stats| stats.relay_index)
-        .chain(sync.per_relay.iter().map(|stats| stats.relay_index))
-        .collect();
-    indices.sort_unstable();
-    indices.dedup();
-
-    let relays = indices
-        .into_iter()
-        .map(|relay_index| {
-            let delivery = spread
-                .per_relay
-                .iter()
-                .find(|stats| stats.relay_index == relay_index);
-            let latency = sync
-                .per_relay
-                .iter()
-                .find(|stats| stats.relay_index == relay_index);
-            RelayRollupEntry {
-                relay_index,
-                first_event_latency: latency
-                    .map(|stats| stats.first_event.clone())
-                    .unwrap_or_default(),
-                eose_latency: latency.map(|stats| stats.eose.clone()).unwrap_or_default(),
-                delivered_first: delivery
-                    .map(|stats| stats.delivered_first)
-                    .unwrap_or_default(),
-                delivered_later: delivery
-                    .map(|stats| stats.delivered_later)
-                    .unwrap_or_default(),
-            }
-        })
-        .collect();
-
-    RelayTelemetryRollup {
-        relays,
-        cross_relay_spread: spread.spread,
-        messages_observed: spread.observed,
-        messages_corroborated: spread.corroborated,
-        messages_single_source: spread.single_source,
-        connection_attempts: health.connection_attempts as u64,
-        connection_successes: health.connection_successes as u64,
-        publish_attempts: metrics.publish_attempts as u64,
-        publish_successes: metrics.publish_successes as u64,
-        publish_failures: metrics.publish_failures as u64,
-        engine,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct DirectoryEventQuery {
-    pub(crate) kind: u64,
-    pub(crate) authors: Vec<String>,
-    pub(crate) limit: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DirectoryRelayEventRecord {
-    pub(crate) endpoints: Vec<TransportEndpoint>,
-    pub(crate) event: NostrTransportEvent,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DirectoryFetchRequest {
-    endpoints: Vec<TransportEndpoint>,
-    queries: Vec<DirectoryEventQuery>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct DirectoryFetchKey {
-    endpoints: Vec<TransportEndpoint>,
-    queries: Vec<DirectoryEventQuery>,
-}
-
-#[derive(Clone)]
-struct DirectoryRelayPlane {
-    fetcher: Arc<dyn DirectoryRelayFetcher>,
-    state: Arc<Mutex<DirectoryRelayPlaneState>>,
-}
-
-#[derive(Default)]
-struct DirectoryRelayPlaneState {
-    inflight: HashMap<DirectoryFetchKey, Vec<oneshot::Sender<DirectoryFetchResult>>>,
-    active_subscription_ids: HashSet<String>,
-    completed_fetches: usize,
-    coalesced_waiters: usize,
-    failed_fetches: usize,
-    completed_subscription_syncs: usize,
-    subscriptions_created: usize,
-    subscriptions_removed: usize,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct DirectoryRelayStats {
-    inflight_fetches: usize,
-    active_subscriptions: usize,
-    completed_fetches: usize,
-    coalesced_waiters: usize,
-    failed_fetches: usize,
-    completed_subscription_syncs: usize,
-    subscriptions_created: usize,
-    subscriptions_removed: usize,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectorySubscriptionSyncSummary {
-    pub(crate) active_subscriptions: usize,
-    pub(crate) subscriptions_created: usize,
-    pub(crate) subscriptions_removed: usize,
-}
-
-type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
-
-#[async_trait]
-trait DirectoryRelayFetcher: Send + Sync {
-    async fn fetch_directory_events(
-        &self,
-        request: DirectoryFetchRequest,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String>;
-}
-
-#[derive(Clone)]
-struct NostrSdkDirectoryRelayFetcher {
-    client: NostrSdkClient,
 }
 
 impl MarmotRelayPlane {
@@ -828,156 +578,6 @@ impl RelayPlaneHealth {
     }
 }
 
-impl DirectoryEventQuery {
-    pub(crate) fn new(kind: u64, mut authors: Vec<String>, limit: usize) -> Self {
-        authors.sort();
-        authors.dedup();
-        Self {
-            kind,
-            authors,
-            limit,
-        }
-    }
-}
-
-impl DirectoryFetchRequest {
-    fn new(
-        mut endpoints: Vec<TransportEndpoint>,
-        mut queries: Vec<DirectoryEventQuery>,
-    ) -> Result<Self, String> {
-        endpoints.sort();
-        endpoints.dedup();
-        queries.sort();
-        queries.dedup();
-        if endpoints.is_empty() {
-            return Err("directory fetch: no relay endpoints".to_owned());
-        }
-        if queries.is_empty() {
-            return Err("directory fetch: no queries".to_owned());
-        }
-        for query in &queries {
-            if query.authors.is_empty() {
-                return Err("directory fetch: no query authors".to_owned());
-            }
-            if query.limit == 0 {
-                return Err("directory fetch: query limit must be greater than zero".to_owned());
-            }
-        }
-        Ok(Self { endpoints, queries })
-    }
-
-    fn key(&self) -> DirectoryFetchKey {
-        DirectoryFetchKey {
-            endpoints: self.endpoints.clone(),
-            queries: self.queries.clone(),
-        }
-    }
-}
-
-impl DirectoryRelayPlane {
-    fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
-        Self {
-            fetcher,
-            state: Arc::new(Mutex::new(DirectoryRelayPlaneState::default())),
-        }
-    }
-
-    async fn fetch_events(
-        &self,
-        request: DirectoryFetchRequest,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        let key = request.key();
-        let (rx, should_spawn) = {
-            let (tx, rx) = oneshot::channel();
-            let mut state = self.state.lock().await;
-            if let Some(waiters) = state.inflight.get_mut(&key) {
-                waiters.push(tx);
-                state.coalesced_waiters += 1;
-                (rx, false)
-            } else {
-                state.inflight.insert(key.clone(), vec![tx]);
-                (rx, true)
-            }
-        };
-
-        if should_spawn {
-            let fetcher = self.fetcher.clone();
-            let state = self.state.clone();
-            tokio::spawn(async move {
-                let result = fetcher.fetch_directory_events(request).await;
-                let mut state = state.lock().await;
-                if result.is_ok() {
-                    state.completed_fetches += 1;
-                } else {
-                    state.failed_fetches += 1;
-                }
-                if let Some(waiters) = state.inflight.remove(&key) {
-                    for waiter in waiters {
-                        let _ = waiter.send(result.clone());
-                    }
-                }
-            });
-        }
-
-        rx.await
-            .map_err(|_| "directory fetch owner dropped before completing".to_owned())?
-    }
-
-    async fn stats(&self) -> DirectoryRelayStats {
-        let state = self.state.lock().await;
-        DirectoryRelayStats {
-            inflight_fetches: state.inflight.len(),
-            active_subscriptions: state.active_subscription_ids.len(),
-            completed_fetches: state.completed_fetches,
-            coalesced_waiters: state.coalesced_waiters,
-            failed_fetches: state.failed_fetches,
-            completed_subscription_syncs: state.completed_subscription_syncs,
-            subscriptions_created: state.subscriptions_created,
-            subscriptions_removed: state.subscriptions_removed,
-        }
-    }
-
-    async fn subscription_diff(
-        &self,
-        desired_ids: &HashSet<String>,
-    ) -> (HashSet<String>, HashSet<String>) {
-        let state = self.state.lock().await;
-        let to_add = desired_ids
-            .difference(&state.active_subscription_ids)
-            .cloned()
-            .collect::<HashSet<_>>();
-        let to_remove = state
-            .active_subscription_ids
-            .difference(desired_ids)
-            .cloned()
-            .collect::<HashSet<_>>();
-        (to_add, to_remove)
-    }
-
-    async fn replace_subscription_ids(
-        &self,
-        desired_ids: HashSet<String>,
-    ) -> Result<DirectorySubscriptionSyncSummary, String> {
-        let mut state = self.state.lock().await;
-        let created = desired_ids
-            .difference(&state.active_subscription_ids)
-            .count();
-        let removed = state
-            .active_subscription_ids
-            .difference(&desired_ids)
-            .count();
-        state.completed_subscription_syncs += 1;
-        state.subscriptions_created += created;
-        state.subscriptions_removed += removed;
-        state.active_subscription_ids = desired_ids;
-        Ok(DirectorySubscriptionSyncSummary {
-            active_subscriptions: state.active_subscription_ids.len(),
-            subscriptions_created: created,
-            subscriptions_removed: removed,
-        })
-    }
-}
-
 fn spawn_relay_notification_forwarder(
     sdk_relay_client: NostrSdkRelayClient,
     adapter: NostrTransportAdapter,
@@ -1079,143 +679,6 @@ fn spawn_relay_notification_forwarder(
             })
             .await;
     })
-}
-
-impl NostrSdkDirectoryRelayFetcher {
-    fn new(client: NostrSdkClient) -> Self {
-        Self { client }
-    }
-
-    fn standalone() -> Self {
-        Self::new(NostrSdkClient::builder().build())
-    }
-}
-
-#[async_trait]
-impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
-    async fn fetch_directory_events(
-        &self,
-        request: DirectoryFetchRequest,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        let relay_urls = request
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                RelayUrl::parse(endpoint.as_str())
-                    .map_err(|e| format!("invalid relay URL {}: {e}", endpoint.as_str()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for relay_url in &relay_urls {
-            self.client
-                .add_relay(relay_url.clone())
-                .await
-                .map_err(|e| format!("add relay: {e}"))?;
-            timeout(
-                DIRECTORY_RELAY_CONNECT_WAIT,
-                self.client.connect_relay(relay_url.clone()),
-            )
-            .await
-            .map_err(|_| "connect relay timed out".to_owned())?
-            .map_err(|e| format!("connect relay: {e}"))?;
-        }
-
-        let mut records = Vec::new();
-        for query in request.queries {
-            let public_keys = query
-                .authors
-                .iter()
-                .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let kind = u16::try_from(query.kind)
-                .map(Kind::from)
-                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
-            let filter = Filter::new()
-                .authors(public_keys)
-                .kind(kind)
-                .limit(query.limit);
-            let events = self
-                .client
-                .fetch_events_from(relay_urls.clone(), filter, DIRECTORY_RELAY_FETCH_WAIT)
-                .await
-                .map_err(|e| format!("fetch directory events: {e}"))?;
-            for event in events {
-                let event = NostrTransportEvent::from_nostr_event(&event)
-                    .map_err(|e| format!("map directory event: {e}"))?;
-                records.push(DirectoryRelayEventRecord {
-                    endpoints: request.endpoints.clone(),
-                    event,
-                });
-            }
-        }
-        Ok(records)
-    }
-}
-
-impl RelaySafetyPolicy {
-    fn sanitize_activation(
-        &self,
-        mut activation: TransportAccountActivation,
-    ) -> Result<TransportAccountActivation, String> {
-        activation.inbox_endpoints =
-            self.sanitize_endpoints(activation.inbox_endpoints, "account inbox")?;
-        for group in &mut activation.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
-        Ok(activation)
-    }
-
-    fn sanitize_group_sync(
-        &self,
-        mut sync: TransportGroupSync,
-    ) -> Result<TransportGroupSync, String> {
-        for group in &mut sync.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
-        Ok(sync)
-    }
-
-    fn sanitize_publish_request(
-        &self,
-        mut request: TransportPublishRequest,
-    ) -> Result<TransportPublishRequest, String> {
-        match &mut request.target {
-            TransportPublishTarget::Group { endpoints, .. } => {
-                *endpoints = self.sanitize_endpoints(endpoints.clone(), "group publish")?;
-            }
-            TransportPublishTarget::Inbox { endpoints, .. } => {
-                *endpoints = self.sanitize_endpoints(endpoints.clone(), "inbox publish")?;
-            }
-        }
-        Ok(request)
-    }
-
-    fn sanitize_endpoints(
-        &self,
-        endpoints: Vec<TransportEndpoint>,
-        context: &str,
-    ) -> Result<Vec<TransportEndpoint>, String> {
-        let mut sanitized = Vec::with_capacity(endpoints.len());
-        for endpoint in endpoints {
-            let raw = endpoint.as_str().trim();
-            if raw.is_empty() {
-                return Err(format!("{context}: invalid relay endpoint"));
-            }
-            let relay_url = RelayUrl::parse(raw)
-                .map_err(|err| format!("{context}: invalid relay endpoint: {err}"))?;
-            let endpoint = TransportEndpoint(relay_url.to_string());
-            if !sanitized.contains(&endpoint) {
-                sanitized.push(endpoint);
-            }
-        }
-        if sanitized.len() > self.max_endpoints_per_route {
-            return Err(format!(
-                "{context}: relay endpoint count {} exceeds limit {}",
-                sanitized.len(),
-                self.max_endpoints_per_route
-            ));
-        }
-        Ok(sanitized)
-    }
 }
 
 #[async_trait]
