@@ -6,8 +6,15 @@ App runtime bridge for the first real Marmot app surfaces.
 
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, and Nostr transport
   adapter support together.
-- Keep runtime orchestration, managed account workers, subscriptions, and live agent stream watches in `src/runtime.rs`
-  instead of regrowing `src/lib.rs`.
+- Keep runtime orchestration, managed account workers, subscriptions, and live agent stream watches in the `src/runtime/`
+  module instead of regrowing `src/lib.rs`. The module splits along these seams: `mod.rs` (the `MarmotAppRuntime`
+  orchestration core — construction/start/shutdown, shared services, lifecycle, module wiring and re-exports),
+  `account_worker.rs` (the per-account worker: command enum, worker loop, reconnect backoff, runtime-event publishers),
+  `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
+  `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
+  (agent-text-stream discovery and the brokered-QUIC watch machinery), `audit_tracker.rs` (the forensic audit-log
+  tracker upload worker), and `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers). Keep `mod.rs`
+  re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in `src/client.rs`; the crate root should construct clients but not absorb
   their behavior again.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.

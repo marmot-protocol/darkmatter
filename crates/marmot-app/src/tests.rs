@@ -896,7 +896,7 @@ fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
 
 #[test]
 fn account_worker_is_spawned_as_abortable_async_task() {
-    let source = include_str!("runtime.rs");
+    let source = include_str!("runtime/account_worker.rs");
 
     assert!(source.contains("tokio::spawn(run_app_runtime_account_worker"));
     assert!(source.contains("managed account worker shutdown timed out; aborting"));
