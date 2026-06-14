@@ -151,7 +151,7 @@ pub struct TimelineMessagesSubscription {
 impl TimelineMessagesSubscription {
     pub(crate) fn new(inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
         let _span = tracing::debug_span!(
-            target: "marmot_uniffi::conversion",
+            target: "marmot_uniffi::subscriptions",
             "timeline_subscription_snapshot_conversion",
             method = "TimelineMessagesSubscription::new"
         )

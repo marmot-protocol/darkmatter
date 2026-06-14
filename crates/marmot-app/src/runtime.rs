@@ -1029,6 +1029,11 @@ struct TimelineWindow {
     base_query: TimelineMessageQuery,
     page: TimelinePage,
     window_limit: usize,
+    /// Bumped on every window mutation (pagination, live apply, refresh install).
+    /// A refresh captures this before its store read and re-checks it before
+    /// installing, so a pagination that completes during the read is never rolled
+    /// back by a stale refresh.
+    generation: u64,
 }
 
 impl TimelineWindow {
@@ -1037,6 +1042,10 @@ impl TimelineWindow {
     /// from `has_more_after`.
     fn anchored_to_head(&self) -> bool {
         !self.page.has_more_after
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Cursor query that re-materializes the current window from the store.
@@ -1049,21 +1058,19 @@ impl TimelineWindow {
         let mut query = self.base_query.clone();
         let limit = self.page.messages.len().max(1);
         query.pagination = match self.page.messages.last() {
-            // Detached, with a non-saturating newest timestamp: `before` is
-            // exclusive, so `+ 1` with an empty id selects every row at or below
-            // the newest *timestamp* (including the newest message itself). This
-            // over-includes same-second rows that sort after the newest message;
-            // `install_refresh` trims them back to the canonical boundary.
-            Some(newest) if !self.anchored_to_head() && newest.timeline_at != u64::MAX => {
-                TimelinePagination {
-                    before: Some(newest.timeline_at + 1),
-                    before_message_id: Some(String::new()),
-                    limit: Some(limit),
-                    ..TimelinePagination::default()
-                }
-            }
-            // Anchored, empty, or the (impossible-in-practice) `u64::MAX` newest:
-            // refresh the head.
+            // Detached: re-fetch the loaded range ending exactly at the newest
+            // message using an *inclusive* upper-bound cursor. The store applies
+            // the descending `LIMIT` against `<= (timeline_at, message_id_hex)`,
+            // so newer same-second rows are excluded at the SQL level and can't
+            // starve the window — no post-fetch trimming required.
+            Some(newest) if !self.anchored_to_head() => TimelinePagination {
+                before: Some(newest.timeline_at),
+                before_message_id: Some(newest.message_id_hex.clone()),
+                before_inclusive: true,
+                limit: Some(limit),
+                ..TimelinePagination::default()
+            },
+            // Anchored or empty: refresh the head.
             _ => TimelinePagination {
                 limit: Some(limit),
                 ..TimelinePagination::default()
@@ -1122,6 +1129,7 @@ impl TimelineWindowHandle {
         let mut window = self.lock();
         let limit = window.window_limit;
         merge_timeline_window(&mut window.page, older, TimelineWindowEdge::Older, limit);
+        window.bump_generation();
         Ok(window.page.clone())
     }
 
@@ -1151,6 +1159,7 @@ impl TimelineWindowHandle {
         let mut window = self.lock();
         let limit = window.window_limit;
         merge_timeline_window(&mut window.page, newer, TimelineWindowEdge::Newer, limit);
+        window.bump_generation();
         Ok(window.page.clone())
     }
 
@@ -1160,47 +1169,32 @@ impl TimelineWindowHandle {
         let mut window = self.lock();
         let limit = window.window_limit;
         apply_projection_to_window(&mut window.page, update, limit);
+        window.bump_generation();
     }
 
-    /// Read the store handle, the refresh cursor, and (for a detached window)
-    /// the canonical upper bound the refreshed page must not exceed.
-    fn refresh_request(
-        &self,
-    ) -> (
-        Arc<TimelineQueryFn>,
-        TimelineMessageQuery,
-        Option<(u64, String)>,
-    ) {
+    /// Read the store handle, the refresh cursor, and the window generation the
+    /// refresh is based on (so a stale install can be detected).
+    fn refresh_request(&self) -> (Arc<TimelineQueryFn>, TimelineMessageQuery, u64) {
         let window = self.lock();
-        let upper = if window.anchored_to_head() {
-            None
-        } else {
-            window
-                .page
-                .messages
-                .last()
-                .map(|message| (message.timeline_at, message.message_id_hex.clone()))
-        };
-        (window.query.clone(), window.refresh_query(), upper)
+        (
+            window.query.clone(),
+            window.refresh_query(),
+            window.generation,
+        )
     }
 
-    /// Replace the window with a freshly-materialized page and return it. For a
-    /// detached window, `upper` is the canonical `(timeline_at, message_id_hex)`
-    /// boundary: the `before` cursor over-includes same-second rows that sort
-    /// after it (they belong to the unseen head), so trim them to keep the
-    /// scrolled-back boundary exactly where it was.
-    fn install_refresh(
-        &self,
-        mut page: TimelinePage,
-        upper: Option<(u64, String)>,
-    ) -> TimelinePage {
-        if let Some((at, id)) = upper.as_ref() {
-            page.messages.retain(|message| {
-                (message.timeline_at, message.message_id_hex.as_str()) <= (*at, id.as_str())
-            });
-        }
+    /// Replace the window with a freshly-materialized page and return it —
+    /// unless the window changed while the refresh query ran. Pagination uses a
+    /// different lock and can complete during the refresh's `.await`; installing
+    /// the (now stale) refresh would roll that expansion back, so if the
+    /// generation moved we keep the newer window and drop the refresh.
+    fn install_refresh(&self, page: TimelinePage, generation: u64) -> TimelinePage {
         let mut window = self.lock();
+        if window.generation != generation {
+            return window.page.clone();
+        }
         window.page = page;
+        window.bump_generation();
         window.page.clone()
     }
 }
@@ -1257,10 +1251,10 @@ impl RuntimeTimelineMessagesSubscription {
                     return Some(RuntimeTimelineMessageUpdate::Projection(*update));
                 }
                 TimelineSubscriptionSignal::Refresh => {
-                    let (query_fn, query, upper) = self.window.refresh_request();
+                    let (query_fn, query, generation) = self.window.refresh_request();
                     match blocking_app_task(move || query_fn(query)).await {
                         Ok(page) => {
-                            let page = self.window.install_refresh(page, upper);
+                            let page = self.window.install_refresh(page, generation);
                             return Some(RuntimeTimelineMessageUpdate::Page { page });
                         }
                         // Transient store error on refresh: keep the existing
@@ -1817,6 +1811,7 @@ impl MarmotAppRuntime {
                 base_query,
                 page: snapshot,
                 window_limit: TIMELINE_WINDOW_LIMIT,
+                generation: 0,
             })),
         };
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
@@ -6662,6 +6657,7 @@ mod tests {
             base_query: TimelineMessageQuery::default(),
             page,
             window_limit,
+            generation: 0,
         }
     }
 
@@ -7118,13 +7114,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_refresh_trims_same_second_head_leak_when_detached() {
+    async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
         let lifecycle = RuntimeLifecycle::new();
-        // The detached `before = newest.timeline_at + 1` cursor over-fetches a
-        // same-second row ("c", 20) that sorts after the window's newest
-        // ("b", 20); the refresh must trim it back to the canonical boundary.
+        // The store itself excludes newer same-second rows via the inclusive
+        // bound (covered by storage-sqlite's
+        // `before_inclusive_cursor_keeps_window_rows_over_newer_same_second_rows`);
+        // here we assert the runtime issues that inclusive cursor and installs
+        // the returned page verbatim (no post-fetch trimming).
         let store = ScriptedTimelineStore::new(vec![timeline_test_page(
-            &[("a", 10), ("b", 20), ("c", 20)],
+            &[("a", 10), ("b", 20)],
             true,
             true,
         )]);
@@ -7148,9 +7146,47 @@ mod tests {
             }
             other => panic!("expected refreshed page, got {other:?}"),
         }
-        // Detached refresh anchors at the newest timestamp + 1.
         let queries = store.recorded_queries();
-        assert_eq!(queries[0].pagination.before, Some(21));
+        assert_eq!(queries[0].pagination.before, Some(20));
+        assert_eq!(
+            queries[0].pagination.before_message_id.as_deref(),
+            Some("b")
+        );
+        assert!(queries[0].pagination.before_inclusive);
+    }
+
+    #[tokio::test]
+    async fn refresh_install_is_dropped_when_window_paginated_during_query() {
+        // Deterministic model of the P1(b) race: a refresh captures the window
+        // generation before its store read; a pagination completes during that
+        // read (bumping the generation); installing the now-stale refresh must
+        // be a no-op so the paginated expansion is preserved.
+        let store = ScriptedTimelineStore::new(vec![timeline_test_page(
+            &[("a", 10), ("b", 20)],
+            false,
+            true,
+        )]);
+        let handle = timeline_window_handle(
+            &store,
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            300,
+        );
+
+        // recv() captures the refresh request (a generation snapshot) before
+        // awaiting the store.
+        let (_query_fn, _query, generation) = handle.refresh_request();
+
+        // A concurrent pagination lands while the refresh query is "in flight".
+        let paginated = handle.paginate_backwards(2).await.expect("paginate");
+        assert_eq!(timeline_ids(&paginated), vec!["a", "b", "c", "d"]);
+
+        // Installing the stale refresh is rejected; the paginated window stands.
+        let installed = handle.install_refresh(
+            timeline_test_page(&[("c", 30), ("d", 40)], true, false),
+            generation,
+        );
+        assert_eq!(timeline_ids(&installed), vec!["a", "b", "c", "d"]);
+        assert_eq!(timeline_ids(&handle.snapshot()), vec!["a", "b", "c", "d"]);
     }
 
     #[test]
@@ -7164,10 +7200,11 @@ mod tests {
 
         let query = window.refresh_query();
 
-        // Detached: refresh the loaded range ending at (and including) the
-        // current newest message so scroll position survives the lag.
-        assert_eq!(query.pagination.before, Some(21));
-        assert_eq!(query.pagination.before_message_id.as_deref(), Some(""));
+        // Detached: an inclusive upper-bound cursor at the exact newest message,
+        // so the descending LIMIT can't be starved by newer same-second rows.
+        assert_eq!(query.pagination.before, Some(20));
+        assert_eq!(query.pagination.before_message_id.as_deref(), Some("b"));
+        assert!(query.pagination.before_inclusive);
         assert_eq!(query.pagination.limit, Some(2));
     }
 

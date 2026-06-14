@@ -3183,6 +3183,7 @@ fn handle_message_timeline_command(
                     pagination: TimelinePagination {
                         before,
                         before_message_id,
+                        before_inclusive: false,
                         after,
                         after_message_id,
                         limit,

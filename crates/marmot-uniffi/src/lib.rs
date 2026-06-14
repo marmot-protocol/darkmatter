@@ -127,6 +127,7 @@ fn timeline_query_from_ffi(
         pagination: TimelinePagination {
             before: query.before,
             before_message_id: optional_message_id_hex(query.before_message_id)?,
+            before_inclusive: false,
             after: query.after,
             after_message_id: optional_message_id_hex(query.after_message_id)?,
             limit: query.limit.map(|value| value as usize),
