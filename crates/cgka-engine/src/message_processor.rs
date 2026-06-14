@@ -689,6 +689,8 @@ impl<S: StorageProvider> Engine<S> {
                         before,
                         "pre_inbound_commit_apply",
                     );
+                    self.storage
+                        .record_group_transition_intent(&group_id, &recovery_snapshot)?;
                     let before_members = group_lifecycle::marmot_members(&mls_group);
                     let before_admins =
                         crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
@@ -735,7 +737,7 @@ impl<S: StorageProvider> Engine<S> {
                             commit_committer,
                             mls_bytes.as_slice(),
                         ),
-                        recovery_snapshot,
+                        recovery_snapshot.clone(),
                     );
                     if let Ok(mut g) = self.storage.get_group(&group_id) {
                         g.epoch = after;
@@ -840,6 +842,8 @@ impl<S: StorageProvider> Engine<S> {
                         );
                     }
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    self.storage
+                        .clear_group_transition_intent(&group_id, &recovery_snapshot)?;
                     // In-memory fast path mirrors the durable record, keyed on
                     // the content-derived id so a re-wrapped duplicate commit is
                     // caught before the durable lookup.

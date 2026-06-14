@@ -2,9 +2,10 @@ mod capture;
 mod lifecycle;
 mod restore;
 mod rows;
+mod transition_intents;
 
 use crate::SqliteAccountStorage;
-use cgka_traits::storage::StorageResult;
+use cgka_traits::storage::{GroupTransitionIntent, StorageResult};
 use cgka_traits::types::GroupId;
 
 pub(super) fn create(
@@ -35,12 +36,38 @@ pub(super) fn release(
     lifecycle::release(store, group_id, name)
 }
 
+pub(super) fn record_transition_intent(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    snapshot_name: &str,
+) -> StorageResult<()> {
+    transition_intents::record(store, group_id, snapshot_name)
+}
+
+pub(super) fn clear_transition_intent(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    snapshot_name: &str,
+) -> StorageResult<()> {
+    transition_intents::clear(store, group_id, snapshot_name)
+}
+
+pub(super) fn list_transition_intents(
+    store: &SqliteAccountStorage,
+) -> StorageResult<Vec<GroupTransitionIntent>> {
+    transition_intents::list(store)
+}
+
+pub(crate) fn recover_transition_intents(store: &SqliteAccountStorage) -> StorageResult<()> {
+    transition_intents::recover_all(store)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
+    use crate::{SqliteAccountStorage, SqliteStorageOptions};
     use cgka_traits::capabilities::{Capability, GroupCapabilities};
     use cgka_traits::storage::{
         CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, StorageError,
@@ -128,6 +155,58 @@ mod tests {
         );
         assert!(matches!(
             store.rollback_group_to_snapshot(&g1.id, "a-before"),
+            Err(StorageError::SnapshotMissing(_))
+        ));
+    }
+
+    #[test]
+    fn incomplete_transition_intent_rolls_back_snapshot_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let g0 = sample_group(gid(1), 0, 1);
+        let mls_group_id = openmls::group::GroupId::from_slice(g0.id.as_slice());
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let store = SqliteAccountStorage::from_connection_with_options(
+                connection,
+                SqliteStorageOptions::default(),
+            )
+            .unwrap();
+            store.put_group(&g0).unwrap();
+            store
+                .mls_storage()
+                .write_group_state(&mls_group_id, &TestGroupState(b"epoch-0".to_vec()))
+                .unwrap();
+            store
+                .create_group_snapshot(&g0.id, "pre-openmls-transition")
+                .unwrap();
+            store
+                .record_group_transition_intent(&g0.id, "pre-openmls-transition")
+                .unwrap();
+
+            let g1 = sample_group(gid(1), 1, 2);
+            store.put_group(&g1).unwrap();
+            store
+                .mls_storage()
+                .write_group_state(&mls_group_id, &TestGroupState(b"epoch-1".to_vec()))
+                .unwrap();
+        }
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let reopened = SqliteAccountStorage::from_connection_with_options(
+            connection,
+            SqliteStorageOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(reopened.get_group(&g0.id).unwrap(), g0);
+        let state: Option<TestGroupState> =
+            reopened.mls_storage().group_state(&mls_group_id).unwrap();
+        assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
+        assert_eq!(reopened.list_group_transition_intents().unwrap(), vec![]);
+        assert!(matches!(
+            reopened.rollback_group_to_snapshot(&g0.id, "pre-openmls-transition"),
             Err(StorageError::SnapshotMissing(_))
         ));
     }

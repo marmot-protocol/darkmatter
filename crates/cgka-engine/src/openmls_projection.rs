@@ -792,6 +792,9 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     storage
         .create_group_snapshot(group_id, &snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    storage
+        .record_group_transition_intent(group_id, &snapshot)
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let prepare_result =
         if !result.accepted_commits.is_empty() && apply_start_epoch == current_epoch {
@@ -821,6 +824,9 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
 
     match apply_result {
         Ok(observations) => {
+            storage
+                .clear_group_transition_intent(group_id, &snapshot)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
             storage
                 .release_group_snapshot(group_id, &snapshot)
                 .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
@@ -901,6 +907,9 @@ fn rollback_and_release_group_snapshot<S: StorageProvider>(
 ) -> Result<(), OpenMlsProjectionError> {
     storage
         .rollback_group_to_snapshot(group_id, snapshot)
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    storage
+        .clear_group_transition_intent(group_id, snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     storage
         .release_group_snapshot(group_id, snapshot)

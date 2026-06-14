@@ -61,7 +61,13 @@ impl<S: StorageProvider> Engine<S> {
         // Cache invitee capabilities from the staged commit BEFORE merge —
         // staged_commit.add_proposals() exposes each new member's KeyPackage
         // leaf node. After merge the staged commit is consumed.
+        let mut transition_snapshot = None;
         if let Some(staged) = mls_group.pending_commit() {
+            let snapshot = pending_publish_transition_snapshot_name(pending);
+            self.storage.create_group_snapshot(&group_id, &snapshot)?;
+            self.storage
+                .record_group_transition_intent(&group_id, &snapshot)?;
+            transition_snapshot = Some(snapshot);
             self.retain_current_epoch_snapshot_for_group(&group_id)?;
             crate::capability_manager::cache_from_staged_commit(
                 &self.storage,
@@ -131,6 +137,11 @@ impl<S: StorageProvider> Engine<S> {
                 ),
             );
         }
+        if let Some(snapshot) = transition_snapshot.as_deref() {
+            self.storage
+                .clear_group_transition_intent(&group_id, snapshot)?;
+            self.storage.release_group_snapshot(&group_id, snapshot)?;
+        }
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
             crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
@@ -177,7 +188,13 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
+        let mut transition_snapshot = None;
         if mls_group.pending_commit().is_some() {
+            let snapshot = pending_publish_failure_transition_snapshot_name(pending);
+            self.storage.create_group_snapshot(&group_id, &snapshot)?;
+            self.storage
+                .record_group_transition_intent(&group_id, &snapshot)?;
+            transition_snapshot = Some(snapshot);
             mls_group
                 .clear_pending_commit(provider.storage())
                 .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
@@ -217,9 +234,22 @@ impl<S: StorageProvider> Engine<S> {
         );
         self.pending_state_changes.remove(&pending);
         self.forget_pending_commit_for_recovery(pending)?;
+        if let Some(snapshot) = transition_snapshot.as_deref() {
+            self.storage
+                .clear_group_transition_intent(&group_id, snapshot)?;
+            self.storage.release_group_snapshot(&group_id, snapshot)?;
+        }
         self.replay_buffered_messages(&group_id).await?;
         Ok(())
     }
+}
+
+fn pending_publish_transition_snapshot_name(pending: PendingStateRef) -> String {
+    format!("transition-publish-{pending}")
+}
+
+fn pending_publish_failure_transition_snapshot_name(pending: PendingStateRef) -> String {
+    format!("transition-publish-failed-{pending}")
 }
 
 /// Read the `RequiredCapabilities` extension off the (post-merge) MLS
