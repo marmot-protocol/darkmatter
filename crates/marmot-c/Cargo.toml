@@ -1,0 +1,28 @@
+[package]
+name = "marmot-c"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "marmot_c"
+# `cdylib` for dynamic linking (libmarmot_c.so / .dylib / .dll), `staticlib`
+# for embedding (libmarmot_c.a). `lib` keeps the Rust surface usable as a
+# normal dependency (the in-crate tests link against it, and downstream Rust
+# crates can reuse the dispatch layer directly).
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+marmot-app.workspace = true
+marmot-account.workspace = true
+cgka-traits.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+keyring-core.workspace = true

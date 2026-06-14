@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: marmot-c
+Description: C bindings for the Marmot app runtime
+Version: @VERSION@
+Libs: -L${libdir} -lmarmot_c
+Libs.private: -lpthread -ldl -lm
+Cflags: -I${includedir}

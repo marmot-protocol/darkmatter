@@ -2616,6 +2616,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-c"
+version = "0.1.0"
+dependencies = [
+ "cgka-traits",
+ "hex",
+ "keyring-core",
+ "marmot-account",
+ "marmot-app",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "marmot-forensics"
 version = "0.1.0"
 dependencies = [

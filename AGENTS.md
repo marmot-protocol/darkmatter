@@ -45,6 +45,7 @@ This repo owns the candidate CGKA engine workspace:
 | `dm-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/README.md` |
+| App runtime C bindings | `crates/marmot-c/AGENTS.md` |
 | First app CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
