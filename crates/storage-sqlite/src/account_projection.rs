@@ -424,32 +424,6 @@ impl SqliteAccountStorage {
         rows.collect::<Result<Vec<_>, _>>().storage()
     }
 
-    /// Resolve a single app message by id within a group, pushing the filter to
-    /// SQLite instead of scanning the group's full history. Used by the
-    /// reaction notification path to fetch only the reacted-to row.
-    pub fn app_message_by_id(
-        &self,
-        group_id_hex: &str,
-        message_id_hex: &str,
-    ) -> StorageResult<Option<StoredAppMessageRecord>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare(
-                "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
-                        kind, tags_json, source_epoch, recorded_at, received_at
-                 FROM app_events
-                 WHERE group_id_hex = ?1 AND message_id_hex = ?2
-                 LIMIT 1",
-            )
-            .storage()?;
-        let mut records = statement
-            .query_map(params![group_id_hex, message_id_hex], app_message_from_row)
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        Ok(records.pop())
-    }
-
     pub fn app_message_count(&self) -> StorageResult<usize> {
         let count = self
             .lock()?

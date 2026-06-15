@@ -199,21 +199,6 @@ fn app_messages_list_raw_events_and_prune_rebuilds_timeline() {
 }
 
 #[test]
-fn app_message_by_id_fetches_only_the_matching_row() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    store.record_app_event(&app_event("m1", "aa", 10)).unwrap();
-    store.record_app_event(&app_event("m2", "aa", 20)).unwrap();
-
-    let found = store.app_message_by_id("aa", "m2").unwrap();
-    assert_eq!(found.map(|record| record.plaintext), Some("m2".to_owned()));
-
-    // Missing id → None.
-    assert!(store.app_message_by_id("aa", "missing").unwrap().is_none());
-    // Scoped to the group: the same id in another group does not match.
-    assert!(store.app_message_by_id("bb", "m2").unwrap().is_none());
-}
-
-#[test]
 fn app_messages_tie_break_on_message_id_matches_cursor_order() {
     // Same `recorded_at`, but `message_id_hex` lexical order differs from both
     // insertion order and `received_at` order. `dm messages list` filters

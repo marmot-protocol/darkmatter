@@ -20,9 +20,10 @@ use transport_nostr_peeler::NostrTransportEvent;
 use cgka_traits::app_event::{EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION};
 
 use crate::{
-    AppError, AppGroupRecord, AppMessageRecord, MarmotApp, MarmotAppEvent, ReceivedMessage,
-    RuntimeMessageReceived, tag_value,
+    AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
+    tag_value,
 };
+use storage_sqlite::TimelineMessageTarget;
 
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE: u64 = 447;
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST: u64 = 448;
@@ -172,8 +173,10 @@ pub struct NotificationUpdate {
     /// ignore it and still render `preview_text`.
     pub reaction_emoji: Option<String>,
     /// For a reaction message, a preview of the message that was reacted to,
-    /// resolved from the reaction's `e` tag. `None` when this is not a reaction
-    /// or the target message could not be resolved locally.
+    /// resolved from the reaction's `e` tag against the materialized timeline.
+    /// `None` when this is not a reaction, the target row could not be resolved
+    /// locally, or the target is deleted/invalidated (its original text must
+    /// never leak into the preview).
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
@@ -647,15 +650,25 @@ fn notification_update_from_message(
     let receiver = notification_user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;
-    // A reaction resolves only its single target row (fetched by id, not by
-    // scanning the group's whole history) and notifies only the author of the
-    // reacted-to message, like the major messaging apps. If this account didn't
-    // author it (or the target can't be resolved), emit nothing — so a reaction
-    // to your own message never alerts another local account, and reactions to
-    // others' messages don't alert you.
+    // A reaction resolves only its single target row from the materialized
+    // timeline (fetched by id, not by scanning the group's whole history) and
+    // notifies only the author of the reacted-to message, like the major
+    // messaging apps. The timeline is the user-visible truth: it reflects
+    // deleted/invalidated state and never carries a deleted/invalidated row's
+    // original text, so a reaction to a removed message cannot leak that text
+    // into a lock-screen preview.
+    //
+    // Author scope: if this account didn't author the target — or the target is
+    // truly absent (e.g. retention-pruned, so authorship can't be verified) —
+    // emit nothing. A reaction to your own message never alerts another local
+    // account, and reactions to others' messages don't alert you. A
+    // deleted-but-still-present target authored by this account still notifies
+    // (emoji only, no preview): see `reaction_notification_fields`.
     let reaction_target = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
         match tag_value(&event.message.tags, EVENT_REF_TAG) {
-            Some(target_id) => app.message_by_id(&event.account_label, &group_id_hex, target_id)?,
+            Some(target_id) => {
+                app.reaction_target(&event.account_label, &group_id_hex, target_id)?
+            }
             None => None,
         }
     } else {
@@ -759,17 +772,21 @@ fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
 /// Resolve the additive reaction fields for a notification.
 ///
 /// For a Nostr kind-7 reaction the emoji is the event content (trimmed; empty
-/// yields `None`), and the reacted-to preview is resolved by matching the
-/// reaction's `e` tag against the supplied group messages and rendering that
-/// target with the same preview rule as a normal message. Non-reaction messages
-/// yield `(None, None)`. Privacy: returns only display text, never ids.
-/// Reaction display fields: the trimmed emoji from the reaction event, and a
-/// preview of the already-resolved target message (`None` when the target row
-/// couldn't be fetched). The target is resolved by id at the call site so this
-/// stays a pure projection over the single reacted-to row.
+/// yields `None`). The reacted-to preview is rendered from the already-resolved
+/// timeline target with the same preview rule as a normal message — but only
+/// when the target is live: a `deleted` or `invalidated` (convergence-tombstoned)
+/// target yields `None` so the removed message's original text never reaches a
+/// lock-screen preview. Non-reaction messages yield `(None, None)`. Privacy:
+/// returns only display text, never ids.
+///
+/// The target is resolved by id at the call site (from the materialized
+/// timeline, the user-visible truth) so this stays a pure projection over the
+/// single reacted-to row. The call site drops the notification entirely when the
+/// target is absent or authored by another account; this helper only shapes the
+/// emoji/preview pair for a target that has already passed that author scope.
 fn reaction_notification_fields(
     message: &ReceivedMessage,
-    target: Option<&AppMessageRecord>,
+    target: Option<&TimelineMessageTarget>,
 ) -> (Option<String>, Option<String>) {
     if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
         return (None, None);
@@ -782,8 +799,13 @@ fn reaction_notification_fields(
             Some(trimmed.to_owned())
         }
     };
-    let reacted_to_preview =
-        target.and_then(|record| preview_text_for_kind(record.kind, &record.plaintext));
+    let reacted_to_preview = target.and_then(|target| {
+        if target.deleted || target.invalidated {
+            None
+        } else {
+            preview_text_for_kind(target.kind, &target.plaintext)
+        }
+    });
     (reaction_emoji, reacted_to_preview)
 }
 

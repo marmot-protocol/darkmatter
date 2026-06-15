@@ -286,18 +286,13 @@ fn token_fingerprint_is_redacted_and_stable() {
     );
 }
 
-fn app_message_record(message_id_hex: &str, kind: u64, plaintext: &str) -> AppMessageRecord {
-    AppMessageRecord {
-        message_id_hex: message_id_hex.to_owned(),
-        direction: "received".to_owned(),
-        group_id_hex: "ee".repeat(32),
+fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
+    TimelineMessageTarget {
         sender: "bb".repeat(32),
         plaintext: plaintext.to_owned(),
         kind,
-        tags: Vec::new(),
-        source_epoch: Some(1),
-        recorded_at: 0,
-        received_at: 0,
+        deleted: false,
+        invalidated: false,
     }
 }
 
@@ -318,8 +313,7 @@ fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
 
 #[test]
 fn reaction_message_carries_emoji_and_resolved_target_preview() {
-    let target = app_message_record(
-        &"aa".repeat(32),
+    let target = timeline_target(
         cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         "the original message",
     );
@@ -327,15 +321,54 @@ fn reaction_message_carries_emoji_and_resolved_target_preview() {
 
     let (emoji, preview) = reaction_notification_fields(&reaction, Some(&target));
 
-    // Emoji is trimmed; preview comes from the resolved target row.
+    // Emoji is trimmed; preview comes from the resolved live target row.
     assert_eq!(emoji.as_deref(), Some("👍"));
     assert_eq!(preview.as_deref(), Some("the original message"));
 }
 
 #[test]
-fn reaction_with_unresolvable_target_yields_emoji_but_no_preview() {
+fn reaction_to_deleted_target_yields_emoji_but_no_preview() {
+    // The author reacted to a message that was later deleted. The timeline row
+    // is kept (deleted = true, plaintext cleared) so authorship still verifies
+    // and the author is notified, but the preview is suppressed — the original
+    // text must never reach a lock-screen notification.
+    let mut target = timeline_target(
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "the original message",
+    );
+    target.deleted = true;
+    let reaction = received_reaction("👍", &"aa".repeat(32));
+
+    let (emoji, preview) = reaction_notification_fields(&reaction, Some(&target));
+
+    assert_eq!(emoji.as_deref(), Some("👍"));
+    assert_eq!(preview, None);
+}
+
+#[test]
+fn reaction_to_invalidated_target_yields_emoji_but_no_preview() {
+    // The reacted-to message was convergence-invalidated (losing branch) but
+    // kept as a tombstone. Notify with the emoji, never leak its preview.
+    let mut target = timeline_target(
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "the original message",
+    );
+    target.invalidated = true;
     let reaction = received_reaction("❤️", &"aa".repeat(32));
-    // Target row couldn't be fetched.
+
+    let (emoji, preview) = reaction_notification_fields(&reaction, Some(&target));
+
+    assert_eq!(emoji.as_deref(), Some("❤️"));
+    assert_eq!(preview, None);
+}
+
+#[test]
+fn reaction_with_unresolvable_target_yields_emoji_but_no_preview() {
+    // A truly-absent target (e.g. retention-pruned) is dropped at the caller
+    // (`notification_update_from_message` returns `Ok(None)` because authorship
+    // can't be verified). This pure helper, given `None`, still yields the
+    // emoji with no preview.
+    let reaction = received_reaction("❤️", &"aa".repeat(32));
     let (emoji, preview) = reaction_notification_fields(&reaction, None);
     assert_eq!(emoji.as_deref(), Some("❤️"));
     assert_eq!(preview, None);
@@ -343,8 +376,7 @@ fn reaction_with_unresolvable_target_yields_emoji_but_no_preview() {
 
 #[test]
 fn reaction_with_blank_content_yields_no_emoji() {
-    let target = app_message_record(
-        &"aa".repeat(32),
+    let target = timeline_target(
         cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         "original",
     );
@@ -359,8 +391,7 @@ fn reaction_with_blank_content_yields_no_emoji() {
 fn normal_message_yields_no_reaction_fields() {
     let mut message = received_reaction("ignored", &"aa".repeat(32));
     message.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
-    let target = app_message_record(
-        &"aa".repeat(32),
+    let target = timeline_target(
         cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         "original",
     );

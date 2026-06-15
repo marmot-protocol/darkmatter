@@ -1051,19 +1051,23 @@ impl MarmotApp {
             .collect())
     }
 
-    /// Resolve a single message by id within a group without loading the
-    /// group's full history — the storage layer filters by id directly.
-    pub fn message_by_id(
+    /// Resolve the reacted-to target for a reaction notification from the
+    /// materialized timeline (the user-visible truth) rather than raw
+    /// `app_events`. Filters by id directly, so the group's full history is not
+    /// scanned. Returns the small [`storage_sqlite::TimelineMessageTarget`]
+    /// view carrying sender + plaintext + kind + deleted/invalidated flags;
+    /// `None` when the id is absent in that group (e.g. retention-pruned, so the
+    /// reaction's author cannot be verified).
+    pub fn reaction_target(
         &self,
         label: &str,
         group_id_hex: &str,
         message_id_hex: &str,
-    ) -> Result<Option<AppMessageRecord>, AppError> {
+    ) -> Result<Option<storage_sqlite::TimelineMessageTarget>, AppError> {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
-            .app_message_by_id(group_id_hex, message_id_hex)?
-            .map(app_message_record_from_stored))
+            .timeline_message_target(group_id_hex, message_id_hex)?)
     }
 
     pub fn timeline_messages_with_query(
