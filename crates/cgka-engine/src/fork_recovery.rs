@@ -189,7 +189,7 @@ impl ForkRecoveryManager {
         storage: &S,
         group_id: &GroupId,
         oldest_retained_epoch: EpochId,
-    ) -> Result<(), EngineError> {
+    ) {
         let stale: Vec<_> = self
             .incumbents
             .iter()
@@ -202,12 +202,16 @@ impl ForkRecoveryManager {
         for (key, snapshot_name) in stale {
             match storage.release_group_snapshot(group_id, &snapshot_name) {
                 Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-                Err(e) => return Err(EngineError::Storage(e)),
+                Err(_e) => {
+                    tracing::warn!(
+                        target: "cgka_engine::fork_recovery",
+                        source_epoch = key.1 .0,
+                        "failed to release pruned fork recovery snapshot"
+                    );
+                }
             }
             self.incumbents.remove(&key);
         }
-
-        Ok(())
     }
 }
 
@@ -364,7 +368,7 @@ impl<S: StorageProvider> Engine<S> {
                 .saturating_sub(policy.convergence.max_rewind_commits),
         );
         self.fork_recovery
-            .prune_before(&self.storage, group_id, oldest_retained_epoch)?;
+            .prune_before(&self.storage, group_id, oldest_retained_epoch);
         self.epoch_manager
             .prune_committed_from_before(group_id, oldest_retained_epoch);
         Ok(())

@@ -539,9 +539,10 @@ async fn confirmed_commits_prune_fork_recovery_snapshots_to_rewind_horizon() {
     assert_eq!(alice.epoch(&gid).unwrap().0, 4);
     let snapshots = fork_snapshot_names(&storage, &gid);
     assert!(
-        snapshots
-            .iter()
-            .all(|snapshot| snapshot.starts_with("fork-3-")),
+        !snapshots.is_empty()
+            && snapshots
+                .iter()
+                .all(|snapshot| snapshot.starts_with("fork-3-")),
         "only the current rewind horizon's source epoch should remain: {snapshots:?}"
     );
 }
