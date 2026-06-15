@@ -4,6 +4,7 @@ use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
+use nostr_relay_builder::MockRelay;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -481,12 +482,14 @@ async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
     // client's Ping/Status/Shutdown request.
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("dmd.sock");
+    let relay = MockRelay::run().await.expect("start mock relay");
+    let relay_url = relay.url().await.to_string();
     let args = DaemonArgs {
         home: Some(home.path().to_path_buf()),
         data_dir: None,
         logs_dir: None,
         socket: Some(socket.clone()),
-        relay: Some("wss://relay.example".to_owned()),
+        relay: Some(relay_url),
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
         secret_store: Some(crate::SecretStoreKind::File),
@@ -516,12 +519,20 @@ async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
     .await;
     drop(stalled);
 
-    let _ = tokio::time::timeout(
+    let shutdown_output = tokio::time::timeout(
         Duration::from_secs(5),
         send_request(&socket, &DaemonRequest::Shutdown),
     )
-    .await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    .await
+    .expect("shutdown request should not time out")
+    .expect("shutdown request should succeed");
+    assert_eq!(shutdown_output.code, 0);
+
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server task should not time out")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
 
     let output = ping
         .expect("ping should not wait behind stalled request reader")
