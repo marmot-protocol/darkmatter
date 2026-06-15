@@ -205,6 +205,7 @@ impl ForkRecoveryManager {
                 Err(_e) => {
                     tracing::warn!(
                         target: "cgka_engine::fork_recovery",
+                        method = "prune_before",
                         source_epoch = key.1 .0,
                         "failed to release pruned fork recovery snapshot"
                     );
