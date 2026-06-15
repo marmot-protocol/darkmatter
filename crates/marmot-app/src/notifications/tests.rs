@@ -286,6 +286,123 @@ fn token_fingerprint_is_redacted_and_stable() {
     );
 }
 
+fn app_message_record(message_id_hex: &str, kind: u64, plaintext: &str) -> AppMessageRecord {
+    AppMessageRecord {
+        message_id_hex: message_id_hex.to_owned(),
+        direction: "received".to_owned(),
+        group_id_hex: "ee".repeat(32),
+        sender: "bb".repeat(32),
+        plaintext: plaintext.to_owned(),
+        kind,
+        tags: Vec::new(),
+        source_epoch: Some(1),
+        recorded_at: 0,
+        received_at: 0,
+    }
+}
+
+fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
+    ReceivedMessage {
+        message_id_hex: "ff".repeat(32),
+        source_message_id_hex: "ff".repeat(32),
+        sender: "bb".repeat(32),
+        sender_display_name: None,
+        group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
+        source_epoch: 1,
+        plaintext: emoji.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_REACTION,
+        tags: vec![vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]],
+        recorded_at: 0,
+    }
+}
+
+#[test]
+fn reaction_message_carries_emoji_and_resolved_target_preview() {
+    let target_id = "aa".repeat(32);
+    let group_messages = vec![app_message_record(
+        &target_id,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "the original message",
+    )];
+    let reaction = received_reaction("  👍  ", &target_id);
+
+    let (emoji, preview) = reaction_notification_fields(&reaction, &group_messages);
+
+    // Emoji is trimmed; target message resolved from the `e` tag.
+    assert_eq!(emoji.as_deref(), Some("👍"));
+    assert_eq!(preview.as_deref(), Some("the original message"));
+}
+
+#[test]
+fn reaction_with_unresolvable_target_yields_emoji_but_no_preview() {
+    let reaction = received_reaction("❤️", &"aa".repeat(32));
+    // No matching group message for the `e` tag.
+    let (emoji, preview) = reaction_notification_fields(&reaction, &[]);
+    assert_eq!(emoji.as_deref(), Some("❤️"));
+    assert_eq!(preview, None);
+}
+
+#[test]
+fn reaction_with_blank_content_yields_no_emoji() {
+    let target_id = "aa".repeat(32);
+    let group_messages = vec![app_message_record(
+        &target_id,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "original",
+    )];
+    let reaction = received_reaction("   ", &target_id);
+    let (emoji, preview) = reaction_notification_fields(&reaction, &group_messages);
+    assert_eq!(emoji, None);
+    // Target still resolves even when the emoji is blank.
+    assert_eq!(preview.as_deref(), Some("original"));
+}
+
+#[test]
+fn normal_message_yields_no_reaction_fields() {
+    let mut message = received_reaction("ignored", &"aa".repeat(32));
+    message.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+    let group_messages = vec![app_message_record(
+        &"aa".repeat(32),
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "original",
+    )];
+    let (emoji, preview) = reaction_notification_fields(&message, &group_messages);
+    assert_eq!(emoji, None);
+    assert_eq!(preview, None);
+}
+
+#[test]
+fn reaction_target_author_resolves_the_reacted_to_messages_sender() {
+    let target_id = "aa".repeat(32);
+    let group_messages = vec![app_message_record(
+        &target_id,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "original",
+    )];
+    let reaction = received_reaction("👍", &target_id);
+    // app_message_record authors with "bb"*32.
+    assert_eq!(
+        reaction_target_author(&reaction, &group_messages),
+        Some("bb".repeat(32).as_str())
+    );
+}
+
+#[test]
+fn reaction_target_author_is_none_when_target_absent_or_not_a_reaction() {
+    let reaction = received_reaction("👍", &"aa".repeat(32));
+    // Target not in the loaded set → cannot attribute an author.
+    assert_eq!(reaction_target_author(&reaction, &[]), None);
+
+    let mut chat = received_reaction("not-a-reaction", &"aa".repeat(32));
+    chat.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+    let group_messages = vec![app_message_record(
+        &"aa".repeat(32),
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        "original",
+    )];
+    assert_eq!(reaction_target_author(&chat, &group_messages), None);
+}
+
 #[test]
 fn push_platform_from_str_is_lowercase_only() {
     assert!(matches!(

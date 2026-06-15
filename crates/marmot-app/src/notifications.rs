@@ -17,8 +17,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
+use cgka_traits::app_event::{EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION};
+
 use crate::{
-    AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
+    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
+    ReceivedMessage, RuntimeMessageReceived, tag_value,
 };
 
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE: u64 = 447;
@@ -164,6 +167,14 @@ pub struct NotificationUpdate {
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
     pub preview_text: Option<String>,
+    /// For a reaction message (Nostr kind 7), the reaction emoji carried in the
+    /// event content. `None` for non-reaction messages. Additive: old clients
+    /// ignore it and still render `preview_text`.
+    pub reaction_emoji: Option<String>,
+    /// For a reaction message, a preview of the message that was reacted to,
+    /// resolved from the reaction's `e` tag. `None` when this is not a reaction
+    /// or the target message could not be resolved locally.
+    pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
 }
@@ -608,9 +619,7 @@ pub(crate) fn notification_update_from_event(
     event: &MarmotAppEvent,
 ) -> Result<Option<NotificationUpdate>, AppError> {
     match event {
-        MarmotAppEvent::MessageReceived(message) => {
-            notification_update_from_message(app, message).map(Some)
-        }
+        MarmotAppEvent::MessageReceived(message) => notification_update_from_message(app, message),
         MarmotAppEvent::GroupJoined {
             account_id_hex,
             account_label,
@@ -628,7 +637,7 @@ pub(crate) fn notification_update_from_event(
 fn notification_update_from_message(
     app: &MarmotApp,
     event: &RuntimeMessageReceived,
-) -> Result<NotificationUpdate, AppError> {
+) -> Result<Option<NotificationUpdate>, AppError> {
     let settings = app.notification_settings(&event.account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
@@ -638,7 +647,33 @@ fn notification_update_from_message(
     let receiver = notification_user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;
-    Ok(NotificationUpdate {
+    // Only a reaction needs the group's messages (to resolve its target);
+    // normal messages skip the read entirely.
+    let group_messages = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
+        app.messages_with_query(
+            &event.account_label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                limit: None,
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+    // A reaction notifies only the author of the reacted-to message, like the
+    // major messaging apps. If this account didn't author it (or the target
+    // can't be resolved), emit nothing — so a reaction to your own message
+    // never alerts another local account, and reactions to others' messages
+    // don't alert you.
+    if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION
+        && reaction_target_author(&event.message, &group_messages)
+            .is_none_or(|author| author != event.account_id_hex)
+    {
+        return Ok(None);
+    }
+    let (reaction_emoji, reacted_to_preview) =
+        reaction_notification_fields(&event.message, &group_messages);
+    Ok(Some(NotificationUpdate {
         notification_key: format!(
             "message:{}:{}",
             event.account_id_hex, event.message.message_id_hex
@@ -654,9 +689,11 @@ fn notification_update_from_message(
         sender,
         receiver,
         preview_text: preview_text_for_message(&event.message),
+        reaction_emoji,
+        reacted_to_preview,
         timestamp_ms: unix_now_ms(),
         is_from_self,
-    })
+    }))
 }
 
 fn notification_update_from_group_join(
@@ -694,6 +731,8 @@ fn notification_update_from_group_join(
         sender,
         receiver,
         preview_text: None,
+        reaction_emoji: None,
+        reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),
         is_from_self: sender_id == account_id_hex,
     })
@@ -706,11 +745,65 @@ fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
 }
 
 fn preview_text_for_message(message: &ReceivedMessage) -> Option<String> {
-    if is_push_gossip_kind(message.kind) || message.plaintext.trim().is_empty() {
+    preview_text_for_kind(message.kind, &message.plaintext)
+}
+
+/// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
+/// kinds and blank text never produce a preview.
+fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
+    if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
         None
     } else {
-        Some(message.plaintext.clone())
+        Some(plaintext.to_owned())
     }
+}
+
+/// Resolve the additive reaction fields for a notification.
+///
+/// For a Nostr kind-7 reaction the emoji is the event content (trimmed; empty
+/// yields `None`), and the reacted-to preview is resolved by matching the
+/// reaction's `e` tag against the supplied group messages and rendering that
+/// target with the same preview rule as a normal message. Non-reaction messages
+/// yield `(None, None)`. Privacy: returns only display text, never ids.
+/// Account id that authored the message this reaction targets, resolved from
+/// the reaction's `e` tag against the group's messages. `None` when the event
+/// isn't a reaction or the target message isn't in the loaded set.
+fn reaction_target_author<'a>(
+    message: &ReceivedMessage,
+    group_messages: &'a [AppMessageRecord],
+) -> Option<&'a str> {
+    if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
+        return None;
+    }
+    let target_id = tag_value(&message.tags, EVENT_REF_TAG)?;
+    group_messages
+        .iter()
+        .find(|record| record.message_id_hex == target_id)
+        .map(|record| record.sender.as_str())
+}
+
+fn reaction_notification_fields(
+    message: &ReceivedMessage,
+    group_messages: &[AppMessageRecord],
+) -> (Option<String>, Option<String>) {
+    if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
+        return (None, None);
+    }
+    let reaction_emoji = {
+        let trimmed = message.plaintext.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    };
+    let reacted_to_preview = tag_value(&message.tags, EVENT_REF_TAG).and_then(|target_id| {
+        group_messages
+            .iter()
+            .find(|record| record.message_id_hex == target_id)
+            .and_then(|record| preview_text_for_kind(record.kind, &record.plaintext))
+    });
+    (reaction_emoji, reacted_to_preview)
 }
 
 fn notification_user_from_message(
