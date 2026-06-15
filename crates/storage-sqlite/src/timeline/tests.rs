@@ -1018,4 +1018,9 @@ fn timeline_message_target_reflects_invalidated_row() {
         .expect("invalidated target row still present");
     assert!(found.invalidated);
     assert!(!found.deleted);
+    // Unlike a delete (which clears plaintext), an invalidated tombstone KEEPS
+    // its original text — so the `invalidated` flag is the sole guard against
+    // leaking it into a reaction preview. Pin that here so the guarantee can't
+    // silently regress to relying on cleared text.
+    assert_eq!(found.plaintext, "hello");
 }
