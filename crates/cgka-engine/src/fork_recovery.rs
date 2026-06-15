@@ -183,6 +183,32 @@ impl ForkRecoveryManager {
             .map(|record| (record.source_epoch, record.snapshot_name.clone()))
             .collect()
     }
+
+    fn prune_before<S: StorageProvider>(
+        &mut self,
+        storage: &S,
+        group_id: &GroupId,
+        oldest_retained_epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let stale: Vec<_> = self
+            .incumbents
+            .iter()
+            .filter(|((record_group_id, source_epoch), _)| {
+                record_group_id == group_id && source_epoch.0 < oldest_retained_epoch.0
+            })
+            .map(|(key, record)| (key.clone(), record.snapshot_name.clone()))
+            .collect();
+
+        for (key, snapshot_name) in stale {
+            match storage.release_group_snapshot(group_id, &snapshot_name) {
+                Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
+                Err(e) => return Err(EngineError::Storage(e)),
+            }
+            self.incumbents.remove(&key);
+        }
+
+        Ok(())
+    }
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -322,5 +348,25 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) fn retained_fork_snapshots(&self, group_id: &GroupId) -> Vec<(EpochId, String)> {
         self.fork_recovery.retained_snapshots(group_id)
+    }
+
+    pub(crate) fn prune_fork_recovery_for_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let current_epoch = self.storage.get_group(group_id)?.epoch;
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+        let oldest_retained_epoch = EpochId(
+            current_epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        );
+        self.fork_recovery
+            .prune_before(&self.storage, group_id, oldest_retained_epoch)?;
+        self.epoch_manager
+            .prune_committed_from_before(group_id, oldest_retained_epoch);
+        Ok(())
     }
 }
