@@ -152,6 +152,24 @@ async fn create_confirmed_group(engine: &mut Engine<SqliteAccountStorage>) -> Gr
     group_id
 }
 
+fn insert_marmot_group_without_openmls_state(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+    epoch: u64,
+) {
+    storage
+        .put_group(&Group {
+            id: group_id.clone(),
+            name: name.into(),
+            description: String::new(),
+            members: Vec::new(),
+            epoch: EpochId(epoch),
+            required_capabilities: GroupCapabilities::default(),
+        })
+        .expect("insert marmot group record without openmls state");
+}
+
 #[tokio::test]
 async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
     let storage = SqliteAccountStorage::in_memory().expect("storage");
@@ -161,16 +179,7 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
     initial.drain_events();
 
     let broken_group = GroupId::new(b"missing-openmls-state".to_vec());
-    storage
-        .put_group(&Group {
-            id: broken_group.clone(),
-            name: "broken".into(),
-            description: String::new(),
-            members: Vec::new(),
-            epoch: EpochId(9),
-            required_capabilities: GroupCapabilities::default(),
-        })
-        .expect("insert marmot group record without openmls state");
+    insert_marmot_group_without_openmls_state(&storage, &broken_group, "broken", 9);
     drop(initial);
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -221,5 +230,48 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
                     && event.group_ref.is_none()
         )),
         "quarantine audit event missing: {audit_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_group() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let broken_group = GroupId::new(vec![0]);
+    insert_marmot_group_without_openmls_state(&storage, &broken_group, "broken-first", 3);
+
+    let mut initial = build_engine(storage.clone());
+    let healthy_group = create_confirmed_group(&mut initial).await;
+    let healthy_epoch = storage.get_group(&healthy_group).unwrap().epoch;
+    initial.drain_events();
+
+    let listed_groups = storage.list_groups().expect("list groups");
+    assert_eq!(
+        listed_groups.first(),
+        Some(&broken_group),
+        "test setup must put the broken group before the healthy group: {listed_groups:?}"
+    );
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration skips the first bad group and continues");
+
+    assert_eq!(reopened.epoch(&healthy_group).unwrap(), healthy_epoch);
+    assert!(matches!(
+        reopened.epoch(&broken_group),
+        Err(EngineError::UnknownGroup(id)) if id == broken_group
+    ));
+
+    let events = reopened.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupHydrationQuarantined {
+                group_id,
+                reason: GroupHydrationQuarantineReason::OpenMlsGroupMissing,
+            } if group_id == &broken_group
+        )),
+        "quarantine event missing: {events:?}"
     );
 }
