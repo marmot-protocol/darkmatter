@@ -170,19 +170,14 @@ pub struct NotificationUpdate {
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
     pub preview_text: Option<String>,
-    /// For a reaction message (Nostr kind 7), the reaction emoji carried in the
-    /// event content. `None` for non-reaction messages. Additive at the DTO
-    /// level: it does not change `trigger` or `preview_text`, so a consumer that
-    /// doesn't read it still renders the existing fields. It does, however,
-    /// change the generated UniFFI record — consumers must regenerate their
-    /// bindings and ship the matching native library to see it; a client still
-    /// on the old bindings/library pair simply doesn't receive the field.
+    /// Reaction emoji (Nostr kind 7 content); `None` for non-reactions. Additive
+    /// at the DTO level (no `trigger`/`preview_text` change), but it changes the
+    /// generated UniFFI record: consumers must regenerate bindings and ship the
+    /// matching native library to receive it.
     pub reaction_emoji: Option<String>,
-    /// For a reaction message, a preview of the message that was reacted to,
-    /// resolved from the reaction's `e` tag against the materialized timeline.
-    /// `None` when this is not a reaction, the target row could not be resolved
-    /// locally, or the target is deleted/invalidated (its original text must
-    /// never leak into the preview).
+    /// Preview of the reacted-to message (resolved via the `e` tag against the
+    /// timeline). `None` for non-reactions, an unresolvable target, or a
+    /// deleted/invalidated one — removed text must never reach the preview.
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
@@ -670,20 +665,11 @@ fn notification_update_from_message(
     let receiver = notification_user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;
-    // A reaction resolves only its single target row from the materialized
-    // timeline (fetched by id, not by scanning the group's whole history) and
-    // notifies only the author of the reacted-to message, like the major
-    // messaging apps. The timeline is the user-visible truth: it reflects
-    // deleted/invalidated state and never carries a deleted/invalidated row's
-    // original text, so a reaction to a removed message cannot leak that text
-    // into a lock-screen preview.
-    //
-    // Author scope: if this account didn't author the target — or the target is
-    // truly absent (e.g. retention-pruned, so authorship can't be verified) —
-    // emit nothing. A reaction to your own message never alerts another local
-    // account, and reactions to others' messages don't alert you. A
-    // deleted-but-still-present target authored by this account still notifies
-    // (emoji only, no preview): see `reaction_notification_fields`.
+    // Resolve the reacted-to row from the materialized timeline by id (not raw
+    // app_events): the timeline reflects deletion/invalidation and never carries
+    // removed text, so a reaction can't leak it into a preview. Notify only the
+    // target's author; if this account didn't author it, or the target is gone
+    // (authorship unverifiable), emit nothing.
     let reaction_target = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
         match tag_value(&event.message.tags, EVENT_REF_TAG) {
             Some(target_id) => {
@@ -789,21 +775,10 @@ fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     }
 }
 
-/// Resolve the additive reaction fields for a notification.
-///
-/// For a Nostr kind-7 reaction the emoji is the event content (trimmed; empty
-/// yields `None`). The reacted-to preview is rendered from the already-resolved
-/// timeline target with the same preview rule as a normal message — but only
-/// when the target is live: a `deleted` or `invalidated` (convergence-tombstoned)
-/// target yields `None` so the removed message's original text never reaches a
-/// lock-screen preview. Non-reaction messages yield `(None, None)`. Privacy:
-/// returns only display text, never ids.
-///
-/// The target is resolved by id at the call site (from the materialized
-/// timeline, the user-visible truth) so this stays a pure projection over the
-/// single reacted-to row. The call site drops the notification entirely when the
-/// target is absent or authored by another account; this helper only shapes the
-/// emoji/preview pair for a target that has already passed that author scope.
+/// Shape the (emoji, preview) pair for a reaction from its already-resolved
+/// timeline target. Emoji is the trimmed event content. Preview is `None` for a
+/// `deleted`/`invalidated` target so removed text never reaches a preview;
+/// otherwise the normal preview rule applies. Pure; returns display text only.
 fn reaction_notification_fields(
     message: &ReceivedMessage,
     target: Option<&TimelineMessageTarget>,
