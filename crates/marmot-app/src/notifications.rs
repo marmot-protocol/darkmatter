@@ -171,8 +171,12 @@ pub struct NotificationUpdate {
     pub receiver: NotificationUser,
     pub preview_text: Option<String>,
     /// For a reaction message (Nostr kind 7), the reaction emoji carried in the
-    /// event content. `None` for non-reaction messages. Additive: old clients
-    /// ignore it and still render `preview_text`.
+    /// event content. `None` for non-reaction messages. Additive at the DTO
+    /// level: it does not change `trigger` or `preview_text`, so a consumer that
+    /// doesn't read it still renders the existing fields. It does, however,
+    /// change the generated UniFFI record — consumers must regenerate their
+    /// bindings and ship the matching native library to see it; a client still
+    /// on the old bindings/library pair simply doesn't receive the field.
     pub reaction_emoji: Option<String>,
     /// For a reaction message, a preview of the message that was reacted to,
     /// resolved from the reaction's `e` tag against the materialized timeline.
