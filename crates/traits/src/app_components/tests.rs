@@ -161,15 +161,25 @@ fn encrypted_media_endpoint_accepts_query_string() {
         validate_and_normalize_blob_endpoint_url("https://blossom.example/?x=1", false),
         Ok("https://blossom.example/?x=1".to_owned())
     );
-    // A query-bearing endpoint round-trips through the full policy decode path.
+    // The regression that forked commit acceptance was on the decode path, so
+    // exercise it explicitly: a query-bearing endpoint must survive the full
+    // encode -> decode_encrypted_media_policy_v1 round-trip (which dispatches
+    // through validate_blob_endpoint_url_is_canonical, the commit-acceptance
+    // check #374 names), not just producer-side construction.
     let policy = EncryptedMediaPolicyV1::blossom_default(
         vec!["https://blossom.example/?x=1".to_owned()],
         false,
     )
     .expect("query-bearing endpoint is valid policy state");
+    let encoded = encode_encrypted_media_policy_v1(&policy).expect("query-bearing policy encodes");
+    let decoded = decode_encrypted_media_policy_v1(&encoded)
+        .expect("query-bearing endpoint is accepted on the decode/commit-acceptance path");
     assert_eq!(
-        policy.default_blob_endpoints[0].base_url,
-        "https://blossom.example/?x=1"
+        decoded.default_blob_endpoints,
+        vec![BlobStoreEndpointV1 {
+            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            base_url: "https://blossom.example/?x=1".to_owned(),
+        }]
     );
 }
 
