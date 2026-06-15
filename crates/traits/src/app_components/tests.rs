@@ -150,6 +150,29 @@ fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
     );
 }
 
+/// Regression for #374: the spec's invalidity list (group-encrypted-media-v1.md)
+/// names only userinfo / fragments / missing-host / unsafe-host. A query string
+/// is NOT invalid, and WHATWG parse-and-serialize preserves it, so a query-bearing
+/// endpoint is valid normalized state and must be accepted on the decode/commit
+/// path. The sibling avatar validator behaves the same way.
+#[test]
+fn encrypted_media_endpoint_accepts_query_string() {
+    assert_eq!(
+        validate_and_normalize_blob_endpoint_url("https://blossom.example/?x=1", false),
+        Ok("https://blossom.example/?x=1".to_owned())
+    );
+    // A query-bearing endpoint round-trips through the full policy decode path.
+    let policy = EncryptedMediaPolicyV1::blossom_default(
+        vec!["https://blossom.example/?x=1".to_owned()],
+        false,
+    )
+    .expect("query-bearing endpoint is valid policy state");
+    assert_eq!(
+        policy.default_blob_endpoints[0].base_url,
+        "https://blossom.example/?x=1"
+    );
+}
+
 /// Fixed encode→bytes vector pinning the corrected #171 layout: each
 /// `BlobStoreEndpointV1` is the concatenation `{locator_kind, base_url}` with
 /// NO per-item length wrapper, matching `allowed_locator_kinds` and the spec's
