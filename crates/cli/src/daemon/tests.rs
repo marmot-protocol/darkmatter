@@ -475,6 +475,61 @@ async fn daemon_request_reader_times_out_on_stalled_client() {
 }
 
 #[tokio::test]
+async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
+    // Regression for #191: accepting one same-UID client that writes a partial
+    // frame and then stalls must not keep the accept loop from serving another
+    // client's Ping/Status/Shutdown request.
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let args = DaemonArgs {
+        home: Some(home.path().to_path_buf()),
+        data_dir: None,
+        logs_dir: None,
+        socket: Some(socket.clone()),
+        relay: Some("wss://relay.example".to_owned()),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("dm-test-keychain".to_owned()),
+    };
+    let server = tokio::spawn(run_server(args));
+    for _ in 0..50 {
+        if socket.try_exists().expect("socket existence check") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.try_exists().expect("socket existence check"));
+
+    let mut stalled = UnixStream::connect(&socket)
+        .await
+        .expect("connect stalled client");
+    stalled
+        .write_all(b"{\"Ping\"")
+        .await
+        .expect("write partial request");
+
+    let ping = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request(&socket, &DaemonRequest::Ping),
+    )
+    .await;
+    drop(stalled);
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(&socket, &DaemonRequest::Shutdown),
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+
+    let output = ping
+        .expect("ping should not wait behind stalled request reader")
+        .expect("ping request should succeed");
+    assert_eq!(output.code, 0);
+}
+
+#[tokio::test]
 async fn daemon_status_response_does_not_wait_for_busy_workers() {
     // Execute requests run outside the accept loop but may still own the shared
     // worker mutex while a long command is in flight. Status must use a
