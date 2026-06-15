@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
-use cgka_traits::app_event::{EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION};
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+};
 
 use crate::{
     AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
@@ -637,6 +639,13 @@ pub(crate) fn notification_update_from_event(
     }
 }
 
+/// Whether a received app-event kind should ever surface as a notification.
+/// Only chat messages and reactions alert; deletes, edits, agent-stream control
+/// events, and group-system rows are state changes, not new user messages.
+fn is_notifiable_message_kind(kind: u64) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION
+}
+
 fn notification_update_from_message(
     app: &MarmotApp,
     event: &RuntimeMessageReceived,
@@ -644,6 +653,13 @@ fn notification_update_from_message(
     let settings = app.notification_settings(&event.account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
+    }
+    // Only chat messages and reactions alert. Deletes, edits, agent-stream
+    // control events, and group-system rows are not new user-facing messages,
+    // so they never produce a notification (e.g. deleting a message must not
+    // push a "Deleted a message" alert).
+    if !is_notifiable_message_kind(event.message.kind) {
+        return Ok(None);
     }
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
     let group = app.group(&event.account_label, &group_id_hex)?;

@@ -401,6 +401,26 @@ fn normal_message_yields_no_reaction_fields() {
 }
 
 #[test]
+fn only_chat_and_reaction_kinds_are_notifiable() {
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    };
+    assert!(is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_CHAT));
+    assert!(is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_REACTION));
+    // State changes, not new user messages — never alert.
+    assert!(!is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_DELETE));
+    assert!(!is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_EDIT));
+    assert!(!is_notifiable_message_kind(
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+    ));
+    assert!(!is_notifiable_message_kind(
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
+    ));
+}
+
+#[test]
 fn push_platform_from_str_is_lowercase_only() {
     assert!(matches!(
         PushPlatform::from_str("apns"),
