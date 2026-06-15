@@ -1051,6 +1051,21 @@ impl MarmotApp {
             .collect())
     }
 
+    /// Resolve a single message by id within a group without loading the
+    /// group's full history — the storage layer filters by id directly.
+    pub fn message_by_id(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_message_by_id(group_id_hex, message_id_hex)?
+            .map(app_message_record_from_stored))
+    }
+
     pub fn timeline_messages_with_query(
         &self,
         label: &str,

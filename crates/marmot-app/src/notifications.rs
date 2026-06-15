@@ -20,8 +20,8 @@ use transport_nostr_peeler::NostrTransportEvent;
 use cgka_traits::app_event::{EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION};
 
 use crate::{
-    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
-    ReceivedMessage, RuntimeMessageReceived, tag_value,
+    AppError, AppGroupRecord, AppMessageRecord, MarmotApp, MarmotAppEvent, ReceivedMessage,
+    RuntimeMessageReceived, tag_value,
 };
 
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE: u64 = 447;
@@ -647,32 +647,30 @@ fn notification_update_from_message(
     let receiver = notification_user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;
-    // Only a reaction needs the group's messages (to resolve its target);
-    // normal messages skip the read entirely.
-    let group_messages = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
-        app.messages_with_query(
-            &event.account_label,
-            AppMessageQuery {
-                group_id_hex: Some(group_id_hex.clone()),
-                limit: None,
-            },
-        )?
+    // A reaction resolves only its single target row (fetched by id, not by
+    // scanning the group's whole history) and notifies only the author of the
+    // reacted-to message, like the major messaging apps. If this account didn't
+    // author it (or the target can't be resolved), emit nothing — so a reaction
+    // to your own message never alerts another local account, and reactions to
+    // others' messages don't alert you.
+    let reaction_target = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
+        match tag_value(&event.message.tags, EVENT_REF_TAG) {
+            Some(target_id) => app.message_by_id(&event.account_label, &group_id_hex, target_id)?,
+            None => None,
+        }
     } else {
-        Vec::new()
+        None
     };
-    // A reaction notifies only the author of the reacted-to message, like the
-    // major messaging apps. If this account didn't author it (or the target
-    // can't be resolved), emit nothing — so a reaction to your own message
-    // never alerts another local account, and reactions to others' messages
-    // don't alert you.
     if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION
-        && reaction_target_author(&event.message, &group_messages)
-            .is_none_or(|author| author != event.account_id_hex)
+        && reaction_target
+            .as_ref()
+            .map(|target| target.sender.as_str())
+            != Some(event.account_id_hex.as_str())
     {
         return Ok(None);
     }
     let (reaction_emoji, reacted_to_preview) =
-        reaction_notification_fields(&event.message, &group_messages);
+        reaction_notification_fields(&event.message, reaction_target.as_ref());
     Ok(Some(NotificationUpdate {
         notification_key: format!(
             "message:{}:{}",
@@ -765,26 +763,13 @@ fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
 /// reaction's `e` tag against the supplied group messages and rendering that
 /// target with the same preview rule as a normal message. Non-reaction messages
 /// yield `(None, None)`. Privacy: returns only display text, never ids.
-/// Account id that authored the message this reaction targets, resolved from
-/// the reaction's `e` tag against the group's messages. `None` when the event
-/// isn't a reaction or the target message isn't in the loaded set.
-fn reaction_target_author<'a>(
-    message: &ReceivedMessage,
-    group_messages: &'a [AppMessageRecord],
-) -> Option<&'a str> {
-    if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
-        return None;
-    }
-    let target_id = tag_value(&message.tags, EVENT_REF_TAG)?;
-    group_messages
-        .iter()
-        .find(|record| record.message_id_hex == target_id)
-        .map(|record| record.sender.as_str())
-}
-
+/// Reaction display fields: the trimmed emoji from the reaction event, and a
+/// preview of the already-resolved target message (`None` when the target row
+/// couldn't be fetched). The target is resolved by id at the call site so this
+/// stays a pure projection over the single reacted-to row.
 fn reaction_notification_fields(
     message: &ReceivedMessage,
-    group_messages: &[AppMessageRecord],
+    target: Option<&AppMessageRecord>,
 ) -> (Option<String>, Option<String>) {
     if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
         return (None, None);
@@ -797,12 +782,8 @@ fn reaction_notification_fields(
             Some(trimmed.to_owned())
         }
     };
-    let reacted_to_preview = tag_value(&message.tags, EVENT_REF_TAG).and_then(|target_id| {
-        group_messages
-            .iter()
-            .find(|record| record.message_id_hex == target_id)
-            .and_then(|record| preview_text_for_kind(record.kind, &record.plaintext))
-    });
+    let reacted_to_preview =
+        target.and_then(|record| preview_text_for_kind(record.kind, &record.plaintext));
     (reaction_emoji, reacted_to_preview)
 }
 
