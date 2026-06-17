@@ -63,7 +63,9 @@ describe("MarmotLivePreview", () => {
     const calls = emptyCalls();
     const live = preview(calls);
     await live.update("hello world");
+    expect(live.isActive).toBe(true);
     const result = await live.finalize("hello world");
+    expect(live.isActive).toBe(false);
 
     expect(calls.begin).toHaveLength(1);
     expect(calls.begin[0]?.quic).toEqual(["quic://broker:4450"]);
@@ -119,6 +121,7 @@ describe("MarmotLivePreview", () => {
     await live.cancel("superseded");
     await live.cancel("again");
     expect(calls.cancel).toEqual([{ streamId: STREAM_ID, reason: "superseded" }]);
+    expect(live.isActive).toBe(false);
     await expect(live.update("more")).rejects.toThrow(/finalized or cancelled/);
   });
 

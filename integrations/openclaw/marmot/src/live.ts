@@ -51,7 +51,7 @@ export class MarmotLivePreview {
   }
 
   get isActive(): boolean {
-    return this.begun;
+    return this.begun && !this.closed;
   }
 
   private ensureOpen(): void {
