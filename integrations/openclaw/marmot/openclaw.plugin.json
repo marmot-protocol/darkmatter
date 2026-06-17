@@ -31,6 +31,11 @@
           "policy": { "type": "string", "enum": ["open", "allowlist", "pairing", "disabled"] },
           "allowFrom": { "type": "array", "items": { "type": ["string", "number"] } }
         }
+      },
+      "accounts": {
+        "type": "object",
+        "description": "Per-account configs for multi-account mode, keyed by account id.",
+        "additionalProperties": { "type": "object" }
       }
     }
   }

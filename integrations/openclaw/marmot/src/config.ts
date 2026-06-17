@@ -48,38 +48,52 @@ export interface ResolveDeps {
   readTextFile?: (path: string) => string;
 }
 
+/** Per-account config properties (shared by the root slice and `accounts.<id>`). */
+const MARMOT_ACCOUNT_PROPERTIES = {
+  home: { type: "string", description: "dm-agent home directory (default ~/.marmot)." },
+  socketPath: { type: "string", description: "dm-agent control socket path." },
+  accountIdHex: {
+    type: "string",
+    description: "Marmot agent account id hex; required when dm-agent has more than one account.",
+  },
+  authToken: { type: "string", description: "Bearer token for a token-gated control socket." },
+  authTokenFile: { type: "string", description: "Path to a bearer token file." },
+  groupIdHex: { type: "string", description: "Optional inbound Marmot group id filter." },
+  quicCandidates: {
+    type: "array",
+    items: { type: "string" },
+    description: "quic:// preview broker candidates for live previews.",
+  },
+  streaming: { type: "boolean", description: "Enable live QUIC previews (default true)." },
+  profileNameOnboarding: { type: "boolean" },
+  dm: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      enabled: { type: "boolean" },
+      policy: { type: "string", enum: ["open", "allowlist", "pairing", "disabled"] },
+      allowFrom: { type: "array", items: { type: ["string", "number"] } },
+    },
+  },
+};
+
 /** JSON Schema for the marmot channel config (used for the plugin manifest too). */
 export const MARMOT_CONFIG_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
-    home: { type: "string", description: "dm-agent home directory (default ~/.marmot)." },
-    socketPath: { type: "string", description: "dm-agent control socket path." },
-    accountIdHex: {
-      type: "string",
-      description: "Marmot agent account id hex; required when dm-agent has more than one account.",
-    },
-    authToken: { type: "string", description: "Bearer token for a token-gated control socket." },
-    authTokenFile: { type: "string", description: "Path to a bearer token file." },
-    groupIdHex: { type: "string", description: "Optional inbound Marmot group id filter." },
-    quicCandidates: {
-      type: "array",
-      items: { type: "string" },
-      description: "quic:// preview broker candidates for live previews.",
-    },
-    streaming: { type: "boolean", description: "Enable live QUIC previews (default true)." },
-    profileNameOnboarding: { type: "boolean" },
-    dm: {
+    ...MARMOT_ACCOUNT_PROPERTIES,
+    accounts: {
       type: "object",
-      additionalProperties: false,
-      properties: {
-        enabled: { type: "boolean" },
-        policy: { type: "string", enum: ["open", "allowlist", "pairing", "disabled"] },
-        allowFrom: { type: "array", items: { type: ["string", "number"] } },
+      description: "Per-account configs for multi-account mode, keyed by account id.",
+      additionalProperties: {
+        type: "object",
+        additionalProperties: false,
+        properties: MARMOT_ACCOUNT_PROPERTIES,
       },
     },
   },
-} as const;
+};
 
 /** Build the OpenClaw channel config schema from the shared JSON Schema. */
 export function marmotChannelConfigSchema(): ReturnType<typeof buildJsonChannelConfigSchema> {

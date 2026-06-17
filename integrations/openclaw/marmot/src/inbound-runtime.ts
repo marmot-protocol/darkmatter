@@ -1,27 +1,23 @@
-// Inbound runtime wiring: started from the plugin entry's registerFull. Opens
-// the dm-agent inbound subscription via MarmotInboundBridge and hands each
-// mapped message to an agent-dispatch function.
+// Inbound runtime wiring + startup allowlist sync.
 //
-// INTEGRATION SEAM: OpenClaw's inbound turn kernel
-// (`runChannelInboundEvent` / `recordInboundSessionAndDispatchReply` /
-// `buildChannelInboundEventContext`) assembles an agent turn from gateway
-// runtime internals (the agent dispatcher, session store, agent id, delivery
-// adapter) that only exist inside a running OpenClaw gateway. That wiring is
-// exercised + validated by the docker phone-test against a live gateway, not by
-// the in-package unit tests. The agent's reply is delivered back out through the
-// channel message adapter registered by createMarmotChannelPlugin() (durable
-// send / live preview). `dispatch` is injectable so the bridge handoff can be
-// unit-tested without a gateway.
+// `startMarmotInbound` runs the dm-agent inbound subscription and hands each
+// mapped message to a REAL agent dispatcher (no production no-op fallback —
+// consuming inbound without dispatching to the agent would silently swallow
+// messages). Wiring the OpenClaw inbound turn kernel to that dispatcher needs a
+// running gateway; it is done and validated against the docker `openclaw-gateway`
+// harness (see docker-compose.yml). Until that wiring lands, the plugin entry
+// does NOT start a consumer, so the channel currently only sends durable
+// outbound messages.
+//
+// `syncMarmotAllowlist` mirrors the configured `dm.allowFrom` welcomers into
+// dm-agent's per-account allowlist so configured welcomers are accepted.
 
 import { resolveSingleAccount } from "./account.js";
+import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
-import {
-  clientForAccount,
-  resolveMarmotAccount,
-  type MarmotChannelAccountConfig,
-  type ResolvedMarmotAccount,
-} from "./config.js";
+import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
 import { MarmotInboundBridge, type MarmotInboundMessage } from "./inbound.js";
+import { syncAllowlist } from "./security.js";
 
 /** Minimal logger surface (subset of OpenClaw's PluginLogger). */
 interface InboundLogger {
@@ -31,30 +27,41 @@ interface InboundLogger {
 
 /** Minimal plugin-api surface used by the inbound runtime. */
 export interface InboundPluginApi {
-  pluginConfig?: Record<string, unknown> | undefined;
+  /** Full OpenClaw config; the channel config lives at `channels.marmot`. */
+  config: unknown;
   logger: InboundLogger;
+}
+
+type ClientFactory = (resolved: ResolvedMarmotAccount) => MarmotAgentControlClient;
+
+function resolveAccount(api: InboundPluginApi): ResolvedMarmotAccount {
+  return resolveMarmotChannelAccount(
+    api.config as Parameters<typeof resolveMarmotChannelAccount>[0],
+    null,
+  );
 }
 
 export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;
 
 export interface StartMarmotInboundOptions {
-  dispatch?: InboundAgentDispatcher;
   signal?: AbortSignal;
   /** Override the control-client factory (tests inject a stub). */
-  clientFactory?: (resolved: ResolvedMarmotAccount) => MarmotAgentControlClient;
+  clientFactory?: ClientFactory;
 }
 
 /**
- * Start the inbound subscription. Returns a stop function that aborts the
- * subscription loop.
+ * Run the dm-agent inbound subscription, dispatching each mapped message to
+ * `dispatch`. Returns a stop function that aborts the loop. Requires a real
+ * dispatcher — see the module note.
  */
 export function startMarmotInbound(
   api: InboundPluginApi,
+  dispatch: InboundAgentDispatcher,
   options: StartMarmotInboundOptions = {},
 ): () => void {
   const controller = new AbortController();
-  // Always drive the loop off the internal controller so the returned stop()
-  // is authoritative; forward an externally-supplied signal into it.
+  // Always drive the loop off the internal controller so the returned stop() is
+  // authoritative; forward an externally-supplied signal into it.
   if (options.signal) {
     if (options.signal.aborted) {
       controller.abort();
@@ -63,12 +70,8 @@ export function startMarmotInbound(
     }
   }
   const signal = controller.signal;
-  const resolved = resolveMarmotAccount(
-    (api.pluginConfig ?? {}) as MarmotChannelAccountConfig,
-    null,
-  );
+  const resolved = resolveAccount(api);
   const client = (options.clientFactory ?? clientForAccount)(resolved);
-  const dispatch = options.dispatch ?? defaultAgentDispatch(api);
 
   void (async () => {
     let accountIdHex: string;
@@ -97,9 +100,31 @@ export function startMarmotInbound(
   return () => controller.abort();
 }
 
-function defaultAgentDispatch(api: InboundPluginApi): InboundAgentDispatcher {
-  return () => {
-    // See the INTEGRATION SEAM note above. Logged privacy-safe (no ids/text).
-    api.logger.info("marmot: received an inbound message for the agent turn");
-  };
+export interface SyncAllowlistOptions {
+  clientFactory?: ClientFactory;
+}
+
+/**
+ * Mirror the configured `dm.allowFrom` welcomers into dm-agent's allowlist for
+ * the resolved account. No-op when no allow-from is configured, so a bare
+ * deployment does not wipe an allowlist managed directly on dm-agent.
+ */
+export async function syncMarmotAllowlist(
+  api: InboundPluginApi,
+  options: SyncAllowlistOptions = {},
+): Promise<void> {
+  const resolved = resolveAccount(api);
+  if (resolved.allowFrom.length === 0) {
+    return;
+  }
+  const client = (options.clientFactory ?? clientForAccount)(resolved);
+  try {
+    const accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
+    const result = await syncAllowlist(client, accountIdHex, resolved.allowFrom);
+    api.logger.info(
+      `marmot: welcomer allowlist synced (added ${result.added.length}, removed ${result.removed.length})`,
+    );
+  } catch {
+    api.logger.warn("marmot: failed to sync the welcomer allowlist with dm-agent");
+  }
 }

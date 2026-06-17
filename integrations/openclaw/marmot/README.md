@@ -94,32 +94,48 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 
 ## Behavior
 
-- Inbound Marmot messages map to a channel turn with `chatId` = the Marmot group
-  id and `userId` = the sender account id.
-- Durable replies are sent verbatim as `kind: 9` messages via `send_final`; the
-  adapter never merges or rewrites text across sends.
-- Live previews map OpenClaw progressive draft updates to append-only
-  `stream_append` records (`stream_begin` → `stream_append` → `stream_finalize`).
-  A non-append-only update cancels the preview and sends the final verbatim. The
-  transcript hash + chunk count are computed to match `dm-agent`'s own
-  validation byte-for-byte (Rust-anchored parity test in `test/transcript.test.ts`).
-- OpenClaw's per-account `dm.allowFrom` (hex account ids) is mirrored into
-  `dm-agent`'s welcomer allowlist; `dm-agent` still performs welcomer-based
+Wired today:
+
+- **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
+  the adapter never merges or rewrites text across sends.
+- **Allowlist mirroring**: on startup the plugin mirrors the configured
+  `channels.marmot.dm.allowFrom` (hex account ids) into `dm-agent`'s welcomer
+  allowlist (a no-op when none is configured, so it never wipes an allowlist
+  managed directly on `dm-agent`). `dm-agent` still performs welcomer-based
   post-join accept/decline.
 
-### Integration status
+Not yet wired — the building blocks are implemented and unit-tested, and are
+wired and validated against the local `openclaw-gateway` harness below:
 
-The Marmot-side logic — transcript hashing, control client, durable send, live
-preview state machine, inbound bridge, config/account/allowlist resolution — is
-unit-tested in this package (`pnpm test`). Two seams are wired against the
-OpenClaw runtime and validated by the **docker phone test** against a live
-gateway (they cannot be exercised by the in-package unit tests):
+- **Inbound → agent turn** (`src/inbound.ts`, `src/inbound-runtime.ts`): the
+  inbound bridge receives, maps (`chatId` = Marmot group id, `userId` = sender),
+  dedupes, and reconnects, but dispatching a received message into OpenClaw's
+  turn kernel needs gateway runtime internals only present in a running gateway,
+  so the plugin entry does not yet start an inbound consumer.
+- **Live QUIC previews** (`src/live.ts`): the append-only preview state machine
+  (`stream_begin`/`append`/`finalize`/`cancel`, transcript hash matched to
+  `dm-agent` byte-for-byte — Rust-anchored parity test in
+  `test/transcript.test.ts`) is implemented but not yet attached to OpenClaw's
+  streaming/draft message lifecycle, so only the durable `send.text` path runs.
+  The `streaming`/`quicCandidates` config is reserved for it.
 
-1. **Inbound → agent turn** (`src/inbound-runtime.ts`): the bridge receives and
-   maps inbound messages; handing them to OpenClaw's turn kernel uses gateway
-   runtime internals available only inside a running gateway.
-2. **Live-preview pipeline**: the preview state machine (`src/live.ts`) is
-   driven by OpenClaw's streaming/draft pipeline.
+## Local gateway harness
+
+`just openclaw-gateway-up` brings up a fully local stack — the in-repo
+`nostr-rs-relay` + QUIC broker + `dm-agent` (with `--allow-any` and
+`--debug-controls`) + a real OpenClaw gateway with this plugin installed — with
+no public relays and no phone required. This is the harness for wiring and
+validating the inbound and live-preview paths above: inject an inbound message
+over the `dm-agent` control socket (`debug_inject_inbound`), then observe the
+agent turn and the reply.
+
+```sh
+export OPENAI_API_KEY=...           # or another provider key the gateway uses
+just openclaw-gateway-up
+just openclaw-gateway-bootstrap     # prints the agent npub/nprofile
+just openclaw-gateway-logs
+just openclaw-gateway-down          # or openclaw-gateway-reset to wipe data
+```
 
 ## Tests
 

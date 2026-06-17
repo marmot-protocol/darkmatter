@@ -18,13 +18,22 @@ for relay in "${relays[@]}"; do
     [ -n "$relay" ] && relay_args+=(--relay "$relay")
 done
 
+extra_args=()
+if [ "${MARMOT_AGENT_ALLOW_ANY:-0}" = "1" ]; then
+    extra_args+=(--allow-any)
+fi
+if [ "${MARMOT_AGENT_DEBUG_CONTROLS:-0}" = "1" ]; then
+    extra_args+=(--debug-controls)
+fi
+
 dm-agent \
     --home "$MARMOT_HOME" \
     --socket "$MARMOT_AGENT_SOCKET" \
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE" \
     --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0770}" \
     --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0660}" \
-    "${relay_args[@]}" &
+    "${relay_args[@]}" \
+    "${extra_args[@]}" &
 
 # Wait for the control socket before bootstrapping.
 for _ in $(seq 1 30); do
