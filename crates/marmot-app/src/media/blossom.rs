@@ -84,9 +84,7 @@ pub(crate) async fn fetch_blossom_blob(
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
-    let expected_hash = blossom_content_hash_from_url(current.as_str());
     let mut redirects = 0_usize;
-    let mut first_redirect_error = None;
 
     loop {
         let client = media_http_client_for_url(&current, allow_loopback_http).await?;
@@ -100,17 +98,12 @@ pub(crate) async fn fetch_blossom_blob(
             return read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await;
         }
         if !status.is_redirection() {
-            return Err(first_redirect_error.unwrap_or_else(|| {
-                AppError::BlobStore(format!("download returned HTTP {}", status.as_u16()))
-            }));
-        }
-
-        if first_redirect_error.is_none() {
-            first_redirect_error = Some(AppError::BlobStore(format!(
+            return Err(AppError::BlobStore(format!(
                 "download returned HTTP {}",
                 status.as_u16()
             )));
         }
+
         if redirects >= BLOSSOM_REDIRECT_LIMIT {
             return Err(AppError::BlobStore(format!(
                 "media redirect chain exceeded {BLOSSOM_REDIRECT_LIMIT} hops"
@@ -128,18 +121,6 @@ pub(crate) async fn fetch_blossom_blob(
             AppError::BlobStore("redirect Location header is not a valid URL".into())
         })?;
         validate_blossom_redirect_target(&current, &next, allow_loopback_http)?;
-        if let Some(expected_hash) = expected_hash.as_deref() {
-            let redirect_hash = blossom_content_hash_from_url(next.as_str()).ok_or_else(|| {
-                AppError::BlobStore(
-                    "redirect URL did not include the expected encrypted blob hash".into(),
-                )
-            })?;
-            if redirect_hash != expected_hash {
-                return Err(AppError::BlobStore(
-                    "redirect URL did not include the expected encrypted blob hash".into(),
-                ));
-            }
-        }
         current = next;
         redirects += 1;
     }

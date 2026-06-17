@@ -99,6 +99,10 @@ fn http_ok_response(body: &[u8]) -> Vec<u8> {
     response
 }
 
+fn http_not_found_response() -> Vec<u8> {
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+}
+
 #[test]
 fn imeta_parser_rejects_legacy_version_even_when_later_current_version_present() {
     let mut tag = valid_imeta_tag();
@@ -502,9 +506,9 @@ fn blossom_redirect_validation_rejects_cross_scheme_private_ip_and_cross_domain(
 }
 
 #[tokio::test]
-async fn fetch_blossom_blob_follows_valid_redirects() {
+async fn fetch_blossom_blob_follows_hashless_redirect_targets() {
     let final_server = spawn_http_response(http_ok_response(b"hello"));
-    let final_url = format!("{final_server}/{}.bin", valid_hash());
+    let final_url = format!("{final_server}/signed/opaque-key?X-Amz-Signature=test");
     let redirecting_server = spawn_http_response(http_redirect_response(&final_url));
     let url = format!("{redirecting_server}/{}.bin", valid_hash());
 
@@ -542,27 +546,32 @@ async fn fetch_blossom_blob_rejects_redirect_without_location() {
 }
 
 #[tokio::test]
-async fn fetch_blossom_blob_rejects_redirect_without_expected_hash() {
-    let server = spawn_http_response(http_redirect_response("/download.bin"));
+async fn fetch_blossom_blob_reports_terminal_status_after_redirect() {
+    let server = spawn_http_responses(vec![
+        http_redirect_response("/missing-opaque-key"),
+        http_not_found_response(),
+    ]);
     let url = format!("{server}/{}.bin", valid_hash());
     let err = fetch_blossom_blob(&url, true).await.unwrap_err();
 
     assert!(
-        err.to_string()
-            .contains("redirect URL did not include the expected encrypted blob hash")
+        err.to_string().contains("download returned HTTP 404"),
+        "expected terminal status, got: {err}"
     );
 }
 
 #[tokio::test]
-async fn fetch_blossom_blob_rejects_redirect_hash_mismatch() {
-    let server = spawn_http_response(http_redirect_response(&format!("/{}.bin", "22".repeat(32))));
-    let url = format!("{server}/{}.bin", valid_hash());
-    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+async fn fetch_blossom_blob_follows_redirect_target_with_different_path_hash() {
+    let final_server = spawn_http_response(http_ok_response(b"hello"));
+    let final_url = format!("{final_server}/{}.bin", "22".repeat(32));
+    let redirecting_server = spawn_http_response(http_redirect_response(&final_url));
+    let url = format!("{redirecting_server}/{}.bin", valid_hash());
 
-    assert!(
-        err.to_string()
-            .contains("redirect URL did not include the expected encrypted blob hash")
-    );
+    let bytes = fetch_blossom_blob(&url, true)
+        .await
+        .expect("redirect target path hash is not authoritative for content integrity");
+
+    assert_eq!(bytes, b"hello");
 }
 
 #[tokio::test]
