@@ -42,3 +42,23 @@ pub(crate) fn epoch_key_pairs_id(
     // tuple pattern already used for queued-proposal keys in provider.rs.
     Ok(serde_json::to_vec(&(group_id, epoch, leaf_index))?)
 }
+
+/// Reconstructs the pre-#158 EpochKeyPairs storage key: the bare concatenation
+/// of the JSON encodings of `group_id`, `epoch`, and `leaf_index`.
+///
+/// This format is ambiguous (see [`epoch_key_pairs_id`]) and must never be used
+/// for new writes. It exists only so reads and deletes can still reach rows that
+/// were written before the key format was disambiguated, keeping an upgraded
+/// group's current-epoch HPKE private key material reachable until OpenMLS
+/// re-stores it under the new tuple key. Once a tuple-key row exists for a given
+/// (group, epoch, leaf) it takes precedence and the legacy key is never consulted.
+pub(crate) fn epoch_key_pairs_id_legacy(
+    group_id: &impl traits::GroupId<CURRENT_VERSION>,
+    epoch: &impl traits::EpochKey<CURRENT_VERSION>,
+    leaf_index: u32,
+) -> Result<Vec<u8>, SqliteOpenMlsStorageError> {
+    let mut key = serde_json::to_vec(group_id)?;
+    key.extend_from_slice(&serde_json::to_vec(epoch)?);
+    key.extend_from_slice(&serde_json::to_vec(&leaf_index)?);
+    Ok(key)
+}
