@@ -310,9 +310,42 @@ impl KeyPackagePublisher for FlakyKeyPackages {
         let mut remaining = self.remaining_failures.lock().unwrap();
         if *remaining > 0 {
             *remaining -= 1;
-            return Err(KeyPackagePublishError("injected publish failure".into()));
+            return Err(KeyPackagePublishError::unexposed(
+                "injected publish failure",
+            ));
         }
         Ok(())
+    }
+}
+
+/// Publisher that simulates the production `AppKeyPackagePublisher` failure
+/// shape: it "publishes" to an external transport first and only then performs
+/// a local step that fails. The returned error is therefore `externally_exposed`
+/// — the KeyPackage may already be discoverable on a relay, so the runtime must
+/// NOT prune the private bundle (darkmatter#160 adversarial review).
+#[derive(Clone, Default)]
+struct ExposedThenFailsKeyPackages {
+    publications: Arc<Mutex<Vec<KeyPackagePublication>>>,
+}
+
+impl ExposedThenFailsKeyPackages {
+    fn publications(&self) -> Vec<KeyPackagePublication> {
+        self.publications.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for ExposedThenFailsKeyPackages {
+    async fn publish_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<(), KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication);
+        // External publish succeeded; a subsequent local step (e.g. cache write)
+        // failed. The KeyPackage is already exposed.
+        Err(KeyPackagePublishError::exposed(
+            "injected post-exposure failure (e.g. local cache write)",
+        ))
     }
 }
 
@@ -415,6 +448,103 @@ async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() 
     assert_eq!(publications.len(), 2);
     assert_ne!(publications[0].key_package, publications[1].key_package);
     assert_eq!(publications[1].key_package, key_package);
+}
+
+#[tokio::test]
+async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_exposure() {
+    // darkmatter#160 adversarial review: the orphan-cleanup must NOT prune the
+    // private bundle when the publisher fails *after* the KeyPackage may already
+    // be externally exposed (e.g. the production AppKeyPackagePublisher publishes
+    // to a relay first, then fails on a local cache write). Pruning there would
+    // leave a remotely discoverable but unjoinable KeyPackage: an inviter could
+    // build a Welcome against the published event, but this account could never
+    // join because the matching private bundle was deleted.
+    //
+    // This test proves retention end-to-end: after an exposed publish failure,
+    // a peer builds a real group + Welcome against the just-generated KeyPackage,
+    // and the account successfully joins it — which is only possible if the
+    // private bundle survived in storage.
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp exposed retain key").unwrap();
+    let publisher = ExposedThenFailsKeyPackages::default();
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut alice_runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        policy,
+        publisher.clone(),
+    );
+
+    // Publication fails after exposure; the error propagates but the bundle is
+    // retained rather than pruned.
+    let err = alice_runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("exposed publish failure must propagate");
+    assert!(matches!(err, AccountError::KeyPackage(_)), "got {err:?}");
+
+    // Recover the exact KeyPackage that was generated (and exposed). The
+    // publisher recorded it on the failed attempt.
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 1);
+    let alice_kp = publications[0].key_package.clone();
+
+    // A peer builds a real group + Welcome against Alice's published KeyPackage.
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let created = bob_session
+        .create_group(CreateGroupRequest {
+            name: "retained-bundle group".into(),
+            description: "".into(),
+            members: vec![alice_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, pending } => {
+            bob_session.confirm_published(*pending).await.unwrap();
+            welcomes
+                .iter()
+                .find(|msg| {
+                    matches!(
+                        &msg.envelope,
+                        TransportEnvelope::Welcome { recipient }
+                            if recipient == &alice_runtime.session().self_id()
+                    )
+                })
+                .cloned()
+                .expect("welcome addressed to alice")
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+
+    // Alice joins via the Welcome. This succeeds ONLY because the private bundle
+    // was retained: if the cleanup had pruned it, OpenMLS would find no matching
+    // KeyPackage for the Welcome's hash ref and the join would fail.
+    let joined = alice_runtime
+        .session_mut()
+        .ingest(welcome)
+        .await
+        .expect("join must succeed because the private bundle was retained");
+    assert!(
+        joined.effects.events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupJoined { group_id, .. } if group_id == &created.group_id
+        )),
+        "expected GroupJoined event, got {:?}",
+        joined.effects.events
+    );
+    assert_eq!(
+        alice_runtime
+            .session()
+            .members(&created.group_id)
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]

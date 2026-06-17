@@ -190,9 +190,19 @@ where
         let key_package = self.session.fresh_key_package().await?;
         // `fresh_key_package` persists the bundle's private HPKE init key
         // material into storage as a side effect of building it. If publication
-        // fails we must prune that orphaned private bundle; otherwise an app
-        // retrying on a schedule against a failing publisher accumulates unused
-        // private key material indefinitely (darkmatter#160).
+        // fails *before any external exposure*, we must prune that orphaned
+        // private bundle; otherwise an app retrying on a schedule against a
+        // failing publisher accumulates unused private key material indefinitely
+        // (darkmatter#160).
+        //
+        // But pruning is only safe when the publisher guarantees the KeyPackage
+        // was never externally exposed. A publisher may publish to a relay first
+        // and only then perform a local step (e.g. a cache write) that can fail:
+        // in that case the KeyPackage is already discoverable, and deleting the
+        // private bundle would leave a remotely visible but unjoinable
+        // KeyPackage. `KeyPackagePublishError::externally_exposed` distinguishes
+        // the two; we prune only on the unexposed path (mirrors the welcome
+        // publish exposure handling in `publish_group_created`).
         if let Err(publish_err) = self
             .key_packages
             .publish_key_package(KeyPackagePublication {
@@ -202,7 +212,16 @@ where
             })
             .await
         {
-            if let Err(cleanup_err) = self.session.delete_key_package(&key_package).await {
+            if publish_err.externally_exposed {
+                // The KeyPackage may already be discoverable on a relay. Retain
+                // the private bundle so an inviter's Welcome built against the
+                // published event can still be joined.
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "publish_fresh_key_package",
+                    "key package publish failed after possible external exposure; retaining private bundle"
+                );
+            } else if let Err(cleanup_err) = self.session.delete_key_package(&key_package).await {
                 // Cleanup is best-effort. Surface the failure for diagnosis but
                 // still return the original publish error, which is the
                 // actionable one for the caller.
