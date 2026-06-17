@@ -6,6 +6,8 @@ on:
       - .github/workflows/dm-agent-binaries.yml
       - scripts/install-hermes-marmot.sh
       - integrations/hermes/marmot/**
+      - scripts/install-openclaw-marmot.sh
+      - integrations/openclaw/marmot/**
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
@@ -221,6 +223,54 @@ jobs:
           path: dist/hermes-marmot-plugin/*
           if-no-files-found: error
 
+  openclaw-plugin:
+    name: Package OpenClaw plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Package OpenClaw Marmot plugin tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_short="${GITHUB_SHA::12}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          artifact_version="$sha_short"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            if [[ ! "$release_tag" =~ ^dm-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: dm-agent releases must use a version tag like dm-agent-v0.1.0" >&2
+              exit 1
+            fi
+            artifact_version="${release_tag#dm-agent-v}"
+            if [ "$artifact_version" != "$workspace_version" ]; then
+              echo "error: release version $artifact_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+          corepack enable
+          packed_dir="$RUNNER_TEMP/openclaw-pack"
+          rm -rf "$packed_dir"; mkdir -p "$packed_dir"
+          ( cd integrations/openclaw/marmot && pnpm pack --pack-destination "$packed_dir" )
+          packed="$(ls "$packed_dir"/*.tgz | head -n 1)"
+          asset="$RUNNER_TEMP/openclaw-marmot-plugin-$artifact_version.tgz"
+          mv "$packed" "$asset"
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p dist/openclaw-marmot-plugin
+          cp "$asset" "$asset.sha256" dist/openclaw-marmot-plugin/
+
+      - name: Upload OpenClaw plugin tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-marmot-plugin
+          path: dist/openclaw-marmot-plugin/*
+          if-no-files-found: error
+
   publish:
     name: Publish dm-agent release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/dm-agent-v')
@@ -228,6 +278,7 @@ jobs:
     needs:
       - build
       - plugin
+      - openclaw-plugin
     timeout-minutes: 15
     permissions:
       actions: read

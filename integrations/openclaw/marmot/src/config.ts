@@ -1,0 +1,172 @@
+// Channel config schema + resolution. Mirrors the Hermes plugin's env knobs so
+// the same dm-agent deployment serves both gateways. Config can come from the
+// OpenClaw channel config block or from MARMOT_* environment variables.
+
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+
+import { buildJsonChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
+
+import { MarmotAgentControlClient } from "./client.js";
+
+export const DEFAULT_MARMOT_HOME = "~/.marmot";
+
+/** Per-account channel config (also the shape validated by the manifest schema). */
+export interface MarmotChannelAccountConfig {
+  home?: string;
+  socketPath?: string;
+  accountIdHex?: string;
+  authToken?: string;
+  authTokenFile?: string;
+  groupIdHex?: string;
+  quicCandidates?: string[] | string;
+  streaming?: boolean;
+  profileNameOnboarding?: boolean;
+  dm?: {
+    enabled?: boolean;
+    policy?: string;
+    allowFrom?: Array<string | number>;
+  };
+}
+
+/** Fully-resolved Marmot connection + policy for one OpenClaw account. */
+export interface ResolvedMarmotAccount {
+  accountId?: string | null;
+  socketPath: string;
+  authToken?: string;
+  marmotAccountIdHex?: string;
+  groupIdHex?: string;
+  quicCandidates: string[];
+  streaming: boolean;
+  dmPolicy?: string;
+  allowFrom: Array<string | number>;
+}
+
+export interface ResolveDeps {
+  env?: Record<string, string | undefined>;
+  homeDir?: () => string;
+  readTextFile?: (path: string) => string;
+}
+
+/** JSON Schema for the marmot channel config (used for the plugin manifest too). */
+export const MARMOT_CONFIG_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    home: { type: "string", description: "dm-agent home directory (default ~/.marmot)." },
+    socketPath: { type: "string", description: "dm-agent control socket path." },
+    accountIdHex: {
+      type: "string",
+      description: "Marmot agent account id hex; required when dm-agent has more than one account.",
+    },
+    authToken: { type: "string", description: "Bearer token for a token-gated control socket." },
+    authTokenFile: { type: "string", description: "Path to a bearer token file." },
+    groupIdHex: { type: "string", description: "Optional inbound Marmot group id filter." },
+    quicCandidates: {
+      type: "array",
+      items: { type: "string" },
+      description: "quic:// preview broker candidates for live previews.",
+    },
+    streaming: { type: "boolean", description: "Enable live QUIC previews (default true)." },
+    profileNameOnboarding: { type: "boolean" },
+    dm: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: { type: "boolean" },
+        policy: { type: "string", enum: ["open", "allowlist", "pairing", "disabled"] },
+        allowFrom: { type: "array", items: { type: ["string", "number"] } },
+      },
+    },
+  },
+} as const;
+
+/** Build the OpenClaw channel config schema from the shared JSON Schema. */
+export function marmotChannelConfigSchema(): ReturnType<typeof buildJsonChannelConfigSchema> {
+  return buildJsonChannelConfigSchema(
+    MARMOT_CONFIG_JSON_SCHEMA as unknown as Parameters<typeof buildJsonChannelConfigSchema>[0],
+  );
+}
+
+function expandHome(path: string, home: string): string {
+  if (path === "~") {
+    return home;
+  }
+  if (path.startsWith("~/")) {
+    return `${home}/${path.slice(2)}`;
+  }
+  return path;
+}
+
+function splitCandidates(value: string[] | string | undefined): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  const parts = Array.isArray(value) ? value : value.split(",");
+  return parts.map((part) => String(part).trim()).filter((part) => part.length > 0);
+}
+
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    if (value !== undefined && String(value).trim() !== "") {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the dm-agent connection + policy for an OpenClaw account, layering
+ * channel config over MARMOT_* environment variables (config wins).
+ */
+export function resolveMarmotAccount(
+  config: MarmotChannelAccountConfig | undefined,
+  accountId: string | null | undefined,
+  deps: ResolveDeps = {},
+): ResolvedMarmotAccount {
+  const cfg = config ?? {};
+  const env = deps.env ?? process.env;
+  const home = (deps.homeDir ?? homedir)();
+  const readTextFile = deps.readTextFile ?? ((path: string) => readFileSync(path, "utf8"));
+
+  const marmotHome = expandHome(
+    firstNonEmpty(cfg.home, env.MARMOT_HOME) ?? DEFAULT_MARMOT_HOME,
+    home,
+  );
+  const socketPath = expandHome(
+    firstNonEmpty(cfg.socketPath, env.MARMOT_AGENT_SOCKET) ?? `${marmotHome}/dev/dm-agent.sock`,
+    home,
+  );
+
+  let authToken = firstNonEmpty(cfg.authToken, env.MARMOT_AGENT_AUTH_TOKEN);
+  if (authToken === undefined) {
+    const tokenFile = firstNonEmpty(cfg.authTokenFile, env.MARMOT_AGENT_AUTH_TOKEN_FILE);
+    if (tokenFile !== undefined) {
+      authToken = readTextFile(expandHome(tokenFile, home)).trim();
+    }
+  }
+
+  const quicCandidates = splitCandidates(
+    cfg.quicCandidates ?? env.MARMOT_QUIC_CANDIDATES,
+  );
+
+  return {
+    accountId: accountId ?? null,
+    socketPath,
+    authToken: authToken && authToken.trim() ? authToken.trim() : undefined,
+    marmotAccountIdHex: firstNonEmpty(cfg.accountIdHex, env.MARMOT_ACCOUNT_ID_HEX),
+    groupIdHex: firstNonEmpty(cfg.groupIdHex, env.MARMOT_GROUP_ID_HEX),
+    quicCandidates,
+    streaming: cfg.streaming ?? true,
+    dmPolicy: cfg.dm?.policy,
+    allowFrom: cfg.dm?.allowFrom ?? [],
+  };
+}
+
+/** Construct a control client for a resolved account. */
+export function clientForAccount(resolved: ResolvedMarmotAccount): MarmotAgentControlClient {
+  return new MarmotAgentControlClient({
+    socketPath: resolved.socketPath,
+    authToken: resolved.authToken,
+  });
+}

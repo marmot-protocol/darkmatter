@@ -1,0 +1,117 @@
+import { describe, expect, it } from "vitest";
+
+import { NonAppendOnlyUpdateError } from "../src/append-only.js";
+import { MarmotLivePreview, type StreamControlClient } from "../src/live.js";
+
+const HEX32 = (b: string) => b.repeat(32);
+const STREAM_ID = HEX32("11");
+const START_ID = HEX32("22");
+
+// Rust-anchored expectations from test/vectors/transcript-vectors.json with
+// stream_id=0x11*32, start=0x22*32, chunk_bytes=1024.
+const SINGLE_TEXT_HASH = "7484dc0c66dd50ac2fb0dbb11e59d65e9d967eee2c4b73b01e172ed4c5bd218a";
+const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81";
+
+interface Calls {
+  begin: { account: string; group: string; quic: string[] }[];
+  append: { streamId: string; text: string }[];
+  finalize: { streamId: string; finalText: string; hash: string; count: number }[];
+  cancel: { streamId: string; reason: string | null }[];
+}
+
+function emptyCalls(): Calls {
+  return { begin: [], append: [], finalize: [], cancel: [] };
+}
+
+function stubStreamClient(calls: Calls): StreamControlClient {
+  return {
+    async streamBegin(account: string, group: string, opts?: { quicCandidates?: Iterable<string> }) {
+      const quic = [...(opts?.quicCandidates ?? [])];
+      calls.begin.push({ account, group, quic });
+      return {
+        type: "stream_begun",
+        stream_id_hex: STREAM_ID,
+        start_message_id_hex: START_ID,
+        quic_candidates: quic,
+      };
+    },
+    async streamAppend(streamId: string, text: string) {
+      calls.append.push({ streamId, text });
+      return { type: "ack" };
+    },
+    async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
+      calls.finalize.push({ streamId, finalText, hash, count });
+      return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
+    },
+    async streamCancel(streamId: string, reason?: string | null) {
+      calls.cancel.push({ streamId, reason: reason ?? null });
+      return { type: "ack" };
+    },
+  } as unknown as StreamControlClient;
+}
+
+function preview(calls: Calls): MarmotLivePreview {
+  return new MarmotLivePreview(stubStreamClient(calls), {
+    accountIdHex: HEX32("aa"),
+    groupIdHex: HEX32("cc"),
+    quicCandidates: ["quic://broker:4450"],
+  });
+}
+
+describe("MarmotLivePreview", () => {
+  it("begins lazily and finalizes with the Rust transcript hash for one chunk", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.update("hello world");
+    const result = await live.finalize("hello world");
+
+    expect(calls.begin).toHaveLength(1);
+    expect(calls.begin[0]?.quic).toEqual(["quic://broker:4450"]);
+    expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
+    expect(calls.finalize[0]).toMatchObject({
+      streamId: STREAM_ID,
+      finalText: "hello world",
+      hash: SINGLE_TEXT_HASH,
+      count: 1,
+    });
+    expect(result.messageIdsHex).toEqual([HEX32("ab")]);
+  });
+
+  it("reduces incremental updates to append-only deltas matching the Rust hash", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.update("hel");
+    await live.update("hello");
+    await live.update("hello world");
+    await live.finalize("hello world");
+
+    expect(calls.append.map((a) => a.text)).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toMatchObject({ hash: INCREMENTAL_HASH, count: 3 });
+  });
+
+  it("streams the whole final when finalize is called without prior updates", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.finalize("hello world");
+    expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
+    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
+  });
+
+  it("throws on a non-append-only update so the caller can fall back", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.update("hello");
+    await expect(live.update("goodbye")).rejects.toBeInstanceOf(NonAppendOnlyUpdateError);
+  });
+
+  it("cancel is a no-op before begin and sends stream_cancel after", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.cancel("never started");
+    expect(calls.cancel).toHaveLength(0);
+
+    await live.update("hi");
+    await live.cancel("superseded");
+    expect(calls.cancel).toEqual([{ streamId: STREAM_ID, reason: "superseded" }]);
+  });
+});
