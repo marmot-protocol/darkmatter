@@ -22,20 +22,24 @@ export default defineChannelPluginEntry({
   description: "End-to-end encrypted Marmot groups through the local dm-agent connector.",
   plugin: createMarmotChannelPlugin(),
   registerFull(api: OpenClawPluginApi) {
-    // Mirror configured dm.allowFrom welcomers into dm-agent on startup.
-    void syncMarmotAllowlist(api);
+    void (async () => {
+      // Mirror configured dm.allowFrom welcomers into dm-agent before consuming
+      // inbound, so the welcomer policy is in place when the agent goes live.
+      // (syncMarmotAllowlist is self-guarded and never rejects.)
+      await syncMarmotAllowlist(api);
 
-    // Inbound -> agent turn dispatch (Telegram-modeled): the bridge feeds each
-    // received Marmot message into runChannelInboundEvent, and the agent's
-    // reply is delivered back through send_final / live QUIC previews.
-    const resolved = resolveMarmotChannelAccount(api.config, null);
-    const dispatch = createMarmotInboundDispatcher({
-      cfg: api.config,
-      runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
-      client: clientForAccount(resolved),
-      streaming: resolved.streaming,
-      quicCandidates: resolved.quicCandidates,
-    });
-    startMarmotInbound(api, dispatch);
+      // Inbound -> agent turn dispatch (Telegram-modeled): the bridge feeds each
+      // received Marmot message into runChannelInboundEvent, and the agent's
+      // reply is delivered back through send_final / live QUIC previews.
+      const resolved = resolveMarmotChannelAccount(api.config, null);
+      const dispatch = createMarmotInboundDispatcher({
+        cfg: api.config,
+        runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
+        client: clientForAccount(resolved),
+        streaming: resolved.streaming,
+        quicCandidates: resolved.quicCandidates,
+      });
+      startMarmotInbound(api, dispatch);
+    })();
   },
 });
