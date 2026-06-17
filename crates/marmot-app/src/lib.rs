@@ -392,6 +392,18 @@ pub struct SyncSummary {
     pub projection_updates: Vec<AppProjectionUpdate>,
 }
 
+impl SyncSummary {
+    /// Fold another summary's contents into this one. Used to combine the
+    /// relay-delivery sync with the no-inbound engine-event drain so a single
+    /// `sync()` returns all surfaced events together (darkmatter#426).
+    pub fn merge(&mut self, other: SyncSummary) {
+        self.joined_groups.extend(other.joined_groups);
+        self.messages.extend(other.messages);
+        self.events.extend(other.events);
+        self.projection_updates.extend(other.projection_updates);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedMessage {
     pub message_id_hex: String,

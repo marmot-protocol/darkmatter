@@ -432,9 +432,29 @@ async fn run_app_runtime_account_worker(
                     Some(AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond }) => {
                         let result = client.retry_hydrate_quarantined_group(&group_id);
                         if matches!(result, Ok(true)) {
-                            // The group is live again; refresh chat-list /
-                            // projection consumers so it leaves the recovery
+                            // The group is live again; the engine queued a
+                            // `GroupHydrationRecovered` event. Drain it now so
+                            // subscribers see the typed recovery event
+                            // deterministically at retry time rather than only
+                            // when unrelated relay traffic later triggers a
+                            // drain (darkmatter#426). Publish those events plus a
+                            // `GroupStateUpdated` so chat-list / projection
+                            // consumers refresh and the group leaves the recovery
                             // surface and reappears as a normal chat.
+                            match client.drain_pending_session_events().await {
+                                Ok(summary) => publish_app_runtime_summary(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    &summary,
+                                ),
+                                Err(err) => publish_app_runtime_account_error(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    format!("retry recovery drain failed: {err}"),
+                                ),
+                            }
                             publish_app_runtime_group_state_updated(
                                 &events,
                                 &account_id_hex,

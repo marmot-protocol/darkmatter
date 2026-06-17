@@ -256,6 +256,18 @@ where
         Ok(self.session.own_leaf_index(group_id)?)
     }
 
+    /// Drain any session effects queued by the engine without an inbound
+    /// transport delivery (e.g. `GroupHydrationQuarantined` queued during
+    /// `open()` hydration, or `GroupHydrationRecovered` queued by a successful
+    /// `retry_hydrate_quarantined_group`). Without this, those events only
+    /// reach app/runtime subscribers when an unrelated relay delivery happens
+    /// to trigger a drain (darkmatter#426). Publishes any incidental transport
+    /// work the same way `ingest_delivery` does.
+    pub async fn drain(&mut self) -> AccountResult<AccountDeviceEffects> {
+        let effects = self.session.drain();
+        self.publish_session_effects(effects).await
+    }
+
     pub async fn ingest_delivery(
         &mut self,
         delivery: TransportDelivery,
