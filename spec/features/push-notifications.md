@@ -156,6 +156,7 @@ per record, including its own. A recipient applies the same entry rule as for ki
   "removals": [
     {
       "member_id_hex": "<64 lowercase hex characters>",
+      "leaf_index": 3,
       "platform": "apns",
       "token_fingerprint": "sha256:<24 hex characters>",
       "server_pubkey_hex": "<64 lowercase hex characters>"
@@ -165,15 +166,17 @@ per record, including its own. A recipient applies the same entry rule as for ki
 ```
 
 - `removals` is an array of removal entries. A missing `removals` member is read as an empty array.
-- The four members identify the token record being removed and use the encodings defined for token entries.
+- The five members identify the token record being removed and use the encodings defined for token entries. A removal
+  entry MUST carry `leaf_index` so it targets exactly one device's record and cannot revoke a sibling leaf's active
+  token for the same account, platform, and server.
 
-A recipient deletes the stored token record matching all four values.
+A recipient deletes the stored token record matching all five values.
 
 ### Record state
 
 A device keeps one push registration at a time, so a leaf has at most one active token record. Clients store one token
-record per member id, platform, and server public key in a group: an incoming entry that matches a stored record on
-those three values replaces it — including its leaf index, fingerprint, relay hint, and encrypted token — and any
+record per member id, leaf index, platform, and server public key in a group: an incoming entry that matches a stored
+record on those four values replaces it — including its fingerprint, relay hint, and encrypted token — and any
 other entry inserts a new record. Entries are applied in array order, so a later entry replaces an earlier match.
 
 Token records are local push state, never group state. The rules below order and revoke them so that two members'
@@ -183,16 +186,19 @@ message because of a token record's age, absence, or supersession.
 
 #### Record key and ordering primitive
 
-The record key is the triple `(member_id_hex, platform, server_pubkey_hex)`. At most one active record exists per key
-per group.
+The record key is the tuple `(member_id_hex, leaf_index, platform, server_pubkey_hex)`. At most one active record
+exists per key per group. `leaf_index` is part of the key because one Marmot account can participate from multiple MLS
+leaves (see [multi-device.md](multi-device.md)); omitting it would collapse sibling devices, letting one leaf's list
+entry or removal overwrite or suppress another leaf's active token.
 
 Every kind `447`, `448`, and `449` event carries the unsigned Marmot app-event members from
 [../foundation/application-messages.md](../foundation/application-messages.md), including an inner `created_at` and a
 content-derived app-event `id`. The ordering primitive for a record key is the pair `(created_at, app-event id)`,
-compared as the integer `created_at` first and the lowercase-hex app-event `id` as the lexicographic tie-breaker. This
-is the same sender-clock, latest-wins primitive that kind `1009` edits use; it inherits the trust already placed in the
-MLS-authenticated sender and is deliberately advisory. A client MUST NOT substitute transport arrival order, outer
-transport event ids, relay metadata, or local receive time for this primitive.
+compared as the integer `created_at` first and the lowercase-hex app-event `id` as the lexicographic tie-breaker. The
+`created_at` half is the same sender-clock, latest-wins basis that kind `1009` edits use; the app-event `id`
+tie-breaker is added here so that records with an equal `created_at` still converge deterministically. It inherits the
+trust already placed in the MLS-authenticated sender and is deliberately advisory. A client MUST NOT substitute
+transport arrival order, outer transport event ids, relay metadata, or local receive time for this primitive.
 
 A client stamps each stored record with the `(created_at, app-event id)` of the event that last wrote it. Apply an
 incoming entry or removal to a record key only when its event's ordering primitive is strictly greater than the stored
@@ -207,8 +213,15 @@ the removal event's `(created_at, app-event id)`. A tombstone suppresses any lat
 subsequent kind `447`/`448` entry whose stamp is strictly greater than the tombstone re-establishes an active record
 for the key and clears the tombstone.
 
-Clients MAY garbage-collect a tombstone once it is older than the group's accepted message-history window, after which
-no validly ordered event can predate it.
+A tombstone is durable: it persists until a strictly-greater-stamped kind `447`/`448` entry clears it (as above) or
+the owning member is removed from the group (see member cleanup below). A client MUST NOT garbage-collect a tombstone
+merely because it looks old by wall clock or sender `created_at`: record stamps are sender-supplied and uncorrelated
+with MLS epoch, so a later-arriving but earlier-stamped kind `448` could otherwise resurrect a revoked token. A client
+MAY drop a tombstone only once the MLS application message that would carry any competing token record can no longer be
+accepted — that is, once the carrying epoch falls outside the retained app-payload window defined by
+`app_payload_past_epoch_limit` in [../protocol-core/retained-history.md](../protocol-core/retained-history.md). Beyond
+that window the application message is rejected outright (`BeyondAnchor`), so no surviving kind `447`/`448` can deliver
+a competing record for the key and dropping the tombstone cannot resurrect a revoked token.
 
 #### Race handling
 
