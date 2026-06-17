@@ -107,41 +107,46 @@ where
         Ok(cli) => cli,
         Err(err) => {
             use clap::error::ErrorKind;
-            // clap reports `--help`/`--version` as `Err` with exit code 0; the
-            // rendered string is the help/version text, which belongs on stdout
-            // (clap's own default). Only real usage errors go to stderr.
-            match err.kind() {
-                ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-                    if wants_json {
-                        return clap_display_json(err.exit_code(), "help", err.to_string());
-                    }
-                    return CliOutput {
-                        code: err.exit_code(),
-                        stdout: err.to_string(),
-                        stderr: String::new(),
-                    };
+            // clap reports explicit `--help`/`--version` as `Err` with exit code
+            // 0; the rendered string is the help/version text, which belongs on
+            // stdout (clap's own default). Real usage errors go to stderr.
+            //
+            // Crucially, gate on the exit code, not just the kind:
+            // `DisplayHelpOnMissingArgumentOrSubcommand` is also rendered as help
+            // text but exits nonzero (e.g. `dm messages` with no subcommand). That
+            // is a genuine usage error and must stay on stderr / `ok:false`, never
+            // be reported as success. Only zero-exit display errors are real
+            // help/version requests.
+            let is_zero_exit_display = err.exit_code() == 0
+                && matches!(
+                    err.kind(),
+                    ErrorKind::DisplayHelp
+                        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                        | ErrorKind::DisplayVersion
+                );
+            if is_zero_exit_display {
+                let label = if err.kind() == ErrorKind::DisplayVersion {
+                    "version"
+                } else {
+                    "help"
+                };
+                if wants_json {
+                    return clap_display_json(err.exit_code(), label, err.to_string());
                 }
-                ErrorKind::DisplayVersion => {
-                    if wants_json {
-                        return clap_display_json(err.exit_code(), "version", err.to_string());
-                    }
-                    return CliOutput {
-                        code: err.exit_code(),
-                        stdout: err.to_string(),
-                        stderr: String::new(),
-                    };
-                }
-                _ => {
-                    if wants_json {
-                        return json_error(err.exit_code(), "usage", err.to_string());
-                    }
-                    return CliOutput {
-                        code: err.exit_code(),
-                        stdout: String::new(),
-                        stderr: err.to_string(),
-                    };
-                }
+                return CliOutput {
+                    code: err.exit_code(),
+                    stdout: err.to_string(),
+                    stderr: String::new(),
+                };
             }
+            if wants_json {
+                return json_error(err.exit_code(), "usage", err.to_string());
+            }
+            return CliOutput {
+                code: err.exit_code(),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            };
         }
     };
     if let Err(err) = materialize_secret_inputs(&mut cli) {
@@ -1905,6 +1910,49 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(output.stdout.trim()).expect("json error must be valid JSON");
         assert_eq!(value["ok"], false, "usage error must be ok:false");
+        assert_eq!(value["error"]["code"], "usage");
+    }
+
+    #[tokio::test]
+    async fn missing_subcommand_is_a_usage_error_not_help() {
+        // `dm messages` with no subcommand renders help text but exits nonzero
+        // (clap's DisplayHelpOnMissingArgumentOrSubcommand). It is a genuine
+        // usage error and must go to stderr, never stdout, despite resembling
+        // help output. Regression for darkmatter#192 adversarial review.
+        let output = run_from([OsString::from("dm"), OsString::from("messages")]).await;
+        assert_ne!(output.code, 0, "missing subcommand must have nonzero exit");
+        assert!(
+            output.stdout.is_empty(),
+            "missing subcommand must not write to stdout, got: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stderr.is_empty(),
+            "missing subcommand must write help/usage text to stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_subcommand_in_json_mode_is_reported_as_error() {
+        // `dm --json messages` with no subcommand must be ok:false with a
+        // nonzero exit, not wrapped as a success help object. Regression for
+        // darkmatter#192 adversarial review.
+        let output = run_from([
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("messages"),
+        ])
+        .await;
+        assert_ne!(
+            output.code, 0,
+            "missing subcommand in json mode must have nonzero exit"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("json error must be valid JSON");
+        assert_eq!(
+            value["ok"], false,
+            "missing subcommand must be ok:false, got: {value}"
+        );
         assert_eq!(value["error"]["code"], "usage");
     }
 }
