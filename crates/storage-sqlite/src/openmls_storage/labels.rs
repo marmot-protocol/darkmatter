@@ -33,8 +33,12 @@ pub(crate) fn epoch_key_pairs_id(
     epoch: &impl traits::EpochKey<CURRENT_VERSION>,
     leaf_index: u32,
 ) -> Result<Vec<u8>, SqliteOpenMlsStorageError> {
-    let mut key = serde_json::to_vec(group_id)?;
-    key.extend_from_slice(&serde_json::to_vec(epoch)?);
-    key.extend_from_slice(&serde_json::to_vec(&leaf_index)?);
-    Ok(key)
+    // Encode as a single JSON tuple so component boundaries are unambiguous.
+    // Bare concatenation of the JSON encodings is unsafe here: GroupEpoch and
+    // leaf_index both serialize to undelimited digit strings, so distinct
+    // (epoch, leaf_index) pairs could collide (e.g. (3, 45) and (34, 5) both
+    // yield "...345"). A colliding key under INSERT OR REPLACE would silently
+    // clobber unrelated HPKE epoch key pairs. This mirrors the unambiguous
+    // tuple pattern already used for queued-proposal keys in provider.rs.
+    Ok(serde_json::to_vec(&(group_id, epoch, leaf_index))?)
 }

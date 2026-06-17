@@ -734,6 +734,69 @@ mod tests {
     impl Entity<CURRENT_VERSION> for TestQueuedProposal {}
     impl traits::QueuedProposal<CURRENT_VERSION> for TestQueuedProposal {}
 
+    // Serializes transparently to a bare JSON number, matching how the real
+    // GroupEpoch encodes. This is the property that made undelimited
+    // concatenation in epoch_key_pairs_id unsafe.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct TestEpochKey(u64);
+
+    impl Key<CURRENT_VERSION> for TestEpochKey {}
+    impl traits::EpochKey<CURRENT_VERSION> for TestEpochKey {}
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestHpkeKeyPair(Vec<u8>);
+
+    impl Entity<CURRENT_VERSION> for TestHpkeKeyPair {}
+    impl traits::HpkeKeyPair<CURRENT_VERSION> for TestHpkeKeyPair {}
+
+    // Regression test for #158: distinct (epoch, leaf_index) pairs whose
+    // decimal digits realign — (epoch=3, leaf=45) and (epoch=34, leaf=5) —
+    // must map to distinct storage keys. Under the old undelimited
+    // concatenation ("3"+"45" == "34"+"5") the second write silently
+    // clobbered the first via INSERT OR REPLACE, losing HPKE key material.
+    #[test]
+    fn epoch_key_pairs_no_collision_across_realigning_epoch_leaf_digits() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![1, 2, 3, 4]);
+
+        let pairs_a = vec![TestHpkeKeyPair(vec![0xAA])];
+        let pairs_b = vec![TestHpkeKeyPair(vec![0xBB])];
+
+        // (epoch=3, leaf_index=45)
+        mls.write_encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45, &pairs_a)
+            .unwrap();
+        // (epoch=34, leaf_index=5) — would collide under undelimited concat.
+        mls.write_encryption_epoch_key_pairs(&group_id, &TestEpochKey(34), 5, &pairs_b)
+            .unwrap();
+
+        // Both rows must survive independently.
+        let read_a: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45)
+            .unwrap();
+        let read_b: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(34), 5)
+            .unwrap();
+        assert_eq!(read_a, pairs_a, "(epoch=3, leaf=45) was overwritten");
+        assert_eq!(read_b, pairs_b, "(epoch=34, leaf=5) was not stored");
+
+        // Deleting one must not affect the other.
+        mls.delete_encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45)
+            .unwrap();
+        let after_delete_a: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45)
+            .unwrap();
+        let after_delete_b: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(34), 5)
+            .unwrap();
+        assert_eq!(after_delete_a, Vec::new(), "delete missed its own row");
+        assert_eq!(
+            after_delete_b, pairs_b,
+            "delete of (3, 45) wrongly removed (34, 5)"
+        );
+    }
+
     #[test]
     fn queued_proposals_recovers_from_dangling_refs_by_clearing_queue() {
         let store = SqliteAccountStorage::in_memory().unwrap();
