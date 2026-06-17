@@ -1,13 +1,11 @@
 // Inbound runtime wiring + startup allowlist sync.
 //
 // `startMarmotInbound` runs the dm-agent inbound subscription and hands each
-// mapped message to a REAL agent dispatcher (no production no-op fallback —
-// consuming inbound without dispatching to the agent would silently swallow
-// messages). Wiring the OpenClaw inbound turn kernel to that dispatcher needs a
-// running gateway; it is done and validated against the docker `openclaw-gateway`
-// harness (see docker-compose.yml). Until that wiring lands, the plugin entry
-// does NOT start a consumer, so the channel currently only sends durable
-// outbound messages.
+// mapped message to a real agent dispatcher (no production no-op fallback —
+// consuming inbound without dispatching would silently swallow messages). The
+// dispatcher in `src/dispatch.ts` drives the OpenClaw turn kernel; the plugin
+// entry wires it in `registerFull`. End-to-end behavior is validated against the
+// docker `openclaw-gateway` harness (it needs a running gateway + a model).
 //
 // `syncMarmotAllowlist` mirrors the configured `dm.allowFrom` welcomers into
 // dm-agent's per-account allowlist so configured welcomers are accepted.

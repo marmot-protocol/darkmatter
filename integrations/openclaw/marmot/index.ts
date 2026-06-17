@@ -1,13 +1,20 @@
-// OpenClaw plugin runtime entry. Registers the Marmot channel and starts the
-// inbound subscription. See README.md for setup.
+// OpenClaw plugin runtime entry. Registers the Marmot channel, syncs the
+// welcomer allowlist, and starts the inbound subscription that drives the agent
+// turn (modeled on the bundled Telegram channel). See README.md for setup.
 
 import {
   defineChannelPluginEntry,
   type OpenClawPluginApi,
 } from "openclaw/plugin-sdk/channel-core";
 
-import { createMarmotChannelPlugin, MARMOT_CHANNEL_ID } from "./src/channel.js";
-import { syncMarmotAllowlist } from "./src/inbound-runtime.js";
+import {
+  createMarmotChannelPlugin,
+  MARMOT_CHANNEL_ID,
+  resolveMarmotChannelAccount,
+} from "./src/channel.js";
+import { clientForAccount } from "./src/config.js";
+import { createMarmotInboundDispatcher, type OpenClawChannelRuntime } from "./src/dispatch.js";
+import { startMarmotInbound, syncMarmotAllowlist } from "./src/inbound-runtime.js";
 
 export default defineChannelPluginEntry({
   id: MARMOT_CHANNEL_ID,
@@ -17,13 +24,18 @@ export default defineChannelPluginEntry({
   registerFull(api: OpenClawPluginApi) {
     // Mirror configured dm.allowFrom welcomers into dm-agent on startup.
     void syncMarmotAllowlist(api);
-    // Inbound -> agent turn dispatch and live QUIC previews are not yet wired
-    // into the OpenClaw turn kernel; they are wired and validated against the
-    // docker `openclaw-gateway` harness (see docker-compose.yml). Until then the
-    // channel sends durable outbound messages only, so do not start a no-op
-    // inbound consumer that would silently swallow received messages.
-    api.logger.info(
-      "marmot: durable sends active; inbound->agent dispatch and live previews are pending gateway wiring",
-    );
+
+    // Inbound -> agent turn dispatch (Telegram-modeled): the bridge feeds each
+    // received Marmot message into runChannelInboundEvent, and the agent's
+    // reply is delivered back through send_final / live QUIC previews.
+    const resolved = resolveMarmotChannelAccount(api.config, null);
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: api.config,
+      runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
+      client: clientForAccount(resolved),
+      streaming: resolved.streaming,
+      quicCandidates: resolved.quicCandidates,
+    });
+    startMarmotInbound(api, dispatch);
   },
 });

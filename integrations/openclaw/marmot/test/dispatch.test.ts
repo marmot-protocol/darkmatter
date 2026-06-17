@@ -1,0 +1,116 @@
+import { describe, expect, it } from "vitest";
+
+import { MarmotReplySink, type MarmotSinkClient } from "../src/dispatch.js";
+
+const HEX32 = (b: string) => b.repeat(32);
+const STREAM_ID = HEX32("11");
+const START_ID = HEX32("22");
+// Rust-anchored hash for stream=0x11*32 start=0x22*32, appends "hel"/"lo"/" world".
+const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81";
+
+interface Calls {
+  sendFinal: { text: string; replyTo: string | null }[];
+  begin: number;
+  append: string[];
+  finalize: { hash: string; count: number }[];
+  cancel: string[];
+}
+
+function emptyCalls(): Calls {
+  return { sendFinal: [], begin: 0, append: [], finalize: [], cancel: [] };
+}
+
+function stubClient(calls: Calls): MarmotSinkClient {
+  return {
+    async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
+      calls.sendFinal.push({ text, replyTo: replyTo ?? null });
+      return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+    },
+    async streamBegin() {
+      calls.begin += 1;
+      return {
+        type: "stream_begun",
+        stream_id_hex: STREAM_ID,
+        start_message_id_hex: START_ID,
+        quic_candidates: [],
+      };
+    },
+    async streamAppend(_id: string, text: string) {
+      calls.append.push(text);
+      return { type: "ack" };
+    },
+    async streamFinalize(_id: string, _final: string, hash: string, count: number) {
+      calls.finalize.push({ hash, count });
+      return { type: "stream_finalized", stream_id_hex: STREAM_ID, message_ids_hex: [HEX32("ab")] };
+    },
+    async streamCancel(_id: string, reason?: string | null) {
+      calls.cancel.push(reason ?? "");
+      return { type: "ack" };
+    },
+  } as unknown as MarmotSinkClient;
+}
+
+function makeSink(
+  calls: Calls,
+  opts: { streaming?: boolean; quicCandidates?: string[] } = {},
+): MarmotReplySink {
+  return new MarmotReplySink({
+    client: stubClient(calls),
+    accountIdHex: HEX32("aa"),
+    groupIdHex: HEX32("cc"),
+    streaming: opts.streaming ?? true,
+    quicCandidates: opts.quicCandidates ?? ["quic://broker:4450"],
+  });
+}
+
+describe("MarmotReplySink", () => {
+  it("sends a plain final when there were no preview blocks", async () => {
+    const calls = emptyCalls();
+    await makeSink(calls).deliver({ text: "hello world" }, { kind: "final" });
+    expect(calls.begin).toBe(0);
+    expect(calls.append).toEqual([]);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
+  });
+
+  it("streams progressive blocks as append-only deltas and finalizes", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await sink.deliver({ text: "hello" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.begin).toBe(1);
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("ignores blocks and sends a plain final when streaming is off", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls, { streaming: false });
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await sink.deliver({ text: "done" }, { kind: "final" });
+    expect(calls.begin).toBe(0);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
+  });
+
+  it("cancels the preview and falls back to send_final on a non-append-only block", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.deliver({ text: "hello" }, { kind: "block" });
+    await sink.deliver({ text: "goodbye" }, { kind: "block" }); // not an extension
+    await sink.deliver({ text: "goodbye" }, { kind: "final" });
+
+    expect(calls.append).toEqual(["hello"]);
+    expect(calls.cancel).toHaveLength(1);
+    expect(calls.finalize).toEqual([]);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["goodbye"]);
+  });
+
+  it("ignores tool deliveries", async () => {
+    const calls = emptyCalls();
+    await makeSink(calls).deliver({ text: "searching..." }, { kind: "tool" });
+    expect(calls).toEqual(emptyCalls());
+  });
+});

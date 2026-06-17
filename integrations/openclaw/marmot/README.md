@@ -92,32 +92,27 @@ no TCP listener). If OpenClaw and `dm-agent` run as different local users, start
 set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 [`crates/agent-connector/README.md`](../../../crates/agent-connector/README.md).
 
-## Behavior
-
-Wired today:
-
+- **Inbound → agent turn** (`src/dispatch.ts`): the inbound bridge feeds each
+  received Marmot message (`chatId` = Marmot group id, `userId` = sender) into
+  OpenClaw's turn kernel via `runChannelInboundEvent` + `dispatchReplyWithBufferedBlockDispatcher`,
+  **modeled on the bundled Telegram channel**. The agent's reply is delivered
+  back through the message adapter.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
   the adapter never merges or rewrites text across sends.
+- **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
+  append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
+  update cancels the preview and sends the final verbatim. The transcript hash +
+  chunk count match `dm-agent` byte-for-byte (Rust-anchored parity test in
+  `test/transcript.test.ts`). Enable with the `streaming` + `quicCandidates` config.
 - **Allowlist mirroring**: on startup the plugin mirrors the configured
   `channels.marmot.dm.allowFrom` (hex account ids) into `dm-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist
   managed directly on `dm-agent`). `dm-agent` still performs welcomer-based
   post-join accept/decline.
 
-Not yet wired — the building blocks are implemented and unit-tested, and are
-wired and validated against the local `openclaw-gateway` harness below:
-
-- **Inbound → agent turn** (`src/inbound.ts`, `src/inbound-runtime.ts`): the
-  inbound bridge receives, maps (`chatId` = Marmot group id, `userId` = sender),
-  dedupes, and reconnects, but dispatching a received message into OpenClaw's
-  turn kernel needs gateway runtime internals only present in a running gateway,
-  so the plugin entry does not yet start an inbound consumer.
-- **Live QUIC previews** (`src/live.ts`): the append-only preview state machine
-  (`stream_begin`/`append`/`finalize`/`cancel`, transcript hash matched to
-  `dm-agent` byte-for-byte — Rust-anchored parity test in
-  `test/transcript.test.ts`) is implemented but not yet attached to OpenClaw's
-  streaming/draft message lifecycle, so only the durable `send.text` path runs.
-  The `streaming`/`quicCandidates` config is reserved for it.
+The inbound→agent and live-preview paths are typechecked against the SDK and
+their Marmot-side mappings are unit-tested; their end-to-end behavior is
+validated by running the local `openclaw-gateway` harness (below).
 
 ## Local gateway harness
 
