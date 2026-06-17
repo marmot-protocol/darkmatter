@@ -81,17 +81,24 @@ export class MarmotInboundBridge {
     const reconnectDelayMs = this.options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
     while (!signal.aborted) {
       try {
-        for await (const event of this.client.subscribeInbound({
-          accountIdHex: this.options.accountIdHex ?? null,
-          groupIdHex: this.options.groupIdHex ?? null,
-        })) {
+        for await (const event of this.client.subscribeInbound(
+          {
+            accountIdHex: this.options.accountIdHex ?? null,
+            groupIdHex: this.options.groupIdHex ?? null,
+          },
+          signal,
+        )) {
           if (signal.aborted) {
             return;
           }
           await this.handle(event);
         }
       } catch (error) {
-        this.options.onError?.(error);
+        // An abort tears down the socket, which surfaces here as a read error;
+        // that is expected shutdown, not a fault.
+        if (!signal.aborted) {
+          this.options.onError?.(error);
+        }
       }
       if (signal.aborted) {
         return;
@@ -111,7 +118,6 @@ export class MarmotInboundBridge {
     if (this.recent.has(event.message_id_hex)) {
       return;
     }
-    this.recent.add(event.message_id_hex);
     await this.options.onMessage({
       accountIdHex: event.account_id_hex,
       groupIdHex: event.group_id_hex,
@@ -119,5 +125,8 @@ export class MarmotInboundBridge {
       senderAccountIdHex: event.sender_account_id_hex,
       text: event.text,
     });
+    // Record the id only after a successful dispatch so a throwing handler does
+    // not cause the redelivered message to be dropped as a duplicate.
+    this.recent.add(event.message_id_hex);
   }
 }

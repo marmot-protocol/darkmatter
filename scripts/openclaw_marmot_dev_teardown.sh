@@ -26,5 +26,12 @@ if [ "$FORCE" -ne 1 ]; then
     case "$reply" in y|Y|yes|YES) ;; *) echo "aborted"; exit 1;; esac
 fi
 
+case "$ROOT" in
+    ""|"/"|"."|"/home"|"/root"|"/usr"|"/opt"|"/etc"|"/var"|"$HOME")
+        echo "refusing to delete unsafe root path: '$ROOT'" >&2
+        exit 1
+        ;;
+esac
+
 rm -rf "$ROOT"
 echo "openclaw-marmot teardown: removed $ROOT"

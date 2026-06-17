@@ -10,8 +10,10 @@ workspace_version_default="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/..
 workspace_version_default="${workspace_version_default:-latest}"
 
 MARMOT_RELEASE_REPO="${MARMOT_RELEASE_REPO:-marmot-protocol/darkmatter}"
-DM_AGENT_VERSION="${DM_AGENT_VERSION:-$workspace_version_default}"
-MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-dm-agent-v${DM_AGENT_VERSION}}"
+DM_AGENT_VERSION_DEFAULT="${DM_AGENT_VERSION_DEFAULT:-$workspace_version_default}"
+DM_AGENT_VERSION="${DM_AGENT_VERSION:-$DM_AGENT_VERSION_DEFAULT}"
+MARMOT_RELEASE_TAG_DEFAULT="${MARMOT_RELEASE_TAG_DEFAULT:-dm-agent-v${DM_AGENT_VERSION}}"
+MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-$MARMOT_RELEASE_TAG_DEFAULT}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agent}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
@@ -61,8 +63,8 @@ need_cmd openclaw
 
 os="$(uname -s)"; arch="$(uname -m)"
 case "$os/$arch" in
-    Linux/x86_64) dm_asset="dm-agent-${DM_AGENT_VERSION}-x86_64-unknown-linux-gnu";;
-    Darwin/arm64) dm_asset="dm-agent-${DM_AGENT_VERSION}-aarch64-apple-darwin";;
+    Linux/x86_64) dm_asset="dm-agent-linux-x86_64-${DM_AGENT_VERSION}.tar.gz";;
+    Darwin/arm64) dm_asset="dm-agent-darwin-aarch64-${DM_AGENT_VERSION}.tar.gz";;
     *) echo "unsupported platform: $os/$arch" >&2; exit 1;;
 esac
 
@@ -70,10 +72,12 @@ base_url="https://github.com/${MARMOT_RELEASE_REPO}/releases/download/${MARMOT_R
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-log "downloading dm-agent ($dm_asset)"
-run curl -fsSL "$base_url/$dm_asset" -o "$tmp/dm-agent"
+# dm-agent ships as a versioned tar.gz bundle (dm-agent-<platform>/dm-agent).
+log "downloading dm-agent bundle ($dm_asset)"
+run curl -fsSL "$base_url/$dm_asset" -o "$tmp/$dm_asset"
+run tar -xzf "$tmp/$dm_asset" -C "$tmp"
 run install -d "$MARMOT_INSTALL_PREFIX/bin"
-run install -m 0755 "$tmp/dm-agent" "$MARMOT_INSTALL_PREFIX/bin/dm-agent"
+run install -m 0755 "$tmp"/dm-agent-*/dm-agent "$MARMOT_INSTALL_PREFIX/bin/dm-agent"
 
 log "downloading OpenClaw Marmot plugin ($PLUGIN_PACKAGE)"
 run curl -fsSL "$base_url/$PLUGIN_PACKAGE" -o "$tmp/$PLUGIN_PACKAGE"

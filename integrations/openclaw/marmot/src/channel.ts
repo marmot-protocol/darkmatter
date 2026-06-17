@@ -41,9 +41,18 @@ export function resolveMarmotChannelAccount(
   accountId?: string | null,
 ): ResolvedMarmotAccount {
   const slice = marmotSlice(cfg);
-  const accountConfig: MarmotChannelAccountConfig | undefined =
-    accountId && accountId !== "default" ? slice?.accounts?.[accountId] : slice;
-  return resolveMarmotAccount(accountConfig, accountId ?? null);
+  // Multi-account mode: every account (including "default") lives under
+  // `channels.marmot.accounts.<id>`. Single-account mode: settings live on the
+  // `channels.marmot` slice itself.
+  if (slice?.accounts) {
+    const selectedId = accountId ?? "default";
+    const accountConfig = slice.accounts[selectedId];
+    if (!accountConfig) {
+      throw new Error(`unknown Marmot account id: ${selectedId}`);
+    }
+    return resolveMarmotAccount(accountConfig, selectedId);
+  }
+  return resolveMarmotAccount(slice, accountId ?? null);
 }
 
 /** Build the Marmot channel plugin for registration with OpenClaw. */

@@ -109,7 +109,7 @@ function splitCandidates(value: string[] | string | undefined): string[] {
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
   for (const value of values) {
     if (value !== undefined && String(value).trim() !== "") {
-      return value;
+      return String(value).trim();
     }
   }
   return undefined;

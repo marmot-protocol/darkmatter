@@ -104,14 +104,74 @@ describe("MarmotLivePreview", () => {
     await expect(live.update("goodbye")).rejects.toBeInstanceOf(NonAppendOnlyUpdateError);
   });
 
-  it("cancel is a no-op before begin and sends stream_cancel after", async () => {
+  it("cancel before begin is terminal and sends no stream_cancel", async () => {
     const calls = emptyCalls();
     const live = preview(calls);
     await live.cancel("never started");
     expect(calls.cancel).toHaveLength(0);
+    await expect(live.update("hi")).rejects.toThrow(/finalized or cancelled/);
+  });
 
+  it("cancel after begin sends stream_cancel, is idempotent, and is terminal", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
     await live.update("hi");
     await live.cancel("superseded");
+    await live.cancel("again");
     expect(calls.cancel).toEqual([{ streamId: STREAM_ID, reason: "superseded" }]);
+    await expect(live.update("more")).rejects.toThrow(/finalized or cancelled/);
+  });
+
+  it("rejects update and finalize after finalize", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.update("hello world");
+    await live.finalize("hello world");
+    await expect(live.update("hello world!")).rejects.toThrow(/finalized or cancelled/);
+    await expect(live.finalize("hello world!")).rejects.toThrow(/finalized or cancelled/);
+  });
+
+  it("does not advance local state when streamAppend fails (retry-safe)", async () => {
+    const calls = emptyCalls();
+    let appendCalls = 0;
+    const client = {
+      async streamBegin() {
+        return {
+          type: "stream_begun",
+          stream_id_hex: STREAM_ID,
+          start_message_id_hex: START_ID,
+          quic_candidates: [],
+        };
+      },
+      async streamAppend(streamId: string, text: string) {
+        appendCalls += 1;
+        if (appendCalls === 1) {
+          throw new Error("boom");
+        }
+        calls.append.push({ streamId, text });
+        return { type: "ack" };
+      },
+      async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
+        calls.finalize.push({ streamId, finalText, hash, count });
+        return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
+      },
+      async streamCancel() {
+        return { type: "ack" };
+      },
+    } as unknown as StreamControlClient;
+
+    const live = new MarmotLivePreview(client, {
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      quicCandidates: [],
+    });
+
+    await expect(live.update("hello world")).rejects.toThrow("boom");
+    // The failed append must not have advanced local state; retrying the same
+    // text reproduces the Rust single-chunk hash.
+    await live.update("hello world");
+    await live.finalize("hello world");
+    expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
+    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
   });
 });

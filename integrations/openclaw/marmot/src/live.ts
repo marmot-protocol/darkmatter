@@ -7,7 +7,7 @@
 // the transcript hash + chunk count dm-agent validates against its own. A
 // non-append-only update throws so the caller can cancel + send a plain final.
 
-import { AppendOnlyText } from "./append-only.js";
+import { AppendOnlyText, NonAppendOnlyUpdateError } from "./append-only.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { AgentTextStreamTranscript, DEFAULT_STREAM_CHUNK_BYTES } from "./transcript.js";
 
@@ -32,6 +32,7 @@ export interface MarmotLiveFinalizeResult {
 
 export class MarmotLivePreview {
   private begun = false;
+  private closed = false;
   private streamIdHex: string | null = null;
   private startMessageIdHex: string | null = null;
   private transcript: AgentTextStreamTranscript | null = null;
@@ -51,6 +52,12 @@ export class MarmotLivePreview {
 
   get isActive(): boolean {
     return this.begun;
+  }
+
+  private ensureOpen(): void {
+    if (this.closed) {
+      throw new Error("live preview is already finalized or cancelled");
+    }
   }
 
   private async ensureBegun(): Promise<void> {
@@ -76,13 +83,22 @@ export class MarmotLivePreview {
    * if it is not an extension of what was already streamed.
    */
   async update(fullText: string): Promise<void> {
+    this.ensureOpen();
     await this.ensureBegun();
-    const suffix = this.appendOnly.suffixFor(fullText);
+    const current = this.appendOnly.current;
+    if (!fullText.startsWith(current)) {
+      throw new NonAppendOnlyUpdateError();
+    }
+    const suffix = fullText.slice(current.length);
     if (suffix.length === 0) {
       return;
     }
-    this.transcript!.appendText(suffix, this.chunkBytes);
+    // Commit local transcript/append state only after the remote append
+    // succeeds, so a failed append can be retried with the same text without
+    // diverging from dm-agent's transcript.
     await this.client.streamAppend(this.streamIdHex!, suffix);
+    this.transcript!.appendText(suffix, this.chunkBytes);
+    this.appendOnly.suffixFor(fullText);
   }
 
   /**
@@ -91,11 +107,17 @@ export class MarmotLivePreview {
    * of the streamed text.
    */
   async finalize(finalText: string): Promise<MarmotLiveFinalizeResult> {
+    this.ensureOpen();
     await this.ensureBegun();
-    const suffix = this.appendOnly.suffixFor(finalText);
+    const current = this.appendOnly.current;
+    if (!finalText.startsWith(current)) {
+      throw new NonAppendOnlyUpdateError();
+    }
+    const suffix = finalText.slice(current.length);
     if (suffix.length > 0) {
-      this.transcript!.appendText(suffix, this.chunkBytes);
       await this.client.streamAppend(this.streamIdHex!, suffix);
+      this.transcript!.appendText(suffix, this.chunkBytes);
+      this.appendOnly.suffixFor(finalText);
     }
     const response = await this.client.streamFinalize(
       this.streamIdHex!,
@@ -103,6 +125,7 @@ export class MarmotLivePreview {
       this.transcript!.hashHex,
       this.transcript!.chunkCount,
     );
+    this.closed = true;
     return {
       streamIdHex: this.streamIdHex!,
       startMessageIdHex: this.startMessageIdHex!,
@@ -110,8 +133,15 @@ export class MarmotLivePreview {
     };
   }
 
-  /** Cancel the live preview (best-effort). No-op if no stream was begun. */
+  /**
+   * Cancel the live preview (best-effort) and mark it terminal. Idempotent;
+   * a no-op if already finalized/cancelled or never begun.
+   */
   async cancel(reason?: string): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
     if (!this.begun || !this.streamIdHex) {
       return;
     }

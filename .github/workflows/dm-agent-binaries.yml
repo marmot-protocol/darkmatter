@@ -300,6 +300,7 @@ jobs:
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dm-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dm-agent-darwin-aarch64 --dir dist/darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hermes-marmot-plugin --dir dist/plugin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name openclaw-marmot-plugin --dir dist/plugin
 
       - name: Prepare versioned installer
         shell: bash
@@ -323,6 +324,11 @@ jobs:
             -e "s/^DM_AGENT_VERSION_DEFAULT=.*/DM_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-hermes-marmot.sh > dist/install/install-hermes-marmot.sh
           chmod 0755 dist/install/install-hermes-marmot.sh
+          sed \
+            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+            -e "s/^DM_AGENT_VERSION_DEFAULT=.*/DM_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+            scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
+          chmod 0755 dist/install/install-openclaw-marmot.sh
 
       - name: Create or update dm-agent release
         shell: bash
@@ -345,7 +351,9 @@ jobs:
           Assets:
           - \`dm-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
+          - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
+          - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -357,7 +365,10 @@ jobs:
             dist/darwin/dm-agent-darwin-aarch64-"$version".tar.gz.sha256
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz.sha256
+            dist/plugin/openclaw-marmot-plugin-"$version".tgz
+            dist/plugin/openclaw-marmot-plugin-"$version".tgz.sha256
             dist/install/install-hermes-marmot.sh
+            dist/install/install-openclaw-marmot.sh
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

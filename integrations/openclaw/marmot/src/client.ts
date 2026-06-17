@@ -327,9 +327,18 @@ export class MarmotAgentControlClient {
    */
   async *subscribeInbound(
     filter: { accountIdHex?: string | null; groupIdHex?: string | null } = {},
+    signal?: AbortSignal,
   ): AsyncGenerator<AgentControlEvent> {
     const requestId = randomUUID();
     const socket = await this.connect();
+    // Tear down the socket on abort so a blocked read (idle subscription) ends
+    // promptly instead of waiting for the next frame or a disconnect.
+    const onAbort = () => socket.destroy();
+    if (signal?.aborted) {
+      socket.destroy();
+    } else {
+      signal?.addEventListener("abort", onAbort, { once: true });
+    }
     let ackTimer: NodeJS.Timeout | undefined = setTimeout(() => {
       socket.destroy(
         new AgentControlError("timed out waiting for subscribe ack", {
@@ -370,6 +379,7 @@ export class MarmotAgentControlClient {
       if (ackTimer) {
         clearTimeout(ackTimer);
       }
+      signal?.removeEventListener("abort", onAbort);
       socket.destroy();
     }
   }

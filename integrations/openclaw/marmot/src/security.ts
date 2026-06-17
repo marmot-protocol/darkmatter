@@ -13,7 +13,8 @@ export type AllowlistClient = Pick<
   "allowlistList" | "allowlistAdd" | "allowlistRemove"
 >;
 
-const HEX_ID = /^[0-9a-f]{2,}$/;
+// Marmot welcomer ids are 32-byte account pubkeys = exactly 64 hex chars.
+const MARMOT_ACCOUNT_ID_HEX = /^[0-9a-f]{64}$/;
 
 export function normalizeWelcomerId(entry: string | number): string {
   return String(entry).trim().toLowerCase().replace(/^0x/, "");
@@ -34,10 +35,14 @@ export async function syncAllowlist(
   desired: Array<string | number>,
 ): Promise<AllowlistSyncResult> {
   const want = new Set(
-    desired.map(normalizeWelcomerId).filter((id) => HEX_ID.test(id)),
+    desired.map(normalizeWelcomerId).filter((id) => MARMOT_ACCOUNT_ID_HEX.test(id)),
   );
   const current = await client.allowlistList(accountIdHex);
-  const have = new Set((current.welcomer_account_ids_hex ?? []).map((id) => id.toLowerCase()));
+  const have = new Set(
+    (current.welcomer_account_ids_hex ?? [])
+      .map(normalizeWelcomerId)
+      .filter((id) => MARMOT_ACCOUNT_ID_HEX.test(id)),
+  );
 
   const added: string[] = [];
   const removed: string[] = [];

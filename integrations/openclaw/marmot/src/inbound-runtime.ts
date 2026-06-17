@@ -53,7 +53,16 @@ export function startMarmotInbound(
   options: StartMarmotInboundOptions = {},
 ): () => void {
   const controller = new AbortController();
-  const signal = options.signal ?? controller.signal;
+  // Always drive the loop off the internal controller so the returned stop()
+  // is authoritative; forward an externally-supplied signal into it.
+  if (options.signal) {
+    if (options.signal.aborted) {
+      controller.abort();
+    } else {
+      options.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
+  }
+  const signal = controller.signal;
   const resolved = resolveMarmotAccount(
     (api.pluginConfig ?? {}) as MarmotChannelAccountConfig,
     null,

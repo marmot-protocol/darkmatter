@@ -32,6 +32,11 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
+if [ ! -S "$MARMOT_AGENT_SOCKET" ]; then
+    echo "error: dm-agent control socket not available at $MARMOT_AGENT_SOCKET" >&2
+    exit 1
+fi
+
 dm-agent bootstrap \
     --home "$MARMOT_HOME" \
     --socket "$MARMOT_AGENT_SOCKET" \
