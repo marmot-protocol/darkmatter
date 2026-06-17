@@ -188,13 +188,33 @@ where
             "publishing fresh key package"
         );
         let key_package = self.session.fresh_key_package().await?;
-        self.key_packages
+        // `fresh_key_package` persists the bundle's private HPKE init key
+        // material into storage as a side effect of building it. If publication
+        // fails we must prune that orphaned private bundle; otherwise an app
+        // retrying on a schedule against a failing publisher accumulates unused
+        // private key material indefinitely (darkmatter#160).
+        if let Err(publish_err) = self
+            .key_packages
             .publish_key_package(KeyPackagePublication {
                 account_id: self.session.self_id(),
                 key_package: key_package.clone(),
                 endpoints: self.routing.key_package_endpoints(),
             })
-            .await?;
+            .await
+        {
+            if let Err(cleanup_err) = self.session.delete_key_package(&key_package).await {
+                // Cleanup is best-effort. Surface the failure for diagnosis but
+                // still return the original publish error, which is the
+                // actionable one for the caller.
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "publish_fresh_key_package",
+                    error = %cleanup_err,
+                    "failed to delete orphaned key package bundle after publish failure"
+                );
+            }
+            return Err(publish_err.into());
+        }
         Ok(key_package)
     }
 

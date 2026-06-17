@@ -21,8 +21,8 @@ use cgka_traits::{
     TransportPublishReport, TransportPublishRequest,
 };
 use marmot_account::{
-    AccountDeviceRuntime, KeyPackagePublication, KeyPackagePublishError, KeyPackagePublisher,
-    PendingResolution, StaticTransportRouting,
+    AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
+    KeyPackagePublisher, PendingResolution, StaticTransportRouting,
 };
 use storage_sqlite::SqlCipherKey;
 
@@ -279,6 +279,43 @@ impl RecordingKeyPackages {
     }
 }
 
+/// Publisher that fails the first `fail_first` publish attempts, then succeeds,
+/// recording every publication it is asked to send (including failed ones).
+#[derive(Clone)]
+struct FlakyKeyPackages {
+    publications: Arc<Mutex<Vec<KeyPackagePublication>>>,
+    remaining_failures: Arc<Mutex<usize>>,
+}
+
+impl FlakyKeyPackages {
+    fn new(fail_first: usize) -> Self {
+        Self {
+            publications: Arc::new(Mutex::new(Vec::new())),
+            remaining_failures: Arc::new(Mutex::new(fail_first)),
+        }
+    }
+
+    fn publications(&self) -> Vec<KeyPackagePublication> {
+        self.publications.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for FlakyKeyPackages {
+    async fn publish_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<(), KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication);
+        let mut remaining = self.remaining_failures.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(KeyPackagePublishError("injected publish failure".into()));
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn activate_transport_uses_session_identity_and_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -334,6 +371,50 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
         publications[0].endpoints,
         vec![TransportEndpoint("wss://keys.example".into())]
     );
+}
+
+#[tokio::test]
+async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() {
+    // darkmatter#160: when publication fails, publish_fresh_key_package must
+    // surface the publish error AND delete the orphaned private bundle that
+    // fresh_key_package persisted, so a failing-publisher retry loop does not
+    // accumulate unused private key material.
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp cleanup key").unwrap();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    // Fail the first attempt, succeed thereafter.
+    let publisher = FlakyKeyPackages::new(1);
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        RecordingAdapter::default(),
+        policy,
+        publisher.clone(),
+    );
+
+    // First attempt: publisher fails, error propagates.
+    let err = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("publish failure must propagate");
+    assert!(matches!(err, AccountError::KeyPackage(_)), "got {err:?}");
+
+    // Retry: a brand-new bundle is generated and this time publication
+    // succeeds. The bundle from the failed attempt was pruned, so it is not
+    // left orphaned in storage.
+    let key_package = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect("retry should publish successfully");
+    assert!(!key_package.bytes().is_empty());
+
+    let publications = publisher.publications();
+    // One failed attempt + one successful attempt were both sent to the
+    // publisher; they carry distinct freshly generated key packages.
+    assert_eq!(publications.len(), 2);
+    assert_ne!(publications[0].key_package, publications[1].key_package);
+    assert_eq!(publications[1].key_package, key_package);
 }
 
 #[tokio::test]
