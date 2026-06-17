@@ -10,9 +10,9 @@ use super::{AccountManager, AccountWorkerCommand, account_worker_response};
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppError,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, GroupInviteDeclineResult,
-    GroupPushDebugInfo, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, PushRegistration, SendSummary,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
+    GroupInviteDeclineResult, GroupPushDebugInfo, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, PushRegistration, SendSummary,
 };
 
 impl AccountManager {
@@ -72,6 +72,48 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
+    }
+
+    /// Stored groups that failed session-open hydration and were skipped
+    /// (darkmatter#151 / #417). Backs the per-group recovery surface
+    /// (darkmatter#426).
+    pub async fn quarantined_groups(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AppQuarantinedGroup>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    /// `Ok(true)` if it recovered and is now live, `Ok(false)` if still
+    /// unhealthy. On success the recovered group is refreshed in chat-list
+    /// projections.
+    pub async fn retry_hydrate_quarantined_group(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RetryHydrateQuarantinedGroup {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let recovered = account_worker_response(response).await?;
+        if recovered {
+            self.catch_up_accounts().await?;
+            self.schedule_audit_log_tracker_update("retry_hydrate_quarantined_group");
+        }
+        Ok(recovered)
     }
 
     pub async fn safe_export_secret(

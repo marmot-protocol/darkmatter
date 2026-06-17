@@ -22,9 +22,10 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
-    AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, PushRegistration, ReceivedMessage, SendSummary, SyncSummary,
+    AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, AppQuarantinedGroup,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PushRegistration, ReceivedMessage,
+    SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -99,6 +100,13 @@ pub(crate) enum AccountWorkerCommand {
     GroupMlsState {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
+    },
+    QuarantinedGroups {
+        respond: oneshot::Sender<Result<Vec<AppQuarantinedGroup>, AppError>>,
+    },
+    RetryHydrateQuarantinedGroup {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
     },
     SafeExportSecret {
         group_id: GroupId,
@@ -415,6 +423,25 @@ async fn run_app_runtime_account_worker(
                     }
                     Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
                         let result = client.group_mls_state(&group_id);
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
+                        let result = Ok(client.quarantined_groups());
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond }) => {
+                        let result = client.retry_hydrate_quarantined_group(&group_id);
+                        if matches!(result, Ok(true)) {
+                            // The group is live again; refresh chat-list /
+                            // projection consumers so it leaves the recovery
+                            // surface and reappears as a normal chat.
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::UpdateMessageRetention {

@@ -125,9 +125,10 @@ pub use directory::{
 pub use error::AppError;
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppGroupAdminPolicyComponent,
-    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
-    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason,
+    AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
+    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
+    AppQuarantinedGroup,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
