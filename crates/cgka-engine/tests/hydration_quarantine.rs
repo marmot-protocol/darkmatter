@@ -517,12 +517,17 @@ async fn retry_recovers_a_transiently_quarantined_group() {
     assert_eq!(reopened.epoch(&group_id).unwrap(), group_epoch);
 
     let events = reopened.drain_events();
+    // The recovery event must carry the real recovered epoch — not 0. Finding 3
+    // (darkmatter#441): the engine previously re-read storage.get_group() and
+    // unwrap_or_default()'d the epoch on error, which could silently emit
+    // epoch 0. It now uses the epoch hydration established.
     assert!(
         events.iter().any(|event| matches!(
             event,
-            GroupEvent::GroupHydrationRecovered { group_id: gid, .. } if gid == &group_id
+            GroupEvent::GroupHydrationRecovered { group_id: gid, recovered_epoch }
+                if gid == &group_id && *recovered_epoch == group_epoch
         )),
-        "recovery event missing: {events:?}"
+        "recovery event missing or carried the wrong epoch (expected {group_epoch:?}): {events:?}"
     );
 }
 

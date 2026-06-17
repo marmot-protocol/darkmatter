@@ -455,7 +455,7 @@ impl<S: StorageProvider> Engine<S> {
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<(), GroupHydrationQuarantineReason> {
+    ) -> Result<EpochId, GroupHydrationQuarantineReason> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -539,7 +539,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);
-        Ok(())
+        Ok(group.epoch)
     }
 
     fn quarantine_stored_group_on_hydrate(
@@ -623,7 +623,7 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::UnknownGroup(group_id.clone()));
         }
         match self.hydrate_one_stored_group(group_id) {
-            Ok(()) => {
+            Ok(recovered_epoch) => {
                 self.quarantined_groups.remove(group_id);
                 let reason_tag = "recovered";
                 let group_digest = hydration_quarantine_group_digest(group_id);
@@ -634,11 +634,10 @@ impl<S: StorageProvider> Engine<S> {
                     "recovered a quarantined stored group on retry"
                 );
                 self.audit(AuditEventKind::GroupHydrationRecovered { group_digest });
-                let recovered_epoch = self
-                    .storage
-                    .get_group(group_id)
-                    .map(|group| group.epoch)
-                    .unwrap_or_default();
+                // `recovered_epoch` is the epoch hydration just established and
+                // wrote through to storage + epoch_manager (set_stable). Use it
+                // directly rather than a second storage.get_group() that could
+                // fail and silently emit epoch 0 (darkmatter#441 finding 3).
                 self.events_buf
                     .push_back(GroupEvent::GroupHydrationRecovered {
                         group_id: group_id.clone(),
