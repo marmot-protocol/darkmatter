@@ -111,18 +111,20 @@ export async function syncMarmotAllowlist(
   api: InboundPluginApi,
   options: SyncAllowlistOptions = {},
 ): Promise<void> {
-  const resolved = resolveAccount(api);
-  if (resolved.allowFrom.length === 0) {
-    return;
-  }
-  const client = (options.clientFactory ?? clientForAccount)(resolved);
   try {
+    const resolved = resolveAccount(api);
+    if (resolved.allowFrom.length === 0) {
+      return;
+    }
+    const client = (options.clientFactory ?? clientForAccount)(resolved);
     const accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
     const result = await syncAllowlist(client, accountIdHex, resolved.allowFrom);
     api.logger.info(
       `marmot: welcomer allowlist synced (added ${result.added.length}, removed ${result.removed.length})`,
     );
   } catch {
+    // Best-effort on startup: account/config resolution or the sync itself can
+    // throw; keep it inside the guard so the voided caller can't reject.
     api.logger.warn("marmot: failed to sync the welcomer allowlist with dm-agent");
   }
 }
