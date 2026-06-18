@@ -26,6 +26,10 @@ if [ "${MARMOT_AGENT_DEBUG_CONTROLS:-0}" = "1" ]; then
     extra_args+=(--debug-controls)
 fi
 
+# Surface dm-agent's privacy-safe connector tracing in the container logs so the
+# phone test can see welcome/group/inbound activity (override with RUST_LOG).
+export RUST_LOG="${RUST_LOG:-info}"
+
 dm-agent \
     --home "$MARMOT_HOME" \
     --socket "$MARMOT_AGENT_SOCKET" \
@@ -50,6 +54,7 @@ dm-agent bootstrap \
     --home "$MARMOT_HOME" \
     --socket "$MARMOT_AGENT_SOCKET" \
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE" \
+    --label "${MARMOT_AGENT_LABEL:-openclaw-agent}" \
     --qr || true
 
 # OpenClaw refuses to start the gateway unless the config has been onboarded
