@@ -2,7 +2,7 @@
   "id": "marmot",
   "name": "Marmot",
   "description": "OpenClaw channel plugin for Marmot through the local dm-agent control socket.",
-  "kind": "channel",
+  "activation": { "onStartup": true, "onChannels": ["marmot"] },
   "channels": ["marmot"],
   "configSchema": {
     "type": "object",

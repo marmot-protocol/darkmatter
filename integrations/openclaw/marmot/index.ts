@@ -22,6 +22,11 @@ export default defineChannelPluginEntry({
   description: "End-to-end encrypted Marmot groups through the local dm-agent connector.",
   plugin: createMarmotChannelPlugin(),
   registerFull(api: OpenClawPluginApi) {
+    api.logger.info(
+      `marmot: registerFull invoked (registrationMode=${String(
+        (api as { registrationMode?: unknown }).registrationMode ?? "unknown",
+      )})`,
+    );
     void (async () => {
       // Mirror configured dm.allowFrom welcomers into dm-agent before consuming
       // inbound, so the welcomer policy is in place when the agent goes live.

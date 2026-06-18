@@ -79,10 +79,14 @@ export function startMarmotInbound(
       api.logger.warn("marmot: could not resolve an agent account for the inbound subscription");
       return;
     }
+    api.logger.info("marmot: inbound subscription established");
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
-      onMessage: dispatch,
+      onMessage: async (message) => {
+        api.logger.info("marmot: inbound message received; dispatching agent turn");
+        await dispatch(message);
+      },
       onResync: ({ droppedEvents }) => {
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
