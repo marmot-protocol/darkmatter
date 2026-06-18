@@ -720,7 +720,7 @@ impl Drop for RuntimeAgentStreamWatch {
 }
 
 impl MarmotAppRuntime {
-    pub fn subscribe_messages(
+    pub async fn subscribe_messages(
         &self,
         account_ref: &str,
         query: AppMessageQuery,
@@ -742,7 +742,13 @@ impl MarmotAppRuntime {
         // reload the full group history (keeping the group filter) and rely on
         // `seen_message_ids` to dedupe what was already delivered. See #180.
         let recovery_query = messages_recovery_query(&query);
-        let snapshot = self.messages_with_query(&account.account_id_hex, query)?;
+        let snapshot_query = query;
+        let app_for_snapshot = app.clone();
+        let account_label_for_snapshot = account_label.clone();
+        let snapshot = blocking_app_task(move || {
+            app_for_snapshot.messages_with_query(&account_label_for_snapshot, snapshot_query)
+        })
+        .await?;
         let mut seen_message_ids = MessageSubscriptionSeenIds::from_ids(
             snapshot
                 .iter()
