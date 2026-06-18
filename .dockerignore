@@ -5,6 +5,9 @@ target
 # context: `pnpm install` in the image would otherwise try to purge the stale
 # dir and abort with no TTY. The image installs its own fresh copy.
 **/node_modules
+# Build artifacts (gitignored): the image builds its own from source, so a stale
+# host dist (e.g. compiled tests from an older build) must not leak into it.
+**/dist
 dev/data
 .DS_Store
 *.log

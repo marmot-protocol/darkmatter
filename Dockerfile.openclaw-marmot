@@ -30,7 +30,7 @@ COPY . .
 RUN cargo build --locked --release -p agent-connector --bin dm-agent \
     && install -m 0755 target/release/dm-agent /usr/local/bin/dm-agent \
     && install -m 0755 scripts/openclaw_marmot_container_entrypoint.sh /usr/local/bin/openclaw-marmot-entrypoint \
-    && ( cd integrations/openclaw/marmot && pnpm install )
+    && ( cd integrations/openclaw/marmot && pnpm install && pnpm build )
 
 ENV MARMOT_HOME=/data/marmot-agent \
     OPENCLAW_HOME=/data/openclaw-home \
