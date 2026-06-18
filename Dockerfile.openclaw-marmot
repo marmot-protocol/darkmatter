@@ -18,6 +18,12 @@ RUN apt-get update \
     && corepack enable \
     && npm install -g "openclaw@${OPENCLAW_VERSION}"
 
+# Pin pnpm to match the committed pnpm-lock.yaml (lockfileVersion 9.0, generated
+# by pnpm 10.x). Without this, corepack downloads an unpinned pnpm on every
+# build; `.npmrc` (manage-package-manager-versions=false) keeps this pin from
+# being hijacked by openclaw's own packageManager field.
+RUN corepack prepare pnpm@10.13.1 --activate
+
 WORKDIR /work/darkmatter
 COPY . .
 

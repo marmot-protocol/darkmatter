@@ -1,6 +1,10 @@
 .git
 .github
 target
+# Host node_modules (built for the host OS/pnpm store) must not enter the build
+# context: `pnpm install` in the image would otherwise try to purge the stale
+# dir and abort with no TTY. The image installs its own fresh copy.
+**/node_modules
 dev/data
 .DS_Store
 *.log
