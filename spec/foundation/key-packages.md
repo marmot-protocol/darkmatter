@@ -45,19 +45,10 @@ over the inner `KeyPackage` (RFC 9420 `MakeKeyPackageRef`), not over the `MLSMes
 KeyPackages advertise what that client/device can support. Group creation and member addition use these capabilities to
 avoid creating a group that some member cannot process.
 
-Marmot KeyPackages advertise:
-
-- the MLS `app_data_dictionary` extension (`0x0006`);
-- the `marmot.account-identity-proof.v1` LeafNode extension (`0xf2f1`);
-- the upstream `app_components` component (`0x0001`) listing supported Marmot component ids;
-- the `last_resort` extension (`0x000a`);
-- the upstream `app_data_update` proposal type (`0x0008`);
-- the `self_remove` proposal type (`0x000a`).
-
-`last_resort` and `self_remove` both show `0x000a`; this is not a collision, because one is an extension type and the
-other is a proposal type, and MLS values are unique only within their own registry (see
-[registries.md](./registries.md)). Each entry above is namespaced by its kind — extension type, proposal type, or the
-`app_components` component id.
+Marmot KeyPackages advertise the MLS extension, proposal, and component capabilities listed for the current profile in
+[registries.md](./registries.md): `app_data_dictionary`, `marmot.account-identity-proof.v1`, `app_components`,
+`last_resort`, `app_data_update`, and `self_remove`. The registry is the source of numeric ids and namespaces; this
+document only requires that those capabilities appear in the appropriate MLS capability lists.
 
 A member can join only if its KeyPackage advertises support for every MLS primitive and app component the group
 requires.
