@@ -241,6 +241,7 @@ jobs:
           sha_short="${GITHUB_SHA::12}"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           artifact_version="$sha_short"
+          release_tag=""
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             release_tag="$GITHUB_REF_NAME"
             if [[ ! "$release_tag" =~ ^dm-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
@@ -260,7 +261,24 @@ jobs:
           # Build dist/ before packing: package.json#files ships dist (which is
           # gitignored), and the gateway requires compiled runtime output rather
           # than the TypeScript sources.
-          ( cd integrations/openclaw/marmot && pnpm install --frozen-lockfile && pnpm build && pnpm pack --pack-destination "$packed_dir" )
+          ( cd integrations/openclaw/marmot && pnpm install --frozen-lockfile && pnpm build )
+          # Provenance manifest (release.md requires one in each artifact); ships
+          # via package.json#files alongside the built plugin.
+          cat > integrations/openclaw/marmot/manifest.json <<EOF
+          {
+            "name": "openclaw-marmot-plugin",
+            "release_tag": "$release_tag",
+            "artifact_version": "$artifact_version",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version"
+          }
+          EOF
+          # On a release tag, sync the tarball's package version to the cohort
+          # (dm-agent / workspace version). Off-tag validation runs keep 0.1.0.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            ( cd integrations/openclaw/marmot && npm pkg set version="$artifact_version" )
+          fi
+          ( cd integrations/openclaw/marmot && pnpm pack --pack-destination "$packed_dir" )
           packed="$(ls "$packed_dir"/*.tgz | head -n 1)"
           asset="$RUNNER_TEMP/openclaw-marmot-plugin-$artifact_version.tgz"
           mv "$packed" "$asset"
