@@ -155,6 +155,7 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
         blossom_endpoint(failing.clone()),
         blossom_endpoint(succeeding.clone()),
     ];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     let secret = media_secret();
     let keys = signing_keys();
 
@@ -164,7 +165,7 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
         &secret,
         &keys,
         &endpoints,
-        &[],
+        &allowed,
         true,
     )
     .await

@@ -367,6 +367,10 @@ fn upload_error_summary(err: &AppError) -> String {
         AppError::BlobStore(message)
         | AppError::InvalidEncryptedMedia(message)
         | AppError::InvalidAppMessagePayload(message) => message.clone(),
+        // `upload_blossom_blob` should currently surface upload failures through
+        // the privacy-scrubbed variants above. Keep this fallback as a defensive
+        // catch-all only; do not route URL-bearing transport errors here without
+        // first adding an explicit scrubbed summary arm.
         other => other.to_string(),
     }
 }
