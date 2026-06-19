@@ -43,6 +43,7 @@ export default defineChannelPluginEntry({
         client: clientForAccount(resolved),
         streamMode: resolved.streamMode,
         quicCandidates: resolved.quicCandidates,
+        log: (message) => api.logger.info(message),
       });
 
       // Inherit the configured OpenClaw agent name (if any) for the optional

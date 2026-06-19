@@ -109,6 +109,53 @@ describe("MarmotReplySink", () => {
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["goodbye"]);
   });
 
+  it("falls back to a durable final when a preview append fails (e.g. broker unreachable)", async () => {
+    const calls = emptyCalls();
+    const client = stubClient(calls);
+    // A QUIC/broker failure surfaces as a generic error, not a non-append-only
+    // rejection — the reply must still be delivered, just without a live preview.
+    client.streamAppend = (async () => {
+      throw new Error("broker unreachable");
+    }) as typeof client.streamAppend;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "block",
+      quicCandidates: ["quic://broker:4450"],
+    });
+
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.finalize).toEqual([]);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
+  });
+
+  it("falls back to a durable final when preview finalize fails", async () => {
+    const calls = emptyCalls();
+    const client = stubClient(calls);
+    client.streamFinalize = (async () => {
+      throw new Error("finalize failed");
+    }) as typeof client.streamFinalize;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "block",
+      quicCandidates: ["quic://broker:4450"],
+    });
+
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await sink.deliver({ text: "hello" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    // The final suffix is appended before stream_finalize is attempted; the
+    // finalize then throws, so we abandon and re-send the whole text durably.
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
+  });
+
   it("ignores tool deliveries", async () => {
     const calls = emptyCalls();
     await makeSink(calls).deliver({ text: "searching..." }, { kind: "tool" });

@@ -43,6 +43,8 @@ export interface MarmotReplySinkOptions {
   streamMode: StreamMode;
   quicCandidates: string[];
   chunkBytes?: number;
+  /** Optional privacy-safe lifecycle logger (kinds + lengths only, no content/ids). */
+  log?: (message: string) => void;
 }
 
 /**
@@ -55,8 +57,14 @@ export interface MarmotReplySinkOptions {
 export class MarmotReplySink {
   private preview: MarmotLivePreview | null = null;
   private previewAbandoned = false;
+  /** Reply deliveries received from the dispatcher this turn (diagnostic). */
+  deliveries = 0;
 
   constructor(private readonly options: MarmotReplySinkOptions) {}
+
+  private log(message: string): void {
+    this.options.log?.(message);
+  }
 
   private get streamingEnabled(): boolean {
     return this.options.streamMode !== "off" && this.options.quicCandidates.length > 0;
@@ -77,21 +85,29 @@ export class MarmotReplySink {
   private async abandonPreview(reason: string): Promise<void> {
     this.previewAbandoned = true;
     if (this.preview) {
-      await this.preview.cancel(reason);
+      // Best effort: if the QUIC stream is already unhealthy, cancel may also
+      // fail — we still fall back to a plain durable send.
+      await this.preview.cancel(reason).catch(() => undefined);
     }
   }
 
   private async sendFinal(text: string): Promise<void> {
+    this.log(`marmot: sending durable final (${text.length} chars)`);
     await this.options.client.sendFinal(
       this.options.accountIdHex,
       this.options.groupIdHex,
       text,
       this.options.replyToMessageIdHex ?? null,
     );
+    this.log("marmot: durable final sent");
   }
 
   async deliver(payload: ReplyPayloadLike, info: ReplyDelivery): Promise<void> {
     const text = payload?.text ?? "";
+    this.deliveries += 1;
+    this.log(
+      `marmot: reply delivery kind=${info.kind} chars=${text.length} streaming=${this.streamingEnabled}`,
+    );
 
     if (info.kind === "tool") {
       // v1: tool/progress chatter is not surfaced to Marmot.
@@ -105,11 +121,13 @@ export class MarmotReplySink {
       try {
         await this.ensurePreview().update(text);
       } catch (error) {
-        if (error instanceof NonAppendOnlyUpdateError) {
-          await this.abandonPreview("non_append_only");
-        } else {
-          throw error;
-        }
+        // Any preview failure — non-append-only text, or a QUIC/broker error —
+        // abandons the live preview. The full text is still delivered as a plain
+        // durable final below, so a streaming hiccup never drops the reply.
+        const reason =
+          error instanceof NonAppendOnlyUpdateError ? "non_append_only" : "preview_error";
+        this.log(`marmot: live preview abandoned (${reason}); will send the final durably`);
+        await this.abandonPreview(reason);
       }
       return;
     }
@@ -120,11 +138,10 @@ export class MarmotReplySink {
         await this.preview.finalize(text);
         return;
       } catch (error) {
-        if (error instanceof NonAppendOnlyUpdateError) {
-          await this.abandonPreview("final_not_append_only");
-        } else {
-          throw error;
-        }
+        const reason =
+          error instanceof NonAppendOnlyUpdateError ? "final_not_append_only" : "finalize_error";
+        this.log(`marmot: preview finalize failed (${reason}); falling back to a durable send`);
+        await this.abandonPreview(reason);
       }
     }
     await this.sendFinal(text);
@@ -160,6 +177,8 @@ export interface MarmotDispatchDeps {
   streamMode: StreamMode;
   quicCandidates: string[];
   chunkBytes?: number;
+  /** Optional privacy-safe lifecycle logger. */
+  log?: (message: string) => void;
 }
 
 /**
@@ -202,8 +221,10 @@ export function createMarmotInboundDispatcher(
       streamMode: deps.streamMode,
       quicCandidates: deps.quicCandidates,
       chunkBytes: deps.chunkBytes,
+      log: deps.log,
     });
 
+    deps.log?.("marmot: agent turn starting");
     await runChannelInboundEvent({
       channel: "marmot",
       accountId: message.accountIdHex,
@@ -233,5 +254,6 @@ export function createMarmotInboundDispatcher(
         }),
       },
     });
+    deps.log?.(`marmot: agent turn done (sink deliveries=${sink.deliveries})`);
   };
 }

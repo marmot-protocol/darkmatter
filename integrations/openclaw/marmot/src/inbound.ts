@@ -132,6 +132,11 @@ export class MarmotInboundBridge {
     if (this.recent.has(event.message_id_hex)) {
       return;
     }
+    // Record before dispatching: dm-agent can re-emit the same message (e.g. a
+    // rapid catch-up just after subscribe), and an agent turn takes long enough
+    // that a record-after-dispatch would let the duplicate slip through and
+    // start a second, concurrent turn for the same message.
+    this.recent.add(event.message_id_hex);
     await this.options.onMessage({
       accountIdHex: event.account_id_hex,
       groupIdHex: event.group_id_hex,
@@ -139,8 +144,5 @@ export class MarmotInboundBridge {
       senderAccountIdHex: event.sender_account_id_hex,
       text: event.text,
     });
-    // Record the id only after a successful dispatch so a throwing handler does
-    // not cause the redelivered message to be dropped as a duplicate.
-    this.recent.add(event.message_id_hex);
   }
 }
