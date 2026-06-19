@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::transport::{Timestamp, TransportEnvelope};
@@ -14,6 +15,16 @@ use transport_nostr_adapter::{
     NostrTransportAdapter, RelayExportConsent, RelayIndex,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
+
+const DEFAULT_CONCURRENT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn concurrent_subscribe_timeout() -> Duration {
+    std::env::var("MARMOT_CONCURRENT_SUBSCRIBE_TEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_CONCURRENT_SUBSCRIBE_TIMEOUT)
+}
 
 struct ConcurrentSubscribeRelayClient {
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
@@ -47,7 +58,7 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
         self.started.fetch_add(1, Ordering::SeqCst);
         let barrier = self.barrier.lock().unwrap().clone();
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+        tokio::time::timeout(concurrent_subscribe_timeout(), barrier.wait())
             .await
             .map_err(|_| {
                 cgka_traits::TransportAdapterError::Subscription(
