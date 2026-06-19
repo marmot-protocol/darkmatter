@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -12,6 +13,73 @@ use transport_nostr_adapter::{
     NostrTransportAdapter, RelayExportConsent, RelayIndex,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
+
+#[derive(Default)]
+struct ConcurrentSubscribeRelayClient {
+    subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
+    expected_started: AtomicUsize,
+    started: AtomicUsize,
+    ready: tokio::sync::Notify,
+}
+
+impl ConcurrentSubscribeRelayClient {
+    fn expect_concurrent_subscribes(&self, count: usize) {
+        self.started.store(0, Ordering::SeqCst);
+        self.expected_started.store(count, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for ConcurrentSubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let started = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        let expected = self.expected_started.load(Ordering::SeqCst);
+        if started >= expected {
+            self.ready.notify_waiters();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while self.started.load(Ordering::SeqCst) < expected {
+                self.ready.notified().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            cgka_traits::TransportAdapterError::Subscription(
+                "subscription was not issued concurrently".into(),
+            )
+        })?;
+
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
 
 #[derive(Default)]
 struct FakeRelayClient {
@@ -151,6 +219,72 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
     ];
     assert!(replay_accounts.contains(&alice));
     assert!(replay_accounts.contains(&bob));
+}
+
+#[tokio::test]
+async fn activate_account_issues_inbox_and_group_subscriptions_concurrently() {
+    let relay = Arc::new(ConcurrentSubscribeRelayClient::default());
+    relay.expect_concurrent_subscribes(2);
+    let adapter = NostrTransportAdapter::new(relay.clone());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            }],
+            since: None,
+        })
+        .await
+        .expect("activation subscriptions are issued concurrently");
+
+    assert_eq!(relay.started.load(Ordering::SeqCst), 2);
+    assert_eq!(relay.subscriptions.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn sync_account_groups_issues_added_group_subscriptions_concurrently() {
+    let relay = Arc::new(ConcurrentSubscribeRelayClient::default());
+    relay.expect_concurrent_subscribes(1);
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    relay.expect_concurrent_subscribes(2);
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+                    transport_group_id: vec![0xD4; 32],
+                    endpoints: vec![TransportEndpoint("wss://group-one.example".into())],
+                },
+                TransportGroupSubscription {
+                    group_id: cgka_traits::GroupId::new(vec![0xE5; 32]),
+                    transport_group_id: vec![0xF6; 32],
+                    endpoints: vec![TransportEndpoint("wss://group-two.example".into())],
+                },
+            ],
+            since: None,
+        })
+        .await
+        .expect("group sync subscriptions are issued concurrently");
+
+    assert_eq!(relay.started.load(Ordering::SeqCst), 2);
+    assert_eq!(relay.subscriptions.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
