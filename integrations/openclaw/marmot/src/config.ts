@@ -38,6 +38,8 @@ export interface ResolvedMarmotAccount {
   groupIdHex?: string;
   quicCandidates: string[];
   streaming: boolean;
+  profileNameOnboarding: boolean;
+  profileOnboardingStatePath: string;
   dmPolicy?: string;
   allowFrom: Array<string | number>;
 }
@@ -129,6 +131,17 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
   return undefined;
 }
 
+function parseBoolEnv(value: string | undefined): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const v = value.trim().toLowerCase();
+  if (v === "") {
+    return undefined;
+  }
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 /**
  * Resolve the dm-agent connection + policy for an OpenClaw account, layering
  * channel config over MARMOT_* environment variables (config wins).
@@ -164,6 +177,12 @@ export function resolveMarmotAccount(
     cfg.quicCandidates ?? env.MARMOT_QUIC_CANDIDATES,
   );
 
+  const profileOnboardingStatePath = expandHome(
+    firstNonEmpty(env.MARMOT_PROFILE_ONBOARDING_STATE) ??
+      `${marmotHome}/dev/profile-onboarding.json`,
+    home,
+  );
+
   return {
     accountId: accountId ?? null,
     socketPath,
@@ -172,6 +191,9 @@ export function resolveMarmotAccount(
     groupIdHex: firstNonEmpty(cfg.groupIdHex, env.MARMOT_GROUP_ID_HEX),
     quicCandidates,
     streaming: cfg.streaming ?? true,
+    profileNameOnboarding:
+      cfg.profileNameOnboarding ?? parseBoolEnv(env.MARMOT_PROFILE_NAME_ONBOARDING) ?? false,
+    profileOnboardingStatePath,
     dmPolicy: cfg.dm?.policy,
     allowFrom: cfg.dm?.allowFrom ?? [],
   };

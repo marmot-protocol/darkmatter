@@ -84,6 +84,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
 | `streaming` | — | `true` |
+| `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `false` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
 The default control socket is same-UID only (parent dir `0700`, socket `0600`,
@@ -109,6 +110,13 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   allowlist (a no-op when none is configured, so it never wipes an allowlist
   managed directly on `dm-agent`). `dm-agent` still performs welcomer-based
   post-join accept/decline.
+- **Profile-name onboarding** (`src/profile-onboarding.ts`, opt-in via
+  `profileNameOnboarding`, default off): gives the agent a public Nostr profile
+  (`kind:0`) name. If the OpenClaw agent has a configured `name`, it is inherited
+  and published silently on first contact; otherwise the agent asks once in-chat
+  ("reply with a name, or reply `skip`") before publishing anything public.
+  Per-account status is persisted (`$MARMOT_HOME/dev/profile-onboarding.json`,
+  override with `MARMOT_PROFILE_ONBOARDING_STATE`) so it never re-asks.
 
 The inbound→agent and live-preview paths are typechecked against the SDK and
 their Marmot-side mappings are unit-tested; their end-to-end behavior is

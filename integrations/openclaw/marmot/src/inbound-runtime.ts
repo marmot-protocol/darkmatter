@@ -15,6 +15,10 @@ import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
 import { MarmotInboundBridge, type MarmotInboundMessage } from "./inbound.js";
+import {
+  maybeHandleProfileOnboarding,
+  ProfileNameOnboardingStore,
+} from "./profile-onboarding.js";
 import { syncAllowlist } from "./security.js";
 
 /** Minimal logger surface (subset of OpenClaw's PluginLogger). */
@@ -45,6 +49,11 @@ export interface StartMarmotInboundOptions {
   signal?: AbortSignal;
   /** Override the control-client factory (tests inject a stub). */
   clientFactory?: ClientFactory;
+  /**
+   * Configured OpenClaw agent name. When profile-name onboarding is enabled and
+   * a name is present, it is inherited and published instead of asking in-chat.
+   */
+  configuredAgentName?: string | null;
 }
 
 /**
@@ -70,6 +79,11 @@ export function startMarmotInbound(
   const signal = controller.signal;
   const resolved = resolveAccount(api);
   const client = (options.clientFactory ?? clientForAccount)(resolved);
+  // One-time, opt-in public profile-name flow (default off). Runs ahead of the
+  // agent turn so a consent prompt/reply isn't fed to the model.
+  const onboardingStore = resolved.profileNameOnboarding
+    ? new ProfileNameOnboardingStore(resolved.profileOnboardingStatePath)
+    : null;
 
   void (async () => {
     let accountIdHex: string;
@@ -84,6 +98,23 @@ export function startMarmotInbound(
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
       onMessage: async (message) => {
+        if (onboardingStore) {
+          const intercepted = await maybeHandleProfileOnboarding({
+            store: onboardingStore,
+            client,
+            message: {
+              accountIdHex: message.accountIdHex,
+              groupIdHex: message.groupIdHex,
+              messageIdHex: message.messageIdHex,
+              text: message.text,
+            },
+            configuredName: options.configuredAgentName ?? null,
+            logger: api.logger,
+          }).catch(() => false); // never block dispatch on an onboarding error
+          if (intercepted) {
+            return;
+          }
+        }
         api.logger.info("marmot: inbound message received; dispatching agent turn");
         await dispatch(message);
       },

@@ -44,7 +44,17 @@ export default defineChannelPluginEntry({
         streaming: resolved.streaming,
         quicCandidates: resolved.quicCandidates,
       });
-      startMarmotInbound(api, dispatch);
+
+      // Inherit the configured OpenClaw agent name (if any) for the optional
+      // Nostr profile-name onboarding flow; otherwise it asks in-chat.
+      const agents = (api.config as {
+        agents?: { list?: Array<{ name?: string; default?: boolean }> };
+      }).agents;
+      const agentList = agents?.list ?? [];
+      const configuredAgentName =
+        agentList.find((entry) => entry.default)?.name ?? agentList[0]?.name ?? null;
+
+      startMarmotInbound(api, dispatch, { configuredAgentName });
     })();
   },
 });
