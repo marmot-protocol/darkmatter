@@ -86,7 +86,10 @@ if ! node -e 'process.exit(require(process.argv[1]).gateway?.mode==="local"?0:1)
     openclaw onboard "${onboard_args[@]}"
 fi
 
-openclaw plugins install /work/darkmatter/integrations/openclaw/marmot || true
+# --force overwrites an already-installed copy. OPENCLAW_HOME lives on a
+# persisted volume, so without --force a rebuilt image's updated plugin dist is
+# ignored in favor of the stale copy left in the volume from a prior run.
+openclaw plugins install --force /work/darkmatter/integrations/openclaw/marmot || true
 openclaw plugins enable marmot || true
 
 # Enabling the plugin loads its code but does not start a channel: OpenClaw only

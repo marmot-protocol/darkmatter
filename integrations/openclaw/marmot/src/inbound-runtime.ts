@@ -57,6 +57,14 @@ export interface StartMarmotInboundOptions {
   configuredAgentName?: string | null;
 }
 
+// The gateway can full-load the plugin in more than one in-process context
+// (the HTTP server and the agent-runtime pre-warm each invoke `registerFull`),
+// so `startMarmotInbound` can be called more than once in a single process. A
+// second live subscription would deliver — and dispatch an agent turn for —
+// every inbound message twice, so only the first start is honored until it is
+// stopped.
+let inboundActive = false;
+
 /**
  * Run the dm-agent inbound subscription, dispatching each mapped message to
  * `dispatch`. Returns a stop function that aborts the loop. Requires a real
@@ -67,7 +75,20 @@ export function startMarmotInbound(
   dispatch: InboundAgentDispatcher,
   options: StartMarmotInboundOptions = {},
 ): () => void {
+  if (inboundActive) {
+    api.logger.info("marmot: inbound subscription already active; ignoring duplicate start");
+    return () => {};
+  }
+  inboundActive = true;
   const controller = new AbortController();
+  // Release the guard when the loop is stopped so a clean restart can re-subscribe.
+  controller.signal.addEventListener(
+    "abort",
+    () => {
+      inboundActive = false;
+    },
+    { once: true },
+  );
   // Always drive the loop off the internal controller so the returned stop() is
   // authoritative; forward an externally-supplied signal into it.
   if (options.signal) {
