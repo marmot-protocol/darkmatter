@@ -8,24 +8,33 @@ use cgka_traits::{
     TransportEndpoint, TransportGroupSubscription, TransportGroupSync, TransportPublishRequest,
     TransportPublishTarget,
 };
+use tokio::sync::Barrier;
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
     NostrTransportAdapter, RelayExportConsent, RelayIndex,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
-#[derive(Default)]
 struct ConcurrentSubscribeRelayClient {
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
-    expected_started: AtomicUsize,
     started: AtomicUsize,
-    ready: tokio::sync::Notify,
+    barrier: Mutex<Arc<Barrier>>,
+}
+
+impl Default for ConcurrentSubscribeRelayClient {
+    fn default() -> Self {
+        Self {
+            subscriptions: Mutex::default(),
+            started: AtomicUsize::new(0),
+            barrier: Mutex::new(Arc::new(Barrier::new(1))),
+        }
+    }
 }
 
 impl ConcurrentSubscribeRelayClient {
     fn expect_concurrent_subscribes(&self, count: usize) {
         self.started.store(0, Ordering::SeqCst);
-        self.expected_started.store(count, Ordering::SeqCst);
+        *self.barrier.lock().unwrap() = Arc::new(Barrier::new(count));
     }
 }
 
@@ -35,23 +44,16 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
         &self,
         subscription: transport_nostr_adapter::NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        let started = self.started.fetch_add(1, Ordering::SeqCst) + 1;
-        let expected = self.expected_started.load(Ordering::SeqCst);
-        if started >= expected {
-            self.ready.notify_waiters();
-        }
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let barrier = self.barrier.lock().unwrap().clone();
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while self.started.load(Ordering::SeqCst) < expected {
-                self.ready.notified().await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            cgka_traits::TransportAdapterError::Subscription(
-                "subscription was not issued concurrently".into(),
-            )
-        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+            .await
+            .map_err(|_| {
+                cgka_traits::TransportAdapterError::Subscription(
+                    "subscription was not issued concurrently".into(),
+                )
+            })?;
 
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
