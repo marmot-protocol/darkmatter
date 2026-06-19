@@ -45,10 +45,9 @@ MUST satisfy it.
 
 `settlement_quiescence_ms` gates when a client decides it has waited long enough to run or finish convergence. It is
 measured with the client's local monotonic clock from the last time the client retained or reclassified
-convergence-relevant input: an MLS commit, proposal, or application message that is not stale and can affect candidate
-branches, witness counts, deferred-parent resolution, delivered app payloads, or invalidations. Duplicate, invalid, or
-stale input does not reset the clock, and transport timestamps, relay arrival order, event ids, subscription order, and
-local receive order MUST NOT enter the branch score.
+convergence-relevant input. Convergence-relevant input is non-stale protocol input that can affect candidate branches,
+witness counts, deferred-parent resolution, delivered app payloads, or invalidations. Duplicate, invalid, or stale input
+does not reset the clock. Input ordering MUST NOT enter the branch score.
 
 Convergence parameters are deliberately not group-tunable: a bad policy choice can fork a group. A future protocol
 version that changes convergence behavior MUST ship the new policy as a new app component behind a required capability.
