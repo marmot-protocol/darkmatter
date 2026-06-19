@@ -78,7 +78,7 @@ const MARMOT_ACCOUNT_PROPERTIES = {
   streaming: {
     type: ["object", "boolean"],
     description:
-      "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean accepted for legacy on/off).",
+      "Live QUIC preview streaming: { mode: block|off }. 'block' (default) streams completed blocks; 'off' sends a plain final. 'partial'/'progress' are NOT supported — they stream windowed previews and can truncate the durable reply. Boolean accepted for legacy on/off.",
   },
   profileNameOnboarding: { type: "boolean" },
   dm: {
@@ -163,10 +163,12 @@ function normalizeStreamMode(value: string | undefined): StreamMode | undefined 
 /**
  * Resolve the preview-streaming mode. OpenClaw drives previews through the
  * channel's reply `deliver` callback, gated on this mode (see src/dispatch.ts);
- * any non-"off" mode runs the QUIC preview (our preview is append-only, so the
- * `block` append style is the natural default). A boolean is accepted for the
- * legacy on/off knob. Defaults on so previews fire wherever QUIC candidates and
- * block streaming are configured.
+ * any non-"off" mode runs the QUIC preview. Only `block` (default) and `off` are
+ * supported: `partial`/`progress` stream windowed previews that suppress the
+ * complete delivery and can truncate the durable reply (the plugin entry warns;
+ * see the README "Behavior" note). A boolean is accepted for the legacy on/off
+ * knob. Defaults to `block` so previews fire wherever QUIC candidates and block
+ * streaming are configured.
  */
 function resolveStreamMode(
   streaming: MarmotStreamingConfig | boolean | undefined,

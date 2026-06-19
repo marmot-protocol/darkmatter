@@ -37,6 +37,16 @@ export default defineChannelPluginEntry({
       // received Marmot message into runChannelInboundEvent, and the agent's
       // reply is delivered back through send_final / live QUIC previews.
       const resolved = resolveMarmotChannelAccount(api.config, null);
+      if (resolved.streamMode === "partial" || resolved.streamMode === "progress") {
+        // OpenClaw's partial/progress preview modes stream windowed preview edits
+        // and suppress the complete block/final delivery the connector commits, so
+        // the durable reply can be truncated. The dispatcher reads the gateway
+        // config (not the cfg we pass), so we cannot safely override it here. Block
+        // streaming delivers the complete reply; "off" sends a plain final.
+        api.logger.warn(
+          `marmot: streaming mode '${resolved.streamMode}' is not supported and can truncate replies; use 'block' (default) or 'off'`,
+        );
+      }
       const dispatch = createMarmotInboundDispatcher({
         cfg: api.config,
         runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,

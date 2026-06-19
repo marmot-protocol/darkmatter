@@ -83,7 +83,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `accountIdHex` | `MARMOT_ACCOUNT_ID_HEX` | sole local account |
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
-| `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (off/partial/block/progress) |
+| `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`block`/`off`; `partial`/`progress` unsupported — see Behavior) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
@@ -110,6 +110,11 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   "on"`) — the docker phone test configures all of this. Like a Telegram preview,
   this is driven by the channel's reply `deliver` callback, not a core-driven
   live adapter (that SDK seam does not exist yet).
+  - **Use `streaming.mode: block` (default) or `off`.** `partial`/`progress`
+    stream *windowed* preview edits and suppress the complete delivery the
+    connector commits, so the durable reply can be truncated; the dispatcher
+    reads the gateway config (not the cfg the plugin passes), so the connector
+    can only warn, not override. `block` delivers the complete reply.
 - **Allowlist mirroring**: on startup the plugin mirrors the configured
   `channels.marmot.dm.allowFrom` (hex account ids) into `dm-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist
