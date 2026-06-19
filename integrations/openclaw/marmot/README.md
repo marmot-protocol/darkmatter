@@ -68,6 +68,10 @@ just openclaw-phone-test-logs
 just openclaw-phone-test-down        # or -reset to wipe persisted data
 ```
 
+Set `MARMOT_STREAM_MODE=partial` or `MARMOT_STREAM_MODE=progress` before
+`just openclaw-phone-test-up` to exercise OpenClaw's windowed streaming modes
+against a real phone; omit it for the default `block` mode.
+
 ## Configuration
 
 Configure under `channels.marmot` in the OpenClaw config, or via `MARMOT_*`
@@ -83,7 +87,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `accountIdHex` | `MARMOT_ACCOUNT_ID_HEX` | sole local account |
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
-| `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`block`/`off`; `partial`/`progress` unsupported — see Behavior) |
+| `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
@@ -110,11 +114,12 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   "on"`) — the docker phone test configures all of this. Like a Telegram preview,
   this is driven by the channel's reply `deliver` callback, not a core-driven
   live adapter (that SDK seam does not exist yet).
-  - **Use `streaming.mode: block` (default) or `off`.** `partial`/`progress`
-    stream *windowed* preview edits and suppress the complete delivery the
-    connector commits, so the durable reply can be truncated; the dispatcher
-    reads the gateway config (not the cfg the plugin passes), so the connector
-    can only warn, not override. `block` delivers the complete reply.
+  - `block` is the best live-preview mode because it naturally maps onto Marmot's
+    append-only stream. `partial`/`progress` can emit windowed OpenClaw preview
+    text; the plugin treats those modes as best-effort live previews and recovers
+    the complete durable answer from OpenClaw's fresh session transcript before
+    committing. Tool/progress chatter is written as non-text progress records and
+    never becomes durable chat text.
 - **Allowlist mirroring**: on startup the plugin mirrors the configured
   `channels.marmot.dm.allowFrom` (hex account ids) into `dm-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist

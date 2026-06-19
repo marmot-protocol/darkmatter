@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { NonAppendOnlyUpdateError } from "../src/append-only.js";
 import { MarmotLivePreview, type StreamControlClient } from "../src/live.js";
+import { AgentTextStreamTranscript } from "../src/transcript.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 const STREAM_ID = HEX32("11");
@@ -15,12 +16,14 @@ const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb
 interface Calls {
   begin: { account: string; group: string; quic: string[] }[];
   append: { streamId: string; text: string }[];
+  status: { streamId: string; text: string }[];
+  progress: { streamId: string; text: string }[];
   finalize: { streamId: string; finalText: string; hash: string; count: number }[];
   cancel: { streamId: string; reason: string | null }[];
 }
 
 function emptyCalls(): Calls {
-  return { begin: [], append: [], finalize: [], cancel: [] };
+  return { begin: [], append: [], status: [], progress: [], finalize: [], cancel: [] };
 }
 
 function stubStreamClient(calls: Calls): StreamControlClient {
@@ -37,6 +40,14 @@ function stubStreamClient(calls: Calls): StreamControlClient {
     },
     async streamAppend(streamId: string, text: string) {
       calls.append.push({ streamId, text });
+      return { type: "ack" };
+    },
+    async streamStatus(streamId: string, text: string) {
+      calls.status.push({ streamId, text });
+      return { type: "ack" };
+    },
+    async streamProgress(streamId: string, text: string) {
+      calls.progress.push({ streamId, text });
       return { type: "ack" };
     },
     async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
@@ -91,12 +102,64 @@ describe("MarmotLivePreview", () => {
     expect(calls.finalize[0]).toMatchObject({ hash: INCREMENTAL_HASH, count: 3 });
   });
 
+  it("appends explicit deltas without requiring a full snapshot", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.appendDelta("hel");
+    await live.appendDelta("lo");
+    await live.appendDelta(" world");
+    expect(live.currentText).toBe("hello world");
+    await live.finalize("hello world");
+
+    expect(calls.append.map((a) => a.text)).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toMatchObject({ hash: INCREMENTAL_HASH, count: 3 });
+  });
+
+  it("can begin before text arrives without adding transcript records", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.begin();
+    await live.update("hello world");
+    await live.finalize("hello world");
+
+    expect(calls.begin).toHaveLength(1);
+    expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
+    expect(calls.status).toEqual([]);
+    expect(calls.progress).toEqual([]);
+    expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
+  });
+
   it("streams the whole final when finalize is called without prior updates", async () => {
     const calls = emptyCalls();
     const live = preview(calls);
     await live.finalize("hello world");
     expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
     expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
+  });
+
+  it("includes progress/status records in the transcript without changing final text", async () => {
+    const calls = emptyCalls();
+    const live = preview(calls);
+    await live.status("thinking");
+    await live.progress("searching");
+    await live.finalize("done");
+
+    const transcript = new AgentTextStreamTranscript(
+      Buffer.from(STREAM_ID, "hex"),
+      Buffer.from(START_ID, "hex"),
+    );
+    transcript.appendStatus("thinking");
+    transcript.appendProgress("searching");
+    transcript.appendText("done");
+
+    expect(calls.status.map((c) => c.text)).toEqual(["thinking"]);
+    expect(calls.progress.map((c) => c.text)).toEqual(["searching"]);
+    expect(calls.append.map((a) => a.text)).toEqual(["done"]);
+    expect(calls.finalize[0]).toMatchObject({
+      finalText: "done",
+      hash: transcript.hashHex,
+      count: transcript.chunkCount,
+    });
   });
 
   it("throws on a non-append-only update so the caller can fall back", async () => {
@@ -152,6 +215,12 @@ describe("MarmotLivePreview", () => {
           throw new Error("boom");
         }
         calls.append.push({ streamId, text });
+        return { type: "ack" };
+      },
+      async streamStatus() {
+        return { type: "ack" };
+      },
+      async streamProgress() {
         return { type: "ack" };
       },
       async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {

@@ -161,6 +161,10 @@ export class AgentTextStreamTranscript {
     this.appendRecord(AGENT_TEXT_STREAM_RECORD_STATUS, status, chunkBytes);
   }
 
+  appendProgress(text: string, chunkBytes?: number): void {
+    this.appendRecord(AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, text, chunkBytes);
+  }
+
   get hashHex(): string {
     return this.hash.toString("hex");
   }

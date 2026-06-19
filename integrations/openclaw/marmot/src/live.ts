@@ -14,7 +14,7 @@ import { AgentTextStreamTranscript, DEFAULT_STREAM_CHUNK_BYTES } from "./transcr
 /** Narrow control-client surface used by the live preview (eases testing). */
 export type StreamControlClient = Pick<
   MarmotAgentControlClient,
-  "streamBegin" | "streamAppend" | "streamFinalize" | "streamCancel"
+  "streamBegin" | "streamAppend" | "streamStatus" | "streamProgress" | "streamFinalize" | "streamCancel"
 >;
 
 export interface MarmotLivePreviewOptions {
@@ -54,6 +54,10 @@ export class MarmotLivePreview {
     return this.begun && !this.closed;
   }
 
+  get currentText(): string {
+    return this.appendOnly.current;
+  }
+
   private ensureOpen(): void {
     if (this.closed) {
       throw new Error("live preview is already finalized or cancelled");
@@ -79,6 +83,16 @@ export class MarmotLivePreview {
   }
 
   /**
+   * Start the remote stream early without appending transcript records. This
+   * gives clients time to discover the stream-start event and subscribe before
+   * model text arrives.
+   */
+  async begin(): Promise<void> {
+    this.ensureOpen();
+    await this.ensureBegun();
+  }
+
+  /**
    * Push the latest full preview text. Throws {@link NonAppendOnlyUpdateError}
    * if it is not an extension of what was already streamed.
    */
@@ -99,6 +113,41 @@ export class MarmotLivePreview {
     await this.client.streamAppend(this.streamIdHex!, suffix);
     this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(fullText);
+  }
+
+  async appendDelta(delta: string): Promise<void> {
+    this.ensureOpen();
+    await this.ensureBegun();
+    const suffix = String(delta ?? "");
+    if (suffix.length === 0) {
+      return;
+    }
+    const next = `${this.appendOnly.current}${suffix}`;
+    await this.client.streamAppend(this.streamIdHex!, suffix);
+    this.transcript!.appendText(suffix, this.chunkBytes);
+    this.appendOnly.suffixFor(next);
+  }
+
+  async status(status: string): Promise<void> {
+    this.ensureOpen();
+    const text = String(status ?? "");
+    if (text.length === 0) {
+      return;
+    }
+    await this.ensureBegun();
+    await this.client.streamStatus(this.streamIdHex!, text);
+    this.transcript!.appendStatus(text, this.chunkBytes);
+  }
+
+  async progress(text: string): Promise<void> {
+    this.ensureOpen();
+    const progressText = String(text ?? "");
+    if (progressText.length === 0) {
+      return;
+    }
+    await this.ensureBegun();
+    await this.client.streamProgress(this.streamIdHex!, progressText);
+    this.transcript!.appendProgress(progressText, this.chunkBytes);
   }
 
   /**

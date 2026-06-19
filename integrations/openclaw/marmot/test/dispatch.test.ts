@@ -13,12 +13,14 @@ interface Calls {
   sendFinal: { text: string; replyTo: string | null }[];
   begin: number;
   append: string[];
+  status: string[];
+  progress: string[];
   finalize: { hash: string; count: number }[];
   cancel: string[];
 }
 
 function emptyCalls(): Calls {
-  return { sendFinal: [], begin: 0, append: [], finalize: [], cancel: [] };
+  return { sendFinal: [], begin: 0, append: [], status: [], progress: [], finalize: [], cancel: [] };
 }
 
 function stubClient(calls: Calls): MarmotSinkClient {
@@ -40,6 +42,14 @@ function stubClient(calls: Calls): MarmotSinkClient {
       calls.append.push(text);
       return { type: "ack" };
     },
+    async streamStatus(_id: string, text: string) {
+      calls.status.push(text);
+      return { type: "ack" };
+    },
+    async streamProgress(_id: string, text: string) {
+      calls.progress.push(text);
+      return { type: "ack" };
+    },
     async streamFinalize(_id: string, _final: string, hash: string, count: number) {
       calls.finalize.push({ hash, count });
       return { type: "stream_finalized", stream_id_hex: STREAM_ID, message_ids_hex: [HEX32("ab")] };
@@ -53,7 +63,11 @@ function stubClient(calls: Calls): MarmotSinkClient {
 
 function makeSink(
   calls: Calls,
-  opts: { streamMode?: StreamMode; quicCandidates?: string[] } = {},
+  opts: {
+    streamMode?: StreamMode;
+    quicCandidates?: string[];
+    resolveFinalText?: () => Promise<string | undefined> | string | undefined;
+  } = {},
 ): MarmotReplySink {
   return new MarmotReplySink({
     client: stubClient(calls),
@@ -61,6 +75,7 @@ function makeSink(
     groupIdHex: HEX32("cc"),
     streamMode: opts.streamMode ?? "block",
     quicCandidates: opts.quicCandidates ?? ["quic://broker:4450"],
+    resolveFinalText: opts.resolveFinalText,
   });
 }
 
@@ -87,6 +102,124 @@ describe("MarmotReplySink", () => {
     expect(calls.sendFinal).toEqual([]);
   });
 
+  it("streams fragment-style blocks as append-only deltas and finalizes", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.deliver({ text: "hel" }, { kind: "block" });
+    await sink.deliver({ text: "lo" }, { kind: "block" });
+    await sink.deliver({ text: " world" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.begin).toBe(1);
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("streams partial snapshots before delayed block chunks and finalizes", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.partial({ text: "hel" });
+    await sink.partial({ text: "hello" });
+    await sink.partial({ text: "hello world" });
+    await sink.deliver({ text: "delayed block chunk" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.begin).toBe(1);
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
+    expect(calls.cancel).toEqual([]);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("streams partial append deltas even when snapshots are windowed", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.partial({ text: "hel", delta: "hel" });
+    await sink.partial({ text: "lo window", delta: "lo" });
+    await sink.partial({ text: "world window", delta: " world" });
+    await sink.deliver({ text: "delayed block chunk" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.begin).toBe(1);
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
+    expect(calls.cancel).toEqual([]);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("streams delta-only partial payloads", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.partial({ delta: "hel" });
+    await sink.partial({ delta: "lo" });
+    await sink.partial({ delta: " world" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.begin).toBe(1);
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("lets block snapshots recover after a delta-less non-append partial", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.prewarm();
+    await sink.partial({ text: "hel" });
+    await sink.partial({ text: "window shifted" });
+    await sink.deliver({ text: "hello" }, { kind: "block" });
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+
+    expect(calls.append).toEqual(["hel", "lo", " world"]);
+    expect(calls.cancel).toEqual([]);
+    expect(calls.finalize[0]).toEqual({ hash: INCREMENTAL_HASH, count: 3 });
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("falls back durably when partial snapshots become non-append-only", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls, {
+      streamMode: "partial",
+      resolveFinalText: () => "hello complete answer",
+    });
+    await sink.partial({ text: "hello partial answer" });
+    await sink.partial({ text: "window shifted", replace: true });
+    await sink.flush();
+
+    expect(calls.append).toEqual(["hello partial answer"]);
+    expect(calls.cancel).toHaveLength(1);
+    expect(calls.finalize).toEqual([]);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello complete answer"]);
+  });
+
+  it("can prewarm a live preview before answer text arrives", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.prewarm();
+    await sink.partial({ text: "done" });
+    await sink.flush();
+
+    expect(calls.begin).toBe(1);
+    expect(calls.status).toEqual([]);
+    expect(calls.append).toEqual(["done"]);
+    expect(calls.finalize[0]?.count).toBe(1);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("streams tool deliveries as non-text progress and still finalizes answer text", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.deliver({ text: "searching" }, { kind: "tool" });
+    await sink.deliver({ text: "answer" }, { kind: "block" });
+    await sink.deliver({ text: "answer" }, { kind: "final" });
+
+    expect(calls.progress).toEqual(["searching"]);
+    expect(calls.append).toEqual(["answer"]);
+    expect(calls.finalize[0]?.count).toBe(2);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
   it("ignores blocks and sends a plain final when streaming is off", async () => {
     const calls = emptyCalls();
     const sink = makeSink(calls, { streamMode: "off" });
@@ -103,7 +236,7 @@ describe("MarmotReplySink", () => {
     await sink.deliver({ text: "goodbye" }, { kind: "block" }); // not an extension
     await sink.deliver({ text: "goodbye" }, { kind: "final" });
 
-    expect(calls.append).toEqual(["hello"]);
+    expect(calls.append).toEqual(["hello", "goodbye"]);
     expect(calls.cancel).toHaveLength(1);
     expect(calls.finalize).toEqual([]);
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["goodbye"]);
@@ -170,6 +303,27 @@ describe("MarmotReplySink", () => {
     expect(calls.sendFinal).toEqual([]);
   });
 
+  it("recovers the full transcript final for partial-mode windowed previews", async () => {
+    const calls = emptyCalls();
+    const full =
+      "This is the complete recovered answer that OpenClaw persisted to the session transcript after the turn finished.";
+    const sink = makeSink(calls, {
+      streamMode: "partial",
+      resolveFinalText: () => full,
+    });
+
+    await sink.deliver(
+      { text: "This is the complete recovered answer that OpenClaw persisted..." },
+      { kind: "block" },
+    );
+    await sink.deliver({ text: "window shifted and no longer starts at the prefix" }, { kind: "block" });
+    await sink.flush();
+
+    expect(calls.finalize).toEqual([]);
+    expect(calls.cancel).toHaveLength(1);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual([full]);
+  });
+
   it("flush sends a plain final for a blocks-only turn when streaming is off", async () => {
     const calls = emptyCalls();
     const sink = makeSink(calls, { streamMode: "off" });
@@ -194,9 +348,9 @@ describe("MarmotReplySink", () => {
     expect(calls).toEqual(emptyCalls());
   });
 
-  it("ignores tool deliveries", async () => {
+  it("ignores tool deliveries when streaming is off", async () => {
     const calls = emptyCalls();
-    await makeSink(calls).deliver({ text: "searching..." }, { kind: "tool" });
+    await makeSink(calls, { streamMode: "off" }).deliver({ text: "searching..." }, { kind: "tool" });
     expect(calls).toEqual(emptyCalls());
   });
 });

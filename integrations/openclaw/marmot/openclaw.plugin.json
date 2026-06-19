@@ -34,7 +34,7 @@
           },
           "streaming": {
             "type": ["object", "boolean"],
-            "description": "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean for legacy on/off)."
+            "description": "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean for legacy on/off). block is the safest preview mode; partial/progress recover durable finals from the OpenClaw transcript."
           },
           "profileNameOnboarding": { "type": "boolean" },
           "dm": {

@@ -20,6 +20,7 @@ import type { MarmotAgentControlClient } from "./client.js";
 import type { StreamMode } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
+import { resolveLatestAssistantTextFromSessionStore } from "./session-transcript.js";
 
 // --- reply sink (unit-tested) -----------------------------------------------
 
@@ -33,6 +34,13 @@ export interface ReplyPayloadLike {
   text?: string;
 }
 
+/** Partial assistant preview payload emitted before the durable reply dispatcher settles. */
+export interface PartialReplyPayloadLike {
+  text?: string;
+  delta?: string;
+  replace?: true;
+}
+
 export type MarmotSinkClient = Pick<MarmotAgentControlClient, "sendFinal"> & StreamControlClient;
 
 export interface MarmotReplySinkOptions {
@@ -43,8 +51,50 @@ export interface MarmotReplySinkOptions {
   streamMode: StreamMode;
   quicCandidates: string[];
   chunkBytes?: number;
+  resolveFinalText?: () => Promise<string | undefined> | string | undefined;
   /** Optional privacy-safe lifecycle logger (kinds + lengths only, no content/ids). */
   log?: (message: string) => void;
+}
+
+const MIN_TRUNCATED_FINAL_PREFIX_CHARS = 48;
+const MIN_TRUNCATED_FINAL_CONTINUATION_CHARS = 24;
+
+function stripTrailingEllipsis(text: string): string {
+  return text.replace(/(?:\s*(?:\.{3}|…))+$/u, "").trimEnd();
+}
+
+function isPotentialTruncatedFinal(text: string): boolean {
+  const trimmed = text.trimEnd();
+  const untruncated = stripTrailingEllipsis(trimmed);
+  return untruncated.length >= MIN_TRUNCATED_FINAL_PREFIX_CHARS && untruncated !== trimmed;
+}
+
+function selectLongerFinalText(current: string, candidate: string | undefined): string | undefined {
+  const candidateText = candidate?.trimEnd();
+  if (!candidateText) {
+    return undefined;
+  }
+  const currentText = current.trimEnd();
+  if (!currentText) {
+    return candidateText;
+  }
+  if (candidateText === currentText) {
+    return currentText;
+  }
+  if (candidateText.length > currentText.length && candidateText.startsWith(currentText)) {
+    return candidateText;
+  }
+  if (!isPotentialTruncatedFinal(currentText)) {
+    return undefined;
+  }
+  const untruncated = stripTrailingEllipsis(currentText);
+  if (candidateText.length <= currentText.length || !candidateText.startsWith(untruncated)) {
+    return undefined;
+  }
+  const continuation = candidateText.slice(untruncated.length).trimStart();
+  return continuation.length >= MIN_TRUNCATED_FINAL_CONTINUATION_CHARS && /^[\p{L}\p{N}]/u.test(continuation)
+    ? candidateText
+    : undefined;
 }
 
 /**
@@ -59,8 +109,18 @@ export class MarmotReplySink {
   private previewAbandoned = false;
   /** Reply deliveries received from the dispatcher this turn (diagnostic). */
   deliveries = 0;
-  /** Latest full reply text seen; used to commit a blocks-only turn at flush(). */
-  private lastText = "";
+  /** Latest reconstructed answer text; used to commit a blocks-only turn at flush(). */
+  private latestAnswerText = "";
+  /** True once lower-latency partial snapshots, not delayed block chunks, own the preview. */
+  private partialPreviewActive = false;
+  /** True once OpenClaw has emitted any partial reply callback for this turn. */
+  private sawPartialPreview = false;
+  private partialDeliveries = 0;
+  private partialAppendEvents = 0;
+  private partialAppendedChars = 0;
+  private loggedPartialStart = false;
+  private loggedPartialAppendStart = false;
+  private loggedPartialSummary = false;
   /** Whether the durable reply has been committed (stream_finalize or send_final). */
   private finalized = false;
 
@@ -95,6 +155,151 @@ export class MarmotReplySink {
     }
   }
 
+  private nextAnswerTextFromBlock(text: string): string {
+    if (!this.latestAnswerText) {
+      return text;
+    }
+    if (text.startsWith(this.latestAnswerText)) {
+      return text;
+    }
+    if (this.latestAnswerText.endsWith(text)) {
+      return this.latestAnswerText;
+    }
+    return `${this.latestAnswerText}${text}`;
+  }
+
+  private async bestFinalText(fallback: string): Promise<string> {
+    let candidate: string | undefined;
+    try {
+      candidate = await this.options.resolveFinalText?.();
+    } catch {
+      this.log("marmot: transcript final recovery lookup failed");
+    }
+    if (!candidate?.trim()) {
+      return fallback;
+    }
+    if (this.options.streamMode === "partial" || this.options.streamMode === "progress" || this.sawPartialPreview) {
+      return candidate.trimEnd();
+    }
+    return selectLongerFinalText(fallback, candidate) ?? fallback;
+  }
+
+  private async sendProgress(text: string): Promise<void> {
+    const progressText = text.trim();
+    if (!progressText || !this.streamingEnabled || this.previewAbandoned) {
+      return;
+    }
+    try {
+      await this.ensurePreview().progress(progressText);
+    } catch {
+      this.log("marmot: live progress abandoned (preview_error); will send the final durably");
+      await this.abandonPreview("preview_progress_error");
+    }
+  }
+
+  async prewarm(): Promise<void> {
+    if (!this.streamingEnabled || this.previewAbandoned) {
+      return;
+    }
+    try {
+      await this.ensurePreview().begin();
+      this.log("marmot: live preview stream started");
+    } catch {
+      this.log("marmot: live preview start failed; will send the final durably");
+      await this.abandonPreview("preview_begin_error");
+    }
+  }
+
+  async status(status: string): Promise<void> {
+    const statusText = status.trim();
+    if (!statusText || !this.streamingEnabled || this.previewAbandoned) {
+      return;
+    }
+    try {
+      await this.ensurePreview().status(statusText);
+    } catch {
+      this.log("marmot: live status abandoned (preview_error); will send the final durably");
+      await this.abandonPreview("preview_status_error");
+    }
+  }
+
+  async progress(text: string): Promise<void> {
+    await this.sendProgress(text);
+  }
+
+  async partial(payload: PartialReplyPayloadLike): Promise<void> {
+    const text = String(payload.text ?? "");
+    const delta = payload.replace === true ? "" : String(payload.delta ?? "");
+    if (!text.trim() && delta.length === 0) {
+      return;
+    }
+    this.sawPartialPreview = true;
+    this.partialDeliveries += 1;
+    if (!this.loggedPartialStart) {
+      this.loggedPartialStart = true;
+      this.log(
+        `marmot: partial reply streaming started chars=${text.length} delta_chars=${delta.length} streaming=${this.streamingEnabled}`,
+      );
+    }
+    if (!this.streamingEnabled || this.previewAbandoned) {
+      this.latestAnswerText = text || `${this.latestAnswerText}${delta}`;
+      return;
+    }
+    try {
+      const preview = this.ensurePreview();
+      if (delta.length > 0) {
+        await preview.appendDelta(delta);
+        this.partialPreviewActive = true;
+        this.latestAnswerText = text || preview.currentText;
+        this.notePartialAppend("delta", delta.length);
+        return;
+      }
+      if (payload.replace === true) {
+        this.log("marmot: skipped replacement partial without append delta");
+        this.partialPreviewActive = false;
+        return;
+      }
+      const previousLength = preview.currentText.length;
+      await preview.update(text);
+      this.partialPreviewActive = true;
+      this.latestAnswerText = text;
+      const appendedChars = preview.currentText.length - previousLength;
+      if (appendedChars > 0) {
+        this.notePartialAppend("snapshot", appendedChars);
+      }
+    } catch (error) {
+      if (error instanceof NonAppendOnlyUpdateError) {
+        this.log("marmot: skipped non-append partial without append delta");
+        this.partialPreviewActive = false;
+        return;
+      }
+      const reason = "preview_partial_error";
+      this.log(`marmot: live partial preview abandoned (${reason}); will send the final durably`);
+      this.partialPreviewActive = false;
+      this.latestAnswerText = "";
+      await this.abandonPreview(reason);
+    }
+  }
+
+  private notePartialAppend(kind: "delta" | "snapshot", chars: number): void {
+    this.partialAppendEvents += 1;
+    this.partialAppendedChars += chars;
+    if (!this.loggedPartialAppendStart) {
+      this.loggedPartialAppendStart = true;
+      this.log(`marmot: partial reply append started kind=${kind} chars=${chars}`);
+    }
+  }
+
+  private logPartialSummary(): void {
+    if (!this.sawPartialPreview || this.loggedPartialSummary) {
+      return;
+    }
+    this.loggedPartialSummary = true;
+    this.log(
+      `marmot: partial reply summary deliveries=${this.partialDeliveries} appends=${this.partialAppendEvents} appended_chars=${this.partialAppendedChars}`,
+    );
+  }
+
   private async sendFinal(text: string): Promise<void> {
     this.log(`marmot: sending durable final (${text.length} chars)`);
     await this.options.client.sendFinal(
@@ -114,20 +319,23 @@ export class MarmotReplySink {
     );
 
     if (info.kind === "tool") {
-      // v1: tool/progress chatter is not surfaced to Marmot.
+      await this.sendProgress(text);
       return;
     }
 
-    // Remember the latest full reply text so a turn that streams blocks but
-    // never sends an explicit `final` can still be committed durably at flush().
-    this.lastText = text;
-
     if (info.kind === "block") {
+      if (this.partialPreviewActive) {
+        // OpenClaw emits delayed block chunks after earlier partial snapshots.
+        // Once partials own the live preview, blocks are only a durable fallback;
+        // appending them would replay or reorder already-streamed text.
+        return;
+      }
+      this.latestAnswerText = this.nextAnswerTextFromBlock(text);
       if (!this.streamingEnabled || this.previewAbandoned) {
-        return; // recorded in lastText; committed by the final delivery or flush()
+        return; // recorded in latestAnswerText; committed by the final delivery or flush()
       }
       try {
-        await this.ensurePreview().update(text);
+        await this.ensurePreview().update(this.latestAnswerText);
       } catch (error) {
         // Any preview failure — non-append-only text, or a QUIC/broker error —
         // abandons the live preview. The full text is still delivered durably by
@@ -140,22 +348,29 @@ export class MarmotReplySink {
       return;
     }
 
-    await this.commit(text);
+    this.latestAnswerText = text || this.latestAnswerText;
+    await this.commit(this.latestAnswerText);
   }
 
   /**
    * Commit the durable reply exactly once: finalize an active live preview into
    * a stream-final, otherwise send a plain durable final.
    */
-  private async commit(text: string): Promise<void> {
+  private async commit(text: string): Promise<boolean> {
     if (this.finalized) {
-      return;
+      return true;
+    }
+    const finalText = await this.bestFinalText(text);
+    if (!finalText) {
+      return false;
     }
     this.finalized = true;
+    this.logPartialSummary();
     if (this.preview && this.preview.isActive && !this.previewAbandoned) {
       try {
-        await this.preview.finalize(text);
-        return;
+        await this.preview.finalize(finalText);
+        this.log(`marmot: live preview finalized (${finalText.length} chars)`);
+        return true;
       } catch (error) {
         const reason =
           error instanceof NonAppendOnlyUpdateError ? "final_not_append_only" : "finalize_error";
@@ -163,7 +378,8 @@ export class MarmotReplySink {
         await this.abandonPreview(reason);
       }
     }
-    await this.sendFinal(text);
+    await this.sendFinal(finalText);
+    return true;
   }
 
   /**
@@ -177,12 +393,17 @@ export class MarmotReplySink {
     if (this.finalized) {
       return;
     }
-    if (!this.lastText) {
-      this.log("marmot: turn produced no deliverable reply");
+    this.log("marmot: no explicit final delivery; committing the streamed reply at turn end");
+    if (await this.commit(this.latestAnswerText)) {
       return;
     }
-    this.log("marmot: no explicit final delivery; committing the streamed reply at turn end");
-    await this.commit(this.lastText);
+    if (!this.latestAnswerText) {
+      this.log("marmot: turn produced no deliverable reply");
+      if (this.preview?.isActive) {
+        await this.abandonPreview("no_deliverable_reply");
+      }
+      return;
+    }
   }
 }
 
@@ -252,6 +473,7 @@ export function createMarmotInboundDispatcher(
     });
 
     const storePath = deps.runtimeChannel.session.resolveStorePath();
+    const dispatchStartedAt = Date.now();
     const sink = new MarmotReplySink({
       client: deps.client,
       accountIdHex: message.accountIdHex,
@@ -259,10 +481,17 @@ export function createMarmotInboundDispatcher(
       streamMode: deps.streamMode,
       quicCandidates: deps.quicCandidates,
       chunkBytes: deps.chunkBytes,
+      resolveFinalText: () =>
+        resolveLatestAssistantTextFromSessionStore({
+          storePath,
+          sessionKey: route.sessionKey,
+          startedAtMs: dispatchStartedAt,
+        }),
       log: deps.log,
     });
 
     deps.log?.("marmot: agent turn starting");
+    await sink.prewarm();
     await runChannelInboundEvent({
       channel: "marmot",
       accountId: message.accountIdHex,
@@ -287,6 +516,19 @@ export function createMarmotInboundDispatcher(
               dispatcherOptions: {
                 deliver: (payload: ReplyPayloadLike, info: ReplyDelivery) =>
                   sink.deliver(payload, info),
+              },
+              replyOptions: {
+                onPartialReply: (payload: PartialReplyPayloadLike) => sink.partial(payload),
+                onAssistantMessageStart: () => sink.status("Thinking..."),
+                onRunProgress: () => sink.status("Working..."),
+                onExecutionPhase: (info: { phase?: string; firstModelCallStarted?: boolean }) => {
+                  if (info.firstModelCallStarted || info.phase === "model_call_started") {
+                    return sink.status("Thinking...");
+                  }
+                  return undefined;
+                },
+                onToolStart: () => sink.progress("Working..."),
+                onCommandOutput: () => sink.progress("Working..."),
               },
             }) as never,
         }),

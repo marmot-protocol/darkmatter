@@ -110,6 +110,7 @@ services:
       MARMOT_AGENT_ALLOW_ANY: "1"
       MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
       MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
+      MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
       # The agent offers to publish a public Nostr profile name when it joins a
       # group (on by default; the user's in-chat reply is the consent). Uncomment
       # to disable that prompt:
@@ -151,6 +152,7 @@ services:
       MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: ws://nostr-rs-relay:8080
       MARMOT_QUIC_CANDIDATES: quic://quic-broker:4450
+      MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}

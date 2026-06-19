@@ -226,6 +226,14 @@ export class MarmotAgentControlClient {
     });
   }
 
+  async streamProgress(streamIdHex: string, text: string): Promise<Envelope> {
+    return this.request({
+      type: "stream_progress",
+      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+      text: String(text ?? ""),
+    });
+  }
+
   async streamFinalize(
     streamIdHex: string,
     finalText: string,
