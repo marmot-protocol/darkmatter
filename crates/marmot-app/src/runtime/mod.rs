@@ -568,8 +568,10 @@ pub struct GroupLeaveFailure {
 }
 
 /// A failed relay-side operation (currently KeyPackage deletion) during the
-/// wipe. `relay` is the opaque endpoint string the operation targeted and
-/// `reason` is a privacy-safe summary.
+/// wipe. `event_id_hex` identifies the KeyPackage event the deletion targeted
+/// (empty when the failure happened during discovery, before any specific
+/// event was known) and `reason` is a privacy-safe summary — it MUST NOT
+/// contain relay URLs, pubkeys, payloads, or key material.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayFailure {
     pub event_id_hex: String,
@@ -589,6 +591,34 @@ pub struct LocalCleanupReport {
     pub completed: bool,
     /// Failure summary when `completed` is `false`. Privacy-safe.
     pub reason: Option<String>,
+}
+
+/// Map an [`AppError`] to a stable, privacy-safe failure category for the
+/// app-facing [`WipeOutcome`] reports.
+///
+/// The wipe report fields are surfaced to the app (and over FFI) for a
+/// partial-failure sheet, so they must obey the same privacy contract as
+/// tracing: no relay URLs, pubkeys, group/account/message ids, paths,
+/// payloads, ciphertext, plaintext, or key material. Many `AppError` variants
+/// wrap transparent transport/storage/IO errors whose `Display` text can embed
+/// exactly those identifiers, so we never interpolate `err` here — we classify
+/// it into a fixed phrase instead.
+fn wipe_failure_reason(err: &AppError) -> String {
+    let category = match err {
+        AppError::RuntimeStopping => "runtime is shutting down",
+        AppError::Transport(_) | AppError::TransportClosed => "transport error",
+        AppError::Publish(_) => "relay publish failed",
+        AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
+            "local storage error"
+        }
+        AppError::Io(_) => "filesystem error",
+        AppError::Account(_) | AppError::AccountHome(_) => "account error",
+        AppError::Session(_) => "session error",
+        AppError::UnknownGroup(_) => "unknown local group",
+        AppError::MissingKeyPackage(_) => "no published key package",
+        _ => "operation failed",
+    };
+    category.to_owned()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1652,22 +1682,33 @@ impl MarmotAppRuntime {
     /// 1. Best-effort leave for every active MLS group. Failures are collected
     ///    per group and do not abort the wipe. This MUST happen while MLS state
     ///    still exists — once the session DB is wiped the engine can no longer
-    ///    sign leave messages.
+    ///    sign leave messages. "Active" here means *locally MLS-joined*, which
+    ///    in darkmatter includes groups still marked `pending_confirmation`: an
+    ///    incoming Welcome auto-joins MLS state before the user accepts, so a
+    ///    pending invite is a real committed membership this device must leave
+    ///    (the decline path leaves such groups too). Group-enumeration failures
+    ///    are surfaced as a recorded failure rather than silently dropped.
     /// 2. Best-effort delete of every relay-published KeyPackage event, always
     ///    (no toggle), mirroring the `delete_key_package` path.
     /// 3. Local cleanup (stages 3-5 of the spec): tear down the managed worker
     ///    and in-memory caches, then remove the account directory. In darkmatter
-    ///    that single `remove_dir_all` atomically drops the SQLCipher session
-    ///    database (MLS state + projections + cached media/source-epoch
-    ///    secrets), the on-disk KeyPackage material, and the SQL account record,
-    ///    and the secret store drops the nsec. Ephemeral relay/subscription
-    ///    state is held by the worker that was just shut down.
+    ///    `remove_account` first **atomically renames** the live account
+    ///    directory out of the active namespace and only then deletes the
+    ///    tombstoned bytes (the SQLCipher session database holding MLS state,
+    ///    projections, and cached media/source-epoch secrets, the on-disk
+    ///    KeyPackage material, and the SQL account record) plus the secret-store
+    ///    nsec. Ephemeral relay/subscription state is held by the worker that was
+    ///    just shut down.
     ///
     /// # Invariants
     /// - Stage 3 (local MLS-DB wipe) is all-or-nothing: `remove_account`
-    ///   removes the account directory in one `fs::remove_dir_all` so the MLS
-    ///   database is never left partially wiped. `local_cleanup.completed` is
-    ///   only `true` once that returns `Ok`.
+    ///   atomically renames the account directory out of the live namespace as
+    ///   its single commit point, so the MLS database is never observably left
+    ///   partially wiped — a live account either still fully exists (rename not
+    ///   done) or is entirely gone (rename done). `local_cleanup.completed` is
+    ///   only `false` when that rename never happened (nothing was wiped); once
+    ///   it succeeds the wipe completes even if deleting the orphaned tombstone
+    ///   bytes later fails.
     /// - After a successful wipe the `account_ref` is no longer valid for any
     ///   further runtime/FFI call.
     /// - Stages 1 and 2 are network-bound; their per-target failures are
@@ -1687,20 +1728,36 @@ impl MarmotAppRuntime {
 
         // Stage 1: best-effort leave for every active MLS group. We read the
         // group set directly from the in-memory account state (no relay round
-        // trip) and skip groups that are still pending welcome confirmation —
-        // those carry no committed MLS membership for this device to leave.
-        let groups = self.accounts.app.groups(&account.label).unwrap_or_default();
-        for group in groups {
-            if group.pending_confirmation {
-                continue;
+        // trip). We attempt the leave for *every* group with local MLS
+        // membership, including ones still marked `pending_confirmation`: in
+        // darkmatter an incoming Welcome auto-joins MLS state while the app
+        // keeps the invite pending until the user accepts, so a
+        // pending-confirmation group is already a committed MLS member this
+        // device can — and must — leave before its state is wiped (mirroring
+        // `decline_group_invite`, which leaves the group before archiving). If
+        // we skipped them, signing out before accepting an invite would wipe
+        // the local MLS state without ever publishing a leave, and the engine
+        // could never sign one afterwards. A failure to enumerate groups is a
+        // recorded failure, not a silent "no groups" — it must not let the wipe
+        // skip remote leaves without surfacing why.
+        let groups = match self.accounts.app.groups(&account.label) {
+            Ok(groups) => groups,
+            Err(err) => {
+                outcome.group_leave_failures.push(GroupLeaveFailure {
+                    group_id_hex: String::new(),
+                    reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
+                });
+                Vec::new()
             }
+        };
+        for group in groups {
             let group_id_hex = group.group_id_hex.clone();
             let group_id = match hex::decode(&group_id_hex) {
                 Ok(bytes) => GroupId::new(bytes),
-                Err(err) => {
+                Err(_) => {
                     outcome.group_leave_failures.push(GroupLeaveFailure {
                         group_id_hex,
-                        reason: format!("invalid group id: {err}"),
+                        reason: "invalid group id".to_owned(),
                     });
                     continue;
                 }
@@ -1709,7 +1766,7 @@ impl MarmotAppRuntime {
                 Ok(_) => outcome.groups_left += 1,
                 Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
                     group_id_hex,
-                    reason: err.to_string(),
+                    reason: wipe_failure_reason(&err),
                 }),
             }
         }
@@ -1737,14 +1794,17 @@ impl MarmotAppRuntime {
                         Ok(_) => outcome.key_packages_deleted += 1,
                         Err(err) => outcome.key_package_failures.push(RelayFailure {
                             event_id_hex,
-                            reason: err.to_string(),
+                            reason: wipe_failure_reason(&err),
                         }),
                     }
                 }
             }
             Err(err) => outcome.key_package_failures.push(RelayFailure {
                 event_id_hex: String::new(),
-                reason: format!("key package discovery failed: {err}"),
+                reason: format!(
+                    "key package discovery failed: {}",
+                    wipe_failure_reason(&err)
+                ),
             }),
         }
 
@@ -1762,7 +1822,7 @@ impl MarmotAppRuntime {
             Err(err) => {
                 outcome.local_cleanup = LocalCleanupReport {
                     completed: false,
-                    reason: Some(err.to_string()),
+                    reason: Some(wipe_failure_reason(&err)),
                 };
             }
         }

@@ -3827,6 +3827,78 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
 }
 
 #[tokio::test]
+async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
+    // Regression for darkmatter#478: an incoming Welcome auto-joins MLS state
+    // while the app keeps the invite `pending_confirmation` until accepted. A
+    // destructive wipe must still leave such a group before destroying the
+    // local MLS state — otherwise the account keeps a residual remote
+    // membership it can never sign a leave for once its keys are gone.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    // Alice invites Bob; Bob's runtime auto-joins the MLS group on the Welcome.
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "pending wipe",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    // Bob has never accepted, so the projection is still pending confirmation,
+    // yet the group is a real committed MLS membership.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert!(
+        pending.pending_confirmation,
+        "Bob's auto-joined invite should still be pending confirmation"
+    );
+
+    // Wiping Bob must leave that pending group (stage 1) before wiping local
+    // MLS state — exactly one group left, with no leave failure.
+    let outcome = runtime.sign_out_and_wipe(&bob_id).await.unwrap();
+    assert_eq!(
+        outcome.groups_left, 1,
+        "the pending-confirmation group must be left before the wipe"
+    );
+    assert!(
+        outcome.group_leave_failures.is_empty(),
+        "unexpected group leave failures: {:?}",
+        outcome.group_leave_failures
+    );
+    // Local cleanup is the all-or-nothing stage and must complete.
+    assert!(outcome.local_cleanup.completed);
+    assert!(outcome.local_cleanup.reason.is_none());
+
+    // The account is fully gone afterward.
+    assert!(runtime.accounts().resolve(&bob_id).is_err());
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_sign_out_and_wipe_rejects_unknown_account() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, _url) = mock_app(&dir).await;
