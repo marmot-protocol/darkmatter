@@ -32,7 +32,10 @@
             "items": { "type": "string" },
             "description": "quic:// preview broker candidates for live previews."
           },
-          "streaming": { "type": "boolean", "description": "Enable live QUIC previews (default true)." },
+          "streaming": {
+            "type": ["object", "boolean"],
+            "description": "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean for legacy on/off)."
+          },
           "profileNameOnboarding": { "type": "boolean" },
           "dm": {
             "type": "object",

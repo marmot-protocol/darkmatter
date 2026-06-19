@@ -11,6 +11,15 @@ import { MarmotAgentControlClient } from "./client.js";
 
 export const DEFAULT_MARMOT_HOME = "~/.marmot";
 
+/** OpenClaw preview-streaming mode (we map any non-"off" mode onto QUIC previews). */
+export type StreamMode = "off" | "partial" | "block" | "progress";
+
+/** The subset of OpenClaw's `channels.<id>.streaming` object we read. */
+export interface MarmotStreamingConfig {
+  mode?: StreamMode;
+  block?: { enabled?: boolean };
+}
+
 /** Per-account channel config (also the shape validated by the manifest schema). */
 export interface MarmotChannelAccountConfig {
   home?: string;
@@ -20,7 +29,7 @@ export interface MarmotChannelAccountConfig {
   authTokenFile?: string;
   groupIdHex?: string;
   quicCandidates?: string[] | string;
-  streaming?: boolean;
+  streaming?: MarmotStreamingConfig | boolean;
   profileNameOnboarding?: boolean;
   dm?: {
     enabled?: boolean;
@@ -37,7 +46,7 @@ export interface ResolvedMarmotAccount {
   marmotAccountIdHex?: string;
   groupIdHex?: string;
   quicCandidates: string[];
-  streaming: boolean;
+  streamMode: StreamMode;
   profileNameOnboarding: boolean;
   profileOnboardingStatePath: string;
   dmPolicy?: string;
@@ -66,7 +75,11 @@ const MARMOT_ACCOUNT_PROPERTIES = {
     items: { type: "string" },
     description: "quic:// preview broker candidates for live previews.",
   },
-  streaming: { type: "boolean", description: "Enable live QUIC previews (default true)." },
+  streaming: {
+    type: ["object", "boolean"],
+    description:
+      "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean accepted for legacy on/off).",
+  },
   profileNameOnboarding: { type: "boolean" },
   dm: {
     type: "object",
@@ -142,6 +155,36 @@ function parseBoolEnv(value: string | undefined): boolean | undefined {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+function normalizeStreamMode(value: string | undefined): StreamMode | undefined {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "off" || v === "partial" || v === "block" || v === "progress" ? v : undefined;
+}
+
+/**
+ * Resolve the preview-streaming mode. OpenClaw drives previews through the
+ * channel's reply `deliver` callback, gated on this mode (see src/dispatch.ts);
+ * any non-"off" mode runs the QUIC preview (our preview is append-only, so the
+ * `block` append style is the natural default). A boolean is accepted for the
+ * legacy on/off knob. Defaults on so previews fire wherever QUIC candidates and
+ * block streaming are configured.
+ */
+function resolveStreamMode(
+  streaming: MarmotStreamingConfig | boolean | undefined,
+  envMode: string | undefined,
+): StreamMode {
+  const fromEnv = normalizeStreamMode(envMode);
+  if (fromEnv) {
+    return fromEnv;
+  }
+  if (typeof streaming === "boolean") {
+    return streaming ? "block" : "off";
+  }
+  if (streaming && typeof streaming === "object") {
+    return normalizeStreamMode(streaming.mode) ?? "block";
+  }
+  return "block";
+}
+
 /**
  * Resolve the dm-agent connection + policy for an OpenClaw account, layering
  * channel config over MARMOT_* environment variables (config wins).
@@ -190,7 +233,7 @@ export function resolveMarmotAccount(
     marmotAccountIdHex: firstNonEmpty(cfg.accountIdHex, env.MARMOT_ACCOUNT_ID_HEX),
     groupIdHex: firstNonEmpty(cfg.groupIdHex, env.MARMOT_GROUP_ID_HEX),
     quicCandidates,
-    streaming: cfg.streaming ?? true,
+    streamMode: resolveStreamMode(cfg.streaming, env.MARMOT_STREAM_MODE),
     // On by default: the agent always offers to publish a profile on join; the
     // user's in-chat choice is the consent. Operators can disable it explicitly.
     profileNameOnboarding:

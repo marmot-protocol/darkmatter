@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { StreamMode } from "../src/config.js";
 import { MarmotReplySink, type MarmotSinkClient } from "../src/dispatch.js";
 
 const HEX32 = (b: string) => b.repeat(32);
@@ -52,13 +53,13 @@ function stubClient(calls: Calls): MarmotSinkClient {
 
 function makeSink(
   calls: Calls,
-  opts: { streaming?: boolean; quicCandidates?: string[] } = {},
+  opts: { streamMode?: StreamMode; quicCandidates?: string[] } = {},
 ): MarmotReplySink {
   return new MarmotReplySink({
     client: stubClient(calls),
     accountIdHex: HEX32("aa"),
     groupIdHex: HEX32("cc"),
-    streaming: opts.streaming ?? true,
+    streamMode: opts.streamMode ?? "block",
     quicCandidates: opts.quicCandidates ?? ["quic://broker:4450"],
   });
 }
@@ -88,7 +89,7 @@ describe("MarmotReplySink", () => {
 
   it("ignores blocks and sends a plain final when streaming is off", async () => {
     const calls = emptyCalls();
-    const sink = makeSink(calls, { streaming: false });
+    const sink = makeSink(calls, { streamMode: "off" });
     await sink.deliver({ text: "hel" }, { kind: "block" });
     await sink.deliver({ text: "done" }, { kind: "final" });
     expect(calls.begin).toBe(0);

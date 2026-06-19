@@ -17,6 +17,7 @@ import {
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
 import type { MarmotAgentControlClient } from "./client.js";
+import type { StreamMode } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
 
@@ -39,7 +40,7 @@ export interface MarmotReplySinkOptions {
   accountIdHex: string;
   groupIdHex: string;
   replyToMessageIdHex?: string | null;
-  streaming: boolean;
+  streamMode: StreamMode;
   quicCandidates: string[];
   chunkBytes?: number;
 }
@@ -58,7 +59,7 @@ export class MarmotReplySink {
   constructor(private readonly options: MarmotReplySinkOptions) {}
 
   private get streamingEnabled(): boolean {
-    return this.options.streaming && this.options.quicCandidates.length > 0;
+    return this.options.streamMode !== "off" && this.options.quicCandidates.length > 0;
   }
 
   private ensurePreview(): MarmotLivePreview {
@@ -156,7 +157,7 @@ export interface MarmotDispatchDeps {
   /** `api.runtime.channel`. */
   runtimeChannel: OpenClawChannelRuntime;
   client: MarmotSinkClient;
-  streaming: boolean;
+  streamMode: StreamMode;
   quicCandidates: string[];
   chunkBytes?: number;
 }
@@ -198,7 +199,7 @@ export function createMarmotInboundDispatcher(
       client: deps.client,
       accountIdHex: message.accountIdHex,
       groupIdHex: message.groupIdHex,
-      streaming: deps.streaming,
+      streamMode: deps.streamMode,
       quicCandidates: deps.quicCandidates,
       chunkBytes: deps.chunkBytes,
     });

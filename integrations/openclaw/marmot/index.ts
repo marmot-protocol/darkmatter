@@ -41,7 +41,7 @@ export default defineChannelPluginEntry({
         cfg: api.config,
         runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
         client: clientForAccount(resolved),
-        streaming: resolved.streaming,
+        streamMode: resolved.streamMode,
         quicCandidates: resolved.quicCandidates,
       });
 

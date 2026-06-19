@@ -101,9 +101,18 @@ const fs = require("fs");
 const p = process.argv[1];
 const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
 cfg.channels = cfg.channels || {};
-cfg.channels.marmot = { ...(cfg.channels.marmot || {}), enabled: true };
+// Enable the channel + live QUIC previews. streaming.mode gates our preview and
+// streaming.block.enabled + agents.defaults.blockStreamingDefault make OpenClaw
+// emit the progressive block deliveries the preview is built from.
+cfg.channels.marmot = {
+  ...(cfg.channels.marmot || {}),
+  enabled: true,
+  streaming: { mode: "block", block: { enabled: true } },
+};
+cfg.agents = cfg.agents || {};
+cfg.agents.defaults = { ...(cfg.agents.defaults || {}), blockStreamingDefault: "on" };
 fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
-' "$openclaw_config" && echo "marmot: enabled channels.marmot in OpenClaw config"
+' "$openclaw_config" && echo "marmot: enabled channels.marmot (+ live previews) in OpenClaw config"
 fi
 
 exec openclaw gateway run

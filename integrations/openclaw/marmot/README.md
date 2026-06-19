@@ -83,7 +83,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `accountIdHex` | `MARMOT_ACCOUNT_ID_HEX` | sole local account |
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
-| `streaming` | — | `true` |
+| `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (off/partial/block/progress) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
@@ -104,7 +104,12 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
   update cancels the preview and sends the final verbatim. The transcript hash +
   chunk count match `dm-agent` byte-for-byte (Rust-anchored parity test in
-  `test/transcript.test.ts`). Enable with the `streaming` + `quicCandidates` config.
+  `test/transcript.test.ts`). Previews run whenever `streaming.mode` is not
+  `off` and `quicCandidates` are set, and OpenClaw is emitting progressive
+  blocks (`streaming.block.enabled` or `agents.defaults.blockStreamingDefault:
+  "on"`) — the docker phone test configures all of this. Like a Telegram preview,
+  this is driven by the channel's reply `deliver` callback, not a core-driven
+  live adapter (that SDK seam does not exist yet).
 - **Allowlist mirroring**: on startup the plugin mirrors the configured
   `channels.marmot.dm.allowFrom` (hex account ids) into `dm-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist

@@ -20,7 +20,7 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.socketPath).toBe("/home/agent/.marmot/dev/dm-agent.sock");
     expect(resolved.marmotAccountIdHex).toBe("aa");
     expect(resolved.quicCandidates).toEqual(["quic://a:1", "quic://b:2"]);
-    expect(resolved.streaming).toBe(true);
+    expect(resolved.streamMode).toBe("block");
     expect(resolved.accountId).toBe("openclaw-acct");
   });
 
@@ -33,7 +33,7 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.socketPath).toBe("/tmp/x.sock");
     expect(resolved.marmotAccountIdHex).toBe("bb");
     expect(resolved.quicCandidates).toEqual(["quic://c:3"]);
-    expect(resolved.streaming).toBe(false);
+    expect(resolved.streamMode).toBe("off");
   });
 
   it("derives the socket path from MARMOT_HOME", () => {
