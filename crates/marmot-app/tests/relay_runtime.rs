@@ -3752,3 +3752,90 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
         "profile should be retrievable from the account's nip65 (home) relay"
     );
 }
+
+#[tokio::test]
+async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let home = AccountHome::open(dir.path());
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let account_id = created.account.account_id_hex.clone();
+
+    // The initial KeyPackage was published to the relay during setup, so the
+    // wipe's stage-2 discovery should find and delete at least one.
+    let before = runtime
+        .account_key_packages(&account_id, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    assert!(
+        before.iter().any(|pkg| pkg.relay),
+        "setup should leave a relay-published key package to delete"
+    );
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    // No groups joined, so nothing to leave and no leave failures.
+    assert_eq!(outcome.groups_left, 0);
+    assert!(outcome.group_leave_failures.is_empty());
+    // The published key package is deleted with no per-relay failures.
+    assert!(
+        outcome.key_packages_deleted >= 1,
+        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted
+    );
+    assert!(
+        outcome.key_package_failures.is_empty(),
+        "unexpected key package failures: {:?}",
+        outcome.key_package_failures
+    );
+    // Local cleanup is the all-or-nothing stage and must complete.
+    assert!(outcome.local_cleanup.completed);
+    assert!(outcome.local_cleanup.reason.is_none());
+
+    // The account is gone from both the runtime view and on-disk storage.
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .into_iter()
+            .all(|account| account.account_id_hex != account_id),
+        "wiped account must not remain managed"
+    );
+    assert!(
+        home.accounts()
+            .unwrap()
+            .into_iter()
+            .all(|account| account.account_id_hex != account_id),
+        "wiped account directory must be removed"
+    );
+
+    // Stage 5 invariant: the account ref is no longer valid for any FFI call.
+    assert!(runtime.accounts().resolve(&account_id).is_err());
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_and_wipe_rejects_unknown_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+
+    // A ref that resolves to no account must error rather than report a
+    // successful (empty) wipe.
+    let missing = "0".repeat(64);
+    assert!(runtime.sign_out_and_wipe(&missing).await.is_err());
+
+    runtime.shutdown().await;
+}
