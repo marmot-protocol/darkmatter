@@ -48,14 +48,17 @@ The eligible committer list is:
 3. remove members that are not allowed to commit the resulting state;
 4. sort the remaining members by increasing MLS leaf index.
 
-The member at position `0` in that list is the first-round committer and SHOULD auto-commit the proposal promptly when
-the group lifecycle permits local group-state commits.
+Initially, eligible member position `0` SHOULD auto-commit the proposal promptly when the group lifecycle permits
+local group-state commits.
 
 If no accepted commit consumes the SelfRemove, later members MAY auto-commit through deterministic fallback rounds:
 
 - round `0` selects eligible member position `0`;
 - round `1` selects eligible member position `1` after one fallback quiescence window;
 - round `n` selects eligible member position `n` after `n` fallback quiescence windows.
+
+If a fallback round has no eligible member at its selected position, automatic fallback rounds are exhausted. The retained
+SelfRemove then awaits an explicit user or recovery action; this draft defines no further automatic committer.
 
 The fallback quiescence window is the pinned convergence-policy `settlement_quiescence_ms`. It is a local scheduling
 gate only: it tells a client when it is allowed to try a later-round commit. It MUST NOT enter branch scoring, same-epoch
