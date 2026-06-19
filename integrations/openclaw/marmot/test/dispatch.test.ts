@@ -156,6 +156,44 @@ describe("MarmotReplySink", () => {
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["hello world"]);
   });
 
+  it("commits the streamed reply at flush when the turn sends blocks but no final", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    // Block streaming delivered the whole answer as one block, with no trailing
+    // `final` delivery — the live preview must still be finalized durably.
+    await sink.deliver({ text: "the full answer" }, { kind: "block" });
+    await sink.flush();
+
+    expect(calls.begin).toBe(1);
+    expect(calls.append).toEqual(["the full answer"]);
+    expect(calls.finalize).toHaveLength(1);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("flush sends a plain final for a blocks-only turn when streaming is off", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls, { streamMode: "off" });
+    await sink.deliver({ text: "the answer" }, { kind: "block" });
+    await sink.flush();
+
+    expect(calls.begin).toBe(0);
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["the answer"]);
+  });
+
+  it("flush is a no-op once a final delivery has committed the reply", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls);
+    await sink.deliver({ text: "answer" }, { kind: "final" });
+    await sink.flush();
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["answer"]);
+  });
+
+  it("flush sends nothing when the turn produced no reply", async () => {
+    const calls = emptyCalls();
+    await makeSink(calls).flush();
+    expect(calls).toEqual(emptyCalls());
+  });
+
   it("ignores tool deliveries", async () => {
     const calls = emptyCalls();
     await makeSink(calls).deliver({ text: "searching..." }, { kind: "tool" });

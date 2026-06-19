@@ -59,6 +59,10 @@ export class MarmotReplySink {
   private previewAbandoned = false;
   /** Reply deliveries received from the dispatcher this turn (diagnostic). */
   deliveries = 0;
+  /** Latest full reply text seen; used to commit a blocks-only turn at flush(). */
+  private lastText = "";
+  /** Whether the durable reply has been committed (stream_finalize or send_final). */
+  private finalized = false;
 
   constructor(private readonly options: MarmotReplySinkOptions) {}
 
@@ -114,16 +118,20 @@ export class MarmotReplySink {
       return;
     }
 
+    // Remember the latest full reply text so a turn that streams blocks but
+    // never sends an explicit `final` can still be committed durably at flush().
+    this.lastText = text;
+
     if (info.kind === "block") {
       if (!this.streamingEnabled || this.previewAbandoned) {
-        return; // folded into the final send
+        return; // recorded in lastText; committed by the final delivery or flush()
       }
       try {
         await this.ensurePreview().update(text);
       } catch (error) {
         // Any preview failure — non-append-only text, or a QUIC/broker error —
-        // abandons the live preview. The full text is still delivered as a plain
-        // durable final below, so a streaming hiccup never drops the reply.
+        // abandons the live preview. The full text is still delivered durably by
+        // the final delivery or flush(), so a streaming hiccup never drops it.
         const reason =
           error instanceof NonAppendOnlyUpdateError ? "non_append_only" : "preview_error";
         this.log(`marmot: live preview abandoned (${reason}); will send the final durably`);
@@ -132,7 +140,18 @@ export class MarmotReplySink {
       return;
     }
 
-    // final
+    await this.commit(text);
+  }
+
+  /**
+   * Commit the durable reply exactly once: finalize an active live preview into
+   * a stream-final, otherwise send a plain durable final.
+   */
+  private async commit(text: string): Promise<void> {
+    if (this.finalized) {
+      return;
+    }
+    this.finalized = true;
     if (this.preview && this.preview.isActive && !this.previewAbandoned) {
       try {
         await this.preview.finalize(text);
@@ -145,6 +164,25 @@ export class MarmotReplySink {
       }
     }
     await this.sendFinal(text);
+  }
+
+  /**
+   * Commit the reply once the agent turn has finished. Block streaming can
+   * deliver the whole reply as `block`s with no trailing `final`; without this
+   * the live preview would never be finalized and no durable kind:9 would land.
+   * A no-op once a `final` delivery already committed, or if the turn produced
+   * no text at all.
+   */
+  async flush(): Promise<void> {
+    if (this.finalized) {
+      return;
+    }
+    if (!this.lastText) {
+      this.log("marmot: turn produced no deliverable reply");
+      return;
+    }
+    this.log("marmot: no explicit final delivery; committing the streamed reply at turn end");
+    await this.commit(this.lastText);
   }
 }
 
@@ -254,6 +292,9 @@ export function createMarmotInboundDispatcher(
         }),
       },
     });
+    // Block streaming can finish a turn with only `block` deliveries; commit the
+    // accumulated reply durably if no explicit `final` did.
+    await sink.flush();
     deps.log?.(`marmot: agent turn done (sink deliveries=${sink.deliveries})`);
   };
 }
