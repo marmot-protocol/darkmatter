@@ -260,7 +260,7 @@ inside the epoch. Implementations MAY derive it more than once for send, watch, 
 keys MUST be derived through `AgentTextStreamKeyContextV1`; implementations MUST NOT use `stream_secret` directly as an
 AEAD key.
 
-`AgentTextStreamKeyContextV1` uses Marmot canonical length encoding:
+`AgentTextStreamKeyContextV1` uses Marmot canonical encoding:
 
 ```text
 struct {
@@ -268,7 +268,7 @@ struct {
   opaque group_id<1..1024>;
   opaque stream_id[32];
   uint64 mls_epoch;
-  opaque sender_id<1..1024>;
+  opaque sender_id[32];
   opaque start_event_id[32];
 } AgentTextStreamKeyContextV1;
 ```
@@ -289,9 +289,9 @@ ct    = AEAD_Encrypt(record_key, nonce, aad, plaintext_frame)
 struct {
   uint8  version = 1;
   opaque group_id_hash[32];
-  opaque stream_id<1..64>;
+  opaque stream_id[32];
   uint64 mls_epoch;
-  opaque sender_id<1..1024>;
+  opaque sender_id[32];
   uint64 seq;
   uint8  record_type;
   uint8  flags;
@@ -301,8 +301,8 @@ struct {
 The AAD is the canonical encoding of `AgentTextStreamRecordAadV1` and binds records to the group, sender, epoch, stream
 id, sequence number, type, and flags. The raw group id is not sent on the wire; `group_id_hash` is `SHA-256(group_id)`,
 the 32-byte digest of the raw MLS group id. `version` is the record wire version — the single byte `0x01`, never the
-`"v1"` key-context text bytes. The first text profile still requires `stream_id` to be exactly 32 bytes. Fixed test
-vectors for the AAD bytes and record encryption will be published with the conformance fixtures.
+`"v1"` key-context text bytes. The `stream_id` and `sender_id` fields are fixed 32-byte values in this profile. Fixed
+test vectors for the AAD bytes and record encryption will be published with the conformance fixtures.
 
 ## Preview authenticity
 
