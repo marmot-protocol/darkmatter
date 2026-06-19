@@ -16,10 +16,17 @@ export interface MarmotInboundMessage {
   text: string;
 }
 
+export interface MarmotGroupInvite {
+  accountIdHex: string;
+  groupIdHex: string;
+}
+
 export interface MarmotInboundBridgeOptions {
   accountIdHex?: string | null;
   groupIdHex?: string | null;
   onMessage: (message: MarmotInboundMessage) => void | Promise<void>;
+  /** The agent joined a group via a welcome (used to greet/onboard on join). */
+  onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
   onResync?: (info: { droppedEvents: number }) => void | Promise<void>;
   onError?: (error: unknown) => void;
   reconnectDelayMs?: number;
@@ -110,6 +117,13 @@ export class MarmotInboundBridge {
   private async handle(event: AgentControlEvent): Promise<void> {
     if (event.type === "resync_required") {
       await this.options.onResync?.({ droppedEvents: event.dropped_events });
+      return;
+    }
+    if (event.type === "group_invite") {
+      await this.options.onGroupInvite?.({
+        accountIdHex: event.account_id_hex,
+        groupIdHex: event.group_id_hex,
+      });
       return;
     }
     if (event.type !== "inbound_message") {

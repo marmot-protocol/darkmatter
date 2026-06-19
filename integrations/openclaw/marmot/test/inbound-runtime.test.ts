@@ -35,7 +35,12 @@ describe("startMarmotInbound", () => {
       resolveFirst = resolve;
     });
 
-    const api: InboundPluginApi = { config: {}, logger: noopLogger };
+    // Disable profile onboarding so this exercises the dispatch path directly
+    // (onboarding is on by default and would intercept the first message).
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
     const stop = startMarmotInbound(
       api,
       (message) => {

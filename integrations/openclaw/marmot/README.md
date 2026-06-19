@@ -84,7 +84,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
 | `streaming` | — | `true` |
-| `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `false` |
+| `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
 The default control socket is same-UID only (parent dir `0700`, socket `0600`,
@@ -110,12 +110,14 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   allowlist (a no-op when none is configured, so it never wipes an allowlist
   managed directly on `dm-agent`). `dm-agent` still performs welcomer-based
   post-join accept/decline.
-- **Profile-name onboarding** (`src/profile-onboarding.ts`, opt-in via
-  `profileNameOnboarding`, default off): gives the agent a public Nostr profile
-  (`kind:0`) name. If the OpenClaw agent has a configured `name`, it is inherited
-  and published silently on first contact; otherwise the agent asks once in-chat
-  ("reply with a name, or reply `skip`") before publishing anything public.
-  Per-account status is persisted (`$MARMOT_HOME/dev/profile-onboarding.json`,
+- **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
+  disable with `profileNameOnboarding: false`): when the agent joins a group it
+  asks, on its own, whether to publish a public Nostr profile (`kind:0`) name —
+  offering the configured OpenClaw agent `name` as the default ("reply `yes`, a
+  different name, or `skip`"), or asking for a name when none is configured.
+  Nothing is published until the user replies (that reply is the consent). A
+  first message in a group the agent already joined triggers the same prompt as a
+  fallback. Per-account status is persisted (`$MARMOT_HOME/dev/profile-onboarding.json`,
   override with `MARMOT_PROFILE_ONBOARDING_STATE`) so it never re-asks.
 
 The inbound→agent and live-preview paths are typechecked against the SDK and

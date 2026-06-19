@@ -110,10 +110,10 @@ services:
       MARMOT_AGENT_ALLOW_ANY: "1"
       MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
       MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
-      # Exercise the public profile-name onboarding flow in the phone test
-      # (set to 0 to disable). Publishes a kind:0 only after inheriting a
-      # configured agent name or an in-chat consent reply.
-      MARMOT_PROFILE_NAME_ONBOARDING: "1"
+      # The agent offers to publish a public Nostr profile name when it joins a
+      # group (on by default; the user's in-chat reply is the consent). Uncomment
+      # to disable that prompt:
+      # MARMOT_PROFILE_NAME_ONBOARDING: "0"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}

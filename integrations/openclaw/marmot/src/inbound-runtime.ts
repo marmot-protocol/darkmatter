@@ -16,7 +16,8 @@ import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
 import { MarmotInboundBridge, type MarmotInboundMessage } from "./inbound.js";
 import {
-  maybeHandleProfileOnboarding,
+  maybeHandleProfileOnboardingInbound,
+  maybeSendProfilePromptOnJoin,
   ProfileNameOnboardingStore,
 } from "./profile-onboarding.js";
 import { syncAllowlist } from "./security.js";
@@ -99,7 +100,7 @@ export function startMarmotInbound(
       groupIdHex: resolved.groupIdHex ?? null,
       onMessage: async (message) => {
         if (onboardingStore) {
-          const intercepted = await maybeHandleProfileOnboarding({
+          const intercepted = await maybeHandleProfileOnboardingInbound({
             store: onboardingStore,
             client,
             message: {
@@ -118,6 +119,19 @@ export function startMarmotInbound(
         api.logger.info("marmot: inbound message received; dispatching agent turn");
         await dispatch(message);
       },
+      onGroupInvite: onboardingStore
+        ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {
+            // Greet on join: offer to publish a public profile name (once).
+            await maybeSendProfilePromptOnJoin({
+              store: onboardingStore,
+              client,
+              accountIdHex: joinedAccountIdHex,
+              groupIdHex: joinedGroupIdHex,
+              configuredName: options.configuredAgentName ?? null,
+              logger: api.logger,
+            }).catch(() => undefined);
+          }
+        : undefined,
       onResync: ({ droppedEvents }) => {
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,

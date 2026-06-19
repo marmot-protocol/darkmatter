@@ -191,8 +191,10 @@ export function resolveMarmotAccount(
     groupIdHex: firstNonEmpty(cfg.groupIdHex, env.MARMOT_GROUP_ID_HEX),
     quicCandidates,
     streaming: cfg.streaming ?? true,
+    // On by default: the agent always offers to publish a profile on join; the
+    // user's in-chat choice is the consent. Operators can disable it explicitly.
     profileNameOnboarding:
-      cfg.profileNameOnboarding ?? parseBoolEnv(env.MARMOT_PROFILE_NAME_ONBOARDING) ?? false,
+      cfg.profileNameOnboarding ?? parseBoolEnv(env.MARMOT_PROFILE_NAME_ONBOARDING) ?? true,
     profileOnboardingStatePath,
     dmPolicy: cfg.dm?.policy,
     allowFrom: cfg.dm?.allowFrom ?? [],
