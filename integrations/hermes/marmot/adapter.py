@@ -886,6 +886,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Dedupe repeated ambient surfacings (deletion / group-state change) by a
         # context key (mirror inbound.ts contextKeys).
         self._recent_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
+        # Pending quiet next-turn ambient context, keyed by group id. Ambient
+        # events (a deletion, a group-state change) are NOT reply triggers: they
+        # are buffered here and prepended to the next real inbound message for
+        # that group as channel_context, so the agent sees the fact on its next
+        # turn without an ambient event spuriously starting an agent turn of its
+        # own. Mirrors OpenClaw's quiet-next-turn surfacer (inbound-runtime.ts);
+        # when no message follows, the fact is only logged (also OpenClaw parity).
+        self._pending_ambient_context: Dict[str, list[str]] = {}
         # Optional inbound debounce: coalesce rapid same-(account,group,sender)
         # bursts into one turn. Disabled when debounce_ms <= 0.
         self._debounce_pending: Dict[str, list[Dict[str, Any]]] = {}
@@ -930,6 +938,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         await self._inbound_queue.cancel_all()
         await self._cancel_all_streams("adapter disconnect")
         self._cancel_debounce_tasks()
+        self._pending_ambient_context.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._mark_disconnected()
@@ -1480,7 +1489,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         while True:
             try:
                 await self._consume_inbound_once(on_established=lambda: None)
-                attempt = 0
             except asyncio.CancelledError:
                 raise
             except _ResyncRequired as exc:
@@ -1493,10 +1501,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Marmot inbound subscription failed, retrying: %s", exc)
             else:
-                continue
+                # A clean return means the subscription was dropped (the connector
+                # closed the inbound stream with a normal EOF rather than an error).
+                # That is still a reconnect, NOT a success: fall through to the same
+                # backoff path as an error so a socket that accepts-acks-then-closes
+                # cannot pin us in a hot resubscribe loop (mirrors OpenClaw's
+                # MarmotInboundBridge.run(), which backs off after stream completion
+                # too). The _inbound_established check below keeps an established-then-
+                # idle subscription reconnecting promptly.
+                logger.debug("Marmot inbound subscription closed cleanly, reconnecting")
             # Reset the attempt counter whenever the subscription was healthy
             # (it established and yielded/acked at least once) so the next failure
-            # starts the backoff fresh.
+            # starts the backoff fresh; a subscription that never established (e.g.
+            # an immediate clean EOF) backs off geometrically instead of spinning.
             if self._inbound_established:
                 attempt = 0
             delay_ms = reconnect_backoff_ms(attempt, effective_base_ms, cap_ms, rand=rand)
@@ -1621,6 +1638,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 raw_message=event,
                 message_id=message_id_hex,
             )
+            # Attach any buffered quiet ambient context (a deletion / group-state
+            # change observed since the last turn) as channel_context. The runner
+            # prepends channel_context to the trigger text as context without it
+            # being a trigger itself, so the fact reaches the agent on this turn.
+            # Set via setattr so the adapter stays compatible with a MessageEvent
+            # build that predates the channel_context field.
+            ambient = self._take_pending_ambient_context(group_id_hex)
+            if ambient and hasattr(hermes_event, "channel_context"):
+                hermes_event.channel_context = ambient
             await self.handle_message(hermes_event)
         except asyncio.CancelledError:
             raise
@@ -1704,31 +1730,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._recent_ambient_keys.add(context_key)
 
         group_id_hex = str(event.get("group_id_hex") or "")
-        # Deliver as a non-triggering ambient/system MessageEvent: raw_message
-        # flags it as ambient so the gateway treats it as quiet next-turn context
-        # rather than a reply trigger. (Hermes' MessageEvent/handle_message
-        # contract has no dedicated ambient channel here, so flag in raw_message —
-        # see the change summary.)
-        source = self.build_source(
-            chat_id=group_id_hex,
-            chat_name=f"Marmot {group_id_hex[:12]}",
-            chat_type="group",
-            user_id="marmot-system",
-            user_name="Marmot",
-            message_id=None,
-        )
-        hermes_event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message={
-                "type": event.get("type"),
-                "marmot_ambient": True,
-                "context_key": context_key,
-            },
-            message_id=None,
-        )
-        await self.handle_message(hermes_event)
+        # Quiet next-turn context: an ambient event is NEVER a reply trigger, so
+        # do NOT route it through handle_message() (which would start/queue an
+        # agent turn). Hermes' BasePlatformAdapter has no system-event surface
+        # (unlike OpenClaw's api.runtime.system.enqueueSystemEvent), so we mirror
+        # OpenClaw's quiet-context behavior by buffering the sentence per group
+        # and prepending it to the NEXT real inbound message's channel_context.
+        # If no message ever follows, the fact is only logged — matching
+        # OpenClaw's "when omitted, those events are only logged" degraded mode.
+        self._pending_ambient_context.setdefault(group_id_hex, []).append(text)
+
+    def _take_pending_ambient_context(self, group_id_hex: str) -> Optional[str]:
+        # Drain and join the buffered ambient sentences for a group. Returns None
+        # when nothing is pending so callers can leave channel_context unset.
+        pending = self._pending_ambient_context.pop(group_id_hex, None)
+        if not pending:
+            return None
+        return "\n".join(pending)
 
     async def _maybe_handle_profile_name_onboarding(self, event: Dict[str, Any]) -> bool:
         store = self.profile_name_onboarding

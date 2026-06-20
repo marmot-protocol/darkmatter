@@ -52,6 +52,9 @@ def install_fake_hermes_modules():
         message_id: str | None = None
         media_urls: list = field(default_factory=list)
         media_types: list = field(default_factory=list)
+        # Quiet next-turn context prepended to the trigger text by the runner;
+        # never a trigger itself. Mirrors gateway.platforms.base.MessageEvent.
+        channel_context: str | None = None
 
     class Platform:
         def __init__(self, value):
@@ -2076,7 +2079,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sentence("group_avatar_changed"), "The group avatar was changed.")
         self.assertEqual(sentence("something_else"), "The group state changed.")
 
-    async def test_ambient_events_surface_quietly_and_dedupe(self):
+    async def test_ambient_events_are_quiet_and_attach_to_next_inbound(self):
+        # Ambient events (a deletion, a group-state change) must NEVER start an
+        # agent turn. They are buffered per group and prepended to the next real
+        # inbound message for that group as channel_context. A duplicate deletion
+        # is deduped by context key.
         events = [
             {
                 "type": "message_deleted",
@@ -2099,6 +2106,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "change": "group_renamed",
                 "detail": "Crew",
             },
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": "a1" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "hello there",
+            },
         ]
 
         class FakeClient:
@@ -2107,15 +2122,56 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     yield value
 
         adapter = self._adapter(FakeClient())
+        await adapter._consume_inbound_once(drain=True)
+
+        # Only the real inbound message reached handle_message (one agent turn);
+        # the three ambient events did NOT trigger turns of their own.
+        self.assertEqual(len(adapter.events), 1)
+        triggered = adapter.events[0]
+        self.assertEqual(triggered.text, "hello there")
+        # No ambient event masquerades as a triggering message: the dispatched
+        # event is a normal inbound_message, never an ambient flag.
+        self.assertEqual(triggered.raw_message.get("type"), "inbound_message")
+        self.assertNotIn("marmot_ambient", triggered.raw_message)
+        # The two distinct ambient facts (deletion deduped to one, rename) are
+        # carried as quiet channel_context on the next inbound turn, in order.
+        self.assertEqual(
+            triggered.channel_context,
+            'A message was deleted.\nThe group was renamed to "Crew".',
+        )
+        # Buffer was drained: a second message in the group carries no stale context.
+        self.assertEqual(adapter._take_pending_ambient_context("22" * 32), None)
+
+    async def test_ambient_event_never_invokes_message_handler(self):
+        # Regression guard for the adversarial finding: an ambient event must not
+        # call handle_message(). If only ambient events arrive (no inbound text),
+        # no agent turn is ever started and the fact is merely buffered/logged.
+        handler_calls = []
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                yield {
+                    "type": "message_deleted",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                    "target_message_id_hex": "33" * 32,
+                    "sender_account_id_hex": "44" * 32,
+                }
+
+        adapter = self._adapter(FakeClient())
+
+        async def fail_if_called(event):
+            handler_calls.append(event)
+
+        adapter.handle_message = fail_if_called  # type: ignore[assignment]
         await adapter._consume_inbound_once()
 
-        # Duplicate deletion deduped; deletion + rename surfaced once each.
-        self.assertEqual(len(adapter.events), 2)
-        deletion, rename = adapter.events
-        self.assertEqual(deletion.text, "A message was deleted.")
-        self.assertTrue(deletion.raw_message.get("marmot_ambient"))
-        self.assertEqual(rename.text, 'The group was renamed to "Crew".')
-        self.assertTrue(rename.raw_message.get("marmot_ambient"))
+        self.assertEqual(handler_calls, [], "ambient event must not invoke handle_message")
+        # The fact is buffered for a later real message rather than dropped.
+        self.assertEqual(
+            adapter._take_pending_ambient_context("22" * 32),
+            "A message was deleted.",
+        )
 
     # --- Behavior 6: optional debounce coalescing preserves mentions+media ----
     async def test_debounce_coalesces_and_preserves_mentions_and_media(self):
@@ -2290,6 +2346,64 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.events), 1)
         self.assertEqual(adapter.events[0].text, "healthy")
         self.assertEqual(delays[0], (0, 1000))
+
+    async def test_clean_eof_subscription_backs_off_instead_of_hot_looping(self):
+        # Regression guard for the adversarial finding: a connector that accepts,
+        # acks, then immediately closes the inbound stream with a clean EOF (the
+        # async generator returns without yielding) must NOT pin the loop in a
+        # hot resubscribe spin. A clean return is treated as a dropped
+        # subscription and runs the SAME backoff path as an error; because the
+        # subscription never established, the attempt counter grows so the
+        # computed delay backs off geometrically (0ms gets only the first attempt).
+        attempts = {"n": 0}
+        delays = []
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                attempts["n"] += 1
+                await asyncio.sleep(0)
+                # Never yields: a clean EOF on the inbound stream.
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+        adapter = self._adapter(FakeClient())
+
+        real_backoff = self.adapter_module.reconnect_backoff_ms
+
+        def recording_backoff(attempt, base_ms, cap_ms, rand=None):
+            value = real_backoff(attempt, base_ms, cap_ms, rand=rand)
+            delays.append((attempt, value))
+            # Return 0 so the test never actually sleeps; we only assert on the
+            # computed (attempt -> delay) sequence to prove the backoff grows.
+            return 0
+
+        self.adapter_module.reconnect_backoff_ms = recording_backoff
+        try:
+            loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 1.0))
+            for _ in range(300):
+                if len(delays) >= 4:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            self.adapter_module.reconnect_backoff_ms = real_backoff
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+
+        # The clean EOF entered the backoff path every reconnect (not else:continue),
+        # so the loop never opened a subscription without first consulting backoff.
+        self.assertGreaterEqual(attempts["n"], 1)
+        self.assertGreaterEqual(len(delays), 4)
+        # Attempt counter advances on each clean-EOF reconnect (never reset, since
+        # the subscription never established): 0, 1, 2, 3, ...
+        self.assertEqual([a for a, _ in delays[:4]], [0, 1, 2, 3])
+        # Delay grows geometrically: only attempt 0 is the base; later attempts
+        # are strictly larger, so the loop cannot spin at a flat cadence.
+        self.assertEqual(delays[0][1], 1000)
+        self.assertGreater(delays[1][1], delays[0][1])
+        self.assertGreater(delays[2][1], delays[1][1])
 
     # --- Behavior 8: preview vs durable timeout -------------------------------
     async def test_preview_ops_use_short_timeout_durable_uses_full(self):
