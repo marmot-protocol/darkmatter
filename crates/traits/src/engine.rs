@@ -129,6 +129,41 @@ pub enum SendIntent {
         name: Option<String>,
         description: Option<String>,
     },
+    /// Grant admin rights to an existing group member (darkmatter#488).
+    ///
+    /// The caller must already be an admin. `member_pubkey` is the target's
+    /// 32-byte Marmot account identity (x-only secp256k1 public key). Granting
+    /// admin to an account that is already an admin is an idempotent success
+    /// that stages no commit. The engine — not the application — recomputes the
+    /// admin set, verifies caller authorization, and verifies the target is a
+    /// member before issuing the underlying admin-policy `AppDataUpdate` commit.
+    GrantAdmin {
+        group_id: GroupId,
+        member_pubkey: [u8; 32],
+    },
+    /// Revoke admin rights from an existing group member (darkmatter#488).
+    ///
+    /// The caller must already be an admin. Revoking from an account that is
+    /// not currently an admin is an idempotent success that stages no commit.
+    /// Refuses with `LastAdminCannotResign` if the target is the sole admin and
+    /// the group still has non-admin members, and with `SoleMemberCannotRevoke`
+    /// if the target is the sole admin and the sole remaining member.
+    RevokeAdmin {
+        group_id: GroupId,
+        member_pubkey: [u8; 32],
+    },
+    /// Transfer admin: grant admin to `new_admin_pubkey` and revoke it from the
+    /// caller, in a single admin-policy commit (darkmatter#488).
+    ///
+    /// The caller must already be an admin and `new_admin_pubkey` must be a
+    /// member. Because the grant and revoke are applied as one atomic
+    /// admin-policy update, the resulting epoch never transiently lacks an
+    /// admin. Transferring to oneself, or to an account that is already the
+    /// sole admin such that the result is unchanged, is an idempotent success.
+    TransferAdmin {
+        group_id: GroupId,
+        new_admin_pubkey: [u8; 32],
+    },
 }
 
 /// The engine's response to [`CgkaEngine::send`].
@@ -137,6 +172,13 @@ pub enum SendIntent {
 /// member additions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
+    /// The engine accepted the intent but determined that no group-state
+    /// change is required, so nothing was staged or published. Returned by the
+    /// idempotent admin-lifecycle intents (`SendIntent::GrantAdmin` for an
+    /// already-admin target, `RevokeAdmin` for a non-admin target, or a
+    /// `TransferAdmin` whose grant+revoke nets to the current admin set). No
+    /// `confirm_published` is required and no `PendingStateRef` is issued.
+    Noop { group_id: GroupId },
     /// Pure application message — publish once, no state advance.
     ApplicationMessage { msg: TransportMessage },
     /// The engine accepted the local intent but did not publish anything

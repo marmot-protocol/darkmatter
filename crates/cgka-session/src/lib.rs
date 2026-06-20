@@ -599,6 +599,7 @@ impl AccountDeviceSession {
         };
         for result in results {
             match result {
+                SendResult::Noop { .. } => {}
                 SendResult::ApplicationMessage { msg } => effects
                     .publish
                     .push(PublishWork::ApplicationMessage { msg }),
@@ -651,11 +652,15 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::Leave { .. } => "leave",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
+        SendIntent::GrantAdmin { .. } => "grant_admin",
+        SendIntent::RevokeAdmin { .. } => "revoke_admin",
+        SendIntent::TransferAdmin { .. } => "transfer_admin",
     }
 }
 
 fn send_result_kind(result: &SendResult) -> &'static str {
     match result {
+        SendResult::Noop { .. } => "noop",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",

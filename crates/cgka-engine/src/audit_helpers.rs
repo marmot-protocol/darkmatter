@@ -89,6 +89,9 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::Leave { .. } => "leave",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
+        SendIntent::GrantAdmin { .. } => "grant_admin",
+        SendIntent::RevokeAdmin { .. } => "revoke_admin",
+        SendIntent::TransferAdmin { .. } => "transfer_admin",
     }
 }
 
@@ -99,12 +102,16 @@ pub(crate) fn send_intent_group_ref(intent: &SendIntent) -> Option<String> {
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => Some(hex::encode(group_id.as_slice())),
+        | SendIntent::UpdateGroupData { group_id, .. }
+        | SendIntent::GrantAdmin { group_id, .. }
+        | SendIntent::RevokeAdmin { group_id, .. }
+        | SendIntent::TransferAdmin { group_id, .. } => Some(hex::encode(group_id.as_slice())),
     }
 }
 
 pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
     match result {
+        SendResult::Noop { .. } => "noop",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
@@ -134,7 +141,7 @@ pub(crate) fn send_outbound_ids(
                 .map(|w| hex::encode(w.id.as_slice()))
                 .collect(),
         ),
-        SendResult::Queued { .. } => (None, Vec::new()),
+        SendResult::Noop { .. } | SendResult::Queued { .. } => (None, Vec::new()),
     }
 }
 
@@ -238,6 +245,8 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
         EngineError::AdminDepletion { .. } => "admin_depletion",
+        EngineError::LastAdminCannotResign { .. } => "last_admin_cannot_resign",
+        EngineError::SoleMemberCannotRevoke { .. } => "sole_member_cannot_revoke",
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",

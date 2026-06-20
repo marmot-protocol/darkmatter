@@ -30,8 +30,10 @@
 //! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
 //! - [`auto_committer`] - deterministic SelfRemove auto-commit policy.
 //! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
+//! - [`admin_lifecycle`] - grant / revoke / transfer admin FFI (darkmatter#488).
 
 pub mod account_identity_proof;
+pub mod admin_lifecycle;
 pub mod app_components;
 
 pub(crate) mod app_payload;

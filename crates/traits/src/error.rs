@@ -43,6 +43,22 @@ pub enum EngineError {
     #[error("commit would deplete group admins")]
     AdminDepletion { group_id: GroupId },
 
+    /// Revoking admin from the target would leave a group that still has
+    /// non-admin members without any admin. Returned by the admin-lifecycle
+    /// FFI (`SendIntent::RevokeAdmin` / `TransferAdmin`) before any commit is
+    /// staged. Distinct from [`Self::AdminDepletion`], which classifies an
+    /// inbound MIP-03 SelfRemove that would deplete admins on commit.
+    #[error("revoking admin would leave a non-empty group without an admin")]
+    LastAdminCannotResign { group_id: GroupId },
+
+    /// The caller is the sole admin **and** the sole remaining member, so
+    /// revoking admin is undefined: there is no other member to take the role
+    /// and the group cannot run admin-less with members present. Returned by
+    /// the admin-lifecycle FFI so the application can route to its
+    /// delete-empty-group path instead of attempting a revoke.
+    #[error("cannot revoke admin from the sole remaining member; delete the group instead")]
+    SoleMemberCannotRevoke { group_id: GroupId },
+
     /// Invitee KeyPackage is missing a capability required by the group.
     /// `required` and `had` are populated so callers can render the diff.
     #[error("missing required capabilities: required={required:?} had={had:?}")]

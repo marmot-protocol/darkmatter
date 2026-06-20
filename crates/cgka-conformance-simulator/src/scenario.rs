@@ -743,9 +743,10 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
 fn observe_engine_error(error: &EngineError) -> String {
     match error {
         EngineError::NotGroupAdmin { .. } => "not_group_admin",
-        EngineError::AdminCannotSelfRemove { .. } | EngineError::AdminDepletion { .. } => {
-            "admin_policy"
-        }
+        EngineError::AdminCannotSelfRemove { .. }
+        | EngineError::AdminDepletion { .. }
+        | EngineError::LastAdminCannotResign { .. }
+        | EngineError::SoleMemberCannotRevoke { .. } => "admin_policy",
         EngineError::Serialize(_) => "invalid_admin_policy",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::UnknownGroup(_) => "unknown_group",

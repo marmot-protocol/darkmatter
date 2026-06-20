@@ -48,6 +48,21 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_update_group_data(group_id, name, description)
                     .await
             }
+            SendIntent::GrantAdmin {
+                group_id,
+                member_pubkey,
+            } => self.do_send_grant_admin(group_id, member_pubkey).await,
+            SendIntent::RevokeAdmin {
+                group_id,
+                member_pubkey,
+            } => self.do_send_revoke_admin(group_id, member_pubkey).await,
+            SendIntent::TransferAdmin {
+                group_id,
+                new_admin_pubkey,
+            } => {
+                self.do_send_transfer_admin(group_id, new_admin_pubkey)
+                    .await
+            }
         }
     }
 

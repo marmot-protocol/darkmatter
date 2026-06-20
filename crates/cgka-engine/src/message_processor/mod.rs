@@ -436,6 +436,9 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => group_id,
+        | SendIntent::UpdateGroupData { group_id, .. }
+        | SendIntent::GrantAdmin { group_id, .. }
+        | SendIntent::RevokeAdmin { group_id, .. }
+        | SendIntent::TransferAdmin { group_id, .. } => group_id,
     }
 }
