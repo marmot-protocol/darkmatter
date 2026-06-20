@@ -293,10 +293,10 @@ class MarmotAgentControlClient:
             }
         )
 
-    async def stream_tool(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
+    async def stream_progress(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
         return await self.request(
             {
-                "type": "stream_tool",
+                "type": "stream_progress",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "text": str(text or ""),
             }
