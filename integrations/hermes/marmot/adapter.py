@@ -85,6 +85,76 @@ class _ResyncRequired(RuntimeError):
     recovered rather than silently lost."""
 
 
+class KeyedAsyncQueue:
+    """Per-key serialization for fire-and-forget async tasks.
+
+    Mirrors the OpenClaw `KeyedAsyncQueue` (`integrations/openclaw/marmot`): tasks enqueued
+    under the same key run strictly FIFO (the next task waits for the prior task of that key
+    to finish), while tasks under distinct keys run concurrently. This lets the inbound
+    dispatcher hand a slow/hung turn in one group off to the background and keep pulling
+    events for other groups instead of blocking head-of-line on every group.
+
+    `enqueue` is non-blocking: it schedules the work and returns immediately. Use `join` to
+    wait for all currently scheduled work to drain (chiefly for tests and clean shutdown) and
+    `cancel_all` to tear everything down.
+    """
+
+    def __init__(self) -> None:
+        # Most-recently-enqueued task per key; the chain tail each new same-key task awaits.
+        self._tails: Dict[Any, asyncio.Task] = {}
+        # Every in-flight task, so join()/cancel_all() can act on the whole queue.
+        self._pending: set[asyncio.Task] = set()
+
+    def enqueue(self, key: Any, coro_factory) -> asyncio.Task:
+        """Schedule ``coro_factory()`` to run after any prior task for ``key`` completes.
+
+        ``coro_factory`` is a zero-arg callable returning a coroutine; it is only invoked when
+        the task actually starts, so per-key ordering is preserved without eagerly creating
+        coroutines that might warn if never awaited.
+        """
+
+        predecessor = self._tails.get(key)
+
+        async def _runner() -> None:
+            if predecessor is not None:
+                # Wait for the prior same-key task, but never inherit its failure/cancellation:
+                # one group's bad turn must not poison the next message in that group.
+                try:
+                    await asyncio.shield(predecessor)
+                except BaseException:
+                    pass
+            await coro_factory()
+
+        task = asyncio.ensure_future(_runner())
+        self._tails[key] = task
+        self._pending.add(task)
+
+        def _done(completed: asyncio.Task, _key=key) -> None:
+            self._pending.discard(completed)
+            # Only clear the tail if we are still the latest task for this key; a newer
+            # enqueue may have already replaced us as the chain tail.
+            if self._tails.get(_key) is completed:
+                self._tails.pop(_key, None)
+
+        task.add_done_callback(_done)
+        return task
+
+    async def join(self) -> None:
+        """Wait until all currently scheduled tasks (and any they chain to) have finished."""
+        while self._pending:
+            await asyncio.gather(*list(self._pending), return_exceptions=True)
+
+    async def cancel_all(self) -> None:
+        """Cancel every in-flight task and wait for them to unwind."""
+        pending = list(self._pending)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._pending.clear()
+        self._tails.clear()
+
+
 class AppendOnlyTextState:
     """Tracks the latest visible stream text and returns safe suffix deltas."""
 
@@ -603,6 +673,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             else None
         )
         self._listener_task: Optional[asyncio.Task] = None
+        self._inbound_queue = KeyedAsyncQueue()
         self._active_streams: Dict[str, MarmotLiveStream] = {}
         self._draft_streams: Dict[tuple[str, int], MarmotLiveStream] = {}
         self._last_chat_stream: Dict[str, MarmotLiveStream] = {}
@@ -643,6 +714,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._listener_task = None
+        await self._inbound_queue.cancel_all()
         await self._cancel_all_streams("adapter disconnect")
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
@@ -1167,11 +1239,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 await asyncio.sleep(2.0)
 
     async def _consume_inbound_once(self) -> None:
-        async for event in self.client.inbound_events(
-            account_id_hex=self.account_id_hex,
-            group_id_hex=self.group_id_hex,
-        ):
-            await self._handle_control_event(event)
+        # Per-group serialization (mirrors OpenClaw's KeyedAsyncQueue): a slow/hung turn in one
+        # group must not block inbound dispatch for every other group. We enqueue each inbound
+        # message onto a per-group FIFO queue and keep pulling events instead of awaiting the
+        # turn inline. We drain the queue when the subscription stream ends (or errors out, e.g.
+        # a resync) so already-accepted work for other groups still completes.
+        try:
+            async for event in self.client.inbound_events(
+                account_id_hex=self.account_id_hex,
+                group_id_hex=self.group_id_hex,
+            ):
+                await self._handle_control_event(event)
+        finally:
+            await self._inbound_queue.join()
 
     async def _handle_resync_required(self, event: Dict[str, Any]) -> None:
         # Emitted when the connector's inbound broadcast lagged AND its storage-backed replay
@@ -1196,28 +1276,44 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.debug("Ignoring Marmot control event type %s", event_type)
             return
 
+        # Hand the turn off to the per-group queue and return immediately so the consume loop
+        # keeps pulling events. Distinct groups dispatch concurrently; each group stays FIFO.
         group_id_hex = event["group_id_hex"]
-        sender_account_id_hex = event["sender_account_id_hex"]
-        message_id_hex = event["message_id_hex"]
-        if await self._maybe_handle_profile_name_onboarding(event):
-            return
+        self._inbound_queue.enqueue(
+            group_id_hex,
+            lambda evt=event: self._dispatch_inbound_message(evt),
+        )
 
-        source = self.build_source(
-            chat_id=group_id_hex,
-            chat_name=f"Marmot {group_id_hex[:12]}",
-            chat_type="group",
-            user_id=sender_account_id_hex,
-            user_name=f"Marmot {sender_account_id_hex[:12]}",
-            message_id=message_id_hex,
-        )
-        hermes_event = MessageEvent(
-            text=str(event.get("text") or ""),
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message=event,
-            message_id=message_id_hex,
-        )
-        await self.handle_message(hermes_event)
+    async def _dispatch_inbound_message(self, event: Dict[str, Any]) -> None:
+        try:
+            group_id_hex = event["group_id_hex"]
+            sender_account_id_hex = event["sender_account_id_hex"]
+            message_id_hex = event["message_id_hex"]
+            if await self._maybe_handle_profile_name_onboarding(event):
+                return
+
+            source = self.build_source(
+                chat_id=group_id_hex,
+                chat_name=f"Marmot {group_id_hex[:12]}",
+                chat_type="group",
+                user_id=sender_account_id_hex,
+                user_name=f"Marmot {sender_account_id_hex[:12]}",
+                message_id=message_id_hex,
+            )
+            hermes_event = MessageEvent(
+                text=str(event.get("text") or ""),
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=event,
+                message_id=message_id_hex,
+            )
+            await self.handle_message(hermes_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed turn in one group must not tear down the dispatcher or the queue; log
+            # privacy-safely (no ids/payloads) and let other groups keep flowing.
+            logger.warning("Marmot inbound dispatch failed", exc_info=True)
 
     async def _maybe_handle_profile_name_onboarding(self, event: Dict[str, Any]) -> bool:
         store = self.profile_name_onboarding

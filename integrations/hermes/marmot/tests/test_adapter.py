@@ -812,6 +812,151 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.events), 1)
         self.assertEqual(adapter.events[0].text, "recovered after resync")
 
+    async def test_slow_group_turn_does_not_block_dispatch_for_other_groups(self):
+        # darkmatter#513: inbound was dispatched serially (async for -> await handle_message),
+        # so a slow/hung turn in one group blocked dispatch for every group. With per-group
+        # serialization, a stuck turn in group A must NOT prevent group B's turn from running.
+        group_a = "aa" * 32
+        group_b = "bb" * 32
+
+        def make_event(group_id_hex, message_id_hex, text):
+            return {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": group_id_hex,
+                "message_id_hex": message_id_hex,
+                "sender_account_id_hex": "44" * 32,
+                "text": text,
+            }
+
+        events = [
+            make_event(group_a, "01" * 32, "slow group A"),
+            make_event(group_b, "02" * 32, "fast group B"),
+        ]
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+                # Keep the subscription open after yielding so the consume loop parks on the
+                # next event instead of draining the queue (which would serialize the turns).
+                await asyncio.sleep(3600)
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        release_a = asyncio.Event()
+        completed = []
+
+        async def handle_message(event):
+            chat_id = event.source.chat_id
+            if chat_id == group_a:
+                # Group A's turn is "slow/hung": it blocks until the test releases it.
+                await release_a.wait()
+            completed.append(chat_id)
+
+        adapter.handle_message = handle_message
+
+        loop_task = asyncio.ensure_future(adapter._consume_inbound_once())
+        try:
+            # Group B should complete while group A is still blocked: no head-of-line blocking.
+            for _ in range(200):
+                if group_b in completed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(
+                group_b,
+                completed,
+                "group B turn must dispatch while group A's turn is still in flight",
+            )
+            self.assertNotIn(
+                group_a,
+                completed,
+                "group A turn must still be blocked (it was not released yet)",
+            )
+
+            # Releasing group A lets its turn finish too — nothing was dropped.
+            release_a.set()
+            for _ in range(200):
+                if group_a in completed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(group_a, completed, "group A turn must complete once released")
+        finally:
+            loop_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await loop_task
+            await adapter._inbound_queue.cancel_all()
+
+    async def test_same_group_turns_dispatch_in_fifo_order(self):
+        # Per-group ordering must be preserved: two messages for the SAME group run strictly
+        # in arrival order, with the second turn waiting for the first to finish.
+        group = "cc" * 32
+
+        events = [
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": group,
+                "message_id_hex": "01" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "first",
+            },
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": group,
+                "message_id_hex": "02" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "second",
+            },
+        ]
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        order = []
+        first_started = asyncio.Event()
+
+        async def handle_message(event):
+            text = event.text
+            order.append(f"start:{text}")
+            if text == "first":
+                # Yield control after the first turn starts so that, if ordering were broken,
+                # the second turn would have a chance to interleave before "first" finishes.
+                first_started.set()
+                await asyncio.sleep(0.05)
+            order.append(f"end:{text}")
+
+        adapter.handle_message = handle_message
+
+        await adapter._consume_inbound_once()
+
+        # Strict FIFO: first fully completes before second starts.
+        self.assertEqual(
+            order,
+            ["start:first", "end:first", "start:second", "end:second"],
+        )
+
     async def test_first_inbound_message_prompts_for_public_profile_name(self):
         events = [
             {
