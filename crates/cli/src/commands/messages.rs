@@ -592,6 +592,7 @@ pub(crate) fn timeline_message_display_text(message: &Value) -> String {
             .get("group_system")
             .and_then(|system| system.get("summary"))
             .and_then(Value::as_str)
+            .filter(|summary| !summary.trim().is_empty())
     {
         return summary.to_owned();
     }
@@ -732,6 +733,30 @@ fn shorten_account(value: &str, max_len: usize) -> String {
     }
 }
 
+pub(crate) fn message_record_json(
+    message: AppMessageRecord,
+    from_display_name: Option<String>,
+) -> Value {
+    let agent_text_stream =
+        agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
+    let mut value = json!({
+        "message_id": message.message_id_hex,
+        "direction": message.direction,
+        "group_id": message.group_id_hex,
+        "from": message.sender,
+        "from_display_name": from_display_name,
+        "plaintext": message.plaintext,
+        "kind": message.kind,
+        "tags": message.tags,
+        "recorded_at": message.recorded_at,
+        "received_at": message.received_at,
+    });
+    if let Some(agent_text_stream) = agent_text_stream {
+        value["agent_text_stream"] = agent_text_stream;
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,28 +818,17 @@ mod tests {
         );
         assert_eq!(value["group_system"]["subject_is_self"], true);
     }
-}
 
-pub(crate) fn message_record_json(
-    message: AppMessageRecord,
-    from_display_name: Option<String>,
-) -> Value {
-    let agent_text_stream =
-        agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext);
-    let mut value = json!({
-        "message_id": message.message_id_hex,
-        "direction": message.direction,
-        "group_id": message.group_id_hex,
-        "from": message.sender,
-        "from_display_name": from_display_name,
-        "plaintext": message.plaintext,
-        "kind": message.kind,
-        "tags": message.tags,
-        "recorded_at": message.recorded_at,
-        "received_at": message.received_at,
-    });
-    if let Some(agent_text_stream) = agent_text_stream {
-        value["agent_text_stream"] = agent_text_stream;
+    #[test]
+    fn timeline_message_display_text_ignores_blank_system_summary() {
+        let message = json!({
+            "kind": MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            "plaintext": "fallback text",
+            "group_system": {
+                "summary": "   "
+            }
+        });
+
+        assert_eq!(timeline_message_display_text(&message), "fallback text");
     }
-    value
 }

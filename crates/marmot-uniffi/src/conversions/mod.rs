@@ -275,6 +275,35 @@ mod tests {
     }
 
     #[test]
+    fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
+        let record = TimelineMessageRecord {
+            message_id_hex: "system-bad".to_owned(),
+            source_message_id_hex: None,
+            source_epoch: Some(4),
+            direction: "system".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "aa".repeat(32),
+            plaintext: "not-json".to_owned(),
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: vec![vec!["system".to_owned(), "member_removed".to_owned()]],
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            media: None,
+            agent_text_stream: None,
+            reactions: TimelineReactionSummary::default(),
+            deleted: false,
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+        };
+
+        let ffi = TimelineMessageRecordFfi::from(record);
+
+        assert!(ffi.group_system.is_none());
+    }
+
+    #[test]
     fn app_message_record_ffi_leaves_non_chat_tokens_empty() {
         let record = AppMessageRecord {
             message_id_hex: "reaction-1".to_owned(),

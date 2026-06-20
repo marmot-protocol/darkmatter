@@ -512,7 +512,7 @@ pub(crate) fn group_system_summary(value: &Value, plaintext: &str) -> Option<Str
         .get("group_system")
         .and_then(|system| system.get("summary"))
         .and_then(Value::as_str)
-        .filter(|summary| !summary.is_empty())
+        .filter(|summary| !summary.trim().is_empty())
     {
         return Some(summary.to_owned());
     }

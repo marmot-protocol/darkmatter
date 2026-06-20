@@ -66,6 +66,22 @@ fn group_system_summary_prefers_structured_self_removal_summary() {
 }
 
 #[test]
+fn group_system_summary_ignores_blank_structured_summary() {
+    let value = serde_json::json!({
+        "from": "aa".repeat(32),
+        "from_display_name": "alice",
+        "group_system": {
+            "summary": "   "
+        }
+    });
+    let removed = r#"{"v":1,"system_type":"member_removed","text":"Member removed","data":{"subject":"bbbbbbbb"}}"#;
+    assert_eq!(
+        group_system_summary(&value, removed).as_deref(),
+        Some("alice removed bbbbbbbb")
+    );
+}
+
+#[test]
 fn group_system_summary_falls_back_for_unknown_type() {
     let value = system_value(&"aa".repeat(32), Some("alice"));
     let with_text = r#"{"v":1,"system_type":"mystery","text":"Something happened","data":{}}"#;
