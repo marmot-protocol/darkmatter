@@ -36,6 +36,27 @@ function inboundStubClient(events: AgentControlEvent[]): MarmotAgentControlClien
   } as unknown as MarmotAgentControlClient;
 }
 
+function inboundEvent(groupByte: string, idByte: string): AgentControlEvent {
+  return {
+    type: "inbound_message",
+    account_id_hex: HEX32("aa"),
+    group_id_hex: HEX32(groupByte),
+    message_id_hex: HEX32(idByte),
+    sender_account_id_hex: HEX32("bb"),
+    text: "hello agent",
+  };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("waitFor timed out");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 afterEach(() => {
   resetMarmotInboundRuntimeForTests();
 });
@@ -95,6 +116,46 @@ describe("startMarmotInbound", () => {
       messageIdHex: HEX32("dd"),
       text: "hello agent",
     });
+  });
+
+  it("dispatches distinct groups concurrently and keeps per-group FIFO order", async () => {
+    const a1 = HEX32("d1");
+    const a2 = HEX32("d2");
+    const b1 = HEX32("d3");
+    const started: string[] = [];
+    const gates = new Map<string, () => void>();
+    const gate = (id: string) => new Promise<void>((resolve) => gates.set(id, resolve));
+
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      async (message) => {
+        started.push(message.messageIdHex);
+        await gate(message.messageIdHex);
+      },
+      {
+        clientFactory: () =>
+          inboundStubClient([
+            inboundEvent("ca", "d1"), // group A, message 1
+            inboundEvent("ca", "d2"), // group A, message 2 (FIFO behind a1)
+            inboundEvent("cb", "d3"), // group B, message 1 (independent)
+          ]),
+      },
+    );
+
+    // A's first and B's first run concurrently; A's second must wait behind A's first.
+    await waitFor(() => started.includes(a1) && started.includes(b1));
+    expect(started).not.toContain(a2);
+
+    gates.get(a1)?.(); // release A's first -> A's second may start
+    await waitFor(() => started.includes(a2));
+
+    gates.get(a2)?.();
+    gates.get(b1)?.();
+    stop();
   });
 });
 

@@ -448,5 +448,7 @@ describe("createMarmotInboundDispatcher", () => {
     ).toBe(false);
     expect(calls.sendFinal[0]?.accountIdHex).toBe(HEX32("aa"));
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
+    // GAP-01: the durable reply threads to the triggering message id.
+    expect(calls.sendFinal[0]?.replyTo).toBe(HEX32("dd"));
   });
 });

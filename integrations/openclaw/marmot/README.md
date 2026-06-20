@@ -89,6 +89,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
 | `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
+| `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
@@ -107,7 +108,10 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   received Marmot message (`chatId` = Marmot group id, `userId` = sender) into
   OpenClaw's turn kernel via `runChannelInboundEvent` + `dispatchReplyWithBufferedBlockDispatcher`,
   **modeled on the bundled Telegram channel**. The agent's reply is delivered
-  back through the message adapter.
+  back through the message adapter and threads to the triggering message.
+  Dispatch is serialized per group (distinct groups run concurrently, each group
+  stays FIFO), so a slow turn in one group never blocks inbound for others; set
+  `debounceMs` to coalesce rapid same-sender bursts into one turn.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
   the adapter never merges or rewrites text across sends.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an

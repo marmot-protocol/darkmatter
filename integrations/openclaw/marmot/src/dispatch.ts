@@ -490,6 +490,10 @@ export function createMarmotInboundDispatcher(
       client: deps.client,
       accountIdHex: message.accountIdHex,
       groupIdHex: message.groupIdHex,
+      // Thread the reply to the triggering message (channel declares
+      // topLevelReplyToMode "reply"). Honored by the durable send_final path;
+      // the streaming finalize path threads in a later phase.
+      replyToMessageIdHex: message.messageIdHex,
       streamMode: deps.streamMode,
       quicCandidates: deps.quicCandidates,
       chunkBytes: deps.chunkBytes,

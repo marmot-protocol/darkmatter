@@ -10,6 +10,9 @@
 // `syncMarmotAllowlist` mirrors the configured `dm.allowFrom` welcomers into
 // dm-agent's per-account allowlist so configured welcomers are accepted.
 
+import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
+import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+
 import { resolveSingleAccount } from "./account.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
@@ -49,6 +52,19 @@ function resolveAccount(api: InboundPluginApi): ResolvedMarmotAccount {
     api.config as Parameters<typeof resolveMarmotChannelAccount>[0],
     null,
   );
+}
+
+/** Merge a debounce batch of same-key inbound messages into one turn (newline-joined text). */
+function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMessage {
+  const last = items[items.length - 1]!;
+  if (items.length === 1) {
+    return last;
+  }
+  const text = items
+    .map((item) => item.text)
+    .filter((part) => part.length > 0)
+    .join("\n");
+  return { ...last, text };
 }
 
 export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;
@@ -128,6 +144,61 @@ export function startMarmotInbound(
       return;
     }
     let readyLogged = false;
+
+    // Per-group serialization: distinct groups dispatch concurrently while each
+    // group stays FIFO. A slow/hung turn in one group no longer blocks inbound
+    // dispatch for every other group (the previous inline `await dispatch` did).
+    const dispatchQueue = new KeyedAsyncQueue();
+    const handleInbound = async (message: MarmotInboundMessage): Promise<void> => {
+      if (onboardingStore) {
+        const intercepted = await maybeHandleProfileOnboardingInbound({
+          store: onboardingStore,
+          client,
+          message: {
+            accountIdHex: message.accountIdHex,
+            groupIdHex: message.groupIdHex,
+            messageIdHex: message.messageIdHex,
+            text: message.text,
+          },
+          configuredName: options.configuredAgentName ?? null,
+          logger: api.logger,
+        }).catch(() => false); // never block dispatch on an onboarding error
+        if (intercepted) {
+          return;
+        }
+      }
+      api.logger.info("marmot: inbound message received; dispatching agent turn");
+      await dispatch(message);
+    };
+    const runQueued = (message: MarmotInboundMessage): void => {
+      void dispatchQueue
+        .enqueue(message.groupIdHex, () => handleInbound(message))
+        .catch(() => api.logger.warn("marmot: inbound dispatch task failed"));
+    };
+    // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
+    const debouncer =
+      resolved.debounceMs > 0
+        ? createInboundDebouncer<MarmotInboundMessage>({
+            debounceMs: resolved.debounceMs,
+            buildKey: (message) =>
+              `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`,
+            onFlush: async (items) => {
+              if (items.length > 0) {
+                runQueued(coalesceInboundMessages(items));
+              }
+            },
+          })
+        : null;
+    const submitInbound = (message: MarmotInboundMessage): void => {
+      if (debouncer) {
+        void debouncer
+          .enqueue(message)
+          .catch(() => api.logger.warn("marmot: inbound debounce failed"));
+      } else {
+        runQueued(message);
+      }
+    };
+
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
@@ -140,27 +211,12 @@ export function startMarmotInbound(
         );
         readyLogged = true;
       },
-      onMessage: async (message) => {
+      onMessage: (message) => {
+        // Non-blocking: record receipt, then hand off to the per-group queue so the
+        // inbound loop keeps reading (enables cross-group concurrency). Dedupe in
+        // MarmotInboundBridge.handle() already ran synchronously before this.
         markMarmotInboundReceived(statusAccountId);
-        if (onboardingStore) {
-          const intercepted = await maybeHandleProfileOnboardingInbound({
-            store: onboardingStore,
-            client,
-            message: {
-              accountIdHex: message.accountIdHex,
-              groupIdHex: message.groupIdHex,
-              messageIdHex: message.messageIdHex,
-              text: message.text,
-            },
-            configuredName: options.configuredAgentName ?? null,
-            logger: api.logger,
-          }).catch(() => false); // never block dispatch on an onboarding error
-          if (intercepted) {
-            return;
-          }
-        }
-        api.logger.info("marmot: inbound message received; dispatching agent turn");
-        await dispatch(message);
+        submitInbound(message);
       },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {

@@ -66,6 +66,13 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.authToken).toBe("tok-123");
   });
 
+  it("resolves the inbound debounce window (off by default; config wins over env)", () => {
+    expect(resolveMarmotAccount(undefined, null, deps({})).debounceMs).toBe(0);
+    expect(resolveMarmotAccount(undefined, null, deps({ MARMOT_DEBOUNCE_MS: "750" })).debounceMs).toBe(750);
+    expect(resolveMarmotAccount({ debounceMs: 1200 }, null, deps({ MARMOT_DEBOUNCE_MS: "750" })).debounceMs).toBe(1200);
+    expect(resolveMarmotAccount(undefined, null, deps({ MARMOT_DEBOUNCE_MS: "nope" })).debounceMs).toBe(0);
+  });
+
   it("maps the dm policy and allow-from list", () => {
     const resolved = resolveMarmotAccount(
       { dm: { policy: "allowlist", allowFrom: ["aa", "bb"] } },
