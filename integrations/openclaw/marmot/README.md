@@ -123,6 +123,11 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   and fails open, so a lookup error never silently drops a message.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
   the adapter never merges or rewrites text across sends.
+- **Message deletion**: the control client can retract a prior message via
+  `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
+  kind-5 deletions from other members surface as a `message_deleted` event.
+  (The OpenClaw agent-facing delete trigger and ambient surfacing of inbound
+  deletions are validated on the docker harness.)
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
   update cancels the preview and sends the final verbatim. The transcript hash +

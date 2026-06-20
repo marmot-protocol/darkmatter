@@ -41,6 +41,26 @@ impl AgentConnector {
         })
     }
 
+    /// Delete (retract) a previously-sent group message by id. Emits a kind-5
+    /// deletion event referencing the target; returns its durable message ids.
+    pub(crate) async fn delete_message_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .delete_message(&account.label, &group_id, &target_message_id)
+            .await?;
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: summary.message_ids,
+        })
+    }
+
     /// Report group membership for an account's group so a channel can decide
     /// activation policy: `is_direct` (exactly two members, i.e. an effective DM
     /// where the agent always replies) vs a multi-party group that gates on

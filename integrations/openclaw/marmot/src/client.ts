@@ -117,6 +117,13 @@ export type AgentControlEvent =
       sender_display_name?: string | null;
     }
   | {
+      type: "message_deleted";
+      account_id_hex: string;
+      group_id_hex: string;
+      target_message_id_hex: string;
+      sender_account_id_hex: string;
+    }
+  | {
       type: "group_invite";
       account_id_hex: string;
       group_id_hex: string;
@@ -229,6 +236,20 @@ export class MarmotAgentControlClient {
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       text: String(text ?? ""),
       reply_to_message_id_hex: optionalHex(replyToMessageIdHex, "reply_to_message_id_hex"),
+    })) as unknown as FinalSentResponse;
+  }
+
+  /** Delete (retract) a previously-sent group message; emits a kind-5 deletion. */
+  async deleteMessage(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+  ): Promise<FinalSentResponse> {
+    return (await this.request({
+      type: "delete_message",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
     })) as unknown as FinalSentResponse;
   }
 

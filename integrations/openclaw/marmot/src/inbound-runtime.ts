@@ -218,6 +218,12 @@ export function startMarmotInbound(
         markMarmotInboundReceived(statusAccountId);
         submitInbound(message);
       },
+      onMessageDeleted: () => {
+        // A peer retracted a message. Recorded privacy-safely; surfacing it to the
+        // agent as quiet ambient context lands with the system-event work.
+        markMarmotInboundReceived(statusAccountId);
+        api.logger.info("marmot: inbound message deletion observed");
+      },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {
             markMarmotInboundReceived(statusAccountId);

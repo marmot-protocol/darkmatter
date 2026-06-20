@@ -27,6 +27,13 @@ export interface MarmotGroupInvite {
   groupIdHex: string;
 }
 
+export interface MarmotMessageDeleted {
+  accountIdHex: string;
+  groupIdHex: string;
+  targetMessageIdHex: string;
+  senderAccountIdHex: string;
+}
+
 export interface MarmotInboundBridgeOptions {
   accountIdHex?: string | null;
   groupIdHex?: string | null;
@@ -34,6 +41,8 @@ export interface MarmotInboundBridgeOptions {
   onMessage: (message: MarmotInboundMessage) => void | Promise<void>;
   /** The agent joined a group via a welcome (used to greet/onboard on join). */
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
+  /** Another member deleted (retracted) a message in a group. */
+  onMessageDeleted?: (deletion: MarmotMessageDeleted) => void | Promise<void>;
   onResync?: (info: { droppedEvents: number }) => void | Promise<void>;
   onError?: (error: unknown) => void;
   /** Base reconnect delay (first attempt). Grows exponentially up to the cap. */
@@ -170,6 +179,15 @@ export class MarmotInboundBridge {
       await this.options.onGroupInvite?.({
         accountIdHex: event.account_id_hex,
         groupIdHex: event.group_id_hex,
+      });
+      return;
+    }
+    if (event.type === "message_deleted") {
+      await this.options.onMessageDeleted?.({
+        accountIdHex: event.account_id_hex,
+        groupIdHex: event.group_id_hex,
+        targetMessageIdHex: event.target_message_id_hex,
+        senderAccountIdHex: event.sender_account_id_hex,
       });
       return;
     }

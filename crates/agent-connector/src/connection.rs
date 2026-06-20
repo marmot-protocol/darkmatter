@@ -144,6 +144,14 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::DeleteMessage {
+                account_id_hex,
+                group_id_hex,
+                target_message_id_hex,
+            } => {
+                self.delete_message_response(&account_id_hex, &group_id_hex, &target_message_id_hex)
+                    .await
+            }
             AgentControlRequest::StreamBegin {
                 account_id_hex,
                 group_id_hex,

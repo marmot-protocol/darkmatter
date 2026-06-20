@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agent_control::{AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent};
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, STREAM_TAG,
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, STREAM_TAG,
 };
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
@@ -44,9 +45,27 @@ pub(crate) fn control_event_from_runtime_event(
 ) -> Option<AgentControlEvent> {
     match event {
         MarmotAppEvent::MessageReceived(update) => {
+            // A kind-5 deletion from another member retracts an earlier message;
+            // surface it as a distinct control event (the `e` tag is the target).
+            if update.message.kind == MARMOT_APP_EVENT_KIND_DELETE {
+                let group_id_hex = inbound_event_group_id_hex(
+                    account_filter,
+                    &update.account_id_hex,
+                    group_filter,
+                    &update.message.group_id,
+                    &update.message.sender,
+                )?;
+                let target_message_id_hex = reply_target_from_tags(&update.message.tags)?;
+                return Some(AgentControlEvent::MessageDeleted {
+                    account_id_hex: update.account_id_hex,
+                    group_id_hex,
+                    target_message_id_hex,
+                    sender_account_id_hex: update.message.sender,
+                });
+            }
             // Only kind-9 chat/media is conversational input. Edits, reactions,
-            // deletes, and telemetry need explicit control semantics before they
-            // can safely influence an agent prompt.
+            // and telemetry need explicit control semantics before they can
+            // safely influence an agent prompt.
             if update.message.kind != MARMOT_APP_EVENT_KIND_CHAT {
                 return None;
             }
@@ -129,7 +148,12 @@ pub(crate) fn control_event_from_debug_event(
     group_filter: Option<&str>,
 ) -> Option<AgentControlEvent> {
     let (account_id_hex, group_id_hex) = match &event {
-        AgentControlEvent::InboundMessage {
+        AgentControlEvent::MessageDeleted {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::InboundMessage {
             account_id_hex,
             group_id_hex,
             ..

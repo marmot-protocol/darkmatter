@@ -124,6 +124,34 @@ fn control_event_forwards_only_chat_inner_events_as_inbound_messages() {
 }
 
 #[test]
+fn control_event_projects_kind5_deletion_as_message_deleted() {
+    let agent_account_id_hex = "aa".repeat(32);
+    let target = "99".repeat(32);
+    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+        account_id_hex: agent_account_id_hex.clone(),
+        account_label: "agent".to_owned(),
+        message: received_message(
+            MARMOT_APP_EVENT_KIND_DELETE,
+            "",
+            vec![vec!["e".to_owned(), target.clone()]],
+        ),
+    });
+
+    let Some(AgentControlEvent::MessageDeleted {
+        account_id_hex,
+        target_message_id_hex,
+        sender_account_id_hex,
+        ..
+    }) = control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected kind-5 deletion to become MessageDeleted");
+    };
+    assert_eq!(account_id_hex, agent_account_id_hex);
+    assert_eq!(target_message_id_hex, target);
+    assert_eq!(sender_account_id_hex, "bb".repeat(32));
+}
+
+#[test]
 fn control_event_emits_stream_update_for_agent_stream_started() {
     let agent_account_id_hex = "aa".repeat(32);
     let stream_id_hex = "55".repeat(32);

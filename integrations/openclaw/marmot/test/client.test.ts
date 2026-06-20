@@ -30,6 +30,9 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
     case "send_final":
       send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("ab")] });
       break;
+    case "delete_message":
+      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("de")] });
+      break;
     case "stream_begin":
       send(socket, id, {
         type: "stream_begun",
@@ -135,6 +138,11 @@ describe("MarmotAgentControlClient", () => {
   it("returns durable message ids from send_final", async () => {
     const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
     expect(res.message_ids_hex).toEqual([HEX32("ab")]);
+  });
+
+  it("deletes a message and returns the deletion event ids", async () => {
+    const res = await client.deleteMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"));
+    expect(res.message_ids_hex).toEqual([HEX32("de")]);
   });
 
   it("round-trips group_info (member count + is_direct)", async () => {

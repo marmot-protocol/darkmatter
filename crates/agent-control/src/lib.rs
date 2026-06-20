@@ -77,6 +77,11 @@ pub enum AgentControlRequest {
         text: String,
         reply_to_message_id_hex: Option<String>,
     },
+    DeleteMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+    },
     StreamBegin {
         account_id_hex: String,
         group_id_hex: String,
@@ -267,6 +272,13 @@ pub enum AgentControlEvent {
         /// The sender's display name, when resolvable from the directory.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_display_name: Option<String>,
+    },
+    /// A previously-sent group message was deleted (kind-5) by another member.
+    MessageDeleted {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        sender_account_id_hex: String,
     },
     GroupInvite {
         account_id_hex: String,
@@ -563,6 +575,14 @@ mod tests {
                     reply_to_message_id_hex: None,
                 },
                 "send_final",
+            ),
+            (
+                AgentControlRequest::DeleteMessage {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                },
+                "delete_message",
             ),
             (
                 AgentControlRequest::StreamBegin {

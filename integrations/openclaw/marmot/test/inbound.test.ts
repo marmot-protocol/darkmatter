@@ -107,6 +107,30 @@ describe("MarmotInboundBridge", () => {
     expect(calls).toBeGreaterThanOrEqual(2);
   });
 
+  it("routes a message_deleted event to onMessageDeleted", async () => {
+    const deletion: AgentControlEvent = {
+      type: "message_deleted",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      target_message_id_hex: HEX32("d9"),
+      sender_account_id_hex: HEX32("bb"),
+    };
+    const { client } = makeClient([deletion]);
+    let deletedTarget = "";
+    const controller = new AbortController();
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onMessage: () => {},
+      onMessageDeleted: ({ targetMessageIdHex }) => {
+        deletedTarget = targetMessageIdHex;
+        controller.abort();
+      },
+    });
+
+    await bridge.run(controller.signal);
+    expect(deletedTarget).toBe(HEX32("d9"));
+  });
+
   it("stops cleanly when the signal aborts", async () => {
     const { client, subscribeCalls } = makeClient([]);
     const controller = new AbortController();
