@@ -30,6 +30,14 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
     case "send_final":
       send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("ab")] });
       break;
+    case "stream_begin":
+      send(socket, id, {
+        type: "stream_begun",
+        stream_id_hex: HEX32("ee"),
+        start_message_id_hex: HEX32("ff"),
+        quic_candidates: [],
+      });
+      break;
     case "explode":
       send(socket, id, { type: "error", code: "bad_request", message: "nope" });
       break;
@@ -62,7 +70,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
   }
 }
 
-function startServer(socketPath: string): Promise<Server> {
+function startServer(socketPath: string, responseDelayMs = 0): Promise<Server> {
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0);
     socket.on("data", (chunk) => {
@@ -72,7 +80,12 @@ function startServer(socketPath: string): Promise<Server> {
         const line = buffer.subarray(0, index);
         buffer = buffer.subarray(index + 1);
         if (line.length > 0) {
-          handleRequest(socket, JSON.parse(line.toString("utf8")));
+          const req = JSON.parse(line.toString("utf8"));
+          if (responseDelayMs > 0) {
+            setTimeout(() => handleRequest(socket, req), responseDelayMs);
+          } else {
+            handleRequest(socket, req);
+          }
         }
         index = buffer.indexOf(0x0a);
       }
@@ -148,6 +161,46 @@ describe("MarmotAgentControlClient", () => {
       requestTimeoutMs: 1000,
     });
     await expect(broken.accountList()).rejects.toMatchObject({ retryable: true });
+  });
+});
+
+describe("preview op timeouts", () => {
+  let dir: string;
+  let socketPath: string;
+  let server: Server;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "oc-marmot-delay-"));
+    socketPath = join(dir, "delay.sock");
+    // Every response is delayed 400ms: well past the short preview timeout, well
+    // under the durable request timeout.
+    server = await startServer(socketPath, 400);
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("abandons a best-effort preview op at the short preview timeout", async () => {
+    const client = new MarmotAgentControlClient({
+      socketPath,
+      requestTimeoutMs: 3000,
+      previewRequestTimeoutMs: 80,
+    });
+    await expect(client.streamBegin(HEX32("aa"), HEX32("cc"))).rejects.toMatchObject({
+      code: "timeout",
+    });
+  });
+
+  it("still completes a durable send under the full request timeout", async () => {
+    const client = new MarmotAgentControlClient({
+      socketPath,
+      requestTimeoutMs: 3000,
+      previewRequestTimeoutMs: 80,
+    });
+    const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
+    expect(res.message_ids_hex).toEqual([HEX32("ab")]);
   });
 });
 

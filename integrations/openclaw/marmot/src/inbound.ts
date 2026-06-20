@@ -30,12 +30,39 @@ export interface MarmotInboundBridgeOptions {
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
   onResync?: (info: { droppedEvents: number }) => void | Promise<void>;
   onError?: (error: unknown) => void;
+  /** Base reconnect delay (first attempt). Grows exponentially up to the cap. */
   reconnectDelayMs?: number;
+  /** Cap on the reconnect delay after exponential growth. */
+  maxReconnectDelayMs?: number;
   dedupeWindow?: number;
 }
 
 const DEFAULT_RECONNECT_DELAY_MS = 1000;
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const DEFAULT_DEDUPE_WINDOW = 2048;
+
+/**
+ * Reconnect backoff with jitter: a delay in `[baseMs, min(capMs, baseMs * 2**attempt)]`.
+ * Attempt 0 returns exactly `baseMs` (ceiling == base), so the first reconnect is as
+ * prompt as the old flat delay; later attempts grow geometrically toward `capMs`. The
+ * jitter spreads retries so a persistent failure (e.g. dm-agent down) doesn't spin at a
+ * fixed cadence competing for the event loop the rest of the gateway shares.
+ */
+export function reconnectBackoffMs(
+  attempt: number,
+  baseMs: number,
+  capMs: number,
+  rand: () => number = Math.random,
+): number {
+  if (baseMs <= 0) {
+    return 0;
+  }
+  const ceiling = Math.min(capMs, baseMs * 2 ** Math.max(0, attempt));
+  if (ceiling <= baseMs) {
+    return baseMs;
+  }
+  return Math.round(baseMs + rand() * (ceiling - baseMs));
+}
 
 /** Bounded insertion-ordered set for recent message-id dedupe. */
 class RecentIds {
@@ -86,7 +113,13 @@ export class MarmotInboundBridge {
 
   /** Run until `signal` aborts, reconnecting between subscription drops. */
   async run(signal: AbortSignal): Promise<void> {
-    const reconnectDelayMs = this.options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
+    const baseDelayMs = this.options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
+    const maxDelayMs = this.options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
+    // Consecutive reconnect attempts that have not (re)established a subscription.
+    // Reset to 0 once a subscription is acked (onReady) so a healthy connection
+    // always reconnects promptly, while a persistent failure backs off geometrically
+    // instead of spinning at a flat 1/s.
+    let attempt = 0;
     while (!signal.aborted) {
       try {
         for await (const event of this.client.subscribeInbound(
@@ -95,7 +128,12 @@ export class MarmotInboundBridge {
             groupIdHex: this.options.groupIdHex ?? null,
           },
           signal,
-          { onReady: () => void this.options.onReady?.() },
+          {
+            onReady: () => {
+              attempt = 0;
+              void this.options.onReady?.();
+            },
+          },
         )) {
           if (signal.aborted) {
             return;
@@ -112,7 +150,8 @@ export class MarmotInboundBridge {
       if (signal.aborted) {
         return;
       }
-      await delay(reconnectDelayMs, signal);
+      await delay(reconnectBackoffMs(attempt, baseDelayMs, maxDelayMs), signal);
+      attempt += 1;
     }
   }
 

@@ -15,6 +15,15 @@ export const AGENT_CONTROL_PROTOCOL_V1 = "marmot.agent-control.v1";
 export const MAX_AGENT_CONTROL_FRAME_BYTES = 1024 * 1024;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// Live-preview side-channel ops (stream begin/append/status/progress/cancel) are
+// best-effort: they only drive the QUIC typing preview, while the durable kind-9
+// is committed separately via send_final / stream_finalize. Bounding them well
+// below the full request timeout means a wedged broker abandons the preview in a
+// few seconds instead of pinning the agent turn — and the shared execution-lane
+// slot it holds — for the full 30s per op. The durable ops keep
+// DEFAULT_REQUEST_TIMEOUT_MS so a slow-but-live commit is never abandoned into a
+// duplicate send.
+const DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS = 8_000;
 
 export class AgentControlError extends Error {
   readonly code: string;
@@ -116,6 +125,13 @@ export interface MarmotAgentControlClientOptions {
   socketPath: string;
   authToken?: string | undefined;
   requestTimeoutMs?: number;
+  /**
+   * Timeout for best-effort live-preview ops (stream begin/append/status/progress/
+   * cancel). Defaults to {@link DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS}; kept short so a
+   * wedged preview broker abandons the preview quickly rather than holding the agent
+   * turn open. Durable ops (send_final, stream_finalize) always use requestTimeoutMs.
+   */
+  previewRequestTimeoutMs?: number;
 }
 
 interface RequestOptions {
@@ -155,12 +171,15 @@ export class MarmotAgentControlClient {
   readonly socketPath: string;
   private readonly authToken: string | null;
   private readonly requestTimeoutMs: number;
+  private readonly previewRequestTimeoutMs: number;
 
   constructor(options: MarmotAgentControlClientOptions) {
     this.socketPath = options.socketPath;
     const token = options.authToken?.trim();
     this.authToken = token ? token : null;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.previewRequestTimeoutMs =
+      options.previewRequestTimeoutMs ?? DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS;
   }
 
   // --- typed request helpers --------------------------------------------------
@@ -205,37 +224,49 @@ export class MarmotAgentControlClient {
     const quicCandidates = [...(options.quicCandidates ?? [])]
       .map((candidate) => String(candidate).trim())
       .filter((candidate) => candidate.length > 0);
-    return (await this.request({
-      type: "stream_begin",
-      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
-      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
-      stream_id_hex: optionalHex(options.streamIdHex, "stream_id_hex"),
-      quic_candidates: quicCandidates,
-    })) as unknown as StreamBegunResponse;
+    return (await this.request(
+      {
+        type: "stream_begin",
+        account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+        group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+        stream_id_hex: optionalHex(options.streamIdHex, "stream_id_hex"),
+        quic_candidates: quicCandidates,
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    )) as unknown as StreamBegunResponse;
   }
 
   async streamAppend(streamIdHex: string, appendText: string): Promise<Envelope> {
-    return this.request({
-      type: "stream_append",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      append_text: String(appendText ?? ""),
-    });
+    return this.request(
+      {
+        type: "stream_append",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        append_text: String(appendText ?? ""),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async streamStatus(streamIdHex: string, status: string): Promise<Envelope> {
-    return this.request({
-      type: "stream_status",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      status: String(status ?? ""),
-    });
+    return this.request(
+      {
+        type: "stream_status",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        status: String(status ?? ""),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async streamProgress(streamIdHex: string, text: string): Promise<Envelope> {
-    return this.request({
-      type: "stream_progress",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      text: String(text ?? ""),
-    });
+    return this.request(
+      {
+        type: "stream_progress",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        text: String(text ?? ""),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async streamFinalize(
@@ -244,6 +275,9 @@ export class MarmotAgentControlClient {
     transcriptHashHex: string,
     chunkCount: number,
   ): Promise<StreamFinalizedResponse> {
+    // Durable commit: keep the full request timeout. Abandoning a live finalize
+    // early could re-send via send_final and duplicate the kind-9, so this op is
+    // intentionally not bounded by previewRequestTimeoutMs.
     return (await this.request({
       type: "stream_finalize",
       stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
@@ -254,11 +288,14 @@ export class MarmotAgentControlClient {
   }
 
   async streamCancel(streamIdHex: string, reason?: string | null): Promise<Envelope> {
-    return this.request({
-      type: "stream_cancel",
-      stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
-      reason: reason == null ? null : String(reason),
-    });
+    return this.request(
+      {
+        type: "stream_cancel",
+        stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        reason: reason == null ? null : String(reason),
+      },
+      { timeoutMs: this.previewRequestTimeoutMs },
+    );
   }
 
   async allowlistList(accountIdHex: string): Promise<AllowlistResponse> {

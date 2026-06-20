@@ -29,36 +29,46 @@ export default defineChannelPluginEntry({
       )})`,
     );
     void (async () => {
-      // Mirror configured dm.allowFrom welcomers into dm-agent before consuming
-      // inbound, so the welcomer policy is in place when the agent goes live.
-      // (syncMarmotAllowlist is self-guarded and never rejects.)
-      await syncMarmotAllowlist(api);
+      try {
+        // Mirror configured dm.allowFrom welcomers into dm-agent before consuming
+        // inbound, so the welcomer policy is in place when the agent goes live.
+        // (syncMarmotAllowlist is self-guarded and never rejects.)
+        await syncMarmotAllowlist(api);
 
-      // Inbound -> agent turn dispatch (Telegram-modeled): the bridge feeds each
-      // received Marmot message into runChannelInboundEvent, and the agent's
-      // reply is delivered back through send_final / live QUIC previews.
-      const resolved = resolveMarmotChannelAccount(api.config, null);
-      const dispatch = createMarmotInboundDispatcher({
-        cfg: api.config,
-        runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
-        client: clientForAccount(resolved),
-        channelAccountId: resolved.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
-        streamMode: resolved.streamMode,
-        blockStreaming: resolved.blockStreaming,
-        quicCandidates: resolved.quicCandidates,
-        log: (message) => api.logger.info(message),
-      });
+        // Inbound -> agent turn dispatch (Telegram-modeled): the bridge feeds each
+        // received Marmot message into runChannelInboundEvent, and the agent's
+        // reply is delivered back through send_final / live QUIC previews.
+        const resolved = resolveMarmotChannelAccount(api.config, null);
+        const dispatch = createMarmotInboundDispatcher({
+          cfg: api.config,
+          runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
+          client: clientForAccount(resolved),
+          channelAccountId: resolved.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
+          streamMode: resolved.streamMode,
+          blockStreaming: resolved.blockStreaming,
+          quicCandidates: resolved.quicCandidates,
+          log: (message) => api.logger.info(message),
+        });
 
-      // Inherit the configured OpenClaw agent name (if any) for the optional
-      // Nostr profile-name onboarding flow; otherwise it asks in-chat.
-      const agents = (api.config as {
-        agents?: { list?: Array<{ name?: string; default?: boolean }> };
-      }).agents;
-      const agentList = agents?.list ?? [];
-      const configuredAgentName =
-        agentList.find((entry) => entry.default)?.name ?? agentList[0]?.name ?? null;
+        // Inherit the configured OpenClaw agent name (if any) for the optional
+        // Nostr profile-name onboarding flow; otherwise it asks in-chat.
+        const agents = (api.config as {
+          agents?: { list?: Array<{ name?: string; default?: boolean }> };
+        }).agents;
+        const agentList = agents?.list ?? [];
+        const configuredAgentName =
+          agentList.find((entry) => entry.default)?.name ?? agentList[0]?.name ?? null;
 
-      startMarmotInbound(api, dispatch, { configuredAgentName });
+        startMarmotInbound(api, dispatch, { configuredAgentName });
+      } catch {
+        // This runs in a fire-and-forget IIFE, so an unguarded throw (e.g. a
+        // malformed channels.marmot config that fails account resolution) would
+        // surface as an unhandledRejection — and OpenClaw's handler process.exit(1)s
+        // the whole gateway on a non-transient rejection, taking sibling channels
+        // down with it. Contain it: log a privacy-safe notice and leave the Marmot
+        // channel inert instead of crashing the gateway.
+        api.logger.warn("marmot: inbound startup failed; channel is inactive");
+      }
     })();
   },
 });
