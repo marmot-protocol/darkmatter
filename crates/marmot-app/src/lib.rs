@@ -1152,9 +1152,10 @@ impl MarmotApp {
     ///
     /// Only local-signing accounts are reported (matching `managed_accounts`).
     /// The chat-list projection is built from the on-disk store if missing;
-    /// this is a local operation and never touches the network. A single
-    /// account that fails to open or project is skipped with a privacy-safe
-    /// warning rather than failing the whole query.
+    /// this is a local operation and never touches the network. Intended for
+    /// account-switcher scale, this does one encrypted database open per local
+    /// signing account. A single account that fails to open or project is
+    /// skipped with a privacy-safe warning rather than failing the whole query.
     pub fn account_unread_summary(&self) -> Result<Vec<AccountUnread>, AppError> {
         let accounts = self
             .account_home()
@@ -1166,10 +1167,11 @@ impl MarmotApp {
         for account in accounts {
             match self.account_unread_for(&account) {
                 Ok(summary) => summaries.push(summary),
-                Err(_) => {
+                Err(error) => {
                     tracing::warn!(
                         target: "marmot_app::storage",
                         method = "account_unread_summary",
+                        error_kind = error.privacy_safe_kind(),
                         "skipped an account whose unread aggregate could not be computed"
                     );
                 }
