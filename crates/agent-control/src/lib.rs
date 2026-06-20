@@ -76,6 +76,12 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         text: String,
         reply_to_message_id_hex: Option<String>,
+        /// Optional client-supplied dedup key. When present, the connector dedups
+        /// repeated sends with the same key (returning the original message ids)
+        /// so a retry after a post-write timeout cannot double-post an
+        /// unrecallable durable message. Omitted = no dedup (legacy behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     DeleteMessage {
         account_id_hex: String,
@@ -350,6 +356,22 @@ pub enum AgentControlEvent {
         target_message_id_hex: String,
         sender_account_id_hex: String,
     },
+    /// A durable, MLS-authenticated change to group state was observed (a member
+    /// add/remove/leave, an admin grant/revoke, or a group rename/avatar change).
+    /// Privacy: the subject member's pubkey is never surfaced — only a coarse
+    /// `change` kind plus, for a rename, the new group display name in `detail`.
+    GroupStateChanged {
+        account_id_hex: String,
+        group_id_hex: String,
+        /// Coarse change kind: `"member_added"`, `"member_removed"`,
+        /// `"member_left"`, `"admin_added"`, `"admin_removed"`,
+        /// `"group_renamed"`, or `"group_avatar_changed"`.
+        change: String,
+        /// The new group display name for `group_renamed`; `None` otherwise.
+        /// Never carries a member pubkey.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     GroupInvite {
         account_id_hex: String,
         group_id_hex: String,
@@ -463,9 +485,9 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlRequest, AgentControlResponse,
-        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
-        write_frame,
+        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
+        AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame,
+        read_envelope, read_frame, write_frame,
     };
 
     #[test]
@@ -507,6 +529,67 @@ mod tests {
 
         let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
+        // Additive, v1-compatible field: omitted from the wire when None so an
+        // old peer's frame stays byte-identical; present and round-tripping when
+        // a client supplies it for dedup.
+        let without = AgentControlRequest::SendFinal {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            text: "done".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: None,
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(
+            value.get("idempotency_key").is_none(),
+            "absent key must not be serialized"
+        );
+
+        let with = AgentControlRequest::SendFinal {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            text: "done".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: Some("key-1".to_owned()),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["idempotency_key"], "key-1");
+        let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn group_state_changed_event_round_trips_with_optional_detail() {
+        let renamed = AgentControlEvent::GroupStateChanged {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            change: "group_renamed".to_owned(),
+            detail: Some("Team".to_owned()),
+        };
+        let value = serde_json::to_value(&renamed).unwrap();
+        assert_eq!(value["type"], "group_state_changed");
+        assert_eq!(value["change"], "group_renamed");
+        assert_eq!(value["detail"], "Team");
+        let back: AgentControlEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(back, renamed);
+
+        let member_added = AgentControlEvent::GroupStateChanged {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            change: "member_added".to_owned(),
+            detail: None,
+        };
+        let value = serde_json::to_value(&member_added).unwrap();
+        assert!(
+            value.get("detail").is_none(),
+            "no member detail must be surfaced"
+        );
+        let back: AgentControlEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(back, member_added);
     }
 
     #[tokio::test]
@@ -643,6 +726,7 @@ mod tests {
                     group_id_hex: group(),
                     text: "done".to_owned(),
                     reply_to_message_id_hex: None,
+                    idempotency_key: None,
                 },
                 "send_final",
             ),

@@ -38,6 +38,57 @@ impl DebugFinalSendStore {
     }
 }
 
+/// Maximum number of recent idempotency keys retained for durable-send dedup.
+/// Oldest keys are evicted FIFO once the cap is reached; this bounds memory while
+/// comfortably covering any plausible in-flight retry window.
+const SEND_IDEMPOTENCY_CAPACITY: usize = 1024;
+
+/// Bounded FIFO map from a client-supplied idempotency key to the durable
+/// message ids produced by the first successful `send_final` for that key.
+///
+/// A retry that reuses the same key returns the cached ids without re-sending,
+/// so a retry after a post-write timeout cannot double-post an unrecallable
+/// encrypted message. Keys are evicted oldest-first once the capacity is reached.
+#[derive(Clone, Default)]
+pub(crate) struct SendIdempotencyStore {
+    inner: Arc<Mutex<SendIdempotencyInner>>,
+}
+
+#[derive(Default)]
+struct SendIdempotencyInner {
+    order: std::collections::VecDeque<String>,
+    seen: HashMap<String, Vec<String>>,
+}
+
+impl SendIdempotencyStore {
+    /// The message ids recorded for `key` by an earlier successful send, if any.
+    pub(crate) fn get(&self, key: &str) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("send idempotency lock poisoned")
+            .seen
+            .get(key)
+            .cloned()
+    }
+
+    /// Record the durable message ids produced for `key`. A repeat record for an
+    /// existing key keeps the original ids (the first successful send wins);
+    /// otherwise the key is appended and the oldest is evicted once at capacity.
+    pub(crate) fn record(&self, key: String, message_ids: Vec<String>) {
+        let mut inner = self.inner.lock().expect("send idempotency lock poisoned");
+        if inner.seen.contains_key(&key) {
+            return;
+        }
+        if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
+            && let Some(evicted) = inner.order.pop_front()
+        {
+            inner.seen.remove(&evicted);
+        }
+        inner.seen.insert(key.clone(), message_ids);
+        inner.order.push_back(key);
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct StreamSessionStore {
     sessions: Arc<Mutex<HashMap<String, ActiveStreamSession>>>,

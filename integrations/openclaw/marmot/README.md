@@ -122,12 +122,25 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   reply. Membership is queried lazily (only for otherwise-unaddressed messages)
   and fails open, so a lookup error never silently drops a message.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
-  the adapter never merges or rewrites text across sends.
+  the adapter never merges or rewrites text across sends. Each durable reply is
+  **idempotent + retried**: the sink generates one `idempotency_key` per reply
+  and retries the send a few times (with a short backoff) on retryable errors,
+  reusing the same key so `dm-agent` dedups instead of double-posting. A repeated
+  key returns the original message ids without a second send, so a retry after a
+  post-write timeout cannot double-post an unrecallable encrypted message.
+  (Follow-up: `stream_finalize` is not yet idempotent.)
 - **Message deletion**: the control client can retract a prior message via
   `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
   kind-5 deletions from other members surface as a `message_deleted` event.
   (The OpenClaw agent-facing delete trigger and ambient surfacing of inbound
   deletions are validated on the docker harness.)
+- **Group state changes**: durable, MLS-authenticated changes to group state
+  (member add/remove/leave, admin grant/revoke, group rename/avatar change)
+  surface as a `group_state_changed` event carrying only a coarse `change` kind
+  and, for a rename, the new group display name in `detail` — never a member
+  pubkey. The plugin records it privacy-safely; agent-facing ambient surfacing
+  (via `api.runtime.system` `enqueueSystemEvent`, shared with `message_deleted`)
+  is validated on the docker harness.
 - **Media** (control-plane): the control client can send local files as
   encrypted media via `send_media` (`dm-agent` reads the bytes from its host,
   encrypts + uploads to Blossom, and sends a kind-9 message) and fetch + decrypt

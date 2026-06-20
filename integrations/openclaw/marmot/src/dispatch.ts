@@ -10,13 +10,15 @@
 // end-to-end against the `openclaw-gateway` docker harness (it needs a running
 // gateway + a model). The MarmotReplySink mapping below is unit-tested.
 
+import { randomUUID } from "node:crypto";
+
 import {
   buildChannelInboundEventContext,
   runChannelInboundEvent,
 } from "openclaw/plugin-sdk/channel-inbound";
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
-import type { MarmotAgentControlClient } from "./client.js";
+import { isRetryable, type MarmotAgentControlClient } from "./client.js";
 import type { GroupActivation, StreamMode } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
@@ -303,13 +305,34 @@ export class MarmotReplySink {
 
   private async sendFinal(text: string): Promise<void> {
     this.log(`marmot: sending durable final (${text.length} chars)`);
-    await this.options.client.sendFinal(
-      this.options.accountIdHex,
-      this.options.groupIdHex,
-      text,
-      this.options.replyToMessageIdHex ?? null,
-    );
-    this.log("marmot: durable final sent");
+    // One idempotency key for all attempts of THIS durable reply: a retry after a
+    // post-write timeout reuses the key so the connector dedups instead of
+    // double-posting an unrecallable encrypted message. Bounded retries with a
+    // tiny backoff cover the transient/timeout window; non-retryable errors fail
+    // fast and the last error is rethrown.
+    const idempotencyKey = randomUUID();
+    const backoffMs = [100, 300];
+    let attempt = 0;
+    for (;;) {
+      try {
+        await this.options.client.sendFinal(
+          this.options.accountIdHex,
+          this.options.groupIdHex,
+          text,
+          this.options.replyToMessageIdHex ?? null,
+          idempotencyKey,
+        );
+        this.log("marmot: durable final sent");
+        return;
+      } catch (err) {
+        if (attempt >= backoffMs.length || !isRetryable(err)) {
+          throw err;
+        }
+        this.log(`marmot: durable final send failed; retrying (attempt ${attempt + 1})`);
+        await new Promise((resolve) => setTimeout(resolve, backoffMs[attempt]));
+        attempt += 1;
+      }
+    }
   }
 
   async deliver(payload: ReplyPayloadLike, info: ReplyDelivery): Promise<void> {

@@ -40,6 +40,19 @@ export interface MarmotMessageDeleted {
   senderAccountIdHex: string;
 }
 
+export interface MarmotGroupStateChanged {
+  accountIdHex: string;
+  groupIdHex: string;
+  /**
+   * Coarse change kind: "member_added" | "member_removed" | "member_left" |
+   * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed".
+   * Privacy: never carries a member pubkey.
+   */
+  change: string;
+  /** New group display name for "group_renamed"; absent otherwise. */
+  detail?: string | null;
+}
+
 export interface MarmotInboundBridgeOptions {
   accountIdHex?: string | null;
   groupIdHex?: string | null;
@@ -49,6 +62,8 @@ export interface MarmotInboundBridgeOptions {
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
   /** Another member deleted (retracted) a message in a group. */
   onMessageDeleted?: (deletion: MarmotMessageDeleted) => void | Promise<void>;
+  /** A durable group-state change (membership/admin/rename/avatar) was observed. */
+  onGroupStateChanged?: (change: MarmotGroupStateChanged) => void | Promise<void>;
   onResync?: (info: { droppedEvents: number }) => void | Promise<void>;
   onError?: (error: unknown) => void;
   /** Base reconnect delay (first attempt). Grows exponentially up to the cap. */
@@ -194,6 +209,15 @@ export class MarmotInboundBridge {
         groupIdHex: event.group_id_hex,
         targetMessageIdHex: event.target_message_id_hex,
         senderAccountIdHex: event.sender_account_id_hex,
+      });
+      return;
+    }
+    if (event.type === "group_state_changed") {
+      await this.options.onGroupStateChanged?.({
+        accountIdHex: event.account_id_hex,
+        groupIdHex: event.group_id_hex,
+        change: event.change,
+        detail: event.detail ?? null,
       });
       return;
     }

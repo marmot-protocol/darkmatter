@@ -135,12 +135,14 @@ impl AgentConnector {
                 group_id_hex,
                 text,
                 reply_to_message_id_hex,
+                idempotency_key,
             } => {
                 self.send_final_response(
                     &account_id_hex,
                     &group_id_hex,
                     text,
                     reply_to_message_id_hex,
+                    idempotency_key,
                 )
                 .await
             }

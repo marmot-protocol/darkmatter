@@ -28,7 +28,13 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       });
       break;
     case "send_final":
-      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("ab")] });
+      // Echo back the idempotency_key (when present) so a test can assert the
+      // client forwarded it; real dm-agent never returns it.
+      send(socket, id, {
+        type: "final_sent",
+        message_ids_hex: [HEX32("ab")],
+        echoed_idempotency_key: req.idempotency_key ?? null,
+      });
       break;
     case "delete_message":
       send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("de")] });
@@ -150,6 +156,24 @@ describe("MarmotAgentControlClient", () => {
   it("returns durable message ids from send_final", async () => {
     const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
     expect(res.message_ids_hex).toEqual([HEX32("ab")]);
+  });
+
+  it("forwards an idempotency_key on send_final when supplied, and omits it otherwise", async () => {
+    const withKey = (await client.sendFinal(
+      HEX32("aa"),
+      HEX32("cc"),
+      "done",
+      null,
+      "retry-key-1",
+    )) as unknown as { echoed_idempotency_key?: string | null };
+    expect(withKey.echoed_idempotency_key).toBe("retry-key-1");
+
+    const withoutKey = (await client.sendFinal(
+      HEX32("aa"),
+      HEX32("cc"),
+      "done",
+    )) as unknown as { echoed_idempotency_key?: string | null };
+    expect(withoutKey.echoed_idempotency_key).toBeNull();
   });
 
   it("deletes a message and returns the deletion event ids", async () => {

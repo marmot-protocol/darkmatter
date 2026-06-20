@@ -131,6 +131,33 @@ describe("MarmotInboundBridge", () => {
     expect(deletedTarget).toBe(HEX32("d9"));
   });
 
+  it("routes a group_state_changed event to onGroupStateChanged", async () => {
+    const renamed: AgentControlEvent = {
+      type: "group_state_changed",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      change: "group_renamed",
+      detail: "Team",
+    };
+    const { client } = makeClient([renamed]);
+    let observedChange = "";
+    let observedDetail: string | null = "";
+    const controller = new AbortController();
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onMessage: () => {},
+      onGroupStateChanged: ({ change, detail }) => {
+        observedChange = change;
+        observedDetail = detail ?? null;
+        controller.abort();
+      },
+    });
+
+    await bridge.run(controller.signal);
+    expect(observedChange).toBe("group_renamed");
+    expect(observedDetail).toBe("Team");
+  });
+
   it("stops cleanly when the signal aborts", async () => {
     const { client, subscribeCalls } = makeClient([]);
     const controller = new AbortController();

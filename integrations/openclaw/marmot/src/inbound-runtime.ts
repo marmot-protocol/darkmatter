@@ -224,6 +224,15 @@ export function startMarmotInbound(
         markMarmotInboundReceived(statusAccountId);
         api.logger.info("marmot: inbound message deletion observed");
       },
+      onGroupStateChanged: () => {
+        // A durable group-state change (membership/admin/rename/avatar) was
+        // observed. Recorded privacy-safely; the change kind contents are NOT
+        // logged. Surfacing it to the agent as quiet ambient context (via
+        // api.runtime.system enqueueSystemEvent) lands with the system-event work
+        // and is validated on the docker harness.
+        markMarmotInboundReceived(statusAccountId);
+        api.logger.info("marmot: inbound group state change observed");
+      },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {
             markMarmotInboundReceived(statusAccountId);

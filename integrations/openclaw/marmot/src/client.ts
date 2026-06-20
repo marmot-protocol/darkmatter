@@ -172,6 +172,19 @@ export type AgentControlEvent =
       sender_account_id_hex: string;
     }
   | {
+      type: "group_state_changed";
+      account_id_hex: string;
+      group_id_hex: string;
+      /**
+       * Coarse change kind: "member_added" | "member_removed" | "member_left" |
+       * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed".
+       * Privacy: never carries a member pubkey.
+       */
+      change: string;
+      /** New group display name for "group_renamed"; absent otherwise. */
+      detail?: string | null;
+    }
+  | {
       type: "group_invite";
       account_id_hex: string;
       group_id_hex: string;
@@ -277,13 +290,18 @@ export class MarmotAgentControlClient {
     groupIdHex: string,
     text: string,
     replyToMessageIdHex?: string | null,
+    idempotencyKey?: string,
   ): Promise<FinalSentResponse> {
+    const key = idempotencyKey?.trim();
     return (await this.request({
       type: "send_final",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       text: String(text ?? ""),
       reply_to_message_id_hex: optionalHex(replyToMessageIdHex, "reply_to_message_id_hex"),
+      // Additive, v1-compatible: only sent when supplied, so the connector dedups
+      // a retry that reuses the same key instead of double-posting.
+      ...(key ? { idempotency_key: key } : {}),
     })) as unknown as FinalSentResponse;
   }
 

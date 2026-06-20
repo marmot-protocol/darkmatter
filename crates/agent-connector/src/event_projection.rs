@@ -67,6 +67,7 @@ fn media_refs_from_tags(tags: &[Vec<String>], source_epoch: u64) -> Vec<AgentCon
         })
         .collect()
 }
+use cgka_traits::engine::GroupStateChange;
 use cgka_traits::{GroupId, engine::GroupEvent};
 use marmot_app::{AppError, AppMessageRecord, MarmotAppEvent, MarmotAppRuntime};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
@@ -174,6 +175,37 @@ pub(crate) fn control_event_from_runtime_event(
                     welcomer_account_id_hex: welcomer.map(|member| hex::encode(member.as_slice())),
                 })
             }
+            GroupEvent::GroupStateChanged {
+                group_id, change, ..
+            } => {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                if !inbound_filter_matches(
+                    account_filter,
+                    &group_event.account_id_hex,
+                    group_filter,
+                    &group_id_hex,
+                ) {
+                    return None;
+                }
+                // Map to a coarse change kind. Privacy: the subject member's
+                // pubkey is NEVER surfaced; only a rename carries a detail (the
+                // new group display name, which is operationally visible).
+                let (change, detail) = match change {
+                    GroupStateChange::MemberAdded { .. } => ("member_added", None),
+                    GroupStateChange::MemberRemoved { .. } => ("member_removed", None),
+                    GroupStateChange::MemberLeft { .. } => ("member_left", None),
+                    GroupStateChange::AdminAdded { .. } => ("admin_added", None),
+                    GroupStateChange::AdminRemoved { .. } => ("admin_removed", None),
+                    GroupStateChange::GroupRenamed { name } => ("group_renamed", Some(name)),
+                    GroupStateChange::GroupAvatarChanged => ("group_avatar_changed", None),
+                };
+                Some(AgentControlEvent::GroupStateChanged {
+                    account_id_hex: group_event.account_id_hex,
+                    group_id_hex,
+                    change: change.to_owned(),
+                    detail,
+                })
+            }
             _ => None,
         },
         _ => None,
@@ -187,6 +219,11 @@ pub(crate) fn control_event_from_debug_event(
 ) -> Option<AgentControlEvent> {
     let (account_id_hex, group_id_hex) = match &event {
         AgentControlEvent::MessageDeleted {
+            account_id_hex,
+            group_id_hex,
+            ..
+        }
+        | AgentControlEvent::GroupStateChanged {
             account_id_hex,
             group_id_hex,
             ..

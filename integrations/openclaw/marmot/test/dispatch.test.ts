@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { StreamMode } from "../src/config.js";
+import { AgentControlError } from "../src/client.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
   createMarmotInboundDispatcher,
@@ -391,6 +392,60 @@ describe("MarmotReplySink", () => {
     const calls = emptyCalls();
     await makeSink(calls, { streamMode: "off" }).deliver({ text: "searching..." }, { kind: "tool" });
     expect(calls).toEqual(emptyCalls());
+  });
+
+  it("retries a retryable durable final, reusing one idempotency key per call", async () => {
+    const keys: (string | undefined)[] = [];
+    let attempts = 0;
+    const client = {
+      async sendFinal(
+        _account: string,
+        _group: string,
+        _text: string,
+        _replyTo?: string | null,
+        idempotencyKey?: string,
+      ) {
+        keys.push(idempotencyKey);
+        attempts += 1;
+        if (attempts === 1) {
+          throw new AgentControlError("transient", { code: "io_error", retryable: true });
+        }
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+    } as unknown as MarmotSinkClient;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "off",
+      quicCandidates: [],
+    });
+
+    await sink.deliver({ text: "hello world" }, { kind: "final" });
+    expect(attempts).toBe(2);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]); // same key reused across the retry
+  });
+
+  it("does not retry a non-retryable durable final and rethrows", async () => {
+    let attempts = 0;
+    const client = {
+      async sendFinal() {
+        attempts += 1;
+        throw new AgentControlError("bad request", { code: "bad_request", retryable: false });
+      },
+    } as unknown as MarmotSinkClient;
+    const sink = new MarmotReplySink({
+      client,
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      streamMode: "off",
+      quicCandidates: [],
+    });
+
+    await expect(sink.deliver({ text: "hello" }, { kind: "final" })).rejects.toThrow("bad request");
+    expect(attempts).toBe(1);
   });
 });
 

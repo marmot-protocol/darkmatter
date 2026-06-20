@@ -4,7 +4,6 @@ use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
     AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
-use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AgentTextStreamTranscriptV1,
@@ -15,6 +14,8 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
 };
+use cgka_traits::engine::{GroupEvent, GroupStateChange};
+use cgka_traits::{EpochId, GroupId, MessageId};
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountSetupRequest, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
@@ -149,6 +150,68 @@ fn control_event_projects_kind5_deletion_as_message_deleted() {
     assert_eq!(account_id_hex, agent_account_id_hex);
     assert_eq!(target_message_id_hex, target);
     assert_eq!(sender_account_id_hex, "bb".repeat(32));
+}
+
+#[test]
+fn control_event_projects_group_rename_as_group_state_changed() {
+    // A GroupRenamed change projects to a coarse `group_renamed` control event
+    // carrying the new group display name in `detail`. Privacy: member/admin
+    // changes carry NO detail (the subject member's pubkey is never surfaced).
+    let agent_account_id_hex = "aa".repeat(32);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: agent_account_id_hex.clone(),
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: GroupId::new(vec![0x22; 32]),
+            epoch: EpochId(3),
+            actor: None,
+            change: GroupStateChange::GroupRenamed {
+                name: "Team".to_owned(),
+            },
+            origin_commit_id: None,
+        },
+    });
+
+    let Some(AgentControlEvent::GroupStateChanged {
+        account_id_hex,
+        group_id_hex,
+        change,
+        detail,
+    }) = control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected a group state change to project to GroupStateChanged");
+    };
+    assert_eq!(account_id_hex, agent_account_id_hex);
+    assert_eq!(group_id_hex, "22".repeat(32));
+    assert_eq!(change, "group_renamed");
+    assert_eq!(detail, Some("Team".to_owned()));
+}
+
+#[test]
+fn control_event_group_state_change_member_add_carries_no_member_detail() {
+    // A member add must NOT surface the subject member's pubkey: the projection
+    // collapses to a coarse change kind with `detail == None`.
+    let agent_account_id_hex = "aa".repeat(32);
+    let member = cgka_traits::MemberId::new(vec![0x99; 32]);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: agent_account_id_hex,
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: GroupId::new(vec![0x22; 32]),
+            epoch: EpochId(4),
+            actor: None,
+            change: GroupStateChange::MemberAdded { member },
+            origin_commit_id: None,
+        },
+    });
+
+    let Some(AgentControlEvent::GroupStateChanged { change, detail, .. }) =
+        control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected a member add to project to GroupStateChanged");
+    };
+    assert_eq!(change, "member_added");
+    assert_eq!(detail, None, "member pubkey must never be surfaced");
 }
 
 #[test]
@@ -613,6 +676,7 @@ async fn connector_socket_subscribes_to_inbound_messages() {
             group_id_hex: group_id_hex.clone(),
             text: "hello agent".to_owned(),
             reply_to_message_id_hex: None,
+            idempotency_key: None,
         },
     );
     write_frame(&mut sender_write, &send).await.unwrap();
@@ -775,6 +839,7 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
             group_id_hex: group_id_hex.clone(),
             text: "marmot-e2e-ok: ping from connector".to_owned(),
             reply_to_message_id_hex: Some(message_id_hex.clone()),
+            idempotency_key: None,
         },
     )
     .await;
@@ -1638,6 +1703,7 @@ async fn connector_socket_sends_final_message() {
             group_id_hex,
             text: "final answer".to_owned(),
             reply_to_message_id_hex: None,
+            idempotency_key: None,
         },
     );
     write_frame(&mut client_write, &request).await.unwrap();
@@ -2310,6 +2376,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             &group_id_hex,
             "missed while lagging".to_owned(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2374,5 +2441,159 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             AgentControlEvent::InboundMessage { text, .. } if text == "missed while lagging"
         )),
         "second replay must not duplicate an already-delivered message"
+    );
+}
+
+#[tokio::test]
+async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
+    // GAP-06: a retry that reuses the same idempotency key must return the
+    // ORIGINAL durable message ids without re-sending, so a post-write-timeout
+    // retry can never double-post an unrecallable encrypted message. Observable
+    // proof of "no second send": only one copy of the text lands in storage.
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent idempotent send",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("dm-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+
+    let key = "retry-key-1".to_owned();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: first_ids,
+    } = connector
+        .send_final_response(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            "idempotent reply".to_owned(),
+            None,
+            Some(key.clone()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected first send to return FinalSent");
+    };
+    assert!(!first_ids.is_empty(), "a real send returns message ids");
+
+    // Second call with the SAME key returns the cached ids verbatim.
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: second_ids,
+    } = connector
+        .send_final_response(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            "idempotent reply".to_owned(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected second send to return cached FinalSent");
+    };
+    assert_eq!(
+        second_ids, first_ids,
+        "a repeated idempotency key must return the original message ids"
+    );
+
+    // Observable proof there was no second underlying send: exactly one copy of
+    // the text exists in the agent's own group storage projection.
+    let stored = connector
+        .runtime
+        .messages_with_query(
+            &agent.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                limit: None,
+            },
+        )
+        .unwrap();
+    let copies = stored
+        .iter()
+        .filter(|m| m.plaintext == "idempotent reply")
+        .count();
+    assert_eq!(copies, 1, "a deduped retry must not re-post the message");
+}
+
+#[test]
+fn send_idempotency_store_returns_recorded_ids_for_a_key() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let store = SendIdempotencyStore::default();
+    assert_eq!(store.get("k1"), None, "an unseen key has no cached ids");
+
+    let ids = vec!["aa".repeat(32), "bb".repeat(32)];
+    store.record("k1".to_owned(), ids.clone());
+    assert_eq!(
+        store.get("k1"),
+        Some(ids),
+        "a recorded key returns its message ids"
+    );
+    assert_eq!(store.get("k2"), None, "an unrelated key stays absent");
+}
+
+#[test]
+fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let store = SendIdempotencyStore::default();
+    let first = vec!["11".repeat(32)];
+    let second = vec!["22".repeat(32)];
+    store.record("dup".to_owned(), first.clone());
+    // A repeat record (e.g. a racing duplicate) must not overwrite the original
+    // committed ids: the first successful send for a key always wins.
+    store.record("dup".to_owned(), second);
+    assert_eq!(store.get("dup"), Some(first));
+}
+
+#[test]
+fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    // Cap is 1024; fill past it and assert the oldest key is evicted FIFO while
+    // the newest remain. This bounds memory for a long-lived connector.
+    let store = SendIdempotencyStore::default();
+    for n in 0..1100u32 {
+        store.record(format!("key-{n}"), vec![format!("{n:064x}")]);
+    }
+    assert_eq!(store.get("key-0"), None, "oldest key must be evicted");
+    assert_eq!(store.get("key-75"), None, "early keys must be evicted");
+    assert_eq!(
+        store.get("key-1099"),
+        Some(vec![format!("{:064x}", 1099)]),
+        "the newest key must still be cached"
+    );
+    assert_eq!(
+        store.get("key-200"),
+        Some(vec![format!("{:064x}", 200)]),
+        "a key within the retained window must still be cached"
     );
 }

@@ -59,6 +59,7 @@ impl AgentConnector {
         group_id_hex: &str,
         text: String,
         reply_to_message_id_hex: Option<String>,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         if self.debug_controls {
             return self.debug_record_final_send_response(
@@ -67,6 +68,15 @@ impl AgentConnector {
                 text,
                 reply_to_message_id_hex,
             );
+        }
+
+        // Idempotent durable send: if this key already committed a send, return
+        // the original message ids without re-sending so a retry after a
+        // post-write timeout cannot double-post an unrecallable message.
+        if let Some(key) = idempotency_key.as_deref()
+            && let Some(message_ids_hex) = self.idempotency.get(key)
+        {
+            return Ok(AgentControlResponse::FinalSent { message_ids_hex });
         }
 
         let account = self.local_account_for_account_id(account_id_hex)?;
@@ -80,6 +90,10 @@ impl AgentConnector {
                 .send_message(&account.label, &group_id, text.into_bytes())
                 .await?
         };
+        // Record only after a successful send so a failed send remains retryable.
+        if let Some(key) = idempotency_key {
+            self.idempotency.record(key, summary.message_ids.clone());
+        }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,
         })
