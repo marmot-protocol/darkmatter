@@ -41,6 +41,31 @@ impl AgentConnector {
         })
     }
 
+    /// Report group membership for an account's group so a channel can decide
+    /// activation policy: `is_direct` (exactly two members, i.e. an effective DM
+    /// where the agent always replies) vs a multi-party group that gates on
+    /// being addressed.
+    pub(crate) async fn group_info_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let state = self
+            .runtime
+            .group_mls_state(&account.label, &group_id)
+            .await?;
+        let member_count = u32::try_from(state.member_count).unwrap_or(u32::MAX);
+        Ok(AgentControlResponse::GroupInfo {
+            account_id_hex: account.account_id_hex,
+            group_id_hex: hex::encode(group_id.as_slice()),
+            member_count,
+            is_direct: state.member_count == 2,
+            subject: None,
+        })
+    }
+
     pub(crate) fn debug_inject_inbound_response(
         &self,
         account_id_hex: &str,
@@ -56,6 +81,9 @@ impl AgentConnector {
             message_id_hex: normalize_hex(message_id_hex)?,
             sender_account_id_hex: normalize_hex(sender_account_id_hex)?,
             text,
+            mentions_self: false,
+            reply_to_message_id_hex: None,
+            sender_display_name: None,
         };
         let _ = self.debug_events.send(event);
         Ok(AgentControlResponse::Ack)

@@ -150,6 +150,10 @@ pub enum AgentControlRequest {
         text: String,
         data: Option<Value>,
     },
+    GroupInfo {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
     AllowlistList {
         account_id_hex: String,
     },
@@ -204,6 +208,16 @@ pub enum AgentControlResponse {
         account_id_hex: String,
         welcomer_account_ids_hex: Vec<String>,
     },
+    GroupInfo {
+        account_id_hex: String,
+        group_id_hex: String,
+        member_count: u32,
+        /// True when the group has exactly two members (the agent + one peer),
+        /// i.e. an effective direct conversation where the agent always replies.
+        is_direct: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+    },
     StreamBegun {
         stream_id_hex: String,
         start_message_id_hex: String,
@@ -243,6 +257,16 @@ pub enum AgentControlEvent {
         message_id_hex: String,
         sender_account_id_hex: String,
         text: String,
+        /// True when the receiving agent's account is `p`-tagged (mentioned) in
+        /// the message. Lets a channel gate group replies on being addressed.
+        #[serde(default)]
+        mentions_self: bool,
+        /// The message id this message replies to (`e` tag), when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_message_id_hex: Option<String>,
+        /// The sender's display name, when resolvable from the directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_display_name: Option<String>,
     },
     GroupInvite {
         account_id_hex: String,
@@ -648,6 +672,13 @@ mod tests {
                     data: None,
                 },
                 "send_group_system_event",
+            ),
+            (
+                AgentControlRequest::GroupInfo {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "group_info",
             ),
             (
                 AgentControlRequest::AllowlistList {

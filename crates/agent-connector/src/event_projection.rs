@@ -6,8 +6,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agent_control::{AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent};
 use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, STREAM_TAG,
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT, STREAM_TAG,
 };
+
+/// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
+/// account was mentioned/addressed in the message.
+const PUBKEY_MENTION_TAG: &str = "p";
+
+/// Whether `tags` mention (`p`-tag) the given account pubkey hex.
+fn tags_mention_account(tags: &[Vec<String>], account_id_hex: &str) -> bool {
+    tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == PUBKEY_MENTION_TAG)
+            && tag
+                .get(1)
+                .is_some_and(|value| value.eq_ignore_ascii_case(account_id_hex))
+    })
+}
+
+/// The replied-to message id from the first `e` tag, if present.
+fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
+    tags.iter()
+        .find(|tag| tag.first().is_some_and(|name| name == EVENT_REF_TAG))
+        .and_then(|tag| tag.get(1))
+        .map(|value| value.to_owned())
+}
 use cgka_traits::{GroupId, engine::GroupEvent};
 use marmot_app::{AppError, AppMessageRecord, MarmotAppEvent, MarmotAppRuntime};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
@@ -35,12 +57,17 @@ pub(crate) fn control_event_from_runtime_event(
                 &update.message.group_id,
                 &update.message.sender,
             )?;
+            let mentions_self = tags_mention_account(&update.message.tags, &update.account_id_hex);
+            let reply_to_message_id_hex = reply_target_from_tags(&update.message.tags);
             Some(AgentControlEvent::InboundMessage {
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
                 message_id_hex: update.message.message_id_hex,
                 sender_account_id_hex: update.message.sender,
                 text: update.message.plaintext,
+                mentions_self,
+                reply_to_message_id_hex,
+                sender_display_name: update.message.sender_display_name,
             })
         }
         MarmotAppEvent::AgentStreamStarted(update) => {
@@ -219,12 +246,18 @@ pub(crate) fn inbound_message_event_from_record(
     ) {
         return None;
     }
+    let mentions_self = tags_mention_account(&record.tags, account_id_hex);
+    let reply_to_message_id_hex = reply_target_from_tags(&record.tags);
     Some(AgentControlEvent::InboundMessage {
         account_id_hex: account_id_hex.to_owned(),
         group_id_hex: record.group_id_hex,
         message_id_hex: record.message_id_hex,
         sender_account_id_hex: record.sender,
         text: record.plaintext,
+        mentions_self,
+        reply_to_message_id_hex,
+        // Storage replay has no directory join; display name is best-effort live-only.
+        sender_display_name: None,
     })
 }
 

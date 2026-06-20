@@ -684,6 +684,7 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
         message_id_hex: event_message_id_hex,
         sender_account_id_hex: event_sender_account_id_hex,
         text,
+        ..
     } = inbound.payload
     else {
         panic!("expected debug inbound message event");
@@ -2099,8 +2100,34 @@ fn inbound_message_event_from_record_projects_received_chat() {
             message_id_hex: "aa".to_owned(),
             sender_account_id_hex: "cc".to_owned(),
             text: "hello agent".to_owned(),
+            mentions_self: false,
+            reply_to_message_id_hex: None,
+            sender_display_name: None,
         }
     );
+}
+
+#[test]
+fn inbound_message_event_from_record_extracts_mention_and_reply() {
+    // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
+    // the reply target. Both let a channel gate/thread without re-parsing tags.
+    let mut record = received_chat_record("aa", "bb", "cc", "hey there");
+    record.tags = vec![
+        vec!["p".to_owned(), "acct".to_owned()],
+        vec!["e".to_owned(), "parent-msg-id".to_owned()],
+    ];
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage {
+        mentions_self,
+        reply_to_message_id_hex,
+        ..
+    } = event
+    else {
+        panic!("expected inbound message event");
+    };
+    assert!(mentions_self, "p-tag for the account should mark a mention");
+    assert_eq!(reply_to_message_id_hex.as_deref(), Some("parent-msg-id"));
 }
 
 #[test]

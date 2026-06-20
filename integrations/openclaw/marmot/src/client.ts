@@ -84,6 +84,16 @@ export interface AllowlistResponse {
   welcomer_account_ids_hex: string[];
 }
 
+export interface GroupInfoResponse {
+  type: "group_info";
+  account_id_hex: string;
+  group_id_hex: string;
+  member_count: number;
+  /** True when the group has exactly two members (effective DM; always reply). */
+  is_direct: boolean;
+  subject?: string | null;
+}
+
 export interface ProfilePublishedResponse {
   type: "profile_published";
   account_id_hex: string;
@@ -99,6 +109,12 @@ export type AgentControlEvent =
       message_id_hex: string;
       sender_account_id_hex: string;
       text: string;
+      /** True when the receiving agent's account is mentioned (`p`-tagged). */
+      mentions_self?: boolean;
+      /** The message id this message replies to (`e` tag), when present. */
+      reply_to_message_id_hex?: string | null;
+      /** Sender's directory display name, when resolvable. */
+      sender_display_name?: string | null;
     }
   | {
       type: "group_invite";
@@ -303,6 +319,15 @@ export class MarmotAgentControlClient {
       type: "allowlist_list",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
     })) as unknown as AllowlistResponse;
+  }
+
+  /** Group membership for activation policy (member count, is_direct, subject). */
+  async groupInfo(accountIdHex: string, groupIdHex: string): Promise<GroupInfoResponse> {
+    return (await this.request({
+      type: "group_info",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+    })) as unknown as GroupInfoResponse;
   }
 
   async allowlistAdd(

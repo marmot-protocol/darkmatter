@@ -116,6 +116,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
+        AgentControlRequest::GroupInfo { .. } => "group_info",
         AgentControlRequest::AllowlistList { .. } => "allowlist_list",
         AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
         AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",

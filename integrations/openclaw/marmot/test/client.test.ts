@@ -38,6 +38,16 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         quic_candidates: [],
       });
       break;
+    case "group_info":
+      send(socket, id, {
+        type: "group_info",
+        account_id_hex: req.account_id_hex ?? HEX32("aa"),
+        group_id_hex: req.group_id_hex ?? HEX32("cc"),
+        member_count: 2,
+        is_direct: true,
+        subject: null,
+      });
+      break;
     case "explode":
       send(socket, id, { type: "error", code: "bad_request", message: "nope" });
       break;
@@ -125,6 +135,12 @@ describe("MarmotAgentControlClient", () => {
   it("returns durable message ids from send_final", async () => {
     const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
     expect(res.message_ids_hex).toEqual([HEX32("ab")]);
+  });
+
+  it("round-trips group_info (member count + is_direct)", async () => {
+    const res = await client.groupInfo(HEX32("aa"), HEX32("cc"));
+    expect(res.member_count).toBe(2);
+    expect(res.is_direct).toBe(true);
   });
 
   it("maps an error response to a typed AgentControlError", async () => {

@@ -14,6 +14,12 @@ export interface MarmotInboundMessage {
   messageIdHex: string;
   senderAccountIdHex: string;
   text: string;
+  /** True when the agent's account is mentioned (`p`-tagged) in this message. */
+  mentionsSelf?: boolean;
+  /** The message id this message replies to, when present. */
+  replyToMessageIdHex?: string | null;
+  /** Sender's directory display name, when resolvable. */
+  senderDisplayName?: string | null;
 }
 
 export interface MarmotGroupInvite {
@@ -184,6 +190,9 @@ export class MarmotInboundBridge {
       messageIdHex: event.message_id_hex,
       senderAccountIdHex: event.sender_account_id_hex,
       text: event.text,
+      mentionsSelf: event.mentions_self ?? false,
+      replyToMessageIdHex: event.reply_to_message_id_hex ?? null,
+      senderDisplayName: event.sender_display_name ?? null,
     });
   }
 }

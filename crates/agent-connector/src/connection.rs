@@ -109,6 +109,13 @@ impl AgentConnector {
                 account_id_hex,
                 welcomer_account_id_hex,
             } => self.allowlist_remove_response(&account_id_hex, &welcomer_account_id_hex),
+            AgentControlRequest::GroupInfo {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.group_info_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
             AgentControlRequest::DebugInjectInbound {
                 account_id_hex,
                 group_id_hex,
