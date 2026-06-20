@@ -22,6 +22,20 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   ),
 }));
 
+vi.mock("openclaw/plugin-sdk/media-store", () => ({
+  saveMediaBuffer: vi.fn(async (_buf: Buffer, ct?: string, _sub?: string, _max?: number, name?: string) => ({
+    id: "id1",
+    path: `/oc/media/inbound/${name}`,
+    size: 4,
+    contentType: ct,
+  })),
+}));
+
+vi.mock("node:fs/promises", () => ({
+  readFile: vi.fn(async () => Buffer.from("x")),
+  unlink: vi.fn(async () => {}),
+}));
+
 const buildCtxMock = vi.mocked(buildChannelInboundEventContext);
 
 const HEX32 = (b: string) => b.repeat(32);
@@ -721,9 +735,11 @@ describe("createMarmotInboundDispatcher inbound media", () => {
 
     expect(downloads).toEqual([ref]);
     const ctxArg = buildCtxMock.mock.calls[0]?.[0] as { media?: unknown };
+    // The fact path is the OpenClaw media-store staged path (allowlisted for both
+    // native vision and the agent's `image` tool), not the raw dm-agent temp path.
     expect(ctxArg.media).toEqual([
       {
-        path: `/tmp/marmot-dl/${ref.file_name}`,
+        path: `/oc/media/inbound/${ref.file_name}`,
         contentType: "image/png",
         kind: "image",
         messageId: HEX32("dd"),

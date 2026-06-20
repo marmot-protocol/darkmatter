@@ -17,14 +17,27 @@ use cgka_traits::app_event::{
 /// account was mentioned/addressed in the message.
 const PUBKEY_MENTION_TAG: &str = "p";
 
-/// Whether `tags` mention (`p`-tag) the given account pubkey hex.
-fn tags_mention_account(tags: &[Vec<String>], account_id_hex: &str) -> bool {
-    tags.iter().any(|tag| {
+/// Whether the message mentions the given account. Marmot clients address a
+/// member with an inline `nostr:<pubkey-hex>` reference in the body (the account
+/// id IS the Nostr pubkey hex), so check the plaintext for that; also honor a
+/// `["p", <pubkey-hex>]` tag in case a client emits one. Used to let a channel
+/// gate group replies on being addressed.
+fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_hex: &str) -> bool {
+    if account_id_hex.is_empty() {
+        return false;
+    }
+    let tagged = tags.iter().any(|tag| {
         tag.first().is_some_and(|name| name == PUBKEY_MENTION_TAG)
             && tag
                 .get(1)
                 .is_some_and(|value| value.eq_ignore_ascii_case(account_id_hex))
-    })
+    });
+    if tagged {
+        return true;
+    }
+    // Inline `nostr:<hexpubkey>` mention (Marmot convention).
+    let needle = format!("nostr:{}", account_id_hex.to_ascii_lowercase());
+    plaintext.to_ascii_lowercase().contains(&needle)
 }
 
 /// The replied-to message id from the first `e` tag, if present.
@@ -113,7 +126,11 @@ pub(crate) fn control_event_from_runtime_event(
                 &update.message.group_id,
                 &update.message.sender,
             )?;
-            let mentions_self = tags_mention_account(&update.message.tags, &update.account_id_hex);
+            let mentions_self = message_mentions_account(
+                &update.message.tags,
+                &update.message.plaintext,
+                &update.account_id_hex,
+            );
             let reply_to_message_id_hex = reply_target_from_tags(&update.message.tags);
             let media = media_refs_from_tags(&update.message.tags, update.message.source_epoch);
             Some(AgentControlEvent::InboundMessage {
@@ -345,7 +362,7 @@ pub(crate) fn inbound_message_event_from_record(
     ) {
         return None;
     }
-    let mentions_self = tags_mention_account(&record.tags, account_id_hex);
+    let mentions_self = message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
     let reply_to_message_id_hex = reply_target_from_tags(&record.tags);
     let media = media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or(0));
     Some(AgentControlEvent::InboundMessage {

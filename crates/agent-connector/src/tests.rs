@@ -2270,6 +2270,19 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
 }
 
 #[test]
+fn inbound_message_event_detects_inline_nostr_mention() {
+    // Marmot clients address a member with an inline `nostr:<pubkey-hex>` token
+    // (no p-tag), and the account id IS the pubkey hex.
+    let record = received_chat_record("aa", "bb", "cc", "hey nostr:acct can you help?");
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(mentions_self, "inline nostr:<pubkey> should mark a mention");
+}
+
+#[test]
 fn safe_media_filename_strips_path_traversal() {
     use crate::messaging::safe_media_filename;
     assert_eq!(safe_media_filename("a.png"), "a.png");

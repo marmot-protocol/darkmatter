@@ -11,12 +11,14 @@
 // gateway + a model). The MarmotReplySink mapping below is unit-tested.
 
 import { randomUUID } from "node:crypto";
+import { readFile, unlink } from "node:fs/promises";
 
 import {
   buildChannelInboundEventContext,
   runChannelInboundEvent,
   type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
+import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
 import { isRetryable, type MarmotAgentControlClient } from "./client.js";
@@ -548,10 +550,16 @@ function inboundMediaKind(mediaType: string): NonNullable<InboundMediaFacts["kin
 
 /**
  * Best-effort: download each inbound media ref to a local path on the dm-agent
- * host and build the `InboundMediaFacts` OpenClaw reads (and base64-encodes)
- * downstream. A ref that fails to download is skipped (privacy-safe log) so one
- * broken attachment never drops the whole turn. Returns `undefined` when the
- * message carries no media so the context builder omits the field entirely.
+ * host, then re-stage the decrypted bytes through OpenClaw's official media store
+ * so the resulting path is under an allowlisted media root. Native vision trusts
+ * the path directly, but the agent's `image` tool enforces an allowlist
+ * (`assertLocalMediaAllowed`) whose roots are OpenClaw's media dir — the raw
+ * dm-agent temp path is not under them, so the tool would reject it. Building the
+ * `InboundMediaFacts` from the staged path keeps both paths working. The dm-agent
+ * temp file is unlinked (best-effort) once re-staged. A ref that fails is skipped
+ * (privacy-safe log) so one broken attachment never drops the whole turn. Returns
+ * `undefined` when the message carries no media so the context builder omits the
+ * field entirely.
  */
 async function downloadInboundMedia(
   deps: Pick<MarmotDispatchClient, "downloadMedia">,
@@ -566,8 +574,12 @@ async function downloadInboundMedia(
   for (const ref of refs) {
     try {
       const res = await deps.downloadMedia(message.accountIdHex, message.groupIdHex, ref);
+      const buffer = await readFile(res.path);
+      const saved = await saveMediaBuffer(buffer, res.media_type, "inbound", undefined, res.file_name);
+      // The dm-agent temp file is now redundant; drop it (best-effort).
+      await unlink(res.path).catch(() => undefined);
       facts.push({
-        path: res.path,
+        path: saved.path,
         contentType: res.media_type,
         kind: inboundMediaKind(res.media_type),
         messageId: message.messageIdHex,
