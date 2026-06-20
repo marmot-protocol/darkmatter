@@ -145,6 +145,11 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(EngineError::Storage(err)),
         };
+        if previous.as_ref().is_some_and(|record| {
+            record.group_id == *group_id && record.epoch == epoch && record.state == state
+        }) {
+            return Ok(());
+        }
         let payload = payload
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -155,11 +160,6 @@ impl<S: StorageProvider> Engine<S> {
             state,
             payload,
         })?;
-        if previous.as_ref().is_some_and(|record| {
-            record.group_id == *group_id && record.epoch == epoch && record.state == state
-        }) {
-            return Ok(());
-        }
         self.audit_group(
             group_id,
             crate::audit_helpers::message_state_transition_event(

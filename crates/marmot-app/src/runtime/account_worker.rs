@@ -492,6 +492,9 @@ async fn run_app_runtime_account_worker(
                             }
                         }
                         Err(err) => {
+                            let mut retry_groups = client.take_pending_convergence_groups();
+                            retry_groups.push(group_id.clone());
+                            scheduled_convergence.schedule_groups(retry_groups);
                             publish_app_runtime_account_error(
                                 &events,
                                 &account_id_hex,
