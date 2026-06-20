@@ -17,7 +17,7 @@ import {
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
 import type { MarmotAgentControlClient } from "./client.js";
-import type { StreamMode } from "./config.js";
+import type { GroupActivation, StreamMode } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
@@ -435,20 +435,69 @@ export interface OpenClawChannelRuntime {
   };
 }
 
+/** Dispatcher client: the reply sink surface plus the group-info read for gating. */
+export type MarmotDispatchClient = MarmotSinkClient & Pick<MarmotAgentControlClient, "groupInfo">;
+
 export interface MarmotDispatchDeps {
   /** Full OpenClaw config (`api.config`). */
   cfg: unknown;
   /** `api.runtime.channel`. */
   runtimeChannel: OpenClawChannelRuntime;
-  client: MarmotSinkClient;
+  client: MarmotDispatchClient;
   /** OpenClaw channel account id ("default" or a configured account key), not the Marmot account hex. */
   channelAccountId?: string | null;
   streamMode: StreamMode;
   blockStreaming: boolean;
   quicCandidates: string[];
   chunkBytes?: number;
+  /** When to reply in a multi-party group ("mention" gates; "always" replies to all). */
+  groupActivation: GroupActivation;
+  /** Case-insensitive trigger phrases that count as addressing the agent. */
+  mentionPatterns: string[];
   /** Optional privacy-safe lifecycle logger. */
   log?: (message: string) => void;
+}
+
+/** Whether the message text contains any configured trigger phrase. */
+function matchesMentionPattern(text: string, patterns: string[]): boolean {
+  if (patterns.length === 0) {
+    return false;
+  }
+  const haystack = text.toLowerCase();
+  return patterns.some((pattern) => {
+    const needle = pattern.trim().toLowerCase();
+    return needle.length > 0 && haystack.includes(needle);
+  });
+}
+
+/**
+ * Decide whether an inbound group message should run an agent turn. Always reply
+ * when addressed (agent p-tagged, a trigger matches) or in an effective DM
+ * (exactly two members). Membership is queried lazily — only when the message is
+ * otherwise unaddressed — to avoid a round-trip on the common addressed case.
+ * Fails open (replies) if membership can't be resolved, so a lookup error never
+ * silently drops a user's message.
+ */
+async function shouldRunTurn(
+  deps: MarmotDispatchDeps,
+  message: MarmotInboundMessage,
+): Promise<boolean> {
+  if (deps.groupActivation === "always") {
+    return true;
+  }
+  if (message.mentionsSelf) {
+    return true;
+  }
+  if (matchesMentionPattern(message.text, deps.mentionPatterns)) {
+    return true;
+  }
+  try {
+    const info = await deps.client.groupInfo(message.accountIdHex, message.groupIdHex);
+    return info.is_direct;
+  } catch {
+    deps.log?.("marmot: group membership lookup failed; responding (fail-open)");
+    return true;
+  }
 }
 
 /**
@@ -460,6 +509,11 @@ export function createMarmotInboundDispatcher(
   deps: MarmotDispatchDeps,
 ): (message: MarmotInboundMessage) => Promise<void> {
   return async (message) => {
+    // Activation gating: in a multi-party group, only run a turn when addressed.
+    if (!(await shouldRunTurn(deps, message))) {
+      deps.log?.("marmot: inbound not addressed; skipping turn (groupActivation=mention)");
+      return;
+    }
     const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
       cfg: deps.cfg,
@@ -473,14 +527,20 @@ export function createMarmotInboundDispatcher(
       accountId: channelAccountId,
       messageId: message.messageIdHex,
       from: message.senderAccountIdHex,
-      sender: { id: message.senderAccountIdHex },
+      sender: {
+        id: message.senderAccountIdHex,
+        ...(message.senderDisplayName ? { name: message.senderDisplayName } : {}),
+      },
       conversation: { kind: "group", id: message.groupIdHex },
       route: {
         agentId: route.agentId,
         accountId: route.accountId,
         routeSessionKey: route.sessionKey,
       },
-      reply: { to: message.groupIdHex },
+      reply: {
+        to: message.groupIdHex,
+        ...(message.replyToMessageIdHex ? { replyToId: message.replyToMessageIdHex } : {}),
+      },
       message: { rawBody: message.text, bodyForAgent: message.text },
     });
 

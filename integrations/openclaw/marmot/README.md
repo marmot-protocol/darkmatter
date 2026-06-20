@@ -90,6 +90,8 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
 | `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
+| `groupActivation` | `MARMOT_GROUP_ACTIVATION` | `mention` (reply only when addressed in 3+ member groups; `always` replies to every message) |
+| `mentionPatterns` | `MARMOT_MENTION_PATTERNS` | — (extra case-insensitive trigger phrases; the configured agent name is always a trigger) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
@@ -112,6 +114,13 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   Dispatch is serialized per group (distinct groups run concurrently, each group
   stays FIFO), so a slow turn in one group never blocks inbound for others; set
   `debounceMs` to coalesce rapid same-sender bursts into one turn.
+- **Activation gating**: in a multi-party group the agent replies only when
+  addressed — it is `p`-tag mentioned, the text matches a `mentionPatterns`
+  trigger (or the agent name), or the conversation is an effective DM (exactly
+  two members, resolved via the `group_info` control op). Set
+  `groupActivation: "always"` to reply to every message. Effective DMs always
+  reply. Membership is queried lazily (only for otherwise-unaddressed messages)
+  and fails open, so a lookup error never silently drops a message.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
   the adapter never merges or rewrites text across sends.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an

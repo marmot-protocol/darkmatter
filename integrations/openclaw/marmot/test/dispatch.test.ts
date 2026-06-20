@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { StreamMode } from "../src/config.js";
+import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
   createMarmotInboundDispatcher,
   MarmotReplySink,
+  type MarmotDispatchClient,
   type MarmotSinkClient,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
@@ -37,11 +39,21 @@ function emptyCalls(): Calls {
   return { sendFinal: [], begin: 0, append: [], status: [], progress: [], finalize: [], cancel: [] };
 }
 
-function stubClient(calls: Calls): MarmotSinkClient {
+function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSinkClient {
   return {
     async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
       calls.sendFinal.push({ accountIdHex: _account, text, replyTo: replyTo ?? null });
       return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+    },
+    async groupInfo(accountIdHex: string, groupIdHex: string) {
+      return {
+        type: "group_info",
+        account_id_hex: accountIdHex,
+        group_id_hex: groupIdHex,
+        member_count: opts.isDirect ? 2 : 5,
+        is_direct: opts.isDirect ?? false,
+        subject: null,
+      };
     },
     async streamBegin() {
       calls.begin += 1;
@@ -417,11 +429,13 @@ describe("createMarmotInboundDispatcher", () => {
     const dispatch = createMarmotInboundDispatcher({
       cfg: {},
       runtimeChannel,
-      client: stubClient(calls),
+      client: stubClient(calls) as unknown as MarmotDispatchClient,
       channelAccountId: "default",
       streamMode: "off",
       blockStreaming: true,
       quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
     });
 
     await dispatch({
@@ -450,5 +464,95 @@ describe("createMarmotInboundDispatcher", () => {
     expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
     // GAP-01: the durable reply threads to the triggering message id.
     expect(calls.sendFinal[0]?.replyTo).toBe(HEX32("dd"));
+  });
+});
+
+describe("createMarmotInboundDispatcher activation gating", () => {
+  function gatingRuntime(turnRan: { value: boolean }): OpenClawChannelRuntime {
+    return {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-gating-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          turnRan.value = true;
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "ok" }, { kind: "final" });
+        },
+      },
+    };
+  }
+
+  const baseMessage: MarmotInboundMessage = {
+    accountIdHex: HEX32("aa"),
+    groupIdHex: HEX32("cc"),
+    messageIdHex: HEX32("dd"),
+    senderAccountIdHex: HEX32("bb"),
+    text: "just chatting amongst ourselves",
+  };
+
+  async function runCase(opts: {
+    groupActivation: "mention" | "always";
+    mentionPatterns?: string[];
+    isDirect?: boolean;
+    message?: Partial<MarmotInboundMessage>;
+  }): Promise<boolean> {
+    const turnRan = { value: false };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: gatingRuntime(turnRan),
+      client: stubClient(emptyCalls(), {
+        isDirect: opts.isDirect,
+      }) as unknown as MarmotDispatchClient,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: opts.groupActivation,
+      mentionPatterns: opts.mentionPatterns ?? [],
+    });
+    await dispatch({ ...baseMessage, ...opts.message });
+    return turnRan.value;
+  }
+
+  it("skips an unaddressed message in a multi-party group", async () => {
+    expect(await runCase({ groupActivation: "mention", isDirect: false })).toBe(false);
+  });
+
+  it("replies in an effective DM (two members) even when unaddressed", async () => {
+    expect(await runCase({ groupActivation: "mention", isDirect: true })).toBe(true);
+  });
+
+  it("replies when the agent is mentioned (p-tagged)", async () => {
+    expect(
+      await runCase({ groupActivation: "mention", isDirect: false, message: { mentionsSelf: true } }),
+    ).toBe(true);
+  });
+
+  it("replies when a configured trigger phrase matches", async () => {
+    expect(
+      await runCase({
+        groupActivation: "mention",
+        mentionPatterns: ["marvin"],
+        isDirect: false,
+        message: { text: "hey Marvin, can you help?" },
+      }),
+    ).toBe(true);
+  });
+
+  it("replies to everything when groupActivation is always", async () => {
+    expect(await runCase({ groupActivation: "always", isDirect: false })).toBe(true);
   });
 });
