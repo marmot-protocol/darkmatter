@@ -23,6 +23,7 @@ impl Marmot {
                 label: m.label,
                 account_id_hex: m.account_id_hex,
                 local_signing: m.local_signing,
+                signed_out: m.signed_out,
                 running: m.running,
             })
             .collect())
@@ -110,6 +111,7 @@ impl Marmot {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
             local_signing: result.account.local_signing,
+            signed_out: result.account.signed_out,
             running: true,
         })
     }
@@ -135,7 +137,26 @@ impl Marmot {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
             local_signing: result.account.local_signing,
+            signed_out: result.account.signed_out,
             running: true,
+        })
+    }
+
+    /// Re-activate a non-destructively signed-out local account. This clears
+    /// the durable signed-out marker and starts the account worker again; relay
+    /// list/key-package repair can still be driven by the existing publish
+    /// commands after sign-in.
+    pub async fn sign_in_account(
+        &self,
+        account_ref: String,
+    ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        let account = self.runtime.sign_in_account(&account_ref).await?;
+        Ok(AccountSummaryFfi {
+            label: account.label,
+            account_id_hex: account.account_id_hex,
+            local_signing: account.local_signing,
+            signed_out: account.signed_out,
+            running: account.running,
         })
     }
 

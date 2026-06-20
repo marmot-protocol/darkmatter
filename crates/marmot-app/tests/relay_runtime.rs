@@ -4073,9 +4073,51 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
         "unexpected key package failures: {:?}",
         outcome.key_package_failures
     );
-    // Local teardown ran and never touches on-disk state.
+    // Local teardown ran, persisted the signed-out marker, and never touches
+    // on-disk account state.
     assert!(outcome.local_cleanup.completed);
     assert!(outcome.local_cleanup.reason.is_none());
+    let signed_out_account = home.account(&account_id).unwrap();
+    assert!(
+        signed_out_account.signed_out,
+        "non-destructive sign-out must persist a signed-out marker"
+    );
+
+    let managed_after_sign_out = runtime
+        .accounts()
+        .managed_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.account_id_hex == account_id)
+        .expect("signed-out account should remain listed");
+    assert!(managed_after_sign_out.signed_out);
+    assert!(
+        !managed_after_sign_out.running,
+        "sign-out should stop the worker immediately"
+    );
+
+    // Regression for PR #496 review: routine reconcile/catch-up and foreground
+    // restart must honor the durable signed-out marker instead of re-spawning
+    // the worker and re-warming subscriptions without an explicit sign-in.
+    runtime.catch_up_accounts().await.unwrap();
+    runtime.restart_account(&account_id).await.unwrap();
+    let managed_after_reconcile = runtime
+        .accounts()
+        .managed_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.account_id_hex == account_id)
+        .expect("signed-out account should remain listed");
+    assert!(managed_after_reconcile.signed_out);
+    assert!(
+        !managed_after_reconcile.running,
+        "reconcile/restart must not reactivate a signed-out account"
+    );
+
+    let signed_in = runtime.sign_in_account(&account_id).await.unwrap();
+    assert!(!signed_in.signed_out);
+    assert!(signed_in.running);
+    assert!(!home.account(&account_id).unwrap().signed_out);
 
     // Crucially, the account survives a non-destructive sign-out: it is still a
     // live record on disk and still resolvable for a later sign-in (unlike a

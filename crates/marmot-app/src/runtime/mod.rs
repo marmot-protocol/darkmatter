@@ -9,7 +9,7 @@ use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, SecretBytes, TransportEndpoint};
-use marmot_account::{AccountHomeError, AccountSummary};
+use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -532,6 +532,7 @@ pub struct ManagedAccount {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    pub signed_out: bool,
     pub running: bool,
 }
 
@@ -903,6 +904,10 @@ impl MarmotAppRuntime {
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
         self.accounts.restart_account(account_id_hex).await
+    }
+
+    pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        self.accounts.sign_in_account(account_ref).await
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
@@ -2346,6 +2351,7 @@ impl AccountManager {
                 label: account.label,
                 account_id_hex: account.account_id_hex,
                 local_signing: account.local_signing,
+                signed_out: account.signed_out,
             })
             .collect())
     }
@@ -2378,34 +2384,60 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Non-destructive deactivation of an account on this device: shut its
-    /// managed worker down (which deactivates the worker's transport
-    /// subscriptions) and evict its in-memory storage/directory caches, but
-    /// leave every byte of on-disk state in place.
+    /// Non-destructive deactivation of an account on this device: persist a
+    /// signed-out marker, shut its managed worker down (which deactivates the
+    /// worker's transport subscriptions), and evict its in-memory
+    /// storage/directory caches, but leave every byte of on-disk state in place.
     ///
     /// This is the teardown half of [`MarmotAppRuntime::sign_out`]. Unlike
     /// [`remove_account`](Self::remove_account) it does **not** call
     /// `account_home().remove_account`, so the account directory — the
     /// SQLCipher session database (MLS state + projections), cached
     /// media/source-epoch secrets, on-disk KeyPackage material, the SQL account
-    /// record, and the secret-store nsec — survives. The account stays a live
-    /// record in the picker and can be re-activated later (via
-    /// [`reconcile`](Self::reconcile) / [`restart_account`](Self::restart_account))
-    /// with its groups, history, and drafts intact.
+    /// record, and the secret-store nsec — survives. The durable signed-out
+    /// marker prevents later [`reconcile`](Self::reconcile) /
+    /// [`restart_account`](Self::restart_account) calls from recreating the
+    /// worker until an explicit sign-in clears it.
     ///
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        // Hold the worker-map lock across the shutdown + cache eviction so
-        // reconcile() cannot recreate this account's worker mid-teardown.
+        // Hold the worker-map lock across the signed-out marker write,
+        // shutdown, and cache eviction so reconcile() cannot recreate this
+        // account's worker mid-teardown.
         let mut workers = self.workers.lock().await;
+        self.app
+            .account_home()
+            .set_account_signed_out(&account.label, true)?;
         if let Some(worker) = workers.remove(&account.account_id_hex) {
             worker.shutdown().await;
         }
         self.app.drop_account_caches(&account.label);
         Ok(())
+    }
+
+    /// Explicitly re-activate a reversibly signed-out local account.
+    pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self
+            .app
+            .account_home()
+            .set_account_signed_out(account_ref, false)?;
+        self.reconcile().await?;
+        let running = self
+            .workers
+            .lock()
+            .await
+            .contains_key(&account.account_id_hex);
+        Ok(ManagedAccount {
+            label: account.label,
+            account_id_hex: account.account_id_hex,
+            local_signing: account.local_signing,
+            signed_out: account.signed_out,
+            running,
+        })
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
@@ -2417,7 +2449,7 @@ impl AccountManager {
                 .account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| account.local_signing)
+                .filter(|account| account.is_active_local_signing())
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -2687,6 +2719,9 @@ impl AccountManager {
         if !account.local_signing {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()));
+        }
         self.reconcile().await?;
         let workers = self.workers.lock().await;
         workers
@@ -2707,10 +2742,15 @@ impl AccountManager {
         let imports_private_key = request.identity.as_deref().is_some_and(is_nostr_secret);
         let creates_new_private_key = request.identity.is_none();
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-        let account = match self.create_nostr_account(request.identity.clone()) {
-            Ok(account) => account,
-            Err(err) => return Err(err),
+        let mut account = match request.identity.as_deref() {
+            Some(identity) => match self.signed_out_account_for_identity(identity)? {
+                Some(account) => account,
+                None => self.create_nostr_account(request.identity.clone())?,
+            },
+            None => self.create_nostr_account(None)?,
         };
+        let reactivating_existing = account.signed_out;
+        let rollback_on_setup_failure = !reactivating_existing;
 
         let relay_lists = match self
             .setup_relay_lists_for_account(
@@ -2723,7 +2763,10 @@ impl AccountManager {
         {
             Ok(relay_lists) => relay_lists,
             Err(err) => {
-                return self.rollback_account_after_setup_failure(&account.label, err);
+                if rollback_on_setup_failure {
+                    return self.rollback_account_after_setup_failure(&account.label, err);
+                }
+                return Err(err);
             }
         };
 
@@ -2735,7 +2778,10 @@ impl AccountManager {
             {
                 Ok(profile) => Some(profile),
                 Err(err) => {
-                    return self.rollback_account_after_setup_failure(&account.label, err);
+                    if rollback_on_setup_failure {
+                        return self.rollback_account_after_setup_failure(&account.label, err);
+                    }
+                    return Err(err);
                 }
             }
         } else {
@@ -2747,7 +2793,10 @@ impl AccountManager {
             match self.publish_initial_key_package_for_account(&account).await {
                 Ok(bytes) => Some(bytes),
                 Err(err) => {
-                    return self.rollback_account_after_setup_failure(&account.label, err);
+                    if rollback_on_setup_failure {
+                        return self.rollback_account_after_setup_failure(&account.label, err);
+                    }
+                    return Err(err);
                 }
             }
         } else {
@@ -2762,6 +2811,12 @@ impl AccountManager {
                 directory_bootstrap_relays.clone(),
             )
             .await;
+        if account.signed_out {
+            account = self
+                .app
+                .account_home()
+                .set_account_signed_out(&account.label, false)?;
+        }
         self.reconcile().await?;
 
         Ok(AccountSetupResult {
@@ -2892,6 +2947,23 @@ impl AccountManager {
         let mut client = self.app.client(&account.label).await?;
         let key_package = client.publish_key_package().await?;
         Ok(key_package.bytes().len())
+    }
+
+    fn signed_out_account_for_identity(
+        &self,
+        identity: &str,
+    ) -> Result<Option<AccountSummary>, AppError> {
+        let account_id = if is_nostr_secret(identity) {
+            AccountHome::account_id_for_secret(identity)?
+        } else {
+            AccountHome::account_id_for_public_key(identity)?
+        };
+        match self.app.account_home().account(&account_id) {
+            Ok(account) if account.local_signing && account.signed_out => Ok(Some(account)),
+            Ok(_) => Ok(None),
+            Err(AccountHomeError::UnknownAccount(_)) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn create_nostr_account(&self, identity: Option<String>) -> Result<AccountSummary, AppError> {
