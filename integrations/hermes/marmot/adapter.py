@@ -191,6 +191,39 @@ class ProfileNameOnboardingStore:
             },
         )
 
+    async def try_claim_prompt(self, account_id_hex: str, group_id_hex: str) -> bool:
+        """Atomically claim the one-time prompt slot for ``account_id_hex``.
+
+        Mirrors OpenClaw's ``tryClaimPrompt`` (``integrations/openclaw/marmot/src/
+        profile-onboarding.ts``). The read-decide-write happens under a SINGLE lock
+        acquisition, so two first messages racing across concurrent groups (now that
+        inbound dispatch is per-group concurrent, #513) cannot both observe empty state
+        and both send a prompt. Returns True only for the caller that won the claim and
+        should therefore send the prompt; every later caller gets False. If sending the
+        prompt then fails, the winner must ``clear()`` the slot so a later message retries.
+        """
+        async with self._lock:
+            data = self._read()
+            accounts = data.setdefault("accounts", {})
+            existing = accounts.get(account_id_hex) or {}
+            if existing.get("status"):
+                return False
+            accounts[account_id_hex] = {
+                "status": "prompted",
+                "group_id_hex": group_id_hex,
+            }
+            self._write(data)
+            return True
+
+    async def clear(self, account_id_hex: str) -> None:
+        """Reset an account's record so the prompt can be retried (e.g. after a send failure)."""
+        async with self._lock:
+            data = self._read()
+            accounts = data.setdefault("accounts", {})
+            if account_id_hex in accounts:
+                accounts.pop(account_id_hex, None)
+                self._write(data)
+
     async def mark_published(self, account_id_hex: str, name: str) -> None:
         await self._set(
             account_id_hex,
@@ -1238,12 +1271,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 logger.warning("Marmot inbound subscription failed, retrying: %s", exc)
                 await asyncio.sleep(2.0)
 
-    async def _consume_inbound_once(self) -> None:
+    async def _consume_inbound_once(self, *, drain: bool = False) -> None:
         # Per-group serialization (mirrors OpenClaw's KeyedAsyncQueue): a slow/hung turn in one
         # group must not block inbound dispatch for every other group. We enqueue each inbound
         # message onto a per-group FIFO queue and keep pulling events instead of awaiting the
-        # turn inline. We drain the queue when the subscription stream ends (or errors out, e.g.
-        # a resync) so already-accepted work for other groups still completes.
+        # turn inline.
+        #
+        # The queue is a single long-lived instance owned by the adapter (constructed in
+        # __init__, torn down by disconnect -> cancel_all). It MUST survive subscription
+        # end/error: a resync tears the stream down and _consume_inbound_loop() reopens it, so
+        # joining the queue here would let a hung group-A turn hold the resync (and therefore
+        # every later group) hostage — the exact head-of-line blocking #513 fixes. So production
+        # never drains on stream end; only an explicit shutdown (cancel_all) or a test asking to
+        # observe completion (drain=True) waits on in-flight work.
         try:
             async for event in self.client.inbound_events(
                 account_id_hex=self.account_id_hex,
@@ -1251,7 +1291,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             ):
                 await self._handle_control_event(event)
         finally:
-            await self._inbound_queue.join()
+            if drain:
+                await self._inbound_queue.join()
 
     async def _handle_resync_required(self, event: Dict[str, Any]) -> None:
         # Emitted when the connector's inbound broadcast lagged AND its storage-backed replay
@@ -1338,15 +1379,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     str(event.get("text") or ""),
                 )
 
+            # Claim the one-time prompt slot atomically BEFORE sending. Under the new
+            # per-group concurrency (#513), two first messages for the same account in
+            # different groups could otherwise both read empty state and both prompt
+            # (double-prompting and swallowing both user messages). try_claim_prompt() is
+            # the single-lock claim that lets exactly one caller win; everyone else returns
+            # False here and falls through to a normal turn.
+            if not await store.try_claim_prompt(account_id_hex, group_id_hex):
+                return False
+
             result = await self._send_final_direct(
                 group_id_hex,
                 PROFILE_NAME_PROMPT,
                 reply_to_message_id_hex=message_id_hex,
             )
             if not result.success:
+                # We claimed the slot but could not deliver the prompt; release it so a
+                # later inbound message retries, instead of permanently swallowing this one.
                 logger.debug("Marmot profile-name prompt send failed: %s", result.error)
+                await store.clear(account_id_hex)
                 return False
-            await store.mark_prompted(account_id_hex, group_id_hex)
             return True
         except Exception as exc:
             logger.debug("Marmot profile-name onboarding failed: %s", exc)
