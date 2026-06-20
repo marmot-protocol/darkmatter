@@ -251,6 +251,21 @@ pub(crate) enum AccountWorkerCommand {
     },
 }
 
+/// A command held back during the initial background catch-up, replayed in
+/// arrival order once the catch-up completes.
+///
+/// Keeping `CatchUp` waiters inline in this sequence (rather than fulfilling
+/// them all up front) preserves FIFO: a `CatchUp` enqueued after an earlier
+/// deferred mutation is answered only after that mutation has run.
+enum DeferredStartupCommand {
+    /// A non-read command to run against the live session after catch-up. Boxed
+    /// because `AccountWorkerCommand` is far larger than the `CatchUp` variant.
+    Command(Box<AccountWorkerCommand>),
+    /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
+    /// result at this position in the sequence.
+    CatchUp(oneshot::Sender<Result<(), String>>),
+}
+
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     commands: mpsc::Receiver<AccountWorkerCommand>,
@@ -321,7 +336,24 @@ async fn run_app_runtime_account_worker(
     // path. See `GroupReadSnapshot`. `AccountOpen` (recorded by `reconcile` as
     // the ready-wait) now measures time-to-command-ready (hydrate + connect +
     // subscribe), while `AccountSync` (below) measures the catch-up.
-    let read_snapshot = client.group_read_snapshot();
+    //
+    // Snapshot capture is best-effort: its only failure is the shared profile
+    // load. On failure, surface the error and serve read commands by deferring
+    // them to the live session after catch-up (matching the live path's error
+    // semantics) instead of masking it as empty profiles. Readiness is never
+    // gated on it.
+    let read_snapshot = match client.group_read_snapshot() {
+        Ok(snapshot) => Some(snapshot),
+        Err(err) => {
+            publish_app_runtime_account_error(
+                &events,
+                &account_id_hex,
+                &account_label,
+                format!("runtime startup snapshot capture failed: {err}"),
+            );
+            None
+        }
+    };
     if let Some(ready) = ready.take() {
         let _ = ready.send(Ok(()));
     }
@@ -330,12 +362,12 @@ async fn run_app_runtime_account_worker(
     // holds `&mut client` for its whole lifetime, so while it is in flight the
     // command loop must not touch the live session: read commands are answered
     // from `read_snapshot`, and every other command is deferred and replayed on
-    // live state once the catch-up lands. `CatchUp` requests that arrive during
-    // the initial sync are coalesced onto it, so a second concurrent sync on the
-    // same client is never started. Shutdown drops the pinned future, cancelling
-    // the sync.
-    let mut deferred: Vec<AccountWorkerCommand> = Vec::new();
-    let mut catch_up_waiters: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+    // live state once the catch-up lands, in arrival order. `CatchUp` requests
+    // that arrive during the initial sync are coalesced onto it (kept in the same
+    // deferred sequence so they cannot jump ahead of an earlier mutation), so a
+    // second concurrent sync on the same client is never started. Shutdown drops
+    // the pinned future, cancelling the sync.
+    let mut deferred: Vec<DeferredStartupCommand> = Vec::new();
     let sync_started_at = Instant::now();
     let startup_sync_result = {
         let mut initial_sync = std::pin::pin!(client.sync());
@@ -348,21 +380,38 @@ async fn run_app_runtime_account_worker(
                     match command {
                         None => return,
                         Some(AccountWorkerCommand::Members { group_id, respond }) => {
-                            let _ = respond.send(read_snapshot.members(&group_id));
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.members(&group_id));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::Members { group_id, respond }))),
+                            }
                         }
                         Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
-                            let _ = respond.send(read_snapshot.group_mls_state(&group_id));
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.group_mls_state(&group_id));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::GroupMlsState { group_id, respond }))),
+                            }
                         }
                         Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
-                            let _ = respond.send(Ok(read_snapshot.quarantined_groups()));
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::QuarantinedGroups { respond }))),
+                            }
                         }
                         Some(AccountWorkerCommand::CatchUp { respond }) => {
                             // Coalesce onto the in-flight initial catch-up rather
-                            // than starting a second sync; fulfilled below when it
-                            // completes.
-                            catch_up_waiters.push(respond);
+                            // than starting a second sync; fulfilled in arrival
+                            // order below when it completes.
+                            deferred.push(DeferredStartupCommand::CatchUp(respond));
                         }
-                        Some(other) => deferred.push(other),
+                        Some(other) => {
+                            deferred.push(DeferredStartupCommand::Command(Box::new(other)))
+                        }
                     }
                 }
             }
@@ -394,21 +443,27 @@ async fn run_app_runtime_account_worker(
             Err(message)
         }
     };
-    for waiter in catch_up_waiters {
-        let _ = waiter.send(catch_up_result.clone());
-    }
 
-    // Replay commands deferred during the initial catch-up, now on live state.
-    for command in deferred {
-        handle_account_worker_command(
-            &mut client,
-            command,
-            &events,
-            &account_id_hex,
-            &account_label,
-            &shared,
-        )
-        .await;
+    // Replay commands deferred during the initial catch-up in arrival order, now
+    // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
+    // with the initial catch-up's result.
+    for deferred_command in deferred {
+        match deferred_command {
+            DeferredStartupCommand::CatchUp(respond) => {
+                let _ = respond.send(catch_up_result.clone());
+            }
+            DeferredStartupCommand::Command(command) => {
+                handle_account_worker_command(
+                    &mut client,
+                    *command,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                )
+                .await;
+            }
+        }
     }
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();

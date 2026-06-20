@@ -330,11 +330,17 @@ impl AppClient {
     /// that error for a given group (quarantined / not yet live) are omitted —
     /// the snapshot accessor reports those as `UnknownGroup`, matching the live
     /// path for a group the session does not hold.
-    pub(crate) fn group_read_snapshot(&self) -> GroupReadSnapshot {
+    ///
+    /// Returns the storage error if the one shared profile load fails, rather
+    /// than masking it as empty profiles (which would make every member read
+    /// `account: None` / `local: false` during the catch-up window). The worker
+    /// then falls back to serving those reads from the live session after
+    /// catch-up, matching the live path's error semantics.
+    pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
         // Load account profiles once and reuse across every group: the rest of
         // the capture is in-memory engine reads, so the snapshot adds a single
         // storage read to the worker readiness path regardless of group count.
-        let profiles = self.app.profiles_by_id().unwrap_or_default();
+        let profiles = self.app.profiles_by_id()?;
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
         for group in &self.state.groups {
@@ -349,11 +355,11 @@ impl AppClient {
                 mls_state.insert(group_id, state);
             }
         }
-        GroupReadSnapshot {
+        Ok(GroupReadSnapshot {
             members,
             mls_state,
             quarantined: self.quarantined_groups(),
-        }
+        })
     }
 
     /// Re-attempt hydration of a single quarantined group (darkmatter#426).
