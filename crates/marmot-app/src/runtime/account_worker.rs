@@ -1,6 +1,8 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
+use std::collections::HashSet;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
@@ -9,7 +11,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
 
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
@@ -324,6 +326,7 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
+    let mut scheduled_convergence = ScheduledConvergence::new(convergence_settlement_delay(&app));
 
     // The session is hydrated. Capture a read snapshot and signal
     // command-readiness *now*, before the initial relay catch-up. "Ready" means
@@ -425,6 +428,7 @@ async fn run_app_runtime_account_worker(
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
@@ -476,6 +480,28 @@ async fn run_app_runtime_account_worker(
             _ = &mut shutdown => {
                 return;
             }
+            _ = scheduled_convergence.timer.as_mut() => {
+                let groups = scheduled_convergence.take_ready();
+                for group_id in groups {
+                    match client.advance_convergence_for_sync(&group_id).await {
+                        Ok(summary) => {
+                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                            scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                            if sync_summary_triggers_audit_tracker_update(&summary) {
+                                shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                            }
+                        }
+                        Err(err) => {
+                            publish_app_runtime_account_error(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                format!("scheduled convergence failed: {err}"),
+                            );
+                        }
+                    }
+                }
+            }
             command = commands.recv() => {
                 match command {
                     Some(command) => {
@@ -488,6 +514,7 @@ async fn run_app_runtime_account_worker(
                             &shared,
                         )
                         .await;
+                        scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
                     }
                     None => return,
                 }
@@ -497,6 +524,7 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }
@@ -1153,6 +1181,51 @@ impl AccountWorkerReconnectBackoff {
 fn account_worker_reconnect_jitter() -> Duration {
     let jitter_ms = OsRng.next_u64() % (ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS + 1);
     Duration::from_millis(jitter_ms)
+}
+
+const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
+const IDLE_CONVERGENCE_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+struct ScheduledConvergence {
+    delay: Duration,
+    groups: HashSet<GroupId>,
+    timer: Pin<Box<Sleep>>,
+}
+
+impl ScheduledConvergence {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            groups: HashSet::new(),
+            timer: Box::pin(sleep(IDLE_CONVERGENCE_TIMER_DELAY)),
+        }
+    }
+
+    fn schedule_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
+        let mut saw_group = false;
+        for group_id in groups {
+            saw_group = true;
+            self.groups.insert(group_id);
+        }
+        if saw_group {
+            self.timer.as_mut().reset(TokioInstant::now() + self.delay);
+        }
+    }
+
+    fn take_ready(&mut self) -> Vec<GroupId> {
+        self.timer
+            .as_mut()
+            .reset(TokioInstant::now() + IDLE_CONVERGENCE_TIMER_DELAY);
+        self.groups.drain().collect()
+    }
+}
+
+fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
+    Duration::from_millis(
+        app.config
+            .dev_settlement_quiescence_ms
+            .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS),
+    )
 }
 
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_traits::agent_text_stream::{
@@ -63,6 +63,7 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
+    pub(crate) pending_convergence_groups: HashSet<GroupId>,
 }
 
 /// A point-in-time copy of the live session's read-only group projections
