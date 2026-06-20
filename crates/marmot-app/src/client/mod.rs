@@ -356,10 +356,10 @@ impl AppClient {
         let profiles = self.app.profiles_by_id()?;
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
-        let mut skipped_malformed_group_ids = 0usize;
+        let mut skipped_malformed_group_records = 0usize;
         for group in &self.state.groups {
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {
-                skipped_malformed_group_ids += 1;
+                skipped_malformed_group_records += 1;
                 continue;
             };
             let group_id = GroupId::new(bytes);
@@ -370,11 +370,11 @@ impl AppClient {
                 mls_state.insert(group_id, state);
             }
         }
-        if skipped_malformed_group_ids > 0 {
+        if skipped_malformed_group_records > 0 {
             tracing::warn!(
                 target: "marmot_app::client",
                 method = "group_read_snapshot",
-                skipped_malformed_group_ids,
+                skipped_malformed_group_records,
                 "skipping malformed group records while building group read snapshot"
             );
         }
