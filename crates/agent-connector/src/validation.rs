@@ -123,6 +123,8 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",
         AgentControlRequest::DebugInjectInbound { .. } => "debug_inject_inbound",
         AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
+        AgentControlRequest::SendMedia { .. } => "send_media",
+        AgentControlRequest::DownloadMedia { .. } => "download_media",
     }
 }
 

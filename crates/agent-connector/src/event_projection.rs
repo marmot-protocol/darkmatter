@@ -4,7 +4,10 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use agent_control::{AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent};
+use agent_control::{
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEvent, AgentControlMediaLocator,
+    AgentControlMediaRef,
+};
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, STREAM_TAG,
@@ -30,6 +33,39 @@ fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
         .find(|tag| tag.first().is_some_and(|name| name == EVENT_REF_TAG))
         .and_then(|tag| tag.get(1))
         .map(|value| value.to_owned())
+}
+
+/// Project every parseable `imeta` media tag into a control-plane media ref.
+/// Each tag is parsed by the authoritative app-runtime parser; a tag that fails
+/// structural validation is dropped (it would be unfetchable anyway) rather than
+/// failing the whole message. Loopback-HTTP locators are rejected here (the
+/// connector serves real deployments), matching the runtime download policy.
+fn media_refs_from_tags(tags: &[Vec<String>], source_epoch: u64) -> Vec<AgentControlMediaRef> {
+    tags.iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .filter_map(|tag| {
+            marmot_app::media_attachment_from_imeta_tag(tag, Some(source_epoch), false).ok()
+        })
+        .map(|reference| AgentControlMediaRef {
+            media_type: reference.media_type,
+            file_name: reference.file_name,
+            ciphertext_sha256: reference.ciphertext_sha256,
+            plaintext_sha256: reference.plaintext_sha256,
+            nonce_hex: reference.nonce_hex,
+            version: reference.version,
+            source_epoch: reference.source_epoch,
+            locators: reference
+                .locators
+                .into_iter()
+                .map(|locator| AgentControlMediaLocator {
+                    kind: locator.kind,
+                    value: locator.value,
+                })
+                .collect(),
+            dim: reference.dim,
+            thumbhash: reference.thumbhash,
+        })
+        .collect()
 }
 use cgka_traits::{GroupId, engine::GroupEvent};
 use marmot_app::{AppError, AppMessageRecord, MarmotAppEvent, MarmotAppRuntime};
@@ -78,6 +114,7 @@ pub(crate) fn control_event_from_runtime_event(
             )?;
             let mentions_self = tags_mention_account(&update.message.tags, &update.account_id_hex);
             let reply_to_message_id_hex = reply_target_from_tags(&update.message.tags);
+            let media = media_refs_from_tags(&update.message.tags, update.message.source_epoch);
             Some(AgentControlEvent::InboundMessage {
                 account_id_hex: update.account_id_hex,
                 group_id_hex,
@@ -87,6 +124,7 @@ pub(crate) fn control_event_from_runtime_event(
                 mentions_self,
                 reply_to_message_id_hex,
                 sender_display_name: update.message.sender_display_name,
+                media,
             })
         }
         MarmotAppEvent::AgentStreamStarted(update) => {
@@ -272,6 +310,7 @@ pub(crate) fn inbound_message_event_from_record(
     }
     let mentions_self = tags_mention_account(&record.tags, account_id_hex);
     let reply_to_message_id_hex = reply_target_from_tags(&record.tags);
+    let media = media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or(0));
     Some(AgentControlEvent::InboundMessage {
         account_id_hex: account_id_hex.to_owned(),
         group_id_hex: record.group_id_hex,
@@ -282,6 +321,7 @@ pub(crate) fn inbound_message_event_from_record(
         reply_to_message_id_hex,
         // Storage replay has no directory join; display name is best-effort live-only.
         sender_display_name: None,
+        media,
     })
 }
 

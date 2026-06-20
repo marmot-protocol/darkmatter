@@ -101,6 +101,52 @@ export interface ProfilePublishedResponse {
   display_name: string | null;
 }
 
+/** A single fetch locator for an encrypted media reference. */
+export interface AgentControlMediaLocator {
+  kind: string;
+  value: string;
+}
+
+/**
+ * Faithful, non-secret mirror of the Rust `MediaAttachmentReference`. Carries
+ * everything needed to fetch + authenticate an encrypted blob EXCEPT the content
+ * key, which never leaves `dm-agent`. Pass it back to {@link MarmotAgentControlClient.downloadMedia}.
+ */
+export interface AgentControlMediaRef {
+  media_type: string;
+  file_name: string;
+  ciphertext_sha256: string;
+  plaintext_sha256: string;
+  nonce_hex: string;
+  version: string;
+  source_epoch: number;
+  locators: AgentControlMediaLocator[];
+  dim?: string | null;
+  thumbhash?: string | null;
+}
+
+/**
+ * A local file for {@link MarmotAgentControlClient.sendMedia} to encrypt + upload
+ * as an attachment. `dm-agent` reads the bytes from `path` on its own host; the
+ * control plane never carries plaintext or a content key.
+ */
+export interface AgentControlMediaUpload {
+  path: string;
+  media_type: string;
+  file_name: string;
+  dim?: string | null;
+  thumbhash?: string | null;
+}
+
+export interface MediaDownloadedResponse {
+  type: "media_downloaded";
+  /** Host-local path on the `dm-agent` machine where the plaintext was written. */
+  path: string;
+  media_type: string;
+  file_name: string;
+  size_bytes: number;
+}
+
 export type AgentControlEvent =
   | {
       type: "inbound_message";
@@ -115,6 +161,8 @@ export type AgentControlEvent =
       reply_to_message_id_hex?: string | null;
       /** Sender's directory display name, when resolvable. */
       sender_display_name?: string | null;
+      /** Encrypted media references (`imeta` tags) on this message, if any. */
+      media?: AgentControlMediaRef[];
     }
   | {
       type: "message_deleted";
@@ -410,6 +458,45 @@ export class MarmotAgentControlClient {
       duration_ms: event.durationMs == null ? null : Math.trunc(event.durationMs),
       reply_to_message_id_hex: optionalHex(event.replyToMessageIdHex, "reply_to_message_id_hex"),
     })) as unknown as AppEventSentResponse;
+  }
+
+  /**
+   * Encrypt + upload local files as encrypted media and send them as a kind-9
+   * message in the group. `dm-agent` reads each file's bytes from its host by
+   * `path`; the control plane never carries plaintext or a content key. Returns
+   * the durable message ids (`final_sent`).
+   */
+  async sendMedia(
+    accountIdHex: string,
+    groupIdHex: string,
+    attachments: AgentControlMediaUpload[],
+    caption?: string | null,
+  ): Promise<FinalSentResponse> {
+    return (await this.request({
+      type: "send_media",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      attachments,
+      caption: caption == null ? null : String(caption),
+    })) as unknown as FinalSentResponse;
+  }
+
+  /**
+   * Fetch + decrypt an inbound media reference and write the plaintext to a temp
+   * file on the `dm-agent` host. The content key stays in `dm-agent`; the reply
+   * carries only the host-local path and metadata (`media_downloaded`).
+   */
+  async downloadMedia(
+    accountIdHex: string,
+    groupIdHex: string,
+    media: AgentControlMediaRef,
+  ): Promise<MediaDownloadedResponse> {
+    return (await this.request({
+      type: "download_media",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      media,
+    })) as unknown as MediaDownloadedResponse;
   }
 
   // --- inbound subscription ---------------------------------------------------

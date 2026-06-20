@@ -152,6 +152,50 @@ fn control_event_projects_kind5_deletion_as_message_deleted() {
 }
 
 #[test]
+fn control_event_projects_imeta_tag_into_inbound_media_ref() {
+    // A kind-9 chat carrying a structurally valid `imeta` tag must project a
+    // single media reference onto the InboundMessage (the non-secret mirror: no
+    // content key, just fetch + authentication metadata for download_media).
+    let agent_account_id_hex = "aa".repeat(32);
+    // A blossom-v1 locator URL MUST carry the ciphertext hash so the fetched blob
+    // matches the reference; the parser enforces this binding.
+    let ciphertext_sha256 = "cd".repeat(32);
+    let plaintext_sha256 = "ab".repeat(32);
+    let nonce_hex = "0".repeat(24); // 12 bytes
+    let locator_url = format!("https://blossom.example.com/{ciphertext_sha256}.bin");
+    let imeta = vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!("locator blossom-v1 {locator_url}"),
+        format!("ciphertext_sha256 {ciphertext_sha256}"),
+        format!("plaintext_sha256 {plaintext_sha256}"),
+        format!("nonce {nonce_hex}"),
+        "m image/png".to_owned(),
+        "filename a.png".to_owned(),
+    ];
+    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+        account_id_hex: agent_account_id_hex,
+        account_label: "agent".to_owned(),
+        message: received_message(MARMOT_APP_EVENT_KIND_CHAT, "see this", vec![imeta]),
+    });
+
+    let Some(AgentControlEvent::InboundMessage { media, .. }) =
+        control_event_from_runtime_event(event, None, None)
+    else {
+        panic!("expected kind-9 chat event to become an inbound message");
+    };
+    assert_eq!(media.len(), 1, "one imeta tag should project one media ref");
+    let attachment = &media[0];
+    assert_eq!(attachment.media_type, "image/png");
+    assert_eq!(attachment.file_name, "a.png");
+    assert_eq!(attachment.ciphertext_sha256, ciphertext_sha256);
+    assert_eq!(attachment.source_epoch, 7); // received_message uses source_epoch 7
+    assert_eq!(attachment.locators.len(), 1);
+    assert_eq!(attachment.locators[0].kind, "blossom-v1");
+    assert_eq!(attachment.locators[0].value, locator_url);
+}
+
+#[test]
 fn control_event_emits_stream_update_for_agent_stream_started() {
     let agent_account_id_hex = "aa".repeat(32);
     let stream_id_hex = "55".repeat(32);
@@ -2131,6 +2175,7 @@ fn inbound_message_event_from_record_projects_received_chat() {
             mentions_self: false,
             reply_to_message_id_hex: None,
             sender_display_name: None,
+            media: Vec::new(),
         }
     );
 }
@@ -2156,6 +2201,16 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
     };
     assert!(mentions_self, "p-tag for the account should mark a mention");
     assert_eq!(reply_to_message_id_hex.as_deref(), Some("parent-msg-id"));
+}
+
+#[test]
+fn safe_media_filename_strips_path_traversal() {
+    use crate::messaging::safe_media_filename;
+    assert_eq!(safe_media_filename("a.png"), "a.png");
+    assert_eq!(safe_media_filename("../../etc/passwd"), "passwd");
+    assert_eq!(safe_media_filename("dir/b.jpg"), "b.jpg");
+    assert_eq!(safe_media_filename(".."), "media");
+    assert_eq!(safe_media_filename(""), "media");
 }
 
 #[test]

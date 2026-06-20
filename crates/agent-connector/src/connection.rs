@@ -291,6 +291,23 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::SendMedia {
+                account_id_hex,
+                group_id_hex,
+                attachments,
+                caption,
+            } => {
+                self.send_media_response(&account_id_hex, &group_id_hex, attachments, caption)
+                    .await
+            }
+            AgentControlRequest::DownloadMedia {
+                account_id_hex,
+                group_id_hex,
+                media,
+            } => {
+                self.download_media_response(&account_id_hex, &group_id_hex, media)
+                    .await
+            }
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),
                 message: unsupported_request_message(&other).to_owned(),

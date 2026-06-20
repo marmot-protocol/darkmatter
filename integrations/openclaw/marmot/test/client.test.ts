@@ -33,6 +33,18 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
     case "delete_message":
       send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("de")] });
       break;
+    case "send_media":
+      send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("11")] });
+      break;
+    case "download_media":
+      send(socket, id, {
+        type: "media_downloaded",
+        path: "/tmp/marmot-media/abc/a.png",
+        media_type: "image/png",
+        file_name: "a.png",
+        size_bytes: 4,
+      });
+      break;
     case "stream_begin":
       send(socket, id, {
         type: "stream_begun",
@@ -143,6 +155,33 @@ describe("MarmotAgentControlClient", () => {
   it("deletes a message and returns the deletion event ids", async () => {
     const res = await client.deleteMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"));
     expect(res.message_ids_hex).toEqual([HEX32("de")]);
+  });
+
+  it("uploads media and returns the durable message ids from send_media", async () => {
+    const res = await client.sendMedia(
+      HEX32("aa"),
+      HEX32("cc"),
+      [{ path: "/tmp/a.png", media_type: "image/png", file_name: "a.png" }],
+      "look at this",
+    );
+    expect(res.message_ids_hex).toEqual([HEX32("11")]);
+  });
+
+  it("downloads media and returns the host-local path + metadata", async () => {
+    const res = await client.downloadMedia(HEX32("aa"), HEX32("cc"), {
+      media_type: "image/png",
+      file_name: "a.png",
+      ciphertext_sha256: HEX32("cd"),
+      plaintext_sha256: HEX32("ab"),
+      nonce_hex: "0".repeat(24),
+      version: "encrypted-media-v1",
+      source_epoch: 7,
+      locators: [{ kind: "blossom-v1", value: `https://blossom.example.com/${HEX32("cd")}.bin` }],
+    });
+    expect(res.type).toBe("media_downloaded");
+    expect(res.file_name).toBe("a.png");
+    expect(res.size_bytes).toBe(4);
+    expect(res.path).toBe("/tmp/marmot-media/abc/a.png");
   });
 
   it("round-trips group_info (member count + is_direct)", async () => {

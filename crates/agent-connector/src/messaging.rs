@@ -1,12 +1,56 @@
 //! Final-message sends, agent activity/operation/group-system events, and debug send recording.
 
-use agent_control::{AgentControlDebugFinalSend, AgentControlEvent, AgentControlResponse};
+use std::os::unix::fs::PermissionsExt;
+
+use agent_control::{
+    AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
+    AgentControlResponse,
+};
 use cgka_traits::GroupId;
-use marmot_app::AgentOperationEventRequest;
+use marmot_app::{
+    AgentOperationEventRequest, MediaAttachmentReference, MediaLocator,
+    MediaUploadAttachmentRequest, MediaUploadRequest,
+};
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
+
+/// Map a control-plane media reference (the non-secret mirror) back into the
+/// app-runtime `MediaAttachmentReference`. Field-for-field; the content key is
+/// never part of either type, so this is a pure structural reshape.
+/// Reduce a sender-controlled media file name to a safe basename so a download
+/// cannot escape its per-blob temp dir (e.g. "../../x" -> "x"). Falls back to
+/// "media" for empty or parent-only names.
+pub(crate) fn safe_media_filename(name: &str) -> &str {
+    std::path::Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("media")
+}
+
+pub(crate) fn media_ref_to_reference(media: AgentControlMediaRef) -> MediaAttachmentReference {
+    MediaAttachmentReference {
+        locators: media
+            .locators
+            .into_iter()
+            .map(|locator| MediaLocator {
+                kind: locator.kind,
+                value: locator.value,
+            })
+            .collect(),
+        ciphertext_sha256: media.ciphertext_sha256,
+        plaintext_sha256: media.plaintext_sha256,
+        nonce_hex: media.nonce_hex,
+        file_name: media.file_name,
+        media_type: media.media_type,
+        version: media.version,
+        source_epoch: media.source_epoch,
+        dim: media.dim,
+        thumbhash: media.thumbhash,
+    }
+}
 
 impl AgentConnector {
     pub(crate) async fn send_final_response(
@@ -104,6 +148,7 @@ impl AgentConnector {
             mentions_self: false,
             reply_to_message_id_hex: None,
             sender_display_name: None,
+            media: Vec::new(),
         };
         let _ = self.debug_events.send(event);
         Ok(AgentControlResponse::Ack)
@@ -248,6 +293,83 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+        })
+    }
+
+    /// Encrypt + upload local files as encrypted media and send them as a kind-9
+    /// message. The plaintext bytes are read from the connector host by path and
+    /// never crossed the control plane; the content key stays in the runtime.
+    pub(crate) async fn send_media_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        attachments: Vec<AgentControlMediaUpload>,
+        caption: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let mut upload_attachments = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let plaintext = std::fs::read(&attachment.path)?;
+            upload_attachments.push(MediaUploadAttachmentRequest {
+                file_name: attachment.file_name,
+                media_type: attachment.media_type,
+                plaintext,
+                dim: attachment.dim,
+                thumbhash: attachment.thumbhash,
+            });
+        }
+        let result = self
+            .runtime
+            .upload_media(
+                &account.label,
+                &group_id,
+                MediaUploadRequest {
+                    attachments: upload_attachments,
+                    caption,
+                    send: true,
+                    blossom_server: None,
+                },
+            )
+            .await?;
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: result.sent.map(|sent| sent.message_ids).unwrap_or_default(),
+        })
+    }
+
+    /// Fetch + decrypt an inbound media reference and write the plaintext to a
+    /// per-blob temp dir on the connector host (0600). The content key stays in
+    /// the runtime; only the local path + metadata are returned to the agent.
+    pub(crate) async fn download_media_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        media: AgentControlMediaRef,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let reference = media_ref_to_reference(media);
+        // Derive a unique, stable-per-blob subdir from the ciphertext hash so
+        // repeat downloads land in the same place and distinct blobs do not
+        // collide. The hash is opaque ciphertext metadata, not an id we log.
+        let subdir = normalize_hex(&reference.ciphertext_sha256)?;
+        let result = self
+            .runtime
+            .download_media(&account.label, &group_id, reference)
+            .await?;
+        let dir = std::env::temp_dir().join("marmot-media").join(&subdir);
+        std::fs::create_dir_all(&dir)?;
+        // The file name comes from the (decrypted) sender-controlled media
+        // reference, so write under a sanitized basename: a crafted value like
+        // "../../x" must not let a download escape the per-blob temp dir.
+        let path = dir.join(safe_media_filename(&result.file_name));
+        std::fs::write(&path, &result.plaintext)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(AgentControlResponse::MediaDownloaded {
+            path: path.to_string_lossy().into_owned(),
+            media_type: result.media_type,
+            file_name: result.file_name,
+            size_bytes: result.size_bytes,
         })
     }
 }

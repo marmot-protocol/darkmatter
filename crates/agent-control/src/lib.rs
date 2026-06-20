@@ -178,6 +178,62 @@ pub enum AgentControlRequest {
         text: String,
     },
     DebugRecordedFinals,
+    /// Encrypt + upload local files as encrypted media and send them as a kind-9
+    /// message in the group. Files are read from the connector host by `path`;
+    /// the control plane never carries plaintext bytes or the content key.
+    SendMedia {
+        account_id_hex: String,
+        group_id_hex: String,
+        attachments: Vec<AgentControlMediaUpload>,
+        caption: Option<String>,
+    },
+    /// Fetch + decrypt an inbound media reference and write the plaintext to a
+    /// temp file on the connector host. The content key stays in the connector;
+    /// the reply carries only the local path and metadata.
+    DownloadMedia {
+        account_id_hex: String,
+        group_id_hex: String,
+        media: AgentControlMediaRef,
+    },
+}
+
+/// A local file to encrypt + upload as an attachment. The connector reads the
+/// bytes from `path`; the control plane never carries plaintext or a content key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMediaUpload {
+    pub path: String,
+    pub media_type: String,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
+}
+
+/// A single fetch locator for an encrypted media reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMediaLocator {
+    pub kind: String,
+    pub value: String,
+}
+
+/// Faithful, non-secret mirror of `MediaAttachmentReference`. Carries everything
+/// needed to fetch + authenticate a blob EXCEPT the content key, which never
+/// leaves the connector.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlMediaRef {
+    pub media_type: String,
+    pub file_name: String,
+    pub ciphertext_sha256: String,
+    pub plaintext_sha256: String,
+    pub nonce_hex: String,
+    pub version: String,
+    pub source_epoch: u64,
+    pub locators: Vec<AgentControlMediaLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +291,15 @@ pub enum AgentControlResponse {
     DebugRecordedFinals {
         sends: Vec<AgentControlDebugFinalSend>,
     },
+    /// An inbound media reference was fetched, decrypted, and written to a local
+    /// temp file on the connector host. The path is host-local; no bytes or key
+    /// material cross the control plane.
+    MediaDownloaded {
+        path: String,
+        media_type: String,
+        file_name: String,
+        size_bytes: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +337,11 @@ pub enum AgentControlEvent {
         /// The sender's display name, when resolvable from the directory.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_display_name: Option<String>,
+        /// Encrypted media references (`imeta` tags) attached to this message.
+        /// Empty for a plain text message; the content key is never carried here,
+        /// only the fetch + authentication metadata (use `download_media`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<AgentControlMediaRef>,
     },
     /// A previously-sent group message was deleted (kind-5) by another member.
     MessageDeleted {
@@ -733,6 +803,43 @@ mod tests {
             (
                 AgentControlRequest::DebugRecordedFinals,
                 "debug_recorded_finals",
+            ),
+            (
+                AgentControlRequest::SendMedia {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    attachments: vec![crate::AgentControlMediaUpload {
+                        path: "/tmp/a.png".to_owned(),
+                        media_type: "image/png".to_owned(),
+                        file_name: "a.png".to_owned(),
+                        dim: Some("16x16".to_owned()),
+                        thumbhash: None,
+                    }],
+                    caption: Some("look".to_owned()),
+                },
+                "send_media",
+            ),
+            (
+                AgentControlRequest::DownloadMedia {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    media: crate::AgentControlMediaRef {
+                        media_type: "image/png".to_owned(),
+                        file_name: "a.png".to_owned(),
+                        ciphertext_sha256: hash(),
+                        plaintext_sha256: hash(),
+                        nonce_hex: "0".repeat(24),
+                        version: "marmot.encrypted-media.v1".to_owned(),
+                        source_epoch: 0,
+                        locators: vec![crate::AgentControlMediaLocator {
+                            kind: "blossom-v1".to_owned(),
+                            value: "https://example.invalid/a".to_owned(),
+                        }],
+                        dim: None,
+                        thumbhash: None,
+                    },
+                },
+                "download_media",
             ),
         ];
 

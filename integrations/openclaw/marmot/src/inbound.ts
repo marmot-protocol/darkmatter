@@ -4,7 +4,11 @@
 // event is surfaced so the caller can re-sync (dm-agent already replays what it
 // can before emitting it). SDK-independent so it can be unit-tested directly.
 
-import type { AgentControlEvent, MarmotAgentControlClient } from "./client.js";
+import type {
+  AgentControlEvent,
+  AgentControlMediaRef,
+  MarmotAgentControlClient,
+} from "./client.js";
 
 export type InboundSubscribeClient = Pick<MarmotAgentControlClient, "subscribeInbound">;
 
@@ -20,6 +24,8 @@ export interface MarmotInboundMessage {
   replyToMessageIdHex?: string | null;
   /** Sender's directory display name, when resolvable. */
   senderDisplayName?: string | null;
+  /** Encrypted media references (`imeta` tags) attached to this message, if any. */
+  media?: AgentControlMediaRef[];
 }
 
 export interface MarmotGroupInvite {
@@ -211,6 +217,7 @@ export class MarmotInboundBridge {
       mentionsSelf: event.mentions_self ?? false,
       replyToMessageIdHex: event.reply_to_message_id_hex ?? null,
       senderDisplayName: event.sender_display_name ?? null,
+      media: event.media ?? [],
     });
   }
 }

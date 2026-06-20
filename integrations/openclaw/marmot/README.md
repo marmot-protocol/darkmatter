@@ -128,6 +128,15 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   kind-5 deletions from other members surface as a `message_deleted` event.
   (The OpenClaw agent-facing delete trigger and ambient surfacing of inbound
   deletions are validated on the docker harness.)
+- **Media** (control-plane): the control client can send local files as
+  encrypted media via `send_media` (`dm-agent` reads the bytes from its host,
+  encrypts + uploads to Blossom, and sends a kind-9 message) and fetch + decrypt
+  an inbound attachment via `download_media` (returns a host-local plaintext
+  path; the content key never leaves `dm-agent`). Inbound messages surface their
+  encrypted-media references as `media` refs (the non-secret `imeta` mirror) on
+  the `inbound_message` event. The OpenClaw agent-facing vision input (passing
+  downloaded images into a turn) and the outbound agent image trigger are
+  validated on the docker harness.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
   update cancels the preview and sends the final verbatim. The transcript hash +
