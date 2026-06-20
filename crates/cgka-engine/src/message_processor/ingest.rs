@@ -1283,9 +1283,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 }
 
-fn process_message_error_is_too_distant_in_the_past<StorageError>(
-    err: &ProcessMessageError<StorageError>,
-) -> bool {
+fn process_message_error_is_too_distant_in_the_past<E>(err: &ProcessMessageError<E>) -> bool {
     matches!(
         err,
         ProcessMessageError::ValidationError(ValidationError::NoPastEpochData)

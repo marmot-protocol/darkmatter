@@ -258,11 +258,12 @@ impl AppClient {
         .await
     }
 
-    pub(crate) async fn advance_convergence_for_sync(
+    pub(crate) async fn advance_convergence_after_runtime_sync(
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<SyncSummary, AppError> {
-        self.sync_runtime_groups().await?;
+        // The account worker refreshes transport groups once for the scheduled
+        // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
@@ -280,9 +281,6 @@ impl AppClient {
             source_recorded_at,
         )
         .await?;
-        if self.runtime.has_pending_convergence_inputs(group_id)? {
-            self.pending_convergence_groups.insert(group_id.clone());
-        }
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
         Ok(summary)
