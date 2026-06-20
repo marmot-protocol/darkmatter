@@ -500,6 +500,51 @@ impl AppClient {
             .await
     }
 
+    /// Transfer admin: grant admin to `new_admin_ref` and revoke it from the
+    /// local caller, in a single admin-policy commit (darkmatter#488).
+    ///
+    /// Unlike [`promote_admin`](Self::promote_admin) /
+    /// [`demote_admin`](Self::demote_admin), this routes through the typed
+    /// engine intent [`SendIntent::TransferAdmin`], so the engine — not the
+    /// app — recomputes the resulting admin set, verifies caller authorization
+    /// and target membership, and applies the grant and self-revoke as one
+    /// atomic commit whose resulting epoch never transiently lacks an admin.
+    /// Transferring to the caller themselves (or any net no-op) is an
+    /// idempotent success that stages no commit.
+    pub async fn transfer_admin(
+        &mut self,
+        group_id: &GroupId,
+        new_admin_ref: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let new_admin = admin_pubkey_from_member_id(&self.app.member_id(new_admin_ref)?)?;
+        let audit_context = Self::local_human_action_context(
+            "transfer_admin",
+            vec!["admins"],
+            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+            Some(1),
+        );
+
+        self.sync_runtime_groups().await?;
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::TransferAdmin {
+                    group_id: group_id.clone(),
+                    new_admin_pubkey: new_admin,
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        self.queue_own_group_system_projection_updates(&effects);
+        Ok(send_summary_from_effects(&effects))
+    }
+
     async fn update_admin_policy(
         &mut self,
         group_id: &GroupId,

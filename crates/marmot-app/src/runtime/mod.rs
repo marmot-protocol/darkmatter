@@ -1186,6 +1186,17 @@ impl MarmotAppRuntime {
         self.accounts.self_demote_admin(account_ref, group_id).await
     }
 
+    pub async fn transfer_admin(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        new_admin_ref: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .transfer_admin(account_ref, group_id, new_admin_ref)
+            .await
+    }
+
     pub async fn send_message(
         &self,
         account_ref: &str,

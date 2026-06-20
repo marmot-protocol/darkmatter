@@ -160,6 +160,11 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    TransferAdmin {
+        group_id: GroupId,
+        new_admin_ref: String,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     UpdateGroupProfile {
         group_id: GroupId,
         name: Option<String>,
@@ -682,6 +687,28 @@ async fn run_app_runtime_account_worker(
                     }
                     Some(AccountWorkerCommand::SelfDemoteAdmin { group_id, respond }) => {
                         let result = client.self_demote_admin(&group_id).await;
+                        if result.is_ok() {
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::TransferAdmin {
+                        group_id,
+                        new_admin_ref,
+                        respond,
+                    }) => {
+                        let result = client.transfer_admin(&group_id, &new_admin_ref).await;
                         if result.is_ok() {
                             publish_client_pending_projection_updates(
                                 &mut client,

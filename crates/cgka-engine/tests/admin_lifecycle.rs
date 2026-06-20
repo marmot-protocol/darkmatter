@@ -397,6 +397,27 @@ async fn revoke_non_admin_is_noop() {
 }
 
 #[tokio::test]
+async fn revoke_non_member_is_noop() {
+    // #488 lists MemberNotFound for revoke, but a non-member is by definition
+    // not an admin (admin-leaf coupling), so revoking a pubkey that is not a
+    // current member — e.g. a mistyped key — is the same benign no-op as
+    // revoking a known non-admin member, not a hard error. This pins that
+    // intentional semantics (see do_send_revoke_admin in admin_lifecycle.rs).
+    let (mut alice, _bob, gid) = create_pair().await;
+    let res = alice
+        .send(SendIntent::RevokeAdmin {
+            group_id: gid.clone(),
+            member_pubkey: pk32(b"never-a-member"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(res, SendResult::Noop { .. }));
+    // No commit issued: epoch unchanged, admin set untouched.
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+    assert_eq!(alice.admin_pubkeys(&gid).unwrap(), vec![pk32(b"alice")]);
+}
+
+#[tokio::test]
 async fn revoke_last_admin_in_non_empty_group_is_refused() {
     let (mut alice, _bob, gid) = create_pair().await;
     let err = alice

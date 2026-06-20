@@ -453,6 +453,35 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Transfer admin: grant admin to `new_admin_ref` (npub or hex) and revoke
+    /// it from the active account, applied as a single admin-policy commit
+    /// (darkmatter#488).
+    ///
+    /// Routes through the typed engine intent `SendIntent::TransferAdmin`: the
+    /// engine recomputes the resulting admin set from signed group state,
+    /// verifies the caller is an admin and the target is a member, and applies
+    /// the grant and self-revoke atomically so the resulting epoch never
+    /// transiently lacks an admin. Transferring to oneself (or any change that
+    /// nets to the current admin set) is an idempotent success that publishes
+    /// nothing. Requires the caller to be an admin.
+    pub async fn transfer_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        new_admin_ref: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
+        let summary = self
+            .runtime
+            .transfer_admin(&account_ref, &group_id, &new_admin_ref)
+            .await?;
+        Ok(summary.into())
+    }
+
     pub async fn invite_members_detailed(
         &self,
         account_ref: String,

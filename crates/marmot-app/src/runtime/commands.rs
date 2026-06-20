@@ -492,6 +492,28 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn transfer_admin(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        new_admin_ref: &str,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::TransferAdmin {
+                group_id: group_id.clone(),
+                new_admin_ref: new_admin_ref.to_owned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_accounts().await?;
+        self.schedule_audit_log_tracker_update("transfer_admin");
+        Ok(summary)
+    }
+
     pub async fn update_group_profile(
         &self,
         account_ref: &str,
