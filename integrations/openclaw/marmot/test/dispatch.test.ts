@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { StreamMode } from "../src/config.js";
-import { AgentControlError } from "../src/client.js";
+import { AgentControlError, type AgentControlMediaRef } from "../src/client.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
 import {
   createMarmotInboundDispatcher,
@@ -11,6 +11,8 @@ import {
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
 
+import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   buildChannelInboundEventContext: vi.fn((params: unknown) => params),
   runChannelInboundEvent: vi.fn(
@@ -19,6 +21,8 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
     },
   ),
 }));
+
+const buildCtxMock = vi.mocked(buildChannelInboundEventContext);
 
 const HEX32 = (b: string) => b.repeat(32);
 const STREAM_ID = HEX32("11");
@@ -609,5 +613,177 @@ describe("createMarmotInboundDispatcher activation gating", () => {
 
   it("replies to everything when groupActivation is always", async () => {
     expect(await runCase({ groupActivation: "always", isDirect: false })).toBe(true);
+  });
+});
+
+describe("createMarmotInboundDispatcher inbound media", () => {
+  function mediaRuntime(): OpenClawChannelRuntime {
+    return {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-media-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "ok" }, { kind: "final" });
+        },
+      },
+    };
+  }
+
+  function imageRef(byte: string, mediaType = "image/png"): AgentControlMediaRef {
+    return {
+      media_type: mediaType,
+      file_name: `img-${byte}.png`,
+      ciphertext_sha256: HEX32(byte),
+      plaintext_sha256: HEX32(byte),
+      nonce_hex: HEX32(byte),
+      version: "1",
+      source_epoch: 0,
+      locators: [],
+    };
+  }
+
+  function mediaClient(
+    downloads: AgentControlMediaRef[],
+    opts: { fail?: boolean } = {},
+  ): MarmotDispatchClient {
+    return {
+      async sendFinal() {
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+      async groupInfo(accountIdHex: string, groupIdHex: string) {
+        return {
+          type: "group_info",
+          account_id_hex: accountIdHex,
+          group_id_hex: groupIdHex,
+          member_count: 5,
+          is_direct: false,
+          subject: null,
+        };
+      },
+      async downloadMedia(_account: string, _group: string, media: AgentControlMediaRef) {
+        downloads.push(media);
+        if (opts.fail) {
+          throw new AgentControlError("download failed", { code: "io_error" });
+        }
+        return {
+          type: "media_downloaded",
+          path: `/tmp/marmot-dl/${media.file_name}`,
+          media_type: media.media_type,
+          file_name: media.file_name,
+          size_bytes: 10,
+        };
+      },
+    } as unknown as MarmotDispatchClient;
+  }
+
+  function makeDispatch(client: MarmotDispatchClient) {
+    return createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: mediaRuntime(),
+      client,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "always",
+      mentionPatterns: [],
+    });
+  }
+
+  it("downloads inbound media and passes local file facts into the context builder", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const ref = imageRef("e1");
+    const dispatch = makeDispatch(mediaClient(downloads));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "look",
+      media: [ref],
+    });
+
+    expect(downloads).toEqual([ref]);
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as { media?: unknown };
+    expect(ctxArg.media).toEqual([
+      {
+        path: `/tmp/marmot-dl/${ref.file_name}`,
+        contentType: "image/png",
+        kind: "image",
+        messageId: HEX32("dd"),
+      },
+    ]);
+  });
+
+  it("classifies non-image media types and omits failed downloads", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const ok = imageRef("e2", "application/pdf");
+    const dispatch = makeDispatch(mediaClient(downloads));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "doc",
+      media: [ok],
+    });
+
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as { media?: Array<{ kind?: string }> };
+    expect(ctxArg.media?.[0]?.kind).toBe("document");
+  });
+
+  it("omits the media field entirely when every download fails", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const dispatch = makeDispatch(mediaClient(downloads, { fail: true }));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "broken",
+      media: [imageRef("e3")],
+    });
+
+    expect(downloads).toHaveLength(1);
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect("media" in ctxArg).toBe(false);
+  });
+
+  it("does not call downloadMedia for a message with no media", async () => {
+    buildCtxMock.mockClear();
+    const downloads: AgentControlMediaRef[] = [];
+    const dispatch = makeDispatch(mediaClient(downloads));
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "no media",
+    });
+
+    expect(downloads).toHaveLength(0);
+    const ctxArg = buildCtxMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect("media" in ctxArg).toBe(false);
   });
 });

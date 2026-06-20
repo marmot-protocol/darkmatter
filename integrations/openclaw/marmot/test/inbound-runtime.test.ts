@@ -118,6 +118,98 @@ describe("startMarmotInbound", () => {
     });
   });
 
+  it("surfaces a message deletion to the ambient surfacer with a stable contextKey", async () => {
+    const surfaced: { groupIdHex: string; text: string; contextKey?: string }[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "message_deleted",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            target_message_id_hex: HEX32("dd"),
+            sender_account_id_hex: HEX32("bb"),
+          },
+        ]),
+      surfaceAmbientEvent: (event) => {
+        surfaced.push(event);
+      },
+    });
+
+    await waitFor(() => surfaced.length > 0);
+    stop();
+
+    expect(surfaced[0]).toMatchObject({
+      groupIdHex: HEX32("cc"),
+      text: "A message was deleted.",
+      contextKey: `marmot:message_deleted:${HEX32("cc")}:${HEX32("dd")}`,
+    });
+  });
+
+  it("surfaces a group rename with the new name and a change-scoped contextKey", async () => {
+    const surfaced: { groupIdHex: string; text: string; contextKey?: string }[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "group_state_changed",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            change: "group_renamed",
+            detail: "Project Marmot",
+          },
+        ]),
+      surfaceAmbientEvent: (event) => {
+        surfaced.push(event);
+      },
+    });
+
+    await waitFor(() => surfaced.length > 0);
+    stop();
+
+    expect(surfaced[0]).toMatchObject({
+      groupIdHex: HEX32("cc"),
+      text: 'The group was renamed to "Project Marmot".',
+      contextKey: `marmot:group_state_changed:${HEX32("cc")}:group_renamed`,
+    });
+  });
+
+  it("surfaces a membership change without any member detail", async () => {
+    const surfaced: { text: string }[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "group_state_changed",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            change: "member_added",
+            detail: null,
+          },
+        ]),
+      surfaceAmbientEvent: (event) => {
+        surfaced.push(event);
+      },
+    });
+
+    await waitFor(() => surfaced.length > 0);
+    stop();
+
+    expect(surfaced[0]?.text).toBe("A member was added to the group.");
+  });
+
   it("dispatches distinct groups concurrently and keeps per-group FIFO order", async () => {
     const a1 = HEX32("d1");
     const a2 = HEX32("d2");

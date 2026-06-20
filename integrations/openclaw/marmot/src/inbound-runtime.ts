@@ -54,6 +54,34 @@ function resolveAccount(api: InboundPluginApi): ResolvedMarmotAccount {
   );
 }
 
+/**
+ * Map a coarse group-state change kind to a short, privacy-safe sentence for
+ * ambient agent context. NEVER includes a member pubkey; the only detail
+ * surfaced is the new group name on a rename (already non-secret group metadata).
+ */
+function groupStateChangeSentence(change: string, detail?: string | null): string {
+  switch (change) {
+    case "member_added":
+      return "A member was added to the group.";
+    case "member_removed":
+      return "A member was removed from the group.";
+    case "member_left":
+      return "A member left the group.";
+    case "admin_added":
+      return "A member was made a group admin.";
+    case "admin_removed":
+      return "A member is no longer a group admin.";
+    case "group_renamed":
+      return detail && detail.trim().length > 0
+        ? `The group was renamed to "${detail.trim()}".`
+        : "The group was renamed.";
+    case "group_avatar_changed":
+      return "The group avatar was changed.";
+    default:
+      return "The group state changed.";
+  }
+}
+
 /** Merge a debounce batch of same-key inbound messages into one turn (newline-joined text). */
 function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMessage {
   const last = items[items.length - 1]!;
@@ -69,6 +97,21 @@ function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMe
 
 export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;
 
+/**
+ * A passive ambient event surfaced to the agent as next-turn context (no reply
+ * is triggered). `groupIdHex` selects the agent session; `text` is a short,
+ * privacy-safe sentence; `contextKey` dedupes repeated surfacings of the same
+ * fact. Built in `index.ts` over the full plugin api (it needs
+ * `api.runtime.system`/`api.runtime.channel`, which the narrowed
+ * `InboundPluginApi` does not expose) and passed in here.
+ */
+export type MarmotAmbientSurfacer = (event: {
+  accountIdHex: string;
+  groupIdHex: string;
+  text: string;
+  contextKey?: string;
+}) => void | Promise<void>;
+
 export interface StartMarmotInboundOptions {
   signal?: AbortSignal;
   /** Override the control-client factory (tests inject a stub). */
@@ -78,6 +121,11 @@ export interface StartMarmotInboundOptions {
    * a name is present, it is inherited and published instead of asking in-chat.
    */
   configuredAgentName?: string | null;
+  /**
+   * Surface passive group events (a deletion, a membership/rename change) to the
+   * agent as quiet next-turn context. When omitted, those events are only logged.
+   */
+  surfaceAmbientEvent?: MarmotAmbientSurfacer;
 }
 
 // The gateway can full-load the plugin in more than one in-process context
@@ -218,20 +266,38 @@ export function startMarmotInbound(
         markMarmotInboundReceived(statusAccountId);
         submitInbound(message);
       },
-      onMessageDeleted: () => {
-        // A peer retracted a message. Recorded privacy-safely; surfacing it to the
-        // agent as quiet ambient context lands with the system-event work.
+      onMessageDeleted: (deletion) => {
+        // A peer retracted a message. Surface it to the agent as quiet ambient
+        // (next-turn) context when a surfacer is wired; always recorded + logged
+        // privacy-safely (no ids/pubkeys in the log).
         markMarmotInboundReceived(statusAccountId);
         api.logger.info("marmot: inbound message deletion observed");
+        void Promise.resolve(
+          options.surfaceAmbientEvent?.({
+            accountIdHex: deletion.accountIdHex,
+            groupIdHex: deletion.groupIdHex,
+            text: "A message was deleted.",
+            contextKey: `marmot:message_deleted:${deletion.groupIdHex}:${deletion.targetMessageIdHex}`,
+          }),
+        ).catch(() => api.logger.warn("marmot: failed to surface message deletion to the agent"));
       },
-      onGroupStateChanged: () => {
+      onGroupStateChanged: (change) => {
         // A durable group-state change (membership/admin/rename/avatar) was
-        // observed. Recorded privacy-safely; the change kind contents are NOT
-        // logged. Surfacing it to the agent as quiet ambient context (via
-        // api.runtime.system enqueueSystemEvent) lands with the system-event work
-        // and is validated on the docker harness.
+        // observed. The change kind contents are NOT logged; they ARE surfaced to
+        // the agent as quiet ambient context (via the surfacer) when wired. The
+        // mapped sentence never carries a member pubkey.
         markMarmotInboundReceived(statusAccountId);
         api.logger.info("marmot: inbound group state change observed");
+        void Promise.resolve(
+          options.surfaceAmbientEvent?.({
+            accountIdHex: change.accountIdHex,
+            groupIdHex: change.groupIdHex,
+            text: groupStateChangeSentence(change.change, change.detail),
+            contextKey: `marmot:group_state_changed:${change.groupIdHex}:${change.change}`,
+          }),
+        ).catch(() =>
+          api.logger.warn("marmot: failed to surface group state change to the agent"),
+        );
       },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {

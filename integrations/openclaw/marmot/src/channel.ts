@@ -125,7 +125,7 @@ export function createMarmotChannelPlugin() {
       capabilities: {
         chatTypes: ["direct", "group"],
         reply: true,
-        media: false,
+        media: true,
         blockStreaming: true,
       },
       configSchema: marmotChannelConfigSchema(),

@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import {
   buildChannelInboundEventContext,
   runChannelInboundEvent,
+  type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
 
 import { NonAppendOnlyUpdateError } from "./append-only.js";
@@ -458,8 +459,12 @@ export interface OpenClawChannelRuntime {
   };
 }
 
-/** Dispatcher client: the reply sink surface plus the group-info read for gating. */
-export type MarmotDispatchClient = MarmotSinkClient & Pick<MarmotAgentControlClient, "groupInfo">;
+/**
+ * Dispatcher client: the reply sink surface plus the group-info read for
+ * gating and the media download used to surface inbound images to the agent.
+ */
+export type MarmotDispatchClient = MarmotSinkClient &
+  Pick<MarmotAgentControlClient, "groupInfo" | "downloadMedia">;
 
 export interface MarmotDispatchDeps {
   /** Full OpenClaw config (`api.config`). */
@@ -523,6 +528,57 @@ async function shouldRunTurn(
   }
 }
 
+/** Map a media MIME type onto the OpenClaw inbound media `kind` enum. */
+function inboundMediaKind(mediaType: string): NonNullable<InboundMediaFacts["kind"]> {
+  const type = mediaType.trim().toLowerCase();
+  if (type.startsWith("image/")) {
+    return "image";
+  }
+  if (type.startsWith("video/")) {
+    return "video";
+  }
+  if (type.startsWith("audio/")) {
+    return "audio";
+  }
+  if (type.length === 0) {
+    return "unknown";
+  }
+  return "document";
+}
+
+/**
+ * Best-effort: download each inbound media ref to a local path on the dm-agent
+ * host and build the `InboundMediaFacts` OpenClaw reads (and base64-encodes)
+ * downstream. A ref that fails to download is skipped (privacy-safe log) so one
+ * broken attachment never drops the whole turn. Returns `undefined` when the
+ * message carries no media so the context builder omits the field entirely.
+ */
+async function downloadInboundMedia(
+  deps: Pick<MarmotDispatchClient, "downloadMedia">,
+  message: MarmotInboundMessage,
+  log?: (message: string) => void,
+): Promise<InboundMediaFacts[] | undefined> {
+  const refs = message.media ?? [];
+  if (refs.length === 0) {
+    return undefined;
+  }
+  const facts: InboundMediaFacts[] = [];
+  for (const ref of refs) {
+    try {
+      const res = await deps.downloadMedia(message.accountIdHex, message.groupIdHex, ref);
+      facts.push({
+        path: res.path,
+        contentType: res.media_type,
+        kind: inboundMediaKind(res.media_type),
+        messageId: message.messageIdHex,
+      });
+    } catch {
+      log?.("marmot: inbound media download failed; skipping attachment");
+    }
+  }
+  return facts.length > 0 ? facts : undefined;
+}
+
 /**
  * Build the inbound dispatcher: for each received Marmot message, resolve the
  * agent route, build the inbound context, and run it through the OpenClaw turn
@@ -545,6 +601,11 @@ export function createMarmotInboundDispatcher(
       peer: { kind: "group", id: message.groupIdHex },
     });
 
+    // Surface any inbound encrypted media to the agent: download each ref to a
+    // local path (dm-agent decrypts; the content key never leaves it) and hand
+    // the local file facts to OpenClaw, which reads + base64-encodes them.
+    const media = await downloadInboundMedia(deps.client, message, deps.log);
+
     const ctxPayload = buildChannelInboundEventContext({
       channel: "marmot",
       accountId: channelAccountId,
@@ -565,6 +626,7 @@ export function createMarmotInboundDispatcher(
         ...(message.replyToMessageIdHex ? { replyToId: message.replyToMessageIdHex } : {}),
       },
       message: { rawBody: message.text, bodyForAgent: message.text },
+      ...(media ? { media } : {}),
     });
 
     const storePath = deps.runtimeChannel.session.resolveStorePath();

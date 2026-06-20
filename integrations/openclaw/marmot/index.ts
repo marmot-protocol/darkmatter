@@ -14,7 +14,11 @@ import {
 } from "./src/channel.js";
 import { clientForAccount } from "./src/config.js";
 import { createMarmotInboundDispatcher, type OpenClawChannelRuntime } from "./src/dispatch.js";
-import { startMarmotInbound, syncMarmotAllowlist } from "./src/inbound-runtime.js";
+import {
+  startMarmotInbound,
+  syncMarmotAllowlist,
+  type MarmotAmbientSurfacer,
+} from "./src/inbound-runtime.js";
 import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./src/runtime-state.js";
 
 export default defineChannelPluginEntry({
@@ -66,7 +70,30 @@ export default defineChannelPluginEntry({
           log: (message) => api.logger.info(message),
         });
 
-        startMarmotInbound(api, dispatch, { configuredAgentName });
+        // Ambient surfacer: route a passive group event to the agent's session as
+        // quiet next-turn context. Built here (over the full `api`) because it
+        // needs `api.runtime.channel.routing` + `api.runtime.system`, which the
+        // narrowed inbound api does not expose. Feature-detected at runtime so it
+        // degrades to a no-op on a host without the system-event surface.
+        const channelAccountId = resolved.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+        const surfaceAmbientEvent: MarmotAmbientSurfacer = ({ groupIdHex, text, contextKey }) => {
+          const enqueue = api.runtime?.system?.enqueueSystemEvent;
+          if (typeof enqueue !== "function") {
+            api.logger.warn(
+              "marmot: runtime has no system-event surface; ambient event not delivered",
+            );
+            return;
+          }
+          const route = api.runtime.channel.routing.resolveAgentRoute({
+            cfg: api.config,
+            channel: MARMOT_CHANNEL_ID,
+            accountId: channelAccountId,
+            peer: { kind: "group", id: groupIdHex },
+          });
+          enqueue(text, { sessionKey: route.sessionKey, contextKey: contextKey ?? null });
+        };
+
+        startMarmotInbound(api, dispatch, { configuredAgentName, surfaceAmbientEvent });
       } catch {
         // This runs in a fire-and-forget IIFE, so an unguarded throw (e.g. a
         // malformed channels.marmot config that fails account resolution) would

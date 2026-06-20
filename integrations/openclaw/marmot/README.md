@@ -131,25 +131,33 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   (Follow-up: `stream_finalize` is not yet idempotent.)
 - **Message deletion**: the control client can retract a prior message via
   `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
-  kind-5 deletions from other members surface as a `message_deleted` event.
-  (The OpenClaw agent-facing delete trigger and ambient surfacing of inbound
-  deletions are validated on the docker harness.)
-- **Group state changes**: durable, MLS-authenticated changes to group state
-  (member add/remove/leave, admin grant/revoke, group rename/avatar change)
-  surface as a `group_state_changed` event carrying only a coarse `change` kind
-  and, for a rename, the new group display name in `detail` — never a member
-  pubkey. The plugin records it privacy-safely; agent-facing ambient surfacing
-  (via `api.runtime.system` `enqueueSystemEvent`, shared with `message_deleted`)
-  is validated on the docker harness.
-- **Media** (control-plane): the control client can send local files as
-  encrypted media via `send_media` (`dm-agent` reads the bytes from its host,
-  encrypts + uploads to Blossom, and sends a kind-9 message) and fetch + decrypt
-  an inbound attachment via `download_media` (returns a host-local plaintext
-  path; the content key never leaves `dm-agent`). Inbound messages surface their
-  encrypted-media references as `media` refs (the non-secret `imeta` mirror) on
-  the `inbound_message` event. The OpenClaw agent-facing vision input (passing
-  downloaded images into a turn) and the outbound agent image trigger are
-  validated on the docker harness.
+  kind-5 deletions from other members surface as a `message_deleted` event,
+  routed to the agent as quiet ambient context (below). The agent-facing *delete
+  trigger* is scaffolded — the message adapter records a `messageId → {account,
+  group}` map at send time and exposes `deleteByMessageId(...)` — but wiring the
+  agent's `delete` message-action requires the larger `base.actions`
+  message-tool surface (`ChannelMessageActionAdapter`), which is typed but
+  runtime-unvalidated and left as a follow-up.
+- **Group state changes**: durable, MLS-authenticated changes (member
+  add/remove/leave, admin grant/revoke, rename/avatar) surface as a
+  `group_state_changed` event carrying only a coarse `change` kind and, for a
+  rename, the new group display name — never a member pubkey.
+- **Ambient context** (`index.ts` ambient surfacer): `message_deleted` and
+  `group_state_changed` are surfaced to the agent's session as quiet,
+  next-turn context via `api.runtime.system.enqueueSystemEvent(text, {
+  sessionKey, contextKey })` (sessionKey from `resolveAgentRoute`). It is
+  feature-detected (no-ops on a runtime without the system-event surface). The
+  agent sees the event as context without being forced to reply; confirmed on
+  the docker harness.
+- **Media**: inbound — an `inbound_message` carries non-secret `media` refs
+  (the `imeta` mirror); on dispatch the connector calls `download_media` to get
+  a host-local decrypted path and passes it to the turn as an OpenClaw
+  `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
+  base64-encodes for a vision model. Outbound — the message adapter declares
+  `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
+  `mediaReadFile` when needed) onto `send_media` (`dm-agent` encrypts + uploads
+  to Blossom; the content key never leaves it). The vision model actually
+  receiving the image is confirmed on the docker harness.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
   update cancels the preview and sends the final verbatim. The transcript hash +
