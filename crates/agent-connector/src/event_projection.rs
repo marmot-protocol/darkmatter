@@ -26,6 +26,9 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
     if account_id_hex.is_empty() {
         return false;
     }
+    // Authoritative signal: a Marmot mention carries a `["p", <pubkey-hex>]` tag
+    // for the mentioned account. This is present regardless of how the inline
+    // text encodes the reference, so it is the reliable check.
     let tagged = tags.iter().any(|tag| {
         tag.first().is_some_and(|name| name == PUBKEY_MENTION_TAG)
             && tag
@@ -35,9 +38,15 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
     if tagged {
         return true;
     }
-    // Inline `nostr:<hexpubkey>` mention (Marmot convention).
-    let needle = format!("nostr:{}", account_id_hex.to_ascii_lowercase());
-    plaintext.to_ascii_lowercase().contains(&needle)
+    // Fallback for a p-tag-less mention: an inline NIP-21 `nostr:` reference to
+    // the account in the body, in either hex or bech32 (`npub`) form (the
+    // displayed mention text). `nprofile` mentions still rely on the p-tag above.
+    let body = plaintext.to_ascii_lowercase();
+    if body.contains(&format!("nostr:{}", account_id_hex.to_ascii_lowercase())) {
+        return true;
+    }
+    marmot_app::npub_for_account_id(account_id_hex)
+        .is_ok_and(|npub| body.contains(&format!("nostr:{}", npub.to_ascii_lowercase())))
 }
 
 /// The replied-to message id from the first `e` tag, if present.

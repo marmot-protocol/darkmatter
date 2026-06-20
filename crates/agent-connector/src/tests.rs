@@ -2283,6 +2283,41 @@ fn inbound_message_event_detects_inline_nostr_mention() {
 }
 
 #[test]
+fn inbound_message_event_detects_npub_bech32_mention() {
+    // A p-tag-less mention whose inline text is the bech32 `nostr:npub1…` form
+    // (what marmot-markdown renders) must still be detected.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("hey nostr:{npub} can you help?");
+    let record = received_chat_record("11", "bb", "cc", &text);
+    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(
+        mentions_self,
+        "inline nostr:<npub> bech32 mention should be detected"
+    );
+}
+
+#[test]
+fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
+    // The p-tag is authoritative: a mention with only the structured tag (no
+    // inline nostr: reference in the body) is still detected.
+    let account = "aa".repeat(32);
+    let mut record = received_chat_record("11", "bb", "cc", "please take a look");
+    record.tags = vec![vec!["p".to_owned(), account.clone()]];
+    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(
+        mentions_self,
+        "p-tag mention should be detected without inline text"
+    );
+}
+
+#[test]
 fn safe_media_filename_strips_path_traversal() {
     use crate::messaging::safe_media_filename;
     assert_eq!(safe_media_filename("a.png"), "a.png");
