@@ -117,7 +117,10 @@ async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<Marmo
 /** Dependencies the channel-owned `delete` action adapter needs. */
 export interface MarmotDeleteActionDeps {
   /** Resolve a sent message id to its group from the send-time cache. */
-  deleteByMessageId: (targetMessageIdHex: string) => Promise<boolean>;
+  deleteByMessageId: (
+    targetMessageIdHex: string,
+    resolveCtx: { cfg: unknown; accountId?: string | null },
+  ) => Promise<boolean>;
   /** Resolve the dm-agent client + Marmot account for the explicit-group fallback. */
   resolveTarget: (
     cfg: unknown,
@@ -152,7 +155,7 @@ export function createMarmotDeleteActionAdapter(
       if (!messageId) {
         return jsonResult({ ok: false, error: "messageId required" });
       }
-      if (await deps.deleteByMessageId(messageId)) {
+      if (await deps.deleteByMessageId(messageId, { cfg: ctx.cfg, accountId: ctx.accountId })) {
         return jsonResult({ ok: true, deleted: true });
       }
       const to = typeof ctx.params.to === "string" ? ctx.params.to : undefined;

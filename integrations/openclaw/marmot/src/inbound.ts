@@ -151,6 +151,10 @@ export class MarmotInboundBridge {
   async run(signal: AbortSignal): Promise<void> {
     const baseDelayMs = this.options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
     const maxDelayMs = this.options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
+    // `reconnectBackoffMs` returns `baseMs` whenever the ceiling collapses to it,
+    // so a configured cap below the base would otherwise be exceeded. Clamp the
+    // base to the cap so the delay never goes above the cap.
+    const effectiveBaseMs = Math.min(baseDelayMs, maxDelayMs);
     // Consecutive reconnect attempts that have not (re)established a subscription.
     // Reset to 0 once a subscription is acked (onReady) so a healthy connection
     // always reconnects promptly, while a persistent failure backs off geometrically
@@ -167,7 +171,9 @@ export class MarmotInboundBridge {
           {
             onReady: () => {
               attempt = 0;
-              void this.options.onReady?.();
+              Promise.resolve(this.options.onReady?.()).catch((err) => {
+                this.options.onError?.(err);
+              });
             },
           },
         )) {
@@ -186,7 +192,7 @@ export class MarmotInboundBridge {
       if (signal.aborted) {
         return;
       }
-      await delay(reconnectBackoffMs(attempt, baseDelayMs, maxDelayMs), signal);
+      await delay(reconnectBackoffMs(attempt, effectiveBaseMs, maxDelayMs), signal);
       attempt += 1;
     }
   }

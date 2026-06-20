@@ -41,20 +41,35 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
     // Fallback for a p-tag-less mention: an inline NIP-21 `nostr:` reference to
     // the account in the body, in either hex or bech32 (`npub`) form (the
     // displayed mention text). `nprofile` mentions still rely on the p-tag above.
-    let body = plaintext.to_ascii_lowercase();
-    if body.contains(&format!("nostr:{}", account_id_hex.to_ascii_lowercase())) {
+    if plaintext_has_nostr_ref(plaintext, account_id_hex) {
         return true;
     }
     marmot_app::npub_for_account_id(account_id_hex)
-        .is_ok_and(|npub| body.contains(&format!("nostr:{}", npub.to_ascii_lowercase())))
+        .is_ok_and(|npub| plaintext_has_nostr_ref(plaintext, &npub))
 }
 
-/// The replied-to message id from the first `e` tag, if present.
+/// Whether `plaintext` contains a `nostr:<reference>` token that is not glued to
+/// surrounding alphanumerics (so `nostr:<hex>junk` does NOT match the reference).
+/// Case-insensitive on both sides.
+fn plaintext_has_nostr_ref(plaintext: &str, reference: &str) -> bool {
+    let body = plaintext.to_ascii_lowercase();
+    let needle = format!("nostr:{}", reference.to_ascii_lowercase());
+    body.match_indices(&needle).any(|(start, _)| {
+        let end = start + needle.len();
+        let before_ok = start == 0 || !body.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == body.len() || !body.as_bytes()[end].is_ascii_alphanumeric();
+        before_ok && after_ok
+    })
+}
+
+/// The replied-to message id from the first `e` tag, if present. The tag value is
+/// sender-controlled, so it is normalized + validated as hex (a malformed value is
+/// dropped rather than passed through as a reply/delete target).
 fn reply_target_from_tags(tags: &[Vec<String>]) -> Option<String> {
     tags.iter()
         .find(|tag| tag.first().is_some_and(|name| name == EVENT_REF_TAG))
         .and_then(|tag| tag.get(1))
-        .map(|value| value.to_owned())
+        .and_then(|value| normalize_hex(value).ok())
 }
 
 /// Project every parseable `imeta` media tag into a control-plane media ref.

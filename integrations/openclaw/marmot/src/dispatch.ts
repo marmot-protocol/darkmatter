@@ -572,12 +572,14 @@ async function downloadInboundMedia(
   }
   const facts: InboundMediaFacts[] = [];
   for (const ref of refs) {
+    // Captured so the dm-agent temp file is unlinked even if readFile or
+    // saveMediaBuffer throws after a successful download.
+    let tempPath: string | undefined;
     try {
       const res = await deps.downloadMedia(message.accountIdHex, message.groupIdHex, ref);
+      tempPath = res.path;
       const buffer = await readFile(res.path);
       const saved = await saveMediaBuffer(buffer, res.media_type, "inbound", undefined, res.file_name);
-      // The dm-agent temp file is now redundant; drop it (best-effort).
-      await unlink(res.path).catch(() => undefined);
       facts.push({
         path: saved.path,
         contentType: res.media_type,
@@ -586,6 +588,12 @@ async function downloadInboundMedia(
       });
     } catch {
       log?.("marmot: inbound media download failed; skipping attachment");
+    } finally {
+      // The dm-agent temp file is redundant once re-staged (or unusable on a
+      // mid-stage failure); drop it (best-effort).
+      if (tempPath !== undefined) {
+        await unlink(tempPath).catch(() => undefined);
+      }
     }
   }
   return facts.length > 0 ? facts : undefined;

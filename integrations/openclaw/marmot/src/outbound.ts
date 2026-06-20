@@ -7,9 +7,9 @@
 // (see src/live.ts) and are only declared as capabilities once backed by
 // contract tests.
 
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -160,12 +160,23 @@ function isLocalMediaUrl(mediaUrl: string): boolean {
 }
 
 /**
+ * A resolved outbound media upload, plus an optional cleanup for any temp file
+ * staged on the connector host. The cleanup is present only for the remote-URL
+ * case (a temp file we created); an already-local path is left untouched.
+ */
+export interface ResolvedOutboundMediaUpload {
+  upload: AgentControlMediaUpload;
+  cleanup?: () => Promise<void>;
+}
+
+/**
  * Resolve `ctx.mediaUrl` to a local `AgentControlMediaUpload` the connector can
  * read by path. Handles two cases the ctx can express with the real SDK types:
  *
- * 1. A local filesystem path or `file://` URL — used directly.
+ * 1. A local filesystem path or `file://` URL — used directly (no cleanup).
  * 2. A non-local URL with a `mediaReadFile` host accessor — the bytes are read
- *    and written to a temp file so the connector still gets a path.
+ *    and written to a temp file so the connector still gets a path, and a
+ *    `cleanup` is returned to remove that temp file+dir after the send.
  *
  * Returns `null` when the ctx provides only a remote URL and no buffer accessor;
  * the connector reads a path it cannot be given in that case (see Seam 2 note).
@@ -173,28 +184,35 @@ function isLocalMediaUrl(mediaUrl: string): boolean {
 async function resolveOutboundMediaUpload(
   ctx: ChannelMessageSendMediaContext,
   writeTempMedia: (fileName: string, bytes: Buffer) => Promise<string>,
-): Promise<AgentControlMediaUpload | null> {
+): Promise<ResolvedOutboundMediaUpload | null> {
   const { mediaUrl } = ctx;
   if (isLocalMediaUrl(mediaUrl)) {
     const localPath = mediaUrl.startsWith("file://") ? fileURLToPath(mediaUrl) : mediaUrl;
     const fileName = basename(localPath) || "attachment";
-    return { path: localPath, media_type: mimeFromExtension(fileName), file_name: fileName };
+    return {
+      upload: { path: localPath, media_type: mimeFromExtension(fileName), file_name: fileName },
+    };
   }
   const readFile = ctx.mediaReadFile;
   if (readFile) {
     const bytes = await readFile(mediaUrl);
     const fileName = basename(new URL(mediaUrl).pathname) || "attachment";
     const path = await writeTempMedia(fileName, bytes);
-    return { path, media_type: mimeFromExtension(fileName), file_name: fileName };
+    return {
+      upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
+      // The staged temp file lives under a dedicated mkdtemp dir; remove the
+      // whole dir so nothing is left behind after the send.
+      cleanup: () => rm(dirname(path), { recursive: true, force: true }),
+    };
   }
   return null;
 }
 
-/** Default temp-file writer: materialize media bytes under a fresh temp dir. */
+/** Default temp-file writer: materialize media bytes under a fresh temp dir (0600). */
 async function defaultWriteTempMedia(fileName: string, bytes: Buffer): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "marmot-media-"));
   const path = join(dir, fileName || "attachment");
-  await writeFile(path, bytes);
+  await writeFile(path, bytes, { mode: 0o600 });
   return path;
 }
 
@@ -216,13 +234,21 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
    * Resolve a previously-sent message id to its account+group. Used by a delete
    * trigger once the SDK exposes a typed adapter delete hook (see Seam 4 note);
    * exposed here so the cache + lookup is ready to wire.
+   *
+   * `resolveCtx` carries the delete action's own routing context (`cfg` +
+   * `accountId`) so the dm-agent client is resolved for the correct account in a
+   * multi-account deployment, rather than defaulting to whatever account a
+   * context-free resolve would pick.
    */
-  const deleteByMessageId = async (targetMessageIdHex: string): Promise<boolean> => {
+  const deleteByMessageId = async (
+    targetMessageIdHex: string,
+    resolveCtx: { cfg: unknown; accountId?: string | null },
+  ): Promise<boolean> => {
     const target = sentTargets.get(targetMessageIdHex);
     if (!target) {
       return false;
     }
-    const { client } = await deps.resolveTarget(undefined, null);
+    const { client } = await deps.resolveTarget(resolveCtx.cfg, resolveCtx.accountId ?? null);
     await client.deleteMessage(target.marmotAccountIdHex, target.groupIdHex, targetMessageIdHex);
     return true;
   };
@@ -250,20 +276,31 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
         return { receipt: receiptFromMessageIds(response.message_ids_hex, now()) };
       },
       media: async (ctx: ChannelMessageSendMediaContext) => {
-        const upload = await resolveOutboundMediaUpload(ctx, writeTempMedia);
-        if (!upload) {
+        const resolved = await resolveOutboundMediaUpload(ctx, writeTempMedia);
+        if (!resolved) {
           throw new Error(
             "marmot: outbound media has no local path; dm-agent send_media needs a file path",
           );
         }
-        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
-        const caption = ctx.text.trim().length > 0 ? ctx.text : null;
-        const response = await client.sendMedia(marmotAccountIdHex, ctx.to, [upload], caption);
-        sentTargets.recordAll(response.message_ids_hex, {
-          marmotAccountIdHex,
-          groupIdHex: ctx.to,
-        });
-        return { receipt: receiptFromMessageIds(response.message_ids_hex, now(), "media") };
+        try {
+          const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId);
+          const caption = ctx.text.trim().length > 0 ? ctx.text : null;
+          const response = await client.sendMedia(
+            marmotAccountIdHex,
+            ctx.to,
+            [resolved.upload],
+            caption,
+          );
+          sentTargets.recordAll(response.message_ids_hex, {
+            marmotAccountIdHex,
+            groupIdHex: ctx.to,
+          });
+          return { receipt: receiptFromMessageIds(response.message_ids_hex, now(), "media") };
+        } finally {
+          // Remove any temp file we staged for a remote URL, even if the send
+          // threw. The already-local case has no cleanup.
+          await resolved.cleanup?.().catch(() => undefined);
+        }
       },
     },
     receive: {

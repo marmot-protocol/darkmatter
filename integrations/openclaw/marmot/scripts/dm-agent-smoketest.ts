@@ -195,7 +195,11 @@ async function main(): Promise<void> {
     const kinds = new Map<string, number>();
     let mediaRefCount = 0;
     let firstEvents = 0;
-    const timer = setTimeout(() => controller.abort(), Math.max(0, listenSeconds) * 1000);
+    let listenWindowAborted = false;
+    const timer = setTimeout(() => {
+      listenWindowAborted = true;
+      controller.abort();
+    }, Math.max(0, listenSeconds) * 1000);
 
     let ready = false;
     const iter = client.subscribeInbound(
@@ -225,9 +229,11 @@ async function main(): Promise<void> {
       `ready=${ready} events=${firstEvents} media_refs=${mediaRefCount}${summary ? ` [${summary}]` : ""}`,
     );
   } catch (err) {
-    // An abort tears the socket down and surfaces as a read error; that is the
-    // expected end of the listen window, not a failure.
-    if (err instanceof AgentControlError && err.code === "socket_io") {
+    // An intentional abort (the listen-window timer firing) tears the socket
+    // down and surfaces as a read error; that is the expected end of the listen
+    // window, not a failure. A `socket_io` error before the timer fired is a
+    // genuine transport failure and must be reported.
+    if (listenWindowAborted && err instanceof AgentControlError && err.code === "socket_io") {
       pass("subscribe_inbound", `closed after ~${listenSeconds}s`);
     } else {
       fail("subscribe_inbound", err);

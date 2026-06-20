@@ -1,7 +1,5 @@
 //! Final-message sends, agent activity/operation/group-system events, and debug send recording.
 
-use std::os::unix::fs::PermissionsExt;
-
 use agent_control::{
     AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
     AgentControlResponse,
@@ -15,6 +13,19 @@ use marmot_app::{
 use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
+
+/// Server-derived fingerprint of a `send_final` request: a stable hash over the
+/// destination (account + group) and message text. Used so a reused idempotency
+/// key only short-circuits when it identifies the same request; a different body
+/// under the same key is a cache miss rather than a wrong-id return.
+fn send_final_fingerprint(account_id_hex: &str, group_id_hex: &str, text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account_id_hex.hash(&mut hasher);
+    group_id_hex.hash(&mut hasher);
+    text.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Map a control-plane media reference (the non-secret mirror) back into the
 /// app-runtime `MediaAttachmentReference`. Field-for-field; the content key is
@@ -70,11 +81,17 @@ impl AgentConnector {
             );
         }
 
-        // Idempotent durable send: if this key already committed a send, return
-        // the original message ids without re-sending so a retry after a
+        // Server-derived request fingerprint: a reused idempotency key only short-
+        // circuits when the request it identifies is the same one. A reused key
+        // carrying a different request body is a cache miss, so dedup can never
+        // return ids belonging to an unrelated send.
+        let fingerprint = send_final_fingerprint(account_id_hex, group_id_hex, &text);
+
+        // Idempotent durable send: if this key already committed a matching send,
+        // return the original message ids without re-sending so a retry after a
         // post-write timeout cannot double-post an unrecallable message.
         if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key)
+            && let Some(message_ids_hex) = self.idempotency.get(key, fingerprint)
         {
             return Ok(AgentControlResponse::FinalSent { message_ids_hex });
         }
@@ -91,8 +108,11 @@ impl AgentConnector {
                 .await?
         };
         // Record only after a successful send so a failed send remains retryable.
+        // A key already bound to a different fingerprint is left untouched (first
+        // write wins), so this send simply proceeds without caching.
         if let Some(key) = idempotency_key {
-            self.idempotency.record(key, summary.message_ids.clone());
+            self.idempotency
+                .record(key, fingerprint, summary.message_ids.clone());
         }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,
@@ -324,7 +344,7 @@ impl AgentConnector {
         let group_id = GroupId::new(hex::decode(group_id_hex)?);
         let mut upload_attachments = Vec::with_capacity(attachments.len());
         for attachment in attachments {
-            let plaintext = std::fs::read(&attachment.path)?;
+            let plaintext = tokio::fs::read(&attachment.path).await?;
             upload_attachments.push(MediaUploadAttachmentRequest {
                 file_name: attachment.file_name,
                 media_type: attachment.media_type,
@@ -372,13 +392,22 @@ impl AgentConnector {
             .download_media(&account.label, &group_id, reference)
             .await?;
         let dir = std::env::temp_dir().join("marmot-media").join(&subdir);
-        std::fs::create_dir_all(&dir)?;
+        tokio::fs::create_dir_all(&dir).await?;
         // The file name comes from the (decrypted) sender-controlled media
         // reference, so write under a sanitized basename: a crafted value like
         // "../../x" must not let a download escape the per-blob temp dir.
         let path = dir.join(safe_media_filename(&result.file_name));
-        std::fs::write(&path, &result.plaintext)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        // Create with 0600 atomically so the plaintext is never world-readable,
+        // even momentarily (no post-write chmod TOCTOU window).
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
+        use tokio::io::AsyncWriteExt as _;
+        file.write_all(&result.plaintext).await?;
         Ok(AgentControlResponse::MediaDownloaded {
             path: path.to_string_lossy().into_owned(),
             media_type: result.media_type,

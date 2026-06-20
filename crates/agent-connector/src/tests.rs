@@ -2250,10 +2250,11 @@ fn inbound_message_event_from_record_projects_received_chat() {
 fn inbound_message_event_from_record_extracts_mention_and_reply() {
     // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
     // the reply target. Both let a channel gate/thread without re-parsing tags.
+    let parent_msg_id = "bb".repeat(32);
     let mut record = received_chat_record("aa", "bb", "cc", "hey there");
     record.tags = vec![
         vec!["p".to_owned(), "acct".to_owned()],
-        vec!["e".to_owned(), "parent-msg-id".to_owned()],
+        vec!["e".to_owned(), parent_msg_id.clone()],
     ];
     let event =
         inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
@@ -2266,7 +2267,10 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
         panic!("expected inbound message event");
     };
     assert!(mentions_self, "p-tag for the account should mark a mention");
-    assert_eq!(reply_to_message_id_hex.as_deref(), Some("parent-msg-id"));
+    assert_eq!(
+        reply_to_message_id_hex.as_deref(),
+        Some(parent_msg_id.as_str())
+    );
 }
 
 #[test]
@@ -2596,16 +2600,21 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
     use crate::stream_session::SendIdempotencyStore;
 
     let store = SendIdempotencyStore::default();
-    assert_eq!(store.get("k1"), None, "an unseen key has no cached ids");
+    assert_eq!(store.get("k1", 7), None, "an unseen key has no cached ids");
 
     let ids = vec!["aa".repeat(32), "bb".repeat(32)];
-    store.record("k1".to_owned(), ids.clone());
+    store.record("k1".to_owned(), 7, ids.clone());
     assert_eq!(
-        store.get("k1"),
+        store.get("k1", 7),
         Some(ids),
-        "a recorded key returns its message ids"
+        "a recorded key returns its message ids for a matching fingerprint"
     );
-    assert_eq!(store.get("k2"), None, "an unrelated key stays absent");
+    assert_eq!(
+        store.get("k1", 8),
+        None,
+        "a recorded key with a non-matching fingerprint is a cache miss"
+    );
+    assert_eq!(store.get("k2", 7), None, "an unrelated key stays absent");
 }
 
 #[test]
@@ -2615,11 +2624,12 @@ fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
     let store = SendIdempotencyStore::default();
     let first = vec!["11".repeat(32)];
     let second = vec!["22".repeat(32)];
-    store.record("dup".to_owned(), first.clone());
+    store.record("dup".to_owned(), 1, first.clone());
     // A repeat record (e.g. a racing duplicate) must not overwrite the original
-    // committed ids: the first successful send for a key always wins.
-    store.record("dup".to_owned(), second);
-    assert_eq!(store.get("dup"), Some(first));
+    // committed entry: the first successful send for a key always wins, even if
+    // the later record carries a different fingerprint.
+    store.record("dup".to_owned(), 2, second);
+    assert_eq!(store.get("dup", 1), Some(first));
 }
 
 #[test]
@@ -2630,17 +2640,17 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
     // the newest remain. This bounds memory for a long-lived connector.
     let store = SendIdempotencyStore::default();
     for n in 0..1100u32 {
-        store.record(format!("key-{n}"), vec![format!("{n:064x}")]);
+        store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
     }
-    assert_eq!(store.get("key-0"), None, "oldest key must be evicted");
-    assert_eq!(store.get("key-75"), None, "early keys must be evicted");
+    assert_eq!(store.get("key-0", 0), None, "oldest key must be evicted");
+    assert_eq!(store.get("key-75", 75), None, "early keys must be evicted");
     assert_eq!(
-        store.get("key-1099"),
+        store.get("key-1099", 1099),
         Some(vec![format!("{:064x}", 1099)]),
         "the newest key must still be cached"
     );
     assert_eq!(
-        store.get("key-200"),
+        store.get("key-200", 200),
         Some(vec![format!("{:064x}", 200)]),
         "a key within the retained window must still be cached"
     );

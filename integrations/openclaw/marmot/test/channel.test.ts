@@ -140,7 +140,12 @@ describe("createMarmotDeleteActionAdapter", () => {
 
     const result = await adapter.handleAction!(deleteCtx({ messageId: HEX32("99") }));
 
-    expect(deleteByMessageId).toHaveBeenCalledWith(HEX32("99"));
+    // The cache-hit delete must carry the action's routing context so it resolves
+    // the correct account/client in a multi-account deployment.
+    expect(deleteByMessageId).toHaveBeenCalledWith(HEX32("99"), {
+      cfg: {},
+      accountId: undefined,
+    });
     expect(resolveTarget).not.toHaveBeenCalled();
     expect(resultOk(result)).toBe(true);
   });
