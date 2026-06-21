@@ -1388,6 +1388,30 @@ fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, memb
     );
 }
 
+fn sync_until_member_removed(
+    home: &std::path::Path,
+    relay: &str,
+    account: &str,
+    group_id: &str,
+    member: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        let members = run_json(home, &["--account", account, "group", "members", group_id]);
+        if !member_accounts(&members).contains(&member.to_owned()) {
+            return members;
+        }
+        last = members;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "account <REDACTED_ACCOUNT> still sees departed member in <REDACTED_GROUP>; {}",
+        json_value_summary("last_members", &last)
+    );
+}
+
 fn sync_until_admins<const N: usize>(
     home: &std::path::Path,
     account: &str,
@@ -4116,11 +4140,8 @@ fn groups_leave_publishes_self_remove() {
     assert_eq!(leave["group_id"], group_id);
     assert_eq!(leave["published"], 1);
 
-    let _ = run_json(home.path(), &["--account", &alice, "sync"]);
-    let alice_members = run_json(
-        home.path(),
-        &["--account", &alice, "group", "members", group_id],
-    );
+    let alice_members =
+        sync_until_member_removed(home.path(), test_relay_url(), &alice, group_id, &bob);
     assert!(!member_accounts(&alice_members).contains(&bob));
 }
 
