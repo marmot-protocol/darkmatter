@@ -83,6 +83,15 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = send_intent_group_id(&intent).clone();
+        if !matches!(intent, SendIntent::Leave { .. }) && self.has_leave_send_gate(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Leaving",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "leave requested",
+                },
+            ));
+        }
         if self.should_queue_outbound_intent(&group_id).await? {
             return self.queue_outbound_intent(group_id, intent);
         }
@@ -108,6 +117,11 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
+        self.try_auto_repropose_leave_request(group_id).await;
+        if self.load_leave_request_state(group_id)?.is_some() {
+            return Ok(Vec::new());
+        }
+
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
         for record in queued {
@@ -115,6 +129,10 @@ impl<S: StorageProvider> Engine<S> {
                 .advance_convergence_inputs_until_settled(group_id, now_ms)
                 .await?
             {
+                break;
+            }
+            self.try_auto_repropose_leave_request(group_id).await;
+            if self.load_leave_request_state(group_id)?.is_some() {
                 break;
             }
             let result = self.do_send_ready(record.intent.clone()).await?;
@@ -210,13 +228,10 @@ impl<S: StorageProvider> Engine<S> {
             };
             // A lone uncommitted Proposal does NOT make canonical state
             // ambiguous: commits are the consensus log; a proposal only takes
-            // effect once a commit consumes it (convergence.md:7-8). So an
-            // outstanding Proposal record MUST NOT gate outbound application
-            // payloads — otherwise a receiver that ingested, e.g., a standalone
-            // AppDataUpdate request-flow proposal or a SelfRemove it is not
-            // selected to commit could never send again until (or unless) the
-            // consuming commit flows through convergence, which never happens if
-            // the committing member is offline (darkmatter#154).
+            // effect once a commit consumes it (convergence.md:7-8). The
+            // SelfRemove send-side rule is enforced earlier: remaining members
+            // that may commit a SelfRemove stage a pending commit, and the
+            // leaver is held by `leaving_groups`.
             //
             // The Proposal record stays in its `Created`/`Retryable` state and
             // continues to contribute to the OpenMLS candidate-path graph, so a

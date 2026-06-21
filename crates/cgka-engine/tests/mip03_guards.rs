@@ -606,9 +606,9 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
     // spec/protocol-core/group-messaging.md:46-53 shape (b): a SelfRemove-only
     // commit that processes a pending SelfRemove proposal by reference is
     // allowed for non-admins. We drive the engine's real auto-commit (bob, a
-    // non-admin, self-removes; the remaining lowest-index member stages a
-    // SelfRemove-only commit) and assert the allowlist classifies that staged
-    // commit as not-admin-required.
+    // non-admin, self-removes; a remaining member stages a SelfRemove-only
+    // commit) and assert the allowlist classifies that staged commit as
+    // not-admin-required.
     let (mut alice, alice_storage) = build_with_storage(b"alice");
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");

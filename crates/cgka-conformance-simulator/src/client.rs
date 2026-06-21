@@ -621,6 +621,15 @@ impl HarnessClient {
             }
             self.capture_engine_events();
         }
+        let proposals = self.engine.drain_auto_proposals();
+        for msg in proposals {
+            let routed = if let Some(gid) = &gid {
+                route(msg, gid)
+            } else {
+                msg
+            };
+            self.bus.send(self.bus_id, routed);
+        }
         outcomes
     }
 

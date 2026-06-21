@@ -293,9 +293,9 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
 /// Regression for the auto-commit leave path (darkmatter#150 follow-up).
 ///
 /// A deferred SelfRemove auto-commit legitimately persists a staged commit
-/// across a process boundary: the proposer's device stages the lowest-index
-/// commit, projects the departing member out of the Marmot record *forward*,
-/// and a later run publishes + confirms it. The crash-recovery clear at
+/// across a process boundary: a remaining member stages the commit, projects
+/// the departing member out of the Marmot record *forward*, and a later run
+/// publishes + confirms it. The crash-recovery clear at
 /// hydrate must NOT fire on this surviving commit — rolling it back re-derives
 /// the record from the pre-stage MLS state and re-adds the member who already
 /// left, forking convergence (the CLI `groups_leave_publishes_self_remove`
@@ -363,7 +363,7 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
             other => panic!("expected Proposal, got {other:?}"),
         };
 
-        // Alice ingests it — she is the lowest-index non-target admin, so the
+        // Alice ingests it — she is a remaining non-target member, so the
         // auto-committer stages a commit and projects bob out of the record
         // immediately (epoch advances to the projected value, bob dropped).
         let routed = TransportMessage {

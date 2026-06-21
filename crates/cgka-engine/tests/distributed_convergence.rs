@@ -2372,6 +2372,17 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         carol_outcome,
         cgka_traits::ingest::IngestOutcome::Processed
     ));
+    let mut carol_auto = carol.drain_auto_publish();
+    assert_eq!(
+        carol_auto.len(),
+        1,
+        "carol should attempt a SelfRemove-only commit when she sees the proposal"
+    );
+    assert_message_state(&carol_storage, &proposal, MessageState::Created);
+    carol
+        .publish_failed(carol_auto.remove(0).pending)
+        .await
+        .unwrap();
     assert_message_state(&carol_storage, &proposal, MessageState::Created);
 
     let alice_outcome = alice.ingest(proposal.clone()).await.unwrap();

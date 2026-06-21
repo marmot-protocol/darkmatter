@@ -634,6 +634,9 @@ impl AccountDeviceSession {
                 pending: auto.pending,
             });
         }
+        for msg in self.engine.drain_auto_proposals() {
+            effects.publish.push(PublishWork::Proposal { msg });
+        }
         effects.events.extend(self.engine.drain_events());
         tracing::trace!(
             target: TRACE_TARGET,

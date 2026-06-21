@@ -753,6 +753,27 @@ impl<S: StorageProvider> Engine<S> {
                             origin_commit_id.clone(),
                         );
                     }
+                    if removed
+                        .iter()
+                        .any(|member| member == self.identity.self_id())
+                    {
+                        self.clear_leave_request_state(&group_id)?;
+                    } else if after_ids.contains(self.identity.self_id()) {
+                        if self.load_leave_request_state(&group_id)?.is_some() {
+                            // A SelfRemove proposal is valid only in its
+                            // source epoch, but the local leave request is not.
+                            // Keep the send gate and publish a fresh proposal
+                            // for the accepted epoch.
+                            self.leaving_groups.insert(group_id.clone());
+                            self.try_auto_repropose_leave_request(&group_id).await;
+                        } else if self.leaving_groups.contains(&group_id) {
+                            // Compatibility cleanup for a pre-durable in-memory
+                            // gate that survived until an unrelated accepted
+                            // commit kept us in the group.
+                            self.leaving_groups.remove(&group_id);
+                        }
+                    }
+
                     for member in removed {
                         let (change, actor) = if self_removed.contains(&member) {
                             // A leave is attributed to the leaver, not the member
@@ -854,25 +875,12 @@ impl<S: StorageProvider> Engine<S> {
                         decision_report.decision,
                         crate::auto_committer::AutoCommitDecision::Commit
                     ) {
-                        // Only the elected committer holds the proposal in its
-                        // *live* OpenMLS proposal store and commits it. An
-                        // observing client (the common case: a standalone
-                        // AppDataUpdate request-flow proposal, or a SelfRemove
-                        // this client is not selected to commit) MUST NOT retain
-                        // it in the live store: OpenMLS's `create_message`
-                        // refuses to send while the proposal store is non-empty
-                        // (`MlsGroupStateError::PendingProposal`), so a lingering
-                        // observed proposal would block all outbound application
-                        // payloads until the elected committer's commit arrives —
-                        // indefinitely if that member is offline (darkmatter#154).
-                        //
-                        // Dropping the live-store copy on observe loses nothing:
-                        // the proposal is already persisted as a durable
-                        // `Created` record above, and convergence re-stores it
-                        // from that record (`process_openmls_messages_inner`)
-                        // onto a snapshot group when the consuming commit
-                        // eventually flows through, so it remains available as
-                        // candidate-path input for a later consuming commit.
+                        // A remaining member that is allowed to commit the
+                        // SelfRemove stores it in OpenMLS's live proposal store
+                        // and stages a SelfRemove-only commit. Proposals we do
+                        // not commit stay only in the durable message record;
+                        // convergence re-stores them from that record onto
+                        // snapshot groups when a consuming commit arrives.
                         mls_group
                             .store_pending_proposal(
                                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
