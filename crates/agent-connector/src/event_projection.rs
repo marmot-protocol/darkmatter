@@ -9,8 +9,8 @@ use agent_control::{
     AgentControlMediaRef,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_EVENT_VERSION,
-    GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    EVENT_REF_TAG, GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
+    GROUP_SYSTEM_EVENT_VERSION, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
     GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
     GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, GroupSystemEvent,
@@ -299,13 +299,13 @@ fn group_state_change_replay_id(
     let mut data = serde_json::Map::new();
     if let Some(actor_hex) = actor_hex.as_ref() {
         data.insert(
-            cgka_traits::app_event::GROUP_SYSTEM_DATA_ACTOR.to_owned(),
+            GROUP_SYSTEM_DATA_ACTOR.to_owned(),
             serde_json::Value::String(actor_hex.clone()),
         );
     }
     if let Some(subject) = subject {
         data.insert(
-            cgka_traits::app_event::GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
+            GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
             serde_json::Value::String(hex::encode(subject.as_slice())),
         );
     }
@@ -343,6 +343,8 @@ fn group_system_projection_parts(
     Option<&str>,
     &'static str,
 ) {
+    // The `text` values are part of the canonical storage row id preimage. Keep these in lockstep
+    // with marmot_app's group-system projection until the shared derivation is extracted.
     match change {
         GroupStateChange::MemberAdded { member } => (
             GROUP_SYSTEM_TYPE_MEMBER_ADDED,

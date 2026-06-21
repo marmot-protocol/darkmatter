@@ -188,7 +188,9 @@ impl AgentConnector {
             // Track delivered storage row ids so a later replay re-delivers only genuinely-missed
             // events. Skip a live event the cursor already saw (e.g. one just recovered by a
             // replay) so it is never delivered twice. Debug-injected inbound messages have no
-            // runtime replay id, so preserve the older message-id dedup behavior for them.
+            // runtime replay id, so preserve the older message-id dedup behavior for them. If the
+            // debug channel ever starts injecting delete/state-change events, they need a durable
+            // replay id here before they can safely share storage-backed replay dedup.
             if let Some(replay_id) = replay_id {
                 if delivered.contains(&replay_id) {
                     continue;
@@ -199,6 +201,15 @@ impl AgentConnector {
                     continue;
                 }
                 delivered.record(message_id_hex.clone());
+            } else {
+                debug_assert!(
+                    !matches!(
+                        &event,
+                        AgentControlEvent::MessageDeleted { .. }
+                            | AgentControlEvent::GroupStateChanged { .. }
+                    ),
+                    "debug-injected ambient events need a durable replay id before delivery"
+                );
             }
             let envelope = AgentControlEnvelope::new(request_id.clone(), event);
             write_frame(writer, &envelope).await?;
