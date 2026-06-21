@@ -46,9 +46,9 @@ pub(crate) struct AutoCommitDecisionReport {
 ///    target — if we were, we'd produce an invalid commit and OpenMLS
 ///    would reject it. Enforcing here gives a clean typed early exit
 ///    instead of an opaque MLS error.
-/// Admin checks are partly enforced by send-time guards and partly here:
-/// if the leaver is the only admin, this policy observes instead of
-/// committing.
+/// 3. Admin checks are partly enforced by send-time guards and partly here:
+///    if the leaver is the only admin, this policy observes instead of
+///    committing.
 ///
 /// Not enforced here:
 /// - **§151 remove-beats-self-remove**: a precedence rule when both a
