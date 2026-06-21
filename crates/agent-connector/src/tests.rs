@@ -2699,21 +2699,30 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
-    assert_eq!(store.get("k1", 7), None, "an unseen key has no cached ids");
+    let fingerprint = "fp-k1".to_owned();
+    assert_eq!(
+        store.get("k1", &fingerprint),
+        None,
+        "an unseen key has no cached ids"
+    );
 
     let ids = vec!["aa".repeat(32), "bb".repeat(32)];
-    store.record("k1".to_owned(), 7, ids.clone());
+    store.record("k1".to_owned(), fingerprint.clone(), ids.clone());
     assert_eq!(
-        store.get("k1", 7),
+        store.get("k1", &fingerprint),
         Some(ids),
         "a recorded key returns its message ids for a matching fingerprint"
     );
     assert_eq!(
-        store.get("k1", 8),
+        store.get("k1", "fp-other"),
         None,
         "a recorded key with a non-matching fingerprint is a cache miss"
     );
-    assert_eq!(store.get("k2", 7), None, "an unrelated key stays absent");
+    assert_eq!(
+        store.get("k2", &fingerprint),
+        None,
+        "an unrelated key stays absent"
+    );
 }
 
 #[test]
@@ -2724,12 +2733,12 @@ fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
     let store = SendIdempotencyStore::new(dir.path());
     let first = vec!["11".repeat(32)];
     let second = vec!["22".repeat(32)];
-    store.record("dup".to_owned(), 1, first.clone());
+    store.record("dup".to_owned(), "fp-first".to_owned(), first.clone());
     // A repeat record (e.g. a racing duplicate) must not overwrite the original
     // committed entry: the first successful send for a key always wins, even if
     // the later record carries a different fingerprint.
-    store.record("dup".to_owned(), 2, second);
-    assert_eq!(store.get("dup", 1), Some(first));
+    store.record("dup".to_owned(), "fp-second".to_owned(), second);
+    assert_eq!(store.get("dup", "fp-first"), Some(first));
 }
 
 #[test]
@@ -2741,17 +2750,29 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
     for n in 0..1100u32 {
-        store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
+        store.record(
+            format!("key-{n}"),
+            format!("fp-{n}"),
+            vec![format!("{n:064x}")],
+        );
     }
-    assert_eq!(store.get("key-0", 0), None, "oldest key must be evicted");
-    assert_eq!(store.get("key-75", 75), None, "early keys must be evicted");
     assert_eq!(
-        store.get("key-1099", 1099),
+        store.get("key-0", "fp-0"),
+        None,
+        "oldest key must be evicted"
+    );
+    assert_eq!(
+        store.get("key-75", "fp-75"),
+        None,
+        "early keys must be evicted"
+    );
+    assert_eq!(
+        store.get("key-1099", "fp-1099"),
         Some(vec![format!("{:064x}", 1099)]),
         "the newest key must still be cached"
     );
     assert_eq!(
-        store.get("key-200", 200),
+        store.get("key-200", "fp-200"),
         Some(vec![format!("{:064x}", 200)]),
         "a key within the retained window must still be cached"
     );
@@ -2759,22 +2780,27 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
 
 #[test]
 fn send_idempotency_store_survives_connector_restart() {
+    use crate::messaging::send_final_fingerprint;
     use crate::stream_session::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
+    let fingerprint = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
     let ids = vec!["aa".repeat(32)];
     {
         let store = SendIdempotencyStore::new(dir.path());
-        store.record("retry-key".to_owned(), 42, ids.clone());
+        store.record("retry-key".to_owned(), fingerprint.clone(), ids.clone());
     }
     let reloaded = SendIdempotencyStore::new(dir.path());
     assert_eq!(
-        reloaded.get("retry-key", 42),
+        reloaded.get("retry-key", &fingerprint),
         Some(ids),
         "a persisted idempotency record must survive restart"
     );
     assert_eq!(
-        reloaded.get("retry-key", 43),
+        reloaded.get(
+            "retry-key",
+            &send_final_fingerprint("aa", "bb", "hello", None)
+        ),
         None,
         "a mismatched fingerprint must remain a cache miss after restart"
     );
@@ -2788,13 +2814,21 @@ fn send_idempotency_store_persists_fifo_eviction() {
     {
         let store = SendIdempotencyStore::new(dir.path());
         for n in 0..1100u32 {
-            store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
+            store.record(
+                format!("key-{n}"),
+                format!("fp-{n}"),
+                vec![format!("{n:064x}")],
+            );
         }
     }
     let reloaded = SendIdempotencyStore::new(dir.path());
-    assert_eq!(reloaded.get("key-0", 0), None, "oldest key must stay evicted");
     assert_eq!(
-        reloaded.get("key-1099", 1099),
+        reloaded.get("key-0", "fp-0"),
+        None,
+        "oldest key must stay evicted"
+    );
+    assert_eq!(
+        reloaded.get("key-1099", "fp-1099"),
         Some(vec![format!("{:064x}", 1099)]),
         "newest retained key must reload from disk"
     );
@@ -2810,9 +2844,16 @@ fn send_idempotency_store_ignores_corrupt_on_disk_file() {
     std::fs::write(store.file_path(), b"{not valid json").unwrap();
 
     let reloaded = SendIdempotencyStore::new(dir.path());
-    assert_eq!(reloaded.get("missing", 1), None);
-    reloaded.record("fresh".to_owned(), 9, vec!["cc".repeat(32)]);
-    assert_eq!(reloaded.get("fresh", 9), Some(vec!["cc".repeat(32)]));
+    assert_eq!(reloaded.get("missing", "fp-missing"), None);
+    reloaded.record(
+        "fresh".to_owned(),
+        "fp-fresh".to_owned(),
+        vec!["cc".repeat(32)],
+    );
+    assert_eq!(
+        reloaded.get("fresh", "fp-fresh"),
+        Some(vec!["cc".repeat(32)])
+    );
 }
 
 #[test]
@@ -2825,21 +2866,30 @@ fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
     std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
     std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
 
-    store.record("k1".to_owned(), 7, vec!["aa".repeat(32)]);
+    store.record("k1".to_owned(), "fp-k1".to_owned(), vec!["aa".repeat(32)]);
 
     assert!(!temp_path.exists());
     assert!(store.file_path().exists());
     assert_eq!(
-        store.file_path()
-            .metadata()
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+        store.file_path().metadata().unwrap().permissions().mode() & 0o777,
         0o600
     );
     let reloaded = SendIdempotencyStore::new(dir.path());
-    assert_eq!(reloaded.get("k1", 7), Some(vec!["aa".repeat(32)]));
+    assert_eq!(reloaded.get("k1", "fp-k1"), Some(vec!["aa".repeat(32)]));
+}
+
+#[test]
+fn send_final_fingerprint_pins_stable_digests() {
+    use crate::messaging::send_final_fingerprint;
+
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        "e252cba2c8a1728d36a0cc74a06b00502113fb22cdf10076dd73f5aa88d60f27"
+    );
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", Some("cc")),
+        "f44ab9cc17e0db7571b1e6b1d76b12f09346ea94a576a2a8711272e2caaa6588"
+    );
 }
 
 #[test]

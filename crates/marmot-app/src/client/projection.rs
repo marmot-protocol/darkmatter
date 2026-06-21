@@ -312,9 +312,7 @@ fn build_group_system_projection(
     recorded_at: u64,
     origin_commit_id: Option<String>,
 ) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
-    use cgka_traits::app_event::{
-        group_system_event_material, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    };
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, group_system_event_material};
 
     let material = group_system_event_material(group_id, epoch, actor, change)?;
 

@@ -281,12 +281,7 @@ pub struct GroupSystemEventMaterial {
 
 fn group_system_projection_parts(
     change: &GroupStateChange,
-) -> (
-    &'static str,
-    Option<&MemberId>,
-    Option<&str>,
-    &'static str,
-) {
+) -> (&'static str, Option<&MemberId>, Option<&str>, &'static str) {
     match change {
         GroupStateChange::MemberAdded { member } => (
             GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -567,7 +562,10 @@ mod tests {
         ];
 
         let expected = [
-            ("member_added", "71b369c949fcb272ef975b2969b2efb426143bc70fe8e1c9c56f6c7f6cde4495"),
+            (
+                "member_added",
+                "71b369c949fcb272ef975b2969b2efb426143bc70fe8e1c9c56f6c7f6cde4495",
+            ),
             (
                 "member_removed",
                 "ec9c74bcfc1d543c9498c385c102dea2ebe55c7eaa6fc00f7f3ba6e97324b8eb",
@@ -605,9 +603,11 @@ mod tests {
                 id,
                 "{label}: id must be stable across calls"
             );
-            let material =
-                group_system_event_material(&group_id, epoch, *actor, change).unwrap();
-            assert_eq!(material.message_id_hex, id, "{label}: material id must match");
+            let material = group_system_event_material(&group_id, epoch, *actor, change).unwrap();
+            assert_eq!(
+                material.message_id_hex, id,
+                "{label}: material id must match"
+            );
         }
     }
 }
