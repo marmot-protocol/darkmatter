@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -2555,6 +2556,237 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # Durable ops use the full timeout (request() default -> None -> request_timeout).
         self.assertIsNone(by_type["stream_finalize"])
         self.assertIsNone(by_type["send_final"])
+
+
+class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    async def test_finalize_rejection_falls_back_to_plain_send_final(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.stream_cancels = []
+                self.final_sends = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                return {"type": "ack"}
+
+            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count):
+                raise adapter_module.AgentControlError(
+                    "transcript hash mismatch",
+                    code="stream_finalize_rejected",
+                )
+
+            async def stream_cancel(self, stream_id_hex, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        preview = await adapter.send("22" * 32, "hello\u2589")
+        final = await adapter.send("22" * 32, "hello world")
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(fake_client.final_sends[0][2], "hello world")
+        self.assertTrue(fake_client.stream_cancels)
+
+
+class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    async def test_inbound_media_download_populates_message_event(self):
+        class FakeClient:
+            async def download_media(self, account_id_hex, group_id_hex, media):
+                return {
+                    "type": "media_downloaded",
+                    "path": "/tmp/inbound.png",
+                    "media_type": "image/png",
+                    "file_name": "inbound.png",
+                    "size_bytes": 12,
+                }
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=FakeClient(),
+        )
+        adapter.handle_message = unittest.mock.AsyncMock()
+
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "photo",
+            "mentions_self": True,
+            "media": [{"file_name": "inbound.png", "media_type": "image/png", "ciphertext_sha256": "aa", "plaintext_sha256": "bb", "nonce_hex": "cc", "version": "1", "source_epoch": 1, "locators": []}],
+        }
+        await adapter._dispatch_inbound_message(event)
+
+        dispatched = adapter.handle_message.await_args.args[0]
+        self.assertEqual(dispatched.media_urls, ["/tmp/inbound.png"])
+        self.assertEqual(dispatched.media_types, ["image/png"])
+
+    async def test_outbound_send_image_file_routes_to_send_media(self):
+        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+            tmp.write(b"png")
+            tmp.flush()
+
+            class FakeClient:
+                def __init__(self):
+                    self.media_sends = []
+
+                async def send_media(self, account_id_hex, group_id_hex, attachments, *, caption=None, reply_to_message_id_hex=None):
+                    self.media_sends.append((account_id_hex, group_id_hex, attachments, caption))
+                    return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32}),
+                client=fake_client,
+            )
+            result = await adapter.send_image_file("22" * 32, tmp.name, caption="look")
+
+            self.assertTrue(result.success)
+            self.assertEqual(len(fake_client.media_sends), 1)
+            self.assertEqual(fake_client.media_sends[0][2][0]["path"], tmp.name)
+            self.assertEqual(fake_client.media_sends[0][3], "look")
+
+
+class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    async def test_delete_message_uses_send_time_cache(self):
+        class FakeClient:
+            def __init__(self):
+                self.deletes = []
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+            async def delete_message(self, account_id_hex, group_id_hex, target_message_id_hex):
+                self.deletes.append((account_id_hex, group_id_hex, target_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": []}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+        send_result = await adapter.send("22" * 32, "hello")
+        self.assertTrue(send_result.success)
+
+        deleted = await adapter.delete_message("", "88" * 32)
+        self.assertTrue(deleted)
+        self.assertEqual(
+            fake_client.deletes,
+            [("11" * 32, "22" * 32, "88" * 32)],
+        )
+
+
+class GroupActivationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    async def test_unaddressed_multi_party_message_is_skipped(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"type": "group_info", "is_direct": False, "member_count": 3}
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32, "group_activation": "mention"}),
+            client=FakeClient(),
+        )
+        adapter.handle_message = unittest.mock.AsyncMock()
+
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "hello everyone",
+            "mentions_self": False,
+        }
+        await adapter._dispatch_inbound_message(event)
+        adapter.handle_message.assert_not_called()
+
+    async def test_mention_pattern_triggers_turn(self):
+        class FakeClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                raise AssertionError("group_info should not run when mention pattern matches")
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "group_activation": "mention",
+                    "mention_patterns": ["marvin"],
+                }
+            ),
+            client=FakeClient(),
+        )
+        adapter.handle_message = unittest.mock.AsyncMock()
+
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "hey marvin, status?",
+            "mentions_self": False,
+        }
+        await adapter._dispatch_inbound_message(event)
+        adapter.handle_message.assert_called_once()
+
+
+class ConfigResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+
+    def test_resolve_group_activation_and_mention_patterns(self):
+        extra = {
+            "group_activation": "always",
+            "mention_patterns": ["bot", "assistant"],
+            "agent_name": "Marvin",
+        }
+        self.assertEqual(self.adapter_module.resolve_group_activation(extra), "always")
+        self.assertEqual(
+            self.adapter_module.resolve_mention_patterns(extra),
+            ["bot", "assistant", "Marvin"],
+        )
 
 
 if __name__ == "__main__":

@@ -11,12 +11,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, Literal, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -50,6 +51,8 @@ DEFAULT_RECONNECT_DELAY_MS = 1000
 DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
 DEFAULT_INBOUND_DEDUPE_WINDOW = 2048
 DEFAULT_AMBIENT_CONTEXT_WINDOW = 2048
+DEFAULT_SENT_TARGET_CACHE_SIZE = 2048
+DEFAULT_GROUP_ACTIVATION: Literal["mention", "always"] = "mention"
 MAX_PROFILE_NAME_CHARS = 80
 PROFILE_NAME_PROMPT = (
     "I do not have a public Nostr profile name yet. What should I publish as "
@@ -185,6 +188,77 @@ class _RecentKeys:
         self._keys[key] = None
         while len(self._keys) > self.max_size:
             self._keys.popitem(last=False)
+
+
+class SentMessageTargetCache:
+    """Maps durable message ids to the account+group they were sent to.
+
+    Mirrors OpenClaw ``SentMessageTargetCache`` so a later delete can be routed
+    without an extra round-trip.
+    """
+
+    def __init__(self, max_size: int = DEFAULT_SENT_TARGET_CACHE_SIZE) -> None:
+        self.max_size = int(max_size)
+        self._entries: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
+
+    def record(self, message_id_hex: str, *, account_id_hex: str, group_id_hex: str) -> None:
+        message_id_hex = _normalize_hex(message_id_hex, "message_id_hex")
+        account_id_hex = _normalize_hex(account_id_hex, "account_id_hex")
+        group_id_hex = _normalize_hex(group_id_hex, "group_id_hex")
+        if message_id_hex in self._entries:
+            self._entries.pop(message_id_hex, None)
+        self._entries[message_id_hex] = (account_id_hex, group_id_hex)
+        while len(self._entries) > self.max_size:
+            self._entries.popitem(last=False)
+
+    def record_all(
+        self,
+        message_ids_hex: Iterable[str],
+        *,
+        account_id_hex: str,
+        group_id_hex: str,
+    ) -> None:
+        for message_id_hex in message_ids_hex:
+            self.record(
+                message_id_hex,
+                account_id_hex=account_id_hex,
+                group_id_hex=group_id_hex,
+            )
+
+    def lookup(self, message_id_hex: str) -> Optional[Tuple[str, str]]:
+        return self._entries.get(_normalize_hex(message_id_hex, "message_id_hex"))
+
+
+class GroupActivationCache:
+    """Per-(account, group) cache of the ``is_direct`` activation fact."""
+
+    def __init__(self) -> None:
+        self._is_direct: Dict[str, bool] = {}
+
+    @staticmethod
+    def _key(account_id_hex: str, group_id_hex: str) -> str:
+        return f"{account_id_hex}:{group_id_hex}"
+
+    def get(self, account_id_hex: str, group_id_hex: str) -> Optional[bool]:
+        return self._is_direct.get(self._key(account_id_hex, group_id_hex))
+
+    def set(self, account_id_hex: str, group_id_hex: str, is_direct: bool) -> None:
+        self._is_direct[self._key(account_id_hex, group_id_hex)] = bool(is_direct)
+
+    def invalidate(self, account_id_hex: str, group_id_hex: str) -> None:
+        self._is_direct.pop(self._key(account_id_hex, group_id_hex), None)
+
+    def clear(self) -> None:
+        self._is_direct.clear()
+
+
+def matches_mention_pattern(text: str, patterns: Iterable[str]) -> bool:
+    haystack = str(text or "").lower()
+    for pattern in patterns:
+        needle = str(pattern or "").strip().lower()
+        if needle and needle in haystack:
+            return True
+    return False
 
 
 def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
@@ -507,6 +581,66 @@ class MarmotAgentControlClient:
         if key:
             payload["idempotency_key"] = key
         return await self.request(payload)
+
+    async def delete_message(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        target_message_id_hex: str,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "delete_message",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "target_message_id_hex": _normalize_hex(
+                    target_message_id_hex,
+                    "target_message_id_hex",
+                ),
+            }
+        )
+
+    async def group_info(self, account_id_hex: str, group_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "group_info",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            }
+        )
+
+    async def send_media(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        attachments: Iterable[Dict[str, Any]],
+        *,
+        caption: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "send_media",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "attachments": list(attachments),
+                "caption": str(caption) if caption is not None else None,
+            }
+        )
+
+    async def download_media(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        media: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "download_media",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "media": media,
+            }
+        )
 
     async def stream_begin(
         self,
@@ -869,12 +1003,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.stream_chunk_bytes = int(extra.get("stream_chunk_bytes") or DEFAULT_STREAM_CHUNK_BYTES)
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
         self.debounce_ms = resolve_debounce_ms(extra)
+        self.group_activation = resolve_group_activation(extra)
+        self.mention_patterns = resolve_mention_patterns(extra)
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
         self.profile_name_onboarding = (
             ProfileNameOnboardingStore(resolve_profile_onboarding_state_path(extra, self.socket_path))
             if self.profile_name_onboarding_enabled
             else None
         )
+        self._sent_targets = SentMessageTargetCache()
+        self._activation_cache = GroupActivationCache()
         self._listener_task: Optional[asyncio.Task] = None
         self._inbound_queue = KeyedAsyncQueue()
         self._active_streams: Dict[str, MarmotLiveStream] = {}
@@ -943,6 +1081,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         await self._cancel_all_streams("adapter disconnect")
         self._cancel_debounce_tasks()
         self._pending_ambient_context.clear()
+        self._activation_cache.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._mark_disconnected()
@@ -1002,20 +1141,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     message_id=message_id,
                 )
             except NonAppendOnlyUpdate:
-                await self._cancel_stream(
+                return await self._abandon_preview_and_send_final(
                     chat_id,
-                    message_id,
                     stream,
-                    "final text was not append-only",
-                )
-                return await self._send_final_direct(
-                    chat_id,
                     visible_content,
+                    message_id=message_id,
+                    reason="final text was not append-only",
                     reply_to_message_id_hex=_optional_hex(reply_to),
                 )
             except Exception as exc:
                 logger.debug("Marmot live-preview finalize failed: %s", exc)
-                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+                return await self._abandon_preview_and_send_final(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                    reason="finalize_error",
+                    reply_to_message_id_hex=_optional_hex(reply_to),
+                )
 
         return await self._send_final_direct(
             chat_id,
@@ -1062,12 +1205,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 message_id=message_id,
             )
         except NonAppendOnlyUpdate as exc:
-            await self._cancel_stream(chat_id, message_id, stream, str(exc))
             if finalize:
-                return await self._send_final_direct(chat_id, visible_content)
+                return await self._abandon_preview_and_send_final(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                    reason=str(exc),
+                )
+            await self._cancel_stream(chat_id, message_id, stream, str(exc))
             return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             logger.debug("Marmot live-preview edit failed: %s", exc)
+            if finalize:
+                return await self._abandon_preview_and_send_final(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                    reason="finalize_error",
+                )
             return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
 
     def supports_draft_streaming(
@@ -1176,7 +1333,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if message_id:
             self._active_streams.pop(message_id, None)
         self._forget_stream(chat_id, stream)
-        return self._result_from_stream_finalize(response)
+        try:
+            result = self._result_from_stream_finalize(response)
+        except Exception as exc:
+            logger.debug("Marmot stream finalize response rejected: %s", exc)
+            await self._cancel_stream(chat_id, message_id, stream, "finalize rejected")
+            return await self._send_final_direct(chat_id, final_text)
+        account_id = await self._ensure_account_id()
+        self._sent_targets.record_all(
+            tuple(response.get("message_ids_hex") or ()),
+            account_id_hex=account_id,
+            group_id_hex=chat_id,
+        )
+        return result
 
     @staticmethod
     def _result_from_stream_finalize(response: Dict[str, Any]) -> SendResult:
@@ -1193,6 +1362,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             message_id=message_id,
             raw_response=response,
             continuation_message_ids=message_ids[:-1],
+        )
+
+    async def _abandon_preview_and_send_final(
+        self,
+        chat_id: str,
+        stream: MarmotLiveStream,
+        final_text: str,
+        *,
+        message_id: Optional[str] = None,
+        reason: str,
+        reply_to_message_id_hex: Optional[str] = None,
+    ) -> SendResult:
+        await self._cancel_stream(chat_id, message_id, stream, reason)
+        return await self._send_final_direct(
+            chat_id,
+            final_text,
+            reply_to_message_id_hex=reply_to_message_id_hex,
         )
 
     async def _send_final_direct(
@@ -1221,6 +1407,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 message_ids = tuple(response.get("message_ids_hex") or ())
                 message_id = message_ids[-1] if message_ids else None
+                self._sent_targets.record_all(
+                    message_ids,
+                    account_id_hex=account_id,
+                    group_id_hex=chat_id,
+                )
                 return SendResult(
                     success=True,
                     message_id=message_id,
@@ -1245,6 +1436,141 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             error=str(last_exc) if last_exc else "Marmot send_final failed",
             retryable=is_retryable(last_exc) if last_exc else False,
         )
+
+    async def _send_media_upload(
+        self,
+        chat_id: str,
+        *,
+        path: str,
+        media_type: str,
+        file_name: str,
+        caption: Optional[str] = None,
+    ) -> SendResult:
+        local_path = Path(str(path)).expanduser()
+        if not local_path.is_file():
+            return SendResult(success=False, error="Marmot media path is not a readable file")
+
+        account_id = await self._ensure_account_id()
+        chat_id = _normalize_hex(chat_id, "chat_id")
+        try:
+            response = await self.client.send_media(
+                account_id,
+                chat_id,
+                [
+                    {
+                        "path": str(local_path),
+                        "media_type": str(media_type or "application/octet-stream"),
+                        "file_name": str(file_name or local_path.name or "attachment"),
+                    }
+                ],
+                caption=caption,
+            )
+        except Exception as exc:
+            logger.debug("Marmot send_media failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+
+        message_ids = tuple(response.get("message_ids_hex") or ())
+        message_id = message_ids[-1] if message_ids else None
+        self._sent_targets.record_all(
+            message_ids,
+            account_id_hex=account_id,
+            group_id_hex=chat_id,
+        )
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response=response,
+            continuation_message_ids=message_ids[:-1],
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        path = Path(str(image_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=caption,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        path = Path(str(file_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=caption,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        path = Path(str(video_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=caption,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        **kwargs: Any,
+    ) -> SendResult:
+        path = Path(str(audio_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=kwargs.get("caption"),
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        target = self._sent_targets.lookup(message_id)
+        account_id: Optional[str]
+        group_id: Optional[str]
+        if target is not None:
+            account_id, group_id = target
+        else:
+            account_id = self.account_id_hex or None
+            group_id = _optional_hex(chat_id, "chat_id")
+            if account_id is None or group_id is None:
+                return False
+        try:
+            account_id = account_id or await self._ensure_account_id()
+            await self.client.delete_message(account_id, group_id, message_id)
+            return True
+        except Exception as exc:
+            logger.debug("Marmot delete_message failed: %s", exc)
+            return False
 
     async def _send_tool_progress_events(
         self,
@@ -1571,6 +1897,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             "Marmot connector requested resync (dropped_events=%s); reconnecting subscription",
             dropped_events,
         )
+        self._activation_cache.clear()
         raise _ResyncRequired(
             f"connector resync_required (dropped_events={dropped_events})"
         )
@@ -1618,6 +1945,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             group_id_hex = event["group_id_hex"]
             sender_account_id_hex = event["sender_account_id_hex"]
             message_id_hex = event["message_id_hex"]
+            if not await self._should_run_turn(event):
+                logger.debug("Marmot inbound not addressed; skipping turn (groupActivation=mention)")
+                return
             # Profile-name onboarding runs inside the queued (per-group) unit so the
             # one-time prompt claim is serialized per group: two concurrent first
             # messages in distinct groups race only across groups, and the loser of
@@ -1646,6 +1976,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 raw_message=event,
                 message_id=message_id_hex,
             )
+            media_urls, media_types = await self._download_inbound_media(event)
+            if media_urls:
+                hermes_event.media_urls = media_urls
+                hermes_event.media_types = media_types
             # Attach any buffered quiet ambient context (a deletion / group-state
             # change observed since the last turn) as channel_context. The runner
             # prepends channel_context to the trigger text as context without it
@@ -1662,6 +1996,61 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # A failed turn in one group must not tear down the dispatcher or the queue; log
             # privacy-safely (no ids/payloads) and let other groups keep flowing.
             logger.warning("Marmot inbound dispatch failed", exc_info=True)
+
+    async def _should_run_turn(self, event: Dict[str, Any]) -> bool:
+        if self.group_activation == "always":
+            return True
+        if bool(event.get("mentions_self")):
+            return True
+        if matches_mention_pattern(str(event.get("text") or ""), self.mention_patterns):
+            return True
+
+        account_id_hex = event.get("account_id_hex") or self.account_id_hex
+        group_id_hex = event["group_id_hex"]
+        if not account_id_hex:
+            account_id_hex = await self._ensure_account_id()
+
+        cached = self._activation_cache.get(account_id_hex, group_id_hex)
+        if cached is not None:
+            return cached
+        try:
+            response = await self.client.group_info(account_id_hex, group_id_hex)
+            is_direct = bool(response.get("is_direct"))
+            self._activation_cache.set(account_id_hex, group_id_hex, is_direct)
+            return is_direct
+        except Exception:
+            logger.debug("Marmot group membership lookup failed; skipping turn (fail-closed)")
+            return False
+
+    async def _download_inbound_media(self, event: Dict[str, Any]) -> Tuple[list[str], list[str]]:
+        media_refs = event.get("media") or []
+        if not isinstance(media_refs, list) or not media_refs:
+            return [], []
+
+        account_id_hex = event.get("account_id_hex") or self.account_id_hex
+        group_id_hex = event["group_id_hex"]
+        if not account_id_hex:
+            try:
+                account_id_hex = await self._ensure_account_id()
+            except Exception:
+                return [], []
+
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        for ref in media_refs:
+            if not isinstance(ref, dict):
+                continue
+            try:
+                response = await self.client.download_media(account_id_hex, group_id_hex, ref)
+            except Exception:
+                logger.debug("Marmot inbound media download failed; skipping attachment")
+                continue
+            path = str(response.get("path") or "").strip()
+            if not path:
+                continue
+            media_urls.append(path)
+            media_types.append(str(response.get("media_type") or ref.get("media_type") or "application/octet-stream"))
+        return media_urls, media_types
 
     def _debounce_key(self, event: Dict[str, Any]) -> str:
         # Mirror inbound-runtime.ts buildKey: account:group:sender.
@@ -1722,6 +2111,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         logger.debug("Marmot inbound group state change observed")
         change = str(event.get("change") or "")
         group_id_hex = str(event.get("group_id_hex") or "")
+        account_id_hex = str(event.get("account_id_hex") or self.account_id_hex or "")
+        if account_id_hex and group_id_hex:
+            self._activation_cache.invalidate(account_id_hex, group_id_hex)
         sentence = group_state_change_sentence(change, event.get("detail"))
         context_key = f"marmot:group_state_changed:{group_id_hex}:{change}"
         await self._surface_ambient_context(event, sentence, context_key)
@@ -1922,10 +2314,61 @@ async def _standalone_send(
     force_document=False,
 ):
     adapter = MarmotPlatformAdapter(pconfig)
+    if media_files:
+        results = []
+        caption = str(message or "")
+        for index, media_path in enumerate(media_files):
+            path = Path(str(media_path)).expanduser()
+            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            result = await adapter._send_media_upload(
+                str(chat_id),
+                path=str(path),
+                media_type=media_type,
+                file_name=path.name,
+                caption=caption if index == 0 else None,
+            )
+            if not result.success:
+                return {"error": result.error or "Marmot media send failed"}
+            results.append(result.message_id)
+        return {"success": True, "message_id": results[-1] if results else None}
     result = await adapter.send(str(chat_id), str(message or ""))
     if result.success:
         return {"success": True, "message_id": result.message_id}
     return {"error": result.error or "Marmot send failed"}
+
+
+def _delete_marmot_message_tool(args: Dict[str, Any]) -> str:
+    message_id = str(args.get("message_id") or "").strip()
+    if not message_id:
+        return json.dumps({"ok": False, "error": "message_id required"})
+
+    chat_id: Optional[str] = None
+    target = str(args.get("target") or "").strip()
+    if target:
+        parts = target.split(":", 1)
+        if len(parts) == 2 and parts[0].strip().lower() == "marmot":
+            chat_id = parts[1].strip() or None
+        else:
+            chat_id = target
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from model_tools import _run_async
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        if adapter is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "delete_marmot_message requires a live Marmot adapter in the running gateway",
+                }
+            )
+        deleted = _run_async(adapter.delete_message(chat_id or "", message_id))
+        return json.dumps({"ok": bool(deleted), "deleted": bool(deleted)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
 
 
 def register(ctx):
@@ -1949,6 +2392,30 @@ def register(ctx):
         ),
         emoji="",
     )
+    register_tool = getattr(ctx, "register_tool", None)
+    if callable(register_tool):
+        register_tool(
+            name="delete_marmot_message",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Hex id of the durable Marmot message to retract (kind-5 delete).",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Optional Marmot target as marmot:<group_id_hex>. "
+                            "Omit when the send-time cache can resolve the group."
+                        ),
+                    },
+                },
+                "required": ["message_id"],
+            },
+            handler=_delete_marmot_message_tool,
+        )
 
 
 def resolve_socket_path(extra: Dict[str, Any]) -> str:
@@ -1995,6 +2462,36 @@ def resolve_quic_candidates(extra: Dict[str, Any]) -> list[str]:
     if configured is None:
         configured = os.getenv("MARMOT_QUIC_CANDIDATES") or os.getenv("MARMOT_QUIC_CANDIDATE")
     return [candidate for candidate in _split_config_list(configured) if candidate.startswith("quic://")]
+
+
+def resolve_group_activation(extra: Dict[str, Any]) -> Literal["mention", "always"]:
+    configured = _first_config_value(
+        extra,
+        "group_activation",
+        "groupActivation",
+        env="MARMOT_GROUP_ACTIVATION",
+    )
+    if configured is None:
+        return DEFAULT_GROUP_ACTIVATION
+    value = str(configured).strip().lower()
+    if value == "always":
+        return "always"
+    return "mention"
+
+
+def resolve_mention_patterns(extra: Dict[str, Any]) -> list[str]:
+    configured = extra.get("mention_patterns")
+    if configured is None:
+        configured = extra.get("mentionPatterns")
+    if configured is None:
+        configured = os.getenv("MARMOT_MENTION_PATTERNS")
+    patterns = _split_config_list(configured)
+    agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
+    if agent_name:
+        name = str(agent_name).strip()
+        if name and name not in patterns:
+            patterns.append(name)
+    return patterns
 
 
 def resolve_debounce_ms(extra: Dict[str, Any]) -> int:
