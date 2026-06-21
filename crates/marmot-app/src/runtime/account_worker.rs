@@ -487,11 +487,16 @@ async fn run_app_runtime_account_worker(
                         for group_id in groups {
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
                                 Ok(summary) => {
-                                    scheduled_convergence.note_success(&group_id);
                                     publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
                                     scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
                                     if sync_summary_triggers_audit_tracker_update(&summary) {
                                         shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                                    }
+                                    if client.has_pending_convergence_inputs(&group_id) {
+                                        scheduled_convergence
+                                            .schedule_unsettled_groups([group_id.clone()]);
+                                    } else {
+                                        scheduled_convergence.note_success(&group_id);
                                     }
                                 }
                                 Err(err) => {
@@ -1201,6 +1206,10 @@ fn account_worker_reconnect_jitter() -> Duration {
 }
 
 const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
+/// Extra delay beyond the engine quiescence window before the first scheduled
+/// convergence tick fires. Avoids off-by-one-ms races where the timer fires
+/// while `ConvergenceStatus` is still `Syncing` (darkmatter#494).
+const CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS: u64 = 100;
 const IDLE_CONVERGENCE_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const MIN_CONVERGENCE_SETTLEMENT_DELAY: Duration = Duration::from_millis(10);
 const CONVERGENCE_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -1250,6 +1259,22 @@ impl ScheduledConvergence {
         }
     }
 
+    /// Re-arm the timer for groups whose scheduled pass did not settle stored
+    /// convergence inputs (for example, the tick fired inside the quiescence
+    /// window). Unlike [`Self::schedule_retry_groups`], this is not an error
+    /// backoff — it waits one full settlement delay before retrying.
+    fn schedule_unsettled_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
+        let mut saw_group = false;
+        for group_id in groups {
+            saw_group = true;
+            self.groups.insert(group_id);
+        }
+        if saw_group {
+            let delay = self.normal_delay();
+            self.timer.as_mut().reset(TokioInstant::now() + delay);
+        }
+    }
+
     fn take_ready(&mut self) -> Vec<GroupId> {
         self.timer
             .as_mut()
@@ -1270,7 +1295,8 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     Duration::from_millis(
         app.config
             .dev_settlement_quiescence_ms
-            .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS),
+            .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS)
+            .saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
     )
 }
 
@@ -1435,5 +1461,17 @@ mod tests {
         let ready = scheduled.take_ready();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0], group_id);
+    }
+
+    #[tokio::test]
+    async fn schedule_unsettled_groups_rearms_settlement_delay() {
+        let group_id = test_group_id(9);
+        let mut scheduled =
+            ScheduledConvergence::new(Duration::from_millis(1_100));
+
+        scheduled.schedule_unsettled_groups([group_id.clone()]);
+        let ready = scheduled.take_ready();
+        assert_eq!(ready, vec![group_id.clone()]);
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
     }
 }
