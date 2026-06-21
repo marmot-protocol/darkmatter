@@ -84,6 +84,7 @@ function gatedBeginClient(calls: Calls): {
   });
   let beginCount = 0;
   const client = {
+    ...stubStreamClient(calls),
     async streamBegin(account: string, group: string, opts?: { quicCandidates?: Iterable<string> }) {
       beginCount += 1;
       await beginGate;
@@ -95,26 +96,6 @@ function gatedBeginClient(calls: Calls): {
         start_message_id_hex: START_ID,
         quic_candidates: quic,
       };
-    },
-    async streamAppend(streamId: string, text: string) {
-      calls.append.push({ streamId, text });
-      return { type: "ack" };
-    },
-    async streamStatus(streamId: string, text: string) {
-      calls.status.push({ streamId, text });
-      return { type: "ack" };
-    },
-    async streamProgress(streamId: string, text: string) {
-      calls.progress.push({ streamId, text });
-      return { type: "ack" };
-    },
-    async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
-      calls.finalize.push({ streamId, finalText, hash, count });
-      return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
-    },
-    async streamCancel(streamId: string, reason?: string | null) {
-      calls.cancel.push({ streamId, reason: reason ?? null });
-      return { type: "ack" };
     },
   } as unknown as StreamControlClient;
 
@@ -279,6 +260,28 @@ describe("MarmotLivePreview", () => {
 
     expect(calls.cancel).toEqual([{ streamId: STREAM_ID, reason: "superseded" }]);
     expect(records(calls)).toEqual([]);
+    expect(calls.append).toEqual([]);
+  });
+
+  it("keeps cancel terminal when it waits on begin before a racing write registers", async () => {
+    const calls = emptyCalls();
+    const gated = gatedBeginClient(calls);
+    const live = previewWithClient(gated.client);
+
+    const beginCall = live.begin();
+    expect(gated.beginCount()).toBe(1);
+    const cancelCall = live.cancel("superseded");
+    const updateExpectation = expect(live.update("hi")).rejects.toThrow(/finalized or cancelled/);
+
+    gated.releaseBegin();
+    await expect(beginCall).rejects.toThrow(/finalized or cancelled/);
+    await updateExpectation;
+    await cancelCall;
+
+    expect(calls.begin).toHaveLength(1);
+    expect(calls.cancel).toEqual([{ streamId: STREAM_ID, reason: "superseded" }]);
+    expect(calls.append).toEqual([]);
+    expect(live.isActive).toBe(false);
   });
 
   it("rejects update and finalize after finalize", async () => {

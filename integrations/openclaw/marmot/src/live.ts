@@ -217,6 +217,10 @@ export class MarmotLivePreview {
       return;
     }
     this.closed = true;
+    // `closed` is set before awaiting an in-flight begin so every post-begin
+    // continuation re-checks terminal state before dispatching its first remote
+    // write. A write already inside client.stream* may still land; stream_cancel
+    // is the best-effort terminal signal for that pre-existing window.
     const pendingBegin = this.beginPromise;
     if (pendingBegin) {
       try {
