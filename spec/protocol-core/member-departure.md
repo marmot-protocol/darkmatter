@@ -37,11 +37,13 @@ use it: the removing commit drops the account's last leaf and its `admins` key t
 The leaving member MUST NOT commit its own SelfRemove proposal. A remaining authorized member commits it.
 
 After handing the SelfRemove proposal to the active transport, the leaving member enters a local `Leaving` state for
-that group. While `Leaving`, the member MUST NOT send MLS application messages, group-state commits, or additional MLS
-proposals in that group. Transport-level retries of the same serialized SelfRemove proposal MAY continue, but the client
-MUST NOT generate fresh SelfRemove proposal bytes for the same source epoch. The `Leaving` state is backed by a durable
-leave request and ends only when an accepted commit removes the member, the member repairs or rejoins through a future
-specified recovery flow, a future explicit cancel flow clears the request, or the client discards the local group copy.
+that group. While `Leaving`, the member MUST NOT send MLS application messages, group-state commits, or non-SelfRemove
+MLS proposals in that group; it MAY publish a fresh SelfRemove proposal for a newer source epoch when the prior
+SelfRemove becomes stale. Transport-level retries of the same serialized SelfRemove proposal MAY continue, but the
+client MUST NOT generate fresh SelfRemove proposal bytes for the same source epoch. The `Leaving` state is backed by a
+durable leave request and ends only when an accepted commit removes the member, the member repairs or rejoins through a
+future specified recovery flow, a future explicit cancel flow clears the request, or the client discards the local group
+copy.
 
 If an accepted commit advances the group to a later epoch without removing the leaving member, the prior SelfRemove is
 stale because MLS proposals are epoch-bound. The client remains in `Leaving`, MUST NOT reuse the old SelfRemove

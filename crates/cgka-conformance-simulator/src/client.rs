@@ -31,6 +31,8 @@ use transport_nostr_peeler::NostrMlsPeeler;
 
 const STORAGE_MODE_ENV: &str = "DARKMATTER_CONFORMANCE_SQLITE_STORAGE";
 const TEMP_FILE_KEY: &str = "marmot-conformance-sqlite-temp-key";
+const HARNESS_CONVERGENCE_SETTLED_AT_MS: u64 = 1_000_000;
+const HARNESS_CONVERGENCE_DRAIN_PASSES: usize = 8;
 
 pub struct HarnessClient {
     pub engine: Engine<SqliteAccountStorage>,
@@ -570,8 +572,8 @@ impl HarnessClient {
         }
     }
 
-    /// Drain the bus mailbox into the engine. Returns ingest outcomes for
-    /// each message in order.
+    /// Drain the bus mailbox into the engine and simulate due convergence
+    /// timer work. Returns ingest outcomes for each message in order.
     pub async fn tick(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
         let inbound = self.bus.mailbox(self.bus_id);
         let mut outcomes = Vec::with_capacity(inbound.len());
@@ -591,7 +593,10 @@ impl HarnessClient {
         for group_id in buffered_groups {
             match self
                 .engine
-                .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+                .advance_convergence_inputs_until_settled(
+                    &group_id,
+                    HARNESS_CONVERGENCE_SETTLED_AT_MS,
+                )
                 .await
             {
                 Ok(_) => {}
@@ -604,8 +609,100 @@ impl HarnessClient {
             }
             self.capture_engine_events();
         }
-        // Auto-publish: anything the engine queued in response goes back on
-        // the bus.
+        self.drive_due_convergence(&mut outcomes).await;
+        self.publish_engine_side_effects(&mut outcomes).await;
+        outcomes
+    }
+
+    async fn drive_due_convergence(
+        &mut self,
+        outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
+    ) {
+        for _ in 0..HARNESS_CONVERGENCE_DRAIN_PASSES {
+            let groups = self.engine.drain_pending_convergence_groups();
+            if groups.is_empty() {
+                return;
+            }
+            for group_id in groups {
+                let results = match self
+                    .engine
+                    .converge_and_drain_queued_outbound_intents(
+                        &group_id,
+                        HARNESS_CONVERGENCE_SETTLED_AT_MS,
+                    )
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        outcomes.push(Err(e));
+                        continue;
+                    }
+                };
+                self.capture_engine_events();
+                for result in results {
+                    self.publish_send_result(result, outcomes).await;
+                }
+                self.publish_engine_side_effects(outcomes).await;
+            }
+        }
+        outcomes.push(Err(EngineError::Backend(
+            "convergence drain did not settle within harness pass limit".into(),
+        )));
+    }
+
+    async fn publish_send_result(
+        &mut self,
+        result: SendResult,
+        outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
+    ) {
+        let gid = self.default_group.clone();
+        match result {
+            SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
+                let routed = if let Some(gid) = &gid {
+                    route(msg, gid)
+                } else {
+                    msg
+                };
+                self.bus.send(self.bus_id, routed);
+            }
+            SendResult::GroupEvolution {
+                msg,
+                welcomes,
+                pending,
+            } => {
+                for welcome in welcomes {
+                    self.bus.send(self.bus_id, welcome);
+                }
+                let routed = if let Some(gid) = &gid {
+                    route(msg, gid)
+                } else {
+                    msg
+                };
+                self.bus.send(self.bus_id, routed);
+                if let Err(e) = self.engine.confirm_published(pending).await {
+                    outcomes.push(Err(e));
+                    return;
+                }
+                self.capture_engine_events();
+            }
+            SendResult::GroupCreated { welcomes, pending } => {
+                for welcome in welcomes {
+                    self.bus.send(self.bus_id, welcome);
+                }
+                if let Err(e) = self.engine.confirm_published(pending).await {
+                    outcomes.push(Err(e));
+                    return;
+                }
+                self.capture_engine_events();
+            }
+            SendResult::Queued { .. } => {}
+        }
+    }
+
+    async fn publish_engine_side_effects(
+        &mut self,
+        outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
+    ) {
         let auto = self.engine.drain_auto_publish();
         let gid = self.default_group.clone();
         for auto in auto {
@@ -630,7 +727,6 @@ impl HarnessClient {
             };
             self.bus.send(self.bus_id, routed);
         }
-        outcomes
     }
 
     pub fn drain_events(&mut self) -> Vec<GroupEvent> {
