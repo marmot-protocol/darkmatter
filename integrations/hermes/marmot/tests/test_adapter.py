@@ -2930,5 +2930,28 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertIsNone(name)
 
 
+class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+
+    async def test_queue_sheds_incoming_turn_at_depth_cap(self):
+        queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=2)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_turn():
+            started.set()
+            await release.wait()
+
+        queue.enqueue("group-a", blocking_turn)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        queue.enqueue("group-a", lambda: asyncio.sleep(0))
+        shed = queue.enqueue("group-a", lambda: asyncio.sleep(0))
+        self.assertIsNone(shed)
+
+        release.set()
+        await queue.join()
+
+
 if __name__ == "__main__":
     unittest.main()

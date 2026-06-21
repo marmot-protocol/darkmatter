@@ -11,8 +11,8 @@
 // dm-agent's per-account allowlist so configured welcomers are accepted.
 
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
-import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 
+import { BoundedKeyedAsyncQueue } from "./bounded-keyed-async-queue.js";
 import { resolveSingleAccount } from "./account.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
@@ -235,7 +235,7 @@ export function startMarmotInbound(
     // Per-group serialization: distinct groups dispatch concurrently while each
     // group stays FIFO. A slow/hung turn in one group no longer blocks inbound
     // dispatch for every other group (the previous inline `await dispatch` did).
-    const dispatchQueue = new KeyedAsyncQueue();
+    const dispatchQueue = new BoundedKeyedAsyncQueue(32, (message) => api.logger.warn(message));
     const handleInbound = async (message: MarmotInboundMessage): Promise<void> => {
       if (onboardingStore) {
         const intercepted = await maybeHandleProfileOnboardingInbound({
@@ -258,9 +258,7 @@ export function startMarmotInbound(
       await dispatch(message);
     };
     const runQueued = (message: MarmotInboundMessage): void => {
-      void dispatchQueue
-        .enqueue(message.groupIdHex, () => handleInbound(message))
-        .catch(() => api.logger.warn("marmot: inbound dispatch task failed"));
+      dispatchQueue.enqueue(message.groupIdHex, () => handleInbound(message));
     };
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =

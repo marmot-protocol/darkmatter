@@ -51,6 +51,7 @@ MAX_TOOL_PROGRESS_MESSAGES = 512
 DEFAULT_RECONNECT_DELAY_MS = 1000
 DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
 DEFAULT_INBOUND_DEDUPE_WINDOW = 2048
+DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32
 DEFAULT_AMBIENT_CONTEXT_WINDOW = 2048
 DEFAULT_SENT_TARGET_CACHE_SIZE = 2048
 DEFAULT_GROUP_ACTIVATION: Literal["mention", "always"] = "mention"
@@ -131,36 +132,64 @@ class KeyedAsyncQueue:
     dispatcher hand a slow/hung turn in one group off to the background and keep pulling
     events for other groups instead of blocking head-of-line on every group.
 
+    When ``max_depth_per_key`` is reached for a key, the incoming turn is shed (already-
+    queued work is preserved) and ``on_shed`` is invoked with a privacy-safe message.
+
     `enqueue` is non-blocking: it schedules the work and returns immediately. Use `join` to
     wait for all currently scheduled work to drain (chiefly for tests and clean shutdown) and
     `cancel_all` to tear everything down.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_depth_per_key: int = DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+        on_shed: Optional[Any] = None,
+    ) -> None:
+        self._max_depth_per_key = max(1, int(max_depth_per_key))
+        self._on_shed = on_shed
         # Most-recently-enqueued task per key; the chain tail each new same-key task awaits.
         self._tails: Dict[Any, asyncio.Task] = {}
         # Every in-flight task, so join()/cancel_all() can act on the whole queue.
         self._pending: set[asyncio.Task] = set()
+        self._queued_depth: Dict[Any, int] = {}
 
-    def enqueue(self, key: Any, coro_factory) -> asyncio.Task:
+    def enqueue(self, key: Any, coro_factory) -> Optional[asyncio.Task]:
         """Schedule ``coro_factory()`` to run after any prior task for ``key`` completes.
 
         ``coro_factory`` is a zero-arg callable returning a coroutine; it is only invoked when
         the task actually starts, so per-key ordering is preserved without eagerly creating
         coroutines that might warn if never awaited.
+
+        Returns ``None`` when the per-key depth cap is reached and the turn is shed.
         """
 
+        depth = self._queued_depth.get(key, 0)
+        if depth >= self._max_depth_per_key:
+            if self._on_shed:
+                self._on_shed("Marmot inbound queue depth exceeded; shedding turn")
+            else:
+                logger.warning("Marmot inbound queue depth exceeded; shedding turn")
+            return None
+
+        self._queued_depth[key] = depth + 1
         predecessor = self._tails.get(key)
 
         async def _runner() -> None:
-            if predecessor is not None:
-                # Wait for the prior same-key task, but never inherit its failure/cancellation:
-                # one group's bad turn must not poison the next message in that group.
-                try:
-                    await asyncio.shield(predecessor)
-                except BaseException:
-                    pass
-            await coro_factory()
+            try:
+                if predecessor is not None:
+                    # Wait for the prior same-key task, but never inherit its failure/cancellation:
+                    # one group's bad turn must not poison the next message in that group.
+                    try:
+                        await asyncio.shield(predecessor)
+                    except BaseException:
+                        pass
+                await coro_factory()
+            finally:
+                remaining = max(0, self._queued_depth.get(key, 1) - 1)
+                if remaining == 0:
+                    self._queued_depth.pop(key, None)
+                else:
+                    self._queued_depth[key] = remaining
 
         task = asyncio.ensure_future(_runner())
         self._tails[key] = task
@@ -190,6 +219,7 @@ class KeyedAsyncQueue:
             await asyncio.gather(*pending, return_exceptions=True)
         self._pending.clear()
         self._tails.clear()
+        self._queued_depth.clear()
 
 
 class _RecentKeys:
