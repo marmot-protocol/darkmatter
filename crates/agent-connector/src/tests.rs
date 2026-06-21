@@ -2797,6 +2797,9 @@ async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
     let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
         .await
         .unwrap();
-    assert_eq!(swept, 1, "directories older than the cutoff must be removed");
+    assert_eq!(
+        swept, 1,
+        "directories older than the cutoff must be removed"
+    );
     assert!(!stale.exists(), "stale media dir must be deleted");
 }

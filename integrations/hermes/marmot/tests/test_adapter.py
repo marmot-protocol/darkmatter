@@ -2701,6 +2701,26 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.success)
             self.assertIn("allowed local roots", result.error or "")
 
+    async def test_outbound_media_reply_to_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = Path(tmpdir) / "dev" / "inbound-media"
+            media_dir.mkdir(parents=True)
+            image_path = media_dir / "out.png"
+            image_path.write_bytes(b"png")
+
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
+                client=unittest.mock.AsyncMock(),
+            )
+            result = await adapter.send_image_file(
+                "22" * 32,
+                str(image_path),
+                caption="look",
+                reply_to="33" * 32,
+            )
+            self.assertFalse(result.success)
+            self.assertIn("reply threading", result.error or "")
+
 
 class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

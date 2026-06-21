@@ -170,8 +170,11 @@ enable_openclaw_plugin() {
         log "would run: openclaw plugins enable marmot"
         return 0
     fi
-    run openclaw plugins enable marmot || log "could not auto-enable; run 'openclaw plugins enable marmot'"
-    log "enabled OpenClaw plugin: marmot"
+    if run openclaw plugins enable marmot; then
+        log "enabled OpenClaw plugin: marmot"
+    else
+        log "could not auto-enable; run 'openclaw plugins enable marmot'"
+    fi
 }
 
 ensure_path() {
@@ -192,7 +195,7 @@ ensure_path() {
 
 run_bootstrap() {
     ensure_path
-    if ! command -v dm-agent >/dev/null 2>&1; then
+    if [ "$DRY_RUN" -eq 0 ] && ! command -v dm-agent >/dev/null 2>&1; then
         echo "error: dm-agent not found on PATH after install" >&2
         exit 1
     fi
@@ -255,7 +258,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --bootstrap) INSTALL_BOOTSTRAP=1; START_DM_AGENT=1; shift;;
+        --bootstrap) INSTALL_BOOTSTRAP=1; shift;;
         --no-start-dm-agent) START_DM_AGENT=0; shift;;
         --system) SYSTEM_INSTALL=1; shift;;
         --force) FORCE=1; shift;;

@@ -61,7 +61,7 @@ jobs:
           - runner: macos-latest
             target: darwin-aarch64
             rust_target: aarch64-apple-darwin
-          - runner: macos-13
+          - runner: macos-15-intel
             target: darwin-x86_64
             rust_target: x86_64-apple-darwin
 

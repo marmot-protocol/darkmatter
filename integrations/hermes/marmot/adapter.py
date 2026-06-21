@@ -1675,7 +1675,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         media_type: str,
         file_name: str,
         caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
     ) -> SendResult:
+        if reply_to:
+            return SendResult(
+                success=False,
+                error="Marmot media sends do not support reply threading yet",
+            )
+
         local_path = Path(str(path)).expanduser()
         try:
             assert_local_media_allowed(local_path, self._allowed_media_roots)
@@ -1731,6 +1738,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=caption,
+            reply_to=reply_to,
         )
 
     async def send_document(
@@ -1749,6 +1757,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=caption,
+            reply_to=reply_to,
         )
 
     async def send_video(
@@ -1767,6 +1776,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=caption,
+            reply_to=reply_to,
         )
 
     async def send_voice(
@@ -1783,6 +1793,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             media_type=media_type,
             file_name=path.name,
             caption=kwargs.get("caption"),
+            reply_to=kwargs.get("reply_to"),
         )
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
