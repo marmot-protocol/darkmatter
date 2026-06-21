@@ -2322,28 +2322,15 @@ fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
         },
     });
 
-    let content = cgka_traits::app_event::GroupSystemEvent::new(
-        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
-        "Group renamed",
-        Some(serde_json::json!({
-            cgka_traits::app_event::GROUP_SYSTEM_DATA_ACTOR: hex::encode(actor.as_slice()),
-            cgka_traits::app_event::GROUP_SYSTEM_DATA_NAME: "Team",
-        })),
-    )
-    .to_content()
-    .unwrap();
-    let tags = vec![vec![
-        cgka_traits::app_event::GROUP_SYSTEM_TYPE_TAG.to_owned(),
-        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED.to_owned(),
-    ]];
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let expected = cgka_traits::app_event::canonical_event_id(
-        &hex::encode(actor.as_slice()),
+    let expected = cgka_traits::app_event::group_system_canonical_id(
+        &group_id,
         3,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-        &tags,
-        &format!("{group_id_hex}\u{1f}{content}"),
-    );
+        Some(&actor),
+        &GroupStateChange::GroupRenamed {
+            name: "Team".to_owned(),
+        },
+    )
+    .unwrap();
 
     assert_eq!(
         runtime_replay_dedup_key(&event).as_deref(),
