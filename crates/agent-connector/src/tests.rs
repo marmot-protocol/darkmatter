@@ -2697,7 +2697,8 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
 fn send_idempotency_store_returns_recorded_ids_for_a_key() {
     use crate::stream_session::SendIdempotencyStore;
 
-    let store = SendIdempotencyStore::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
     assert_eq!(store.get("k1", 7), None, "an unseen key has no cached ids");
 
     let ids = vec!["aa".repeat(32), "bb".repeat(32)];
@@ -2719,7 +2720,8 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
 fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
     use crate::stream_session::SendIdempotencyStore;
 
-    let store = SendIdempotencyStore::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
     let first = vec!["11".repeat(32)];
     let second = vec!["22".repeat(32)];
     store.record("dup".to_owned(), 1, first.clone());
@@ -2736,7 +2738,8 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
 
     // Cap is 1024; fill past it and assert the oldest key is evicted FIFO while
     // the newest remain. This bounds memory for a long-lived connector.
-    let store = SendIdempotencyStore::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
     for n in 0..1100u32 {
         store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
     }
@@ -2752,6 +2755,91 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
         Some(vec![format!("{:064x}", 200)]),
         "a key within the retained window must still be cached"
     );
+}
+
+#[test]
+fn send_idempotency_store_survives_connector_restart() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ids = vec!["aa".repeat(32)];
+    {
+        let store = SendIdempotencyStore::new(dir.path());
+        store.record("retry-key".to_owned(), 42, ids.clone());
+    }
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(
+        reloaded.get("retry-key", 42),
+        Some(ids),
+        "a persisted idempotency record must survive restart"
+    );
+    assert_eq!(
+        reloaded.get("retry-key", 43),
+        None,
+        "a mismatched fingerprint must remain a cache miss after restart"
+    );
+}
+
+#[test]
+fn send_idempotency_store_persists_fifo_eviction() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = SendIdempotencyStore::new(dir.path());
+        for n in 0..1100u32 {
+            store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
+        }
+    }
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("key-0", 0), None, "oldest key must stay evicted");
+    assert_eq!(
+        reloaded.get("key-1099", 1099),
+        Some(vec![format!("{:064x}", 1099)]),
+        "newest retained key must reload from disk"
+    );
+}
+
+#[test]
+fn send_idempotency_store_ignores_corrupt_on_disk_file() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
+    std::fs::write(store.file_path(), b"{not valid json").unwrap();
+
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("missing", 1), None);
+    reloaded.record("fresh".to_owned(), 9, vec!["cc".repeat(32)]);
+    assert_eq!(reloaded.get("fresh", 9), Some(vec!["cc".repeat(32)]));
+}
+
+#[test]
+fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let temp_path = store.temp_path();
+    std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
+    std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
+
+    store.record("k1".to_owned(), 7, vec!["aa".repeat(32)]);
+
+    assert!(!temp_path.exists());
+    assert!(store.file_path().exists());
+    assert_eq!(
+        store.file_path()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("k1", 7), Some(vec!["aa".repeat(32)]));
 }
 
 #[test]
