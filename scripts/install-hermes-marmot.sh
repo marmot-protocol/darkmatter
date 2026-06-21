@@ -191,12 +191,12 @@ install_plugin() {
 }
 
 enable_hermes_plugin() {
-    if ! command -v hermes >/dev/null 2>&1; then
-        log "hermes not found on PATH; skipping 'hermes plugins enable marmot'"
-        return 0
-    fi
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would run: hermes plugins enable marmot"
+        return 0
+    fi
+    if ! command -v hermes >/dev/null 2>&1; then
+        log "hermes not found on PATH; skipping 'hermes plugins enable marmot'"
         return 0
     fi
     if run hermes plugins enable marmot; then

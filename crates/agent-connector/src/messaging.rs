@@ -30,7 +30,13 @@ pub(crate) fn send_final_fingerprint(
     account_id_hex.hash(&mut hasher);
     group_id_hex.hash(&mut hasher);
     text.hash(&mut hasher);
-    reply_to_message_id_hex.unwrap_or("").hash(&mut hasher);
+    match reply_to_message_id_hex {
+        None => 0u8.hash(&mut hasher),
+        Some(reply_to) => {
+            1u8.hash(&mut hasher);
+            reply_to.hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 

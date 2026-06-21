@@ -30,4 +30,18 @@ describe("BoundedKeyedAsyncQueue", () => {
     releaseFirst?.();
     await vi.waitFor(() => expect(ran).toEqual(["first-start", "first-done", "second"]));
   });
+
+  it("decrements depth when a queued task rejects", async () => {
+    const ran: string[] = [];
+    const queue = new BoundedKeyedAsyncQueue(2);
+
+    queue.enqueue("group-a", async () => {
+      throw new Error("boom");
+    });
+    queue.enqueue("group-a", async () => {
+      ran.push("after-reject");
+    });
+
+    await vi.waitFor(() => expect(ran).toEqual(["after-reject"]));
+  });
 });

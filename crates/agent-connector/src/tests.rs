@@ -2782,6 +2782,11 @@ fn send_final_fingerprint_includes_reply_to_target() {
         with_reply,
         "the same reply target must hash consistently"
     );
+    assert_ne!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        send_final_fingerprint("aa", "bb", "hello", Some("")),
+        "missing reply target must not collide with an empty reply target"
+    );
 }
 
 #[tokio::test]

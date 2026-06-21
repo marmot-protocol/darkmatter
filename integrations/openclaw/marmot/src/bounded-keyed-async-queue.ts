@@ -10,11 +10,14 @@ export const DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32;
 export class BoundedKeyedAsyncQueue {
   private readonly queue = new KeyedAsyncQueue();
   private readonly depths = new Map<string, number>();
+  private readonly maxDepthPerKey: number;
 
   constructor(
-    private readonly maxDepthPerKey: number = DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+    maxDepthPerKey: number = DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
     private readonly onShed?: (message: string) => void,
-  ) {}
+  ) {
+    this.maxDepthPerKey = Math.max(1, maxDepthPerKey);
+  }
 
   enqueue(key: string, task: () => Promise<void>): void {
     const depth = this.depths.get(key) ?? 0;

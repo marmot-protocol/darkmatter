@@ -54,18 +54,28 @@ pub(crate) async fn sweep_media_dirs_modified_before(
         return Ok(0);
     }
     let mut swept = 0u64;
-    let mut entries = tokio::fs::read_dir(root).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        if !entry.file_type().await?.is_dir() {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(0),
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        let is_dir = match entry.file_type().await {
+            Ok(file_type) => file_type.is_dir(),
+            Err(_) => continue,
+        };
+        if !is_dir {
             continue;
         }
-        let modified = entry
-            .metadata()
-            .await?
-            .modified()
-            .unwrap_or(SystemTime::now());
-        if modified < cutoff {
-            tokio::fs::remove_dir_all(entry.path()).await?;
+        let modified = match entry.metadata().await {
+            Ok(metadata) => metadata.modified().unwrap_or(SystemTime::now()),
+            Err(_) => continue,
+        };
+        if modified < cutoff && tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
             swept += 1;
         }
     }
