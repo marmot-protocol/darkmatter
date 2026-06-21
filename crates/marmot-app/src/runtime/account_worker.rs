@@ -1466,8 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn schedule_unsettled_groups_rearms_settlement_delay() {
         let group_id = test_group_id(9);
-        let mut scheduled =
-            ScheduledConvergence::new(Duration::from_millis(1_100));
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
 
         scheduled.schedule_unsettled_groups([group_id.clone()]);
         let ready = scheduled.take_ready();

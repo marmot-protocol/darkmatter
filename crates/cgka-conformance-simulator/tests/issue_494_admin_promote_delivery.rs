@@ -101,8 +101,7 @@ async fn fixed_app_worker_retry_delivers_post_promote_messages() {
     bob.set_convergence_policy(production_convergence_policy());
     bob.drain_events();
 
-    alice_promotes_bob_and_sends_three_messages(&mut alice, &mut bob, &bus, alice_id, bob_id)
-        .await;
+    alice_promotes_bob_and_sends_three_messages(&mut alice, &mut bob, &bus, alice_id, bob_id).await;
 
     bob.advance_convergence_with_app_retry(PRODUCTION_QUIESCENCE_MS)
         .await
@@ -126,8 +125,7 @@ async fn premature_scheduled_convergence_without_retry_leaves_peer_stuck() {
 
     bob.set_convergence_policy(production_convergence_policy());
 
-    alice_promotes_bob_and_sends_three_messages(&mut alice, &mut bob, &bus, alice_id, bob_id)
-        .await;
+    alice_promotes_bob_and_sends_three_messages(&mut alice, &mut bob, &bus, alice_id, bob_id).await;
 
     bob.advance_convergence()
         .await
@@ -150,8 +148,7 @@ async fn scheduled_convergence_after_quiescence_delivers_post_promote_messages()
     bob.set_convergence_policy(production_convergence_policy());
     bob.drain_events();
 
-    alice_promotes_bob_and_sends_three_messages(&mut alice, &mut bob, &bus, alice_id, bob_id)
-        .await;
+    alice_promotes_bob_and_sends_three_messages(&mut alice, &mut bob, &bus, alice_id, bob_id).await;
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     bob.advance_convergence()
@@ -194,7 +191,9 @@ async fn bob_send_after_quiescence_replays_deferred_post_promote_messages() {
     assert!(bob.admin_labels().contains(&"bob".to_owned()));
     let payloads = bob.received_app_payloads();
     assert!(
-        payloads.iter().any(|payload| payload == b"lost-while-stuck"),
+        payloads
+            .iter()
+            .any(|payload| payload == b"lost-while-stuck"),
         "send-path preflight should replay deferred post-promote messages after quiescence; got {payloads:?}"
     );
 }
