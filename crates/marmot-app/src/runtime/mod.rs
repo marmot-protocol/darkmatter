@@ -1051,6 +1051,11 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// See [`MarmotApp::reveal_nsec`]. darkmatter#543.
+    pub fn reveal_nsec(&self, account_ref: &str) -> Result<String, AppError> {
+        self.accounts.reveal_nsec(account_ref)
+    }
+
     pub async fn agent_text_stream_exporter_secret(
         &self,
         account_ref: &str,

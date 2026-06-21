@@ -156,6 +156,12 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// See `MarmotApp::reveal_nsec`. darkmatter#543. Reads from the keystore
+    /// directly; does not require a running account worker.
+    pub fn reveal_nsec(&self, account_ref: &str) -> Result<String, AppError> {
+        self.app.reveal_nsec(account_ref)
+    }
+
     pub async fn exporter_secret(
         &self,
         account_ref: &str,
