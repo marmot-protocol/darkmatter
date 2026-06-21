@@ -625,6 +625,7 @@ where
 pub struct AccountDeviceEffects {
     pub events: Vec<GroupEvent>,
     pub queued: Vec<QueuedIntentRef>,
+    pub pending_convergence: Vec<GroupId>,
     pub reports: Vec<TransportPublishReport>,
     pub failures: Vec<PublishFailure>,
     pub pending: Vec<PendingResolution>,
@@ -638,6 +639,7 @@ impl AccountDeviceEffects {
     ) {
         self.events.extend(effects.events);
         self.queued.extend(effects.queued);
+        self.pending_convergence.extend(effects.pending_convergence);
         queue.extend(effects.publish);
     }
 }

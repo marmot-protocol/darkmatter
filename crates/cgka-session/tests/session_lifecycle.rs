@@ -373,7 +373,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
 }
 
 #[tokio::test]
-async fn session_ingest_drains_auto_publish_work() {
+async fn session_ingest_schedules_auto_publish_work() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("session auto publish key").unwrap();
     let mut alice = AccountDeviceSession::open(
@@ -421,14 +421,28 @@ async fn session_ingest_drains_auto_publish_work() {
         ingested.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
     );
+    assert_eq!(
+        ingested.effects.pending_convergence,
+        vec![created.group_id.clone()]
+    );
     assert!(
-        ingested
+        !ingested
             .effects
             .publish
             .iter()
             .any(|work| matches!(work, PublishWork::AutoPublish { .. })),
-        "expected auto publish work, got {:?}",
+        "auto publish work should wait for the convergence timer, got {:?}",
         ingested.effects.publish
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = alice.advance_convergence(&created.group_id).await.unwrap();
+    assert!(
+        advanced
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::AutoPublish { .. })),
+        "expected delayed auto publish work, got {:?}",
+        advanced.publish
     );
 }
 

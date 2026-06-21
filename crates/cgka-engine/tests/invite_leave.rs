@@ -32,6 +32,15 @@ use tls_codec::{Deserialize as _, Serialize as _};
 mod support;
 use support::proof_signer;
 
+async fn advance_selfremove_auto_commit<E: CgkaEngine>(engine: &mut E, group_id: &GroupId) {
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let results = engine.advance_convergence(group_id).await.unwrap();
+    assert!(
+        results.is_empty(),
+        "SelfRemove auto-commit should drain through auto-publish, got {results:?}"
+    );
+}
+
 /// True if `events` contains a `GroupStateChanged` departure (removed or left)
 /// for `member`. Accepts either variant because the leave/removed distinction
 /// is path-dependent: the direct inbound seam classifies a SelfRemove as
@@ -928,7 +937,7 @@ async fn selfremove_full_flow_with_auto_commit() {
     // MIP-03 end-to-end (post-§149):
     //   alice creates group with bob + carol, confirms; both join via welcome
     //   bob (non-admin) sends SelfRemove → Proposal
-    //   alice ingests bob's proposal → stages a SelfRemove-only commit
+    //   alice ingests bob's proposal → schedules a delayed SelfRemove commit
     //   drain_auto_publish yields the commit + pending ref
     //   alice confirms publish → epoch 2 applies locally
     //   bob ingests alice's commit → bob's epoch advances, sees himself
@@ -987,7 +996,8 @@ async fn selfremove_full_flow_with_auto_commit() {
         "leaver must not send app data after SelfRemove proposal; got {blocked:?}"
     );
 
-    // Alice ingests bob's proposal and stages a SelfRemove-only commit.
+    // Alice ingests bob's proposal and schedules a delayed SelfRemove-only
+    // commit.
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
@@ -1001,6 +1011,18 @@ async fn selfremove_full_flow_with_auto_commit() {
         !emits_departure_of(&alice_events, &bob.self_id()),
         "alice must not emit a departure until auto-commit publish is confirmed; got {alice_events:?}"
     );
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+    assert!(
+        alice.drain_auto_publish().is_empty(),
+        "auto-commit should not be staged until the jitter timer fires"
+    );
+    assert_eq!(
+        alice.drain_pending_convergence_groups(),
+        vec![group_id.clone()]
+    );
+
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
 
     // Alice has a projected pending epoch/member set, but the group is not
     // Stable/applied yet. New sends must wait for publish confirmation.
@@ -1239,11 +1261,11 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
     );
 }
 
-/// A remaining member that observes a peer SelfRemove proposal stages its own
-/// SelfRemove-only commit. Until that commit's publish lifecycle resolves, the
-/// member must not produce outbound application messages for the group.
+/// A remaining member that observes a peer SelfRemove proposal schedules its
+/// own SelfRemove-only commit. The observer remains sendable until the delayed
+/// commit is staged; after staging, publish-before-apply blocks new sends.
 #[tokio::test]
-async fn observed_selfremove_proposal_stages_commit_and_blocks_outbound_app_messages() {
+async fn observed_selfremove_proposal_delays_commit_then_blocks_outbound_app_messages() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
@@ -1287,7 +1309,7 @@ async fn observed_selfremove_proposal_stages_commit_and_blocks_outbound_app_mess
     };
 
     // Carol ingests bob's proposal. Even though Alice has a lower leaf index,
-    // Carol is a remaining non-target member and may stage a SelfRemove-only
+    // Carol is a remaining non-target member and may schedule a SelfRemove-only
     // commit. Convergence handles any race if Alice does the same.
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
@@ -1298,7 +1320,26 @@ async fn observed_selfremove_proposal_stages_commit_and_blocks_outbound_app_mess
     let outcome = carol.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
 
-    // Carol has a projected pending epoch/member set, but the commit is not
+    assert!(
+        carol.drain_auto_publish().is_empty(),
+        "observing a SelfRemove should schedule, not immediately stage"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 1);
+
+    // Observers remain sendable until their delayed auto-commit is actually
+    // staged.
+    let send_result = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"hello before selfremove commit"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(send_result, SendResult::ApplicationMessage { .. }));
+
+    advance_selfremove_auto_commit(&mut carol, &group_id).await;
+
+    // Carol now has a projected pending epoch/member set, but the commit is not
     // canonical until its publish obligation is confirmed.
     assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
     let auto = carol.drain_auto_publish();
@@ -1419,6 +1460,8 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
         ..proposal
     };
     alice.ingest(routed).await.unwrap();
+    assert!(alice.drain_auto_publish().is_empty());
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
 
     assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
     assert_eq!(alice.members(&group_id).unwrap().len(), 2);
@@ -1478,8 +1521,8 @@ async fn leave_produces_selfremove_proposal() {
         other => panic!("expected Proposal, got {other:?}"),
     }
 
-    // Alice ingests the proposal — classifies as Processed and stages a
-    // SelfRemove-only commit.
+    // Alice ingests the proposal — classifies as Processed and schedules a
+    // delayed SelfRemove-only commit.
     let proposal_msg = match res {
         SendResult::Proposal { msg } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {

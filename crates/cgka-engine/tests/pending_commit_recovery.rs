@@ -312,8 +312,8 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
     let bob_member_id;
 
     // ── Phase 1: create + confirm a 3-member group, then ingest bob's
-    //    SelfRemove so alice stages an auto-commit, and "crash" before
-    //    resolving the publish. ─────────────────────────────────────────────
+    //    SelfRemove so alice schedules then stages an auto-commit, and "crash"
+    //    before resolving the publish. ─────────────────────────────────────
     {
         let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
         let bob_store = SqliteAccountStorage::in_memory().unwrap();
@@ -364,8 +364,7 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         };
 
         // Alice ingests it — she is a remaining non-target member, so the
-        // auto-committer stages a commit and projects bob out of the record
-        // immediately (epoch advances to the projected value, bob dropped).
+        // auto-committer schedules a delayed commit.
         let routed = TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
@@ -374,6 +373,12 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         };
         let outcome = alice.ingest(routed).await.unwrap();
         assert!(matches!(outcome, IngestOutcome::Processed));
+        assert!(alice.drain_auto_publish().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let advanced = alice.advance_convergence(&group_id).await.unwrap();
+        assert!(advanced.is_empty());
+        // Once the delayed auto-commit is staged, bob is projected out of the
+        // record (epoch advances to the projected value, bob dropped).
         assert_eq!(
             alice.members(&group_id).unwrap().len(),
             2,

@@ -15,7 +15,7 @@ mod store;
 pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
 
-use crate::engine::Engine;
+use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
@@ -28,6 +28,8 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 
 const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
+const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
+const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
 
 impl<S: StorageProvider> Engine<S> {
     /// Inbound pipeline. Never panics; every classifiable stale case returns
@@ -117,6 +119,13 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
+        if self
+            .stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+
         self.try_auto_repropose_leave_request(group_id).await;
         if self.load_leave_request_state(group_id)?.is_some() {
             return Ok(Vec::new());
@@ -127,6 +136,12 @@ impl<S: StorageProvider> Engine<S> {
         for record in queued {
             if !self
                 .advance_convergence_inputs_until_settled(group_id, now_ms)
+                .await?
+            {
+                break;
+            }
+            if self
+                .stage_due_self_remove_auto_commit(group_id, now_ms)
                 .await?
             {
                 break;
@@ -157,9 +172,69 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let now_ms = self.convergence_now_ms();
-        Ok(!self
+        if !self
             .advance_convergence_inputs_until_settled(group_id, now_ms)
-            .await?)
+            .await?
+        {
+            return Ok(true);
+        }
+        self.stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await
+    }
+
+    pub(crate) fn schedule_pending_convergence_group(&mut self, group_id: &GroupId) {
+        self.pending_convergence_groups.insert(group_id.clone());
+    }
+
+    pub(crate) fn schedule_self_remove_auto_commit(
+        &mut self,
+        group_id: &GroupId,
+        proposal_id: &MessageId,
+        source_epoch: EpochId,
+        now_ms: u64,
+    ) -> Result<(), EngineError> {
+        if self.load_leave_request_state(group_id)?.is_some() {
+            return Ok(());
+        }
+        let due_at_ms =
+            now_ms.saturating_add(self.self_remove_auto_commit_jitter_ms(group_id, proposal_id));
+        let scheduled = ScheduledSelfRemoveAutoCommit {
+            group_id: group_id.clone(),
+            proposal_id: proposal_id.clone(),
+            source_epoch,
+            due_at_ms,
+        };
+        match self.scheduled_self_remove_auto_commits.get(proposal_id) {
+            Some(existing) if existing.due_at_ms <= due_at_ms => {}
+            _ => {
+                self.scheduled_self_remove_auto_commits
+                    .insert(proposal_id.clone(), scheduled);
+            }
+        }
+        self.schedule_pending_convergence_group(group_id);
+        Ok(())
+    }
+
+    pub(crate) fn drop_self_remove_auto_commit_schedules_for_group(&mut self, group_id: &GroupId) {
+        self.scheduled_self_remove_auto_commits
+            .retain(|_, scheduled| &scheduled.group_id != group_id);
+    }
+
+    fn self_remove_auto_commit_jitter_ms(
+        &self,
+        group_id: &GroupId,
+        proposal_id: &MessageId,
+    ) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-selfremove-auto-commit-jitter/v1");
+        hasher.update(self.identity.self_id().as_slice());
+        hasher.update(group_id.as_slice());
+        hasher.update(proposal_id.as_slice());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS
+            + (u64::from_be_bytes(bytes) % (SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS + 1))
     }
 
     /// Drive stored OpenMLS inputs to stability, retrying raw transport

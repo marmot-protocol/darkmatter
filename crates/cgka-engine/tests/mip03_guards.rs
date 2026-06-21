@@ -651,9 +651,12 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
         },
         ..proposal
     };
-    // Alice ingests bob's SelfRemove and stages the (deferred) auto-commit.
+    // Alice ingests bob's SelfRemove and schedules the deferred auto-commit.
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(advanced.is_empty());
 
     // The staged commit on alice's group is a SelfRemove-only commit. The
     // allowlist must classify it as a shape a non-admin is permitted to make.

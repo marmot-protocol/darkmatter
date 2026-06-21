@@ -33,7 +33,7 @@ use marmot_forensics::{
     ForensicRecorder, NoopRecorder,
 };
 use openmls::prelude::{
-    MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolMessage, Sender,
+    MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolMessage,
 };
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
@@ -75,6 +75,14 @@ fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
 pub(crate) struct PendingGroupStateChange {
     pub(crate) actor: Option<MemberId>,
     pub(crate) change: GroupStateChange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduledSelfRemoveAutoCommit {
+    pub(crate) group_id: GroupId,
+    pub(crate) proposal_id: MessageId,
+    pub(crate) source_epoch: EpochId,
+    pub(crate) due_at_ms: u64,
 }
 
 pub struct Engine<S: StorageProvider> {
@@ -121,6 +129,19 @@ pub struct Engine<S: StorageProvider> {
     /// Fast runtime gate for groups where the local member must not produce
     /// further outbound group traffic while a leave request is outstanding.
     pub(crate) leaving_groups: HashSet<GroupId>,
+
+    /// Delayed SelfRemove auto-commit attempts keyed by the standalone
+    /// proposal's content-derived message id. These are re-checked against live
+    /// storage before staging so unrelated commits can invalidate them without
+    /// producing a commit storm.
+    pub(crate) scheduled_self_remove_auto_commits:
+        HashMap<MessageId, ScheduledSelfRemoveAutoCommit>,
+
+    /// Groups the application should feed through its convergence timer even
+    /// when the triggering input was processed (for example, a delayed
+    /// SelfRemove auto-commit schedule) rather than returned as
+    /// `IngestOutcome::Buffered`.
+    pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
@@ -280,6 +301,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             sent_message_ids: HashSet::new(),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
+            scheduled_self_remove_auto_commits: HashMap::new(),
+            pending_convergence_groups: HashSet::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
@@ -673,17 +696,6 @@ impl<S: StorageProvider> Engine<S> {
             || self.leaving_groups.contains(group_id))
     }
 
-    pub(crate) fn put_leave_request_state(
-        &mut self,
-        request: LeaveRequest,
-    ) -> Result<(), StorageError> {
-        self.storage.put_leave_request(&request)?;
-        self.leaving_groups.insert(request.group_id.clone());
-        self.leave_requests
-            .insert(request.group_id.clone(), request);
-        Ok(())
-    }
-
     pub(crate) fn clear_leave_request_state(
         &mut self,
         group_id: &GroupId,
@@ -735,16 +747,22 @@ impl<S: StorageProvider> Engine<S> {
                 MlsMessageBodyIn::PublicMessage(public) => public.into(),
                 _ => continue,
             };
-            let Ok(processed) = mls_group.process_message(provider, protocol) else {
+            let mut hasher = Sha256::new();
+            hasher.update(b"cgka-engine-hydrate-selfremove-probe/v1");
+            hasher.update(group_id.as_slice());
+            hasher.update(record.id.as_slice());
+            let digest = hasher.finalize();
+            let probe_snapshot = format!("hydrate-selfremove-probe-{}", hex::encode(&digest[..8]));
+            let guard = crate::snapshot_guard::SnapshotRollbackGuard::create(
+                &self.storage,
+                group_id.clone(),
+                probe_snapshot,
+            )?;
+            let processed = mls_group.process_message(provider, protocol);
+            guard.commit()?;
+            let Ok(processed) = processed else {
                 continue;
             };
-            let sender_is_self = matches!(
-                processed.sender(),
-                Sender::Member(index) if *index == mls_group.own_leaf_index()
-            );
-            if !sender_is_self {
-                continue;
-            }
             if let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
                 && matches!(queued.proposal(), Proposal::SelfRemove)
             {
@@ -1182,6 +1200,10 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     fn drain_auto_proposals(&mut self) -> Vec<TransportMessage> {
         self.auto_proposal_buf.drain(..).collect()
+    }
+
+    fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId> {
+        self.pending_convergence_groups.drain().collect()
     }
 
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {

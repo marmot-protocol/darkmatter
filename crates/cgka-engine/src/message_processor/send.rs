@@ -483,14 +483,21 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        let (msg, proposed_epoch) = self.prepare_self_remove_proposal(&group_id).await?;
+        let (msg, proposal_bytes, proposed_epoch) =
+            self.prepare_self_remove_proposal(&group_id).await?;
         let request = existing.get_or_insert_with(|| LeaveRequest {
             group_id: group_id.clone(),
             requested_at_ms,
             last_proposed_epoch: None,
         });
         request.last_proposed_epoch = Some(proposed_epoch);
-        self.put_leave_request_state(request.clone())?;
+        self.record_sent_openmls_message_with_leave_request(
+            &msg,
+            proposal_bytes.as_slice(),
+            &group_id,
+            proposed_epoch,
+            request,
+        )?;
 
         Ok(SendResult::Proposal { msg })
     }
@@ -498,7 +505,7 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn prepare_self_remove_proposal(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<(TransportMessage, EpochId), EngineError> {
+    ) -> Result<(TransportMessage, Vec<u8>, EpochId), EngineError> {
         // MIP-03 SelfRemove only. The legacy Remove-self flow is not exposed
         // by this engine.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -557,14 +564,8 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let wrapped = route_wrapped_group_message(wrapped, &ctx);
-        self.record_sent_openmls_message(
-            &wrapped,
-            bytes.as_slice(),
-            group_id,
-            EpochId(mls_group.epoch().as_u64()),
-        )?;
 
-        Ok((wrapped, EpochId(mls_group.epoch().as_u64())))
+        Ok((wrapped, bytes, EpochId(mls_group.epoch().as_u64())))
     }
 
     pub(crate) async fn try_auto_repropose_leave_request(&mut self, group_id: &GroupId) {
@@ -613,9 +614,16 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         }
 
-        let (msg, proposed_epoch) = self.prepare_self_remove_proposal(group_id).await?;
+        let (msg, proposal_bytes, proposed_epoch) =
+            self.prepare_self_remove_proposal(group_id).await?;
         request.last_proposed_epoch = Some(proposed_epoch);
-        self.put_leave_request_state(request)?;
+        self.record_sent_openmls_message_with_leave_request(
+            &msg,
+            proposal_bytes.as_slice(),
+            group_id,
+            proposed_epoch,
+            &request,
+        )?;
         self.auto_proposal_buf.push_back(msg);
         Ok(true)
     }

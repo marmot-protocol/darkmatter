@@ -504,6 +504,13 @@ pub trait CgkaEngine: Send + Sync {
     /// needs to publish the proposal bytes.
     fn drain_auto_proposals(&mut self) -> Vec<TransportMessage>;
 
+    /// Drain groups that need a future convergence tick even though the last
+    /// ingest outcome was fully processed. Used for delayed lifecycle work such
+    /// as jittered SelfRemove auto-commit attempts: applications should schedule
+    /// these groups through the same convergence timer they use for
+    /// [`IngestOutcome::Buffered`].
+    fn drain_pending_convergence_groups(&mut self) -> Vec<GroupId>;
+
     // ── Outbound ────────────────────────────────────────────────────────────
 
     /// Encrypt + prepare an outbound message or group operation.
