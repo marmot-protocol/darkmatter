@@ -301,6 +301,20 @@ to reply to every message. Trigger phrases come from `MARMOT_MENTION_PATTERNS`
 (comma-separated) plus optional `MARMOT_AGENT_NAME`. Effective DMs (exactly two
 members) always reply.
 
+### Welcomer allowlist
+
+On connect, `MARMOT_WELCOMER_ALLOWLIST` (or `MARMOT_DM_ALLOW_FROM`) mirrors
+configured hex account ids into `dm-agent`'s welcomer allowlist so approved
+inviters are accepted. Non-hex entries are ignored. When unset, the adapter
+does not touch an allowlist managed directly on `dm-agent`.
+
+### Media trust model
+
+Inbound attachments are downloaded through `dm-agent`, re-staged under
+`$MARMOT_HOME/dev/inbound-media` (override with `MARMOT_INBOUND_MEDIA_DIR`),
+and the dm-agent temp file is removed. Outbound local-path sends must stay
+within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
+
 ## Behavior
 
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to

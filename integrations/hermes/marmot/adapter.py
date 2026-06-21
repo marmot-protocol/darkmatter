@@ -14,6 +14,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -58,6 +59,15 @@ PROFILE_NAME_PROMPT = (
     "I do not have a public Nostr profile name yet. What should I publish as "
     'this agent\'s display name? Reply with a name, or reply "skip" to stay unnamed.'
 )
+PROFILE_PROMPT_WITH_NAME = (
+    "Hi! I can publish a public Nostr profile so I show up with a name. Want me to "
+    'publish it as "{name}"? Reply "yes" to use that, reply with a different name to '
+    'use instead, or reply "skip" to stay unnamed.'
+)
+PROFILE_PROMPT_NO_NAME = (
+    "Hi! I can publish a public Nostr profile so I show up with a name. Reply with a "
+    'name to publish, or reply "skip" to stay unnamed.'
+)
 PROFILE_NAME_PUBLISHED = "Done. I published this agent's public Nostr profile name as \"{name}\"."
 PROFILE_NAME_SKIPPED = "Okay, I will stay unnamed for now."
 PROFILE_NAME_EMPTY = 'Please reply with a name, or reply "skip" to stay unnamed.'
@@ -71,6 +81,21 @@ PROFILE_NAME_SKIP_REPLIES = {
     "not now",
     "skip",
 }
+PROFILE_NAME_AFFIRM_REPLIES = {
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "ok",
+    "okay",
+    "publish",
+    "publish it",
+    "do it",
+    "go ahead",
+}
+MARMOT_ACCOUNT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_TOOL_PROGRESS_RE = re.compile(
     r'^\S+\s+(?P<tool>[A-Za-z0-9_.-]+)(?:\([^)]*\))?(?:(?::\s+"(?P<preview>.*)")|(?:\.\.\.))$',
     re.DOTALL,
@@ -269,8 +294,8 @@ def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
     representative, but carries merged text/mentions/media:
     - text: newline-joined, skipping empty parts;
     - ``mentions_self``: OR across the batch (true if ANY message mentions self);
-    - ``media``: CONCATENATED across the batch (never dropped — the explicit
-      OpenClaw coalescing bug to avoid).
+    - ``media``: deduped by ``ciphertext_sha256`` across the batch;
+    - ``reply_to_message_id_hex``: newest non-null value in the batch.
     """
     last = items[-1]
     if len(items) == 1:
@@ -281,12 +306,30 @@ def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
     merged["text"] = "\n".join(part for part in text_parts if part)
     merged["mentions_self"] = any(bool(item.get("mentions_self")) for item in items)
     media: list[Any] = []
+    media_hashes: set[str] = set()
     for item in items:
         item_media = item.get("media")
-        if isinstance(item_media, (list, tuple)):
-            media.extend(item_media)
+        if not isinstance(item_media, (list, tuple)):
+            continue
+        for ref in item_media:
+            if not isinstance(ref, dict):
+                continue
+            digest = str(ref.get("ciphertext_sha256") or "").strip().lower()
+            if digest and digest in media_hashes:
+                continue
+            if digest:
+                media_hashes.add(digest)
+            media.append(ref)
     if media:
         merged["media"] = media
+    reply_to = None
+    for item in reversed(items):
+        candidate = item.get("reply_to_message_id_hex")
+        if candidate:
+            reply_to = candidate
+            break
+    if reply_to:
+        merged["reply_to_message_id_hex"] = reply_to
     return merged
 
 
@@ -341,6 +384,106 @@ def group_state_change_sentence(change: str, detail: Optional[str] = None) -> st
     return "The group state changed."
 
 
+def normalize_welcomer_id(entry: str | int) -> str:
+    return str(entry).strip().lower().removeprefix("0x")
+
+
+async def sync_allowlist(
+    client: MarmotAgentControlClient,
+    account_id_hex: str,
+    desired: Iterable[str | int],
+) -> Dict[str, list[str]]:
+    """Reconcile dm-agent's welcomer allowlist to exactly ``desired`` hex ids."""
+    want = {
+        normalize_welcomer_id(entry)
+        for entry in desired
+        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalize_welcomer_id(entry))
+    }
+    current = await client.allowlist_list(account_id_hex)
+    have = {
+        normalize_welcomer_id(entry)
+        for entry in (current.get("welcomer_account_ids_hex") or [])
+        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalize_welcomer_id(entry))
+    }
+
+    added: list[str] = []
+    removed: list[str] = []
+    for entry in want:
+        if entry not in have:
+            await client.allowlist_add(account_id_hex, entry)
+            added.append(entry)
+    for entry in have:
+        if entry not in want:
+            await client.allowlist_remove(account_id_hex, entry)
+            removed.append(entry)
+    return {"added": added, "removed": removed}
+
+
+def resolve_marmot_home(extra: Dict[str, Any], socket_path: str | Path) -> Path:
+    home = _first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME")
+    if home:
+        return Path(str(home)).expanduser()
+    return Path(socket_path).expanduser().parent.parent
+
+
+def resolve_inbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
+    configured = _first_config_value(extra, "inbound_media_dir", env="MARMOT_INBOUND_MEDIA_DIR")
+    if configured:
+        return Path(str(configured)).expanduser()
+    return resolve_marmot_home(extra, socket_path) / "dev" / "inbound-media"
+
+
+def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) -> list[Path]:
+    configured = extra.get("media_local_roots")
+    if configured is None:
+        configured = extra.get("mediaLocalRoots")
+    if configured is None:
+        configured = os.getenv("MARMOT_MEDIA_LOCAL_ROOTS")
+    if configured is not None:
+        return [Path(entry).expanduser() for entry in _split_config_list(configured)]
+    return [resolve_inbound_media_dir(extra, socket_path)]
+
+
+def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
+    for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
+        if key in extra:
+            return _split_config_list(extra[key])
+    configured = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
+    return _split_config_list(configured) if configured else []
+
+
+def path_is_under_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def assert_local_media_allowed(path: Path, allowed_roots: list[Path]) -> None:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise AgentControlError("Marmot media path is not a readable file")
+    if not allowed_roots:
+        raise AgentControlError("Marmot media path is outside allowed local roots")
+    if any(path_is_under_root(resolved, root) for root in allowed_roots):
+        return
+    raise AgentControlError("Marmot media path is outside allowed local roots")
+
+
+def valid_profile_name(name: Any) -> Optional[str]:
+    value = " ".join(str(name or "").split())
+    if not value or len(value) > MAX_PROFILE_NAME_CHARS:
+        return None
+    return value
+
+
+def build_profile_prompt(suggested_name: Optional[str]) -> str:
+    if suggested_name:
+        return PROFILE_PROMPT_WITH_NAME.format(name=suggested_name)
+    return PROFILE_PROMPT_NO_NAME
+
+
 class AppendOnlyTextState:
     """Tracks the latest visible stream text and returns safe suffix deltas."""
 
@@ -388,7 +531,12 @@ class ProfileNameOnboardingStore:
             },
         )
 
-    async def try_claim_prompt(self, account_id_hex: str, group_id_hex: str) -> bool:
+    async def try_claim_prompt(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        suggested_name: Optional[str] = None,
+    ) -> bool:
         """Atomically claim the one-time prompt slot for ``account_id_hex``.
 
         Mirrors OpenClaw's ``tryClaimPrompt`` (``integrations/openclaw/marmot/src/
@@ -408,6 +556,7 @@ class ProfileNameOnboardingStore:
             accounts[account_id_hex] = {
                 "status": "prompted",
                 "group_id_hex": group_id_hex,
+                **({"suggested_name": suggested_name} if suggested_name else {}),
             }
             self._write(data)
             return True
@@ -639,6 +788,38 @@ class MarmotAgentControlClient:
                 "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
                 "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
                 "media": media,
+            }
+        )
+
+    async def allowlist_list(self, account_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "allowlist_list",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            }
+        )
+
+    async def allowlist_add(self, account_id_hex: str, welcomer_account_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "allowlist_add",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "welcomer_account_id_hex": _normalize_hex(
+                    welcomer_account_id_hex,
+                    "welcomer_account_id_hex",
+                ),
+            }
+        )
+
+    async def allowlist_remove(self, account_id_hex: str, welcomer_account_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "allowlist_remove",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "welcomer_account_id_hex": _normalize_hex(
+                    welcomer_account_id_hex,
+                    "welcomer_account_id_hex",
+                ),
             }
         )
 
@@ -1005,6 +1186,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.debounce_ms = resolve_debounce_ms(extra)
         self.group_activation = resolve_group_activation(extra)
         self.mention_patterns = resolve_mention_patterns(extra)
+        self.agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
+        self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
+        self._allowed_media_roots = resolve_allowed_media_roots(extra, self.socket_path)
+        self._inbound_media_dir = resolve_inbound_media_dir(extra, self.socket_path)
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
         self.profile_name_onboarding = (
             ProfileNameOnboardingStore(resolve_profile_onboarding_state_path(extra, self.socket_path))
@@ -1059,6 +1244,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def connect(self) -> bool:
         try:
             await self._ensure_account_id()
+            await self._sync_welcomer_allowlist()
             self._listener_task = asyncio.create_task(self._consume_inbound_loop())
             self._mark_connected()
             return True
@@ -1068,6 +1254,20 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if callable(set_fatal):
                 set_fatal("marmot_connect_failed", str(exc), retryable=True)
             return False
+
+    async def _sync_welcomer_allowlist(self) -> None:
+        if not self.welcomer_allowlist:
+            return
+        try:
+            account_id = await self._ensure_account_id()
+            result = await sync_allowlist(self.client, account_id, self.welcomer_allowlist)
+            logger.debug(
+                "Marmot welcomer allowlist synced (added=%d removed=%d)",
+                len(result["added"]),
+                len(result["removed"]),
+            )
+        except Exception:
+            logger.debug("Marmot welcomer allowlist sync failed", exc_info=True)
 
     async def disconnect(self) -> None:
         if self._listener_task is not None:
@@ -1447,8 +1647,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
     ) -> SendResult:
         local_path = Path(str(path)).expanduser()
-        if not local_path.is_file():
-            return SendResult(success=False, error="Marmot media path is not a readable file")
+        try:
+            assert_local_media_allowed(local_path, self._allowed_media_roots)
+        except AgentControlError as exc:
+            return SendResult(success=False, error=str(exc))
 
         account_id = await self._ensure_account_id()
         chat_id = _normalize_hex(chat_id, "chat_id")
@@ -1913,6 +2115,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if event_type == "group_state_changed":
             await self._handle_group_state_changed(event)
             return
+        if event_type == "group_invite":
+            await self._handle_group_invite(event)
+            return
         if event_type != "inbound_message":
             logger.debug("Ignoring Marmot control event type %s", event_type)
             return
@@ -1938,6 +2143,20 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._inbound_queue.enqueue(
             group_id_hex,
             lambda evt=event: self._dispatch_inbound_message(evt),
+        )
+
+    async def _handle_group_invite(self, event: Dict[str, Any]) -> None:
+        if not self.profile_name_onboarding_enabled or self.profile_name_onboarding is None:
+            return
+        try:
+            account_id_hex = _normalize_hex(event["account_id_hex"], "account_id_hex")
+            group_id_hex = _normalize_hex(event["group_id_hex"], "group_id_hex")
+        except Exception:
+            logger.debug("Ignoring Marmot group_invite with missing ids")
+            return
+        self._inbound_queue.enqueue(
+            group_id_hex,
+            lambda: self._maybe_send_profile_prompt_on_join(account_id_hex, group_id_hex),
         )
 
     async def _dispatch_inbound_message(self, event: Dict[str, Any]) -> None:
@@ -2048,9 +2267,30 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             path = str(response.get("path") or "").strip()
             if not path:
                 continue
-            media_urls.append(path)
+            source_path = Path(path).expanduser()
+            if not source_path.is_file():
+                continue
+            file_name = str(response.get("file_name") or ref.get("file_name") or source_path.name or "attachment")
+            try:
+                staged_path = self._stage_inbound_media_file(source_path, file_name=file_name)
+            except Exception:
+                logger.debug("Marmot inbound media staging failed; skipping attachment")
+                continue
+            try:
+                os.unlink(source_path)
+            except OSError:
+                pass
+            media_urls.append(str(staged_path))
             media_types.append(str(response.get("media_type") or ref.get("media_type") or "application/octet-stream"))
         return media_urls, media_types
+
+    def _stage_inbound_media_file(self, source_path: Path, *, file_name: str) -> Path:
+        self._inbound_media_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(str(file_name or "attachment")).name or "attachment"
+        dest = self._inbound_media_dir / f"{uuid.uuid4().hex}-{safe_name}"
+        shutil.copy2(source_path, dest)
+        dest.chmod(0o600)
+        return dest
 
     def _debounce_key(self, event: Dict[str, Any]) -> str:
         # Mirror inbound-runtime.ts buildKey: account:group:sender.
@@ -2148,6 +2388,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return None
         return "\n".join(pending)
 
+    async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
+        store = self.profile_name_onboarding
+        if store is None:
+            return
+
+        suggested = valid_profile_name(self.agent_name)
+        if not await store.try_claim_prompt(account_id_hex, group_id_hex, suggested):
+            return
+
+        result = await self._send_final_direct(
+            group_id_hex,
+            build_profile_prompt(suggested),
+        )
+        if not result.success:
+            logger.debug("Marmot profile-name prompt send failed on join: %s", result.error)
+            await store.clear(account_id_hex)
+
     async def _maybe_handle_profile_name_onboarding(self, event: Dict[str, Any]) -> bool:
         store = self.profile_name_onboarding
         if store is None:
@@ -2177,12 +2434,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # (double-prompting and swallowing both user messages). try_claim_prompt() is
             # the single-lock claim that lets exactly one caller win; everyone else returns
             # False here and falls through to a normal turn.
-            if not await store.try_claim_prompt(account_id_hex, group_id_hex):
+            if not await store.try_claim_prompt(
+                account_id_hex,
+                group_id_hex,
+                valid_profile_name(self.agent_name),
+            ):
                 return False
 
             result = await self._send_final_direct(
                 group_id_hex,
-                PROFILE_NAME_PROMPT,
+                build_profile_prompt(valid_profile_name(self.agent_name)),
                 reply_to_message_id_hex=message_id_hex,
             )
             if not result.success:
@@ -2216,7 +2477,18 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to_message_id_hex=message_id_hex,
             )
             return True
-        if action == "invalid":
+        if action == "affirm":
+            state = await store.get(account_id_hex)
+            suggested = valid_profile_name(state.get("suggested_name"))
+            if not suggested:
+                await self._send_final_direct(
+                    group_id_hex,
+                    PROFILE_NAME_EMPTY,
+                    reply_to_message_id_hex=message_id_hex,
+                )
+                return True
+            name = suggested
+        elif action == "invalid":
             await self._send_final_direct(
                 group_id_hex,
                 response,
@@ -2545,6 +2817,8 @@ def parse_profile_name_reply(text: str) -> tuple[str, Optional[str], str]:
         return ("invalid", None, PROFILE_NAME_EMPTY)
     if value.casefold() in PROFILE_NAME_SKIP_REPLIES:
         return ("skip", None, PROFILE_NAME_SKIPPED)
+    if value.casefold() in PROFILE_NAME_AFFIRM_REPLIES:
+        return ("affirm", None, "")
     if (
         len(value) >= 2
         and value[0] == value[-1]

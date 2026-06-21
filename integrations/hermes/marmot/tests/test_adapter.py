@@ -2623,42 +2623,50 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
     async def test_inbound_media_download_populates_message_event(self):
-        class FakeClient:
-            async def download_media(self, account_id_hex, group_id_hex, media):
-                return {
-                    "type": "media_downloaded",
-                    "path": "/tmp/inbound.png",
-                    "media_type": "image/png",
-                    "file_name": "inbound.png",
-                    "size_bytes": 12,
-                }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "inbound.png"
+            source.write_bytes(b"png")
 
-        adapter = self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra={"account_id_hex": "11" * 32}),
-            client=FakeClient(),
-        )
-        adapter.handle_message = unittest.mock.AsyncMock()
+            class FakeClient:
+                async def download_media(self, account_id_hex, group_id_hex, media):
+                    return {
+                        "type": "media_downloaded",
+                        "path": str(source),
+                        "media_type": "image/png",
+                        "file_name": "inbound.png",
+                        "size_bytes": 12,
+                    }
 
-        event = {
-            "type": "inbound_message",
-            "account_id_hex": "11" * 32,
-            "group_id_hex": "22" * 32,
-            "message_id_hex": "33" * 32,
-            "sender_account_id_hex": "44" * 32,
-            "text": "photo",
-            "mentions_self": True,
-            "media": [{"file_name": "inbound.png", "media_type": "image/png", "ciphertext_sha256": "aa", "plaintext_sha256": "bb", "nonce_hex": "cc", "version": "1", "source_epoch": 1, "locators": []}],
-        }
-        await adapter._dispatch_inbound_message(event)
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
+                client=FakeClient(),
+            )
+            adapter.handle_message = unittest.mock.AsyncMock()
 
-        dispatched = adapter.handle_message.await_args.args[0]
-        self.assertEqual(dispatched.media_urls, ["/tmp/inbound.png"])
-        self.assertEqual(dispatched.media_types, ["image/png"])
+            event = {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "photo",
+                "mentions_self": True,
+                "media": [{"file_name": "inbound.png", "media_type": "image/png", "ciphertext_sha256": "aa", "plaintext_sha256": "bb", "nonce_hex": "cc", "version": "1", "source_epoch": 1, "locators": []}],
+            }
+            await adapter._dispatch_inbound_message(event)
+
+            dispatched = adapter.handle_message.await_args.args[0]
+            staged_root = str(Path(tmpdir) / "dev" / "inbound-media")
+            self.assertTrue(dispatched.media_urls[0].startswith(staged_root))
+            self.assertEqual(dispatched.media_types, ["image/png"])
+            self.assertFalse(source.exists())
 
     async def test_outbound_send_image_file_routes_to_send_media(self):
-        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
-            tmp.write(b"png")
-            tmp.flush()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = Path(tmpdir) / "dev" / "inbound-media"
+            media_dir.mkdir(parents=True)
+            image_path = media_dir / "out.png"
+            image_path.write_bytes(b"png")
 
             class FakeClient:
                 def __init__(self):
@@ -2670,15 +2678,28 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
 
             fake_client = FakeClient()
             adapter = self.adapter_module.MarmotPlatformAdapter(
-                self.config_cls(extra={"account_id_hex": "11" * 32}),
+                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
                 client=fake_client,
             )
-            result = await adapter.send_image_file("22" * 32, tmp.name, caption="look")
+            result = await adapter.send_image_file("22" * 32, str(image_path), caption="look")
 
             self.assertTrue(result.success)
             self.assertEqual(len(fake_client.media_sends), 1)
-            self.assertEqual(fake_client.media_sends[0][2][0]["path"], tmp.name)
+            self.assertEqual(fake_client.media_sends[0][2][0]["path"], str(image_path))
             self.assertEqual(fake_client.media_sends[0][3], "look")
+
+    async def test_outbound_media_outside_allowlist_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outside = Path(tmpdir) / "secret.png"
+            outside.write_bytes(b"png")
+
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32, "home": tmpdir}),
+                client=unittest.mock.AsyncMock(),
+            )
+            result = await adapter.send_image_file("22" * 32, str(outside), caption="look")
+            self.assertFalse(result.success)
+            self.assertIn("allowed local roots", result.error or "")
 
 
 class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -2787,6 +2808,126 @@ class ConfigResolutionTests(unittest.TestCase):
             self.adapter_module.resolve_mention_patterns(extra),
             ["bot", "assistant", "Marvin"],
         )
+
+
+class CoalesceInboundTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+
+    def test_coalesce_dedupes_media_and_keeps_newest_reply_to(self):
+        ref = {
+            "file_name": "a.png",
+            "media_type": "image/png",
+            "ciphertext_sha256": "aa" * 32,
+            "plaintext_sha256": "bb" * 32,
+            "nonce_hex": "cc",
+            "version": "1",
+            "source_epoch": 1,
+            "locators": [],
+        }
+        merged = self.adapter_module._coalesce_inbound_events(
+            [
+                {
+                    "type": "inbound_message",
+                    "message_id_hex": "11" * 32,
+                    "reply_to_message_id_hex": "aa" * 32,
+                    "text": "one",
+                    "media": [ref],
+                },
+                {
+                    "type": "inbound_message",
+                    "message_id_hex": "22" * 32,
+                    "reply_to_message_id_hex": "bb" * 32,
+                    "text": "two",
+                    "media": [dict(ref)],
+                },
+            ]
+        )
+        self.assertEqual(merged["message_id_hex"], "22" * 32)
+        self.assertEqual(merged["reply_to_message_id_hex"], "bb" * 32)
+        self.assertEqual(merged["text"], "one\ntwo")
+        self.assertEqual(len(merged["media"]), 1)
+
+
+class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+
+    async def test_sync_allowlist_adds_and_removes(self):
+        current = ["33" * 32, "44" * 32]
+
+        class FakeClient:
+            async def allowlist_list(self, account_id_hex):
+                return {"type": "allowlist", "welcomer_account_ids_hex": list(current)}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                current.append(welcomer_account_id_hex)
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                current.remove(welcomer_account_id_hex)
+
+        result = await self.adapter_module.sync_allowlist(
+            FakeClient(),
+            "11" * 32,
+            ["22" * 32, "33" * 32],
+        )
+        self.assertEqual(result["added"], ["22" * 32])
+        self.assertEqual(result["removed"], ["44" * 32])
+        self.assertEqual(sorted(current), sorted(["22" * 32, "33" * 32]))
+
+
+class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    async def test_group_invite_sends_profile_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "profile-onboarding.json"
+
+            class FakeClient:
+                async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
+                    self.last = (account_id_hex, group_id_hex, text, reply_to_message_id_hex)
+                    return {"type": "final_sent", "message_ids_hex": ["55" * 32]}
+
+            fake_client = FakeClient()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "profile_name_onboarding": True,
+                        "profile_onboarding_state_path": str(state_path),
+                        "agent_name": "Marvin",
+                    }
+                ),
+                client=fake_client,
+            )
+            await adapter._handle_group_invite(
+                {
+                    "type": "group_invite",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                }
+            )
+            await adapter._inbound_queue.join()
+
+            self.assertIn("Marvin", fake_client.last[2])
+            self.assertIsNone(fake_client.last[3])
+
+
+class ProfilePromptTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter_module = load_adapter_module()
+
+    def test_build_profile_prompt_offers_configured_name(self):
+        prompt = self.adapter_module.build_profile_prompt("Marvin")
+        self.assertIn("Marvin", prompt)
+        self.assertIn("yes", prompt.casefold())
+
+    def test_parse_profile_name_reply_accepts_affirm(self):
+        action, name, _ = self.adapter_module.parse_profile_name_reply("yes")
+        self.assertEqual(action, "affirm")
+        self.assertIsNone(name)
 
 
 if __name__ == "__main__":
