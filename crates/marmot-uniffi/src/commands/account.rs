@@ -273,7 +273,9 @@ impl Marmot {
     /// drop it. Refuses unknown / public-only / cross-account refs via the
     /// existing keystore validation.
     pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError> {
-        Ok(self.runtime.reveal_nsec(&account_ref)?)
+        Ok(self
+            .runtime
+            .reveal_nsec(&account_ref, "marmot_uniffi::Marmot::reveal_nsec")?)
     }
 
     /// Publish the Nostr kind:0 metadata for `account_ref`. The returned

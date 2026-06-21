@@ -84,6 +84,12 @@ pub struct AuditLogSettings {
 /// One always-on key-reveal audit record (darkmatter#543). Privacy-safe: it
 /// carries only a salted-hash account ref, never key material, the nsec, the
 /// raw pubkey, or the npub.
+///
+/// `caller_context` identifies the surface that initiated the reveal (issue
+/// #543 requires timestamp + caller context for each reveal). It is a static,
+/// privacy-safe module/surface label (e.g. `marmot_uniffi::Marmot::reveal_nsec`)
+/// supplied by the caller — never a user identifier, account id, or key
+/// material.
 #[derive(Serialize)]
 struct KeyRevealAuditEntry<'a> {
     schema_version: &'a str,
@@ -91,6 +97,7 @@ struct KeyRevealAuditEntry<'a> {
     account_ref: String,
     action: &'a str,
     format: &'a str,
+    caller_context: &'a str,
 }
 
 pub(crate) fn audit_account_ref_hex(account_id: &MemberId) -> String {
@@ -494,7 +501,13 @@ impl MarmotApp {
     /// in-app backup display (darkmatter#543). Logs an always-on reveal record
     /// to the per-account audit log and flips the NIP-49 KEY_SECURITY_BYTE to
     /// 0x00. Never caches or logs the key material itself.
-    pub fn reveal_nsec(&self, account_ref: &str) -> Result<String, AppError> {
+    ///
+    /// `caller_context` is a static, privacy-safe surface label identifying who
+    /// initiated the reveal (e.g. `marmot_uniffi::Marmot::reveal_nsec`); it is
+    /// recorded in the audit entry so users can see which surface requested the
+    /// export. It must never carry a user identifier, account id, or key
+    /// material.
+    pub fn reveal_nsec(&self, account_ref: &str, caller_context: &str) -> Result<String, AppError> {
         // Resolve to confirm the account exists before doing anything else.
         let account = self.account_home().account(account_ref)?;
         let nsec = self.account_home().reveal_nsec(account_ref)?;
@@ -503,7 +516,7 @@ impl MarmotApp {
         // because the audit trail is a stated requirement — so propagate IO
         // errors here. (The key-security byte is already persisted by
         // account_home().reveal_nsec above.)
-        self.append_key_reveal_audit(&account)?;
+        self.append_key_reveal_audit(&account, caller_context)?;
         Ok(nsec)
     }
 
@@ -511,9 +524,14 @@ impl MarmotApp {
     /// `audit-key-reveal.jsonl` file (darkmatter#543).
     ///
     /// The record carries only a salted-hash account ref (matching the
-    /// forensic audit log's derivation) and the reveal action/format; it never
-    /// contains key material, the nsec, the raw pubkey, or the npub.
-    fn append_key_reveal_audit(&self, account: &AccountSummary) -> Result<(), AppError> {
+    /// forensic audit log's derivation), the reveal action/format, and the
+    /// caller-context surface label; it never contains key material, the nsec,
+    /// the raw pubkey, or the npub.
+    fn append_key_reveal_audit(
+        &self,
+        account: &AccountSummary,
+        caller_context: &str,
+    ) -> Result<(), AppError> {
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let entry = KeyRevealAuditEntry {
             schema_version: "marmot-key-reveal-audit/v1",
@@ -521,6 +539,7 @@ impl MarmotApp {
             account_ref: audit_account_ref_hex(&account_id),
             action: "reveal_nsec",
             format: "nsec1_bech32",
+            caller_context,
         };
         let path = self.account_dir(&account.label).join(KEY_REVEAL_AUDIT_FILE);
         let mut bytes = serde_json::to_vec(&entry)?;
@@ -741,7 +760,9 @@ mod tests {
             0x02
         );
 
-        let revealed = app.reveal_nsec(&account.account_id_hex).unwrap();
+        let revealed = app
+            .reveal_nsec(&account.account_id_hex, "test::reveal_caller")
+            .unwrap();
         assert_eq!(revealed.len(), 63);
         assert!(revealed.starts_with("nsec1"));
         assert_eq!(
@@ -757,13 +778,15 @@ mod tests {
             0x00
         );
 
-        // An always-on audit line is appended with the reveal action, but the
-        // file must never contain key material: not the nsec, not the raw
-        // pubkey.
+        // An always-on audit line is appended with the reveal action and the
+        // caller-context surface label (issue #543: timestamp + caller
+        // context), but the file must never contain key material: not the
+        // nsec, not the raw pubkey.
         let audit_path = app.account_dir(&account.label).join(KEY_REVEAL_AUDIT_FILE);
         assert!(audit_path.exists());
         let contents = std::fs::read_to_string(&audit_path).unwrap();
         assert!(contents.contains("\"action\":\"reveal_nsec\""));
+        assert!(contents.contains("\"caller_context\":\"test::reveal_caller\""));
         assert!(!contents.contains(&revealed));
         assert!(!contents.contains(&account.account_id_hex));
     }

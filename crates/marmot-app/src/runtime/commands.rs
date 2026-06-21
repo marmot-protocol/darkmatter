@@ -157,9 +157,10 @@ impl AccountManager {
     }
 
     /// See `MarmotApp::reveal_nsec`. darkmatter#543. Reads from the keystore
-    /// directly; does not require a running account worker.
-    pub fn reveal_nsec(&self, account_ref: &str) -> Result<String, AppError> {
-        self.app.reveal_nsec(account_ref)
+    /// directly; does not require a running account worker. `caller_context` is
+    /// the privacy-safe surface label recorded in the reveal audit entry.
+    pub fn reveal_nsec(&self, account_ref: &str, caller_context: &str) -> Result<String, AppError> {
+        self.app.reveal_nsec(account_ref, caller_context)
     }
 
     pub async fn exporter_secret(
