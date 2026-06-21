@@ -16,8 +16,14 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 ## Install (release)
 
-Versioned `dm-agent` builds and this plugin are published as `dm-agent-v*`
+Versioned `dm-agent` builds and this plugin are published as [`dm-agent-v*`](https://github.com/marmot-protocol/darkmatter/releases)
 GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH`.
+
+Prerequisites:
+
+- OpenClaw **2026.6.8** or compatible (this plugin pins `openclaw@2026.6.8`)
+- Node ≥ 22.19
+- Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
 DM_AGENT_VERSION=0.1.0
@@ -26,8 +32,9 @@ curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-a
 curl -fsSL ".../install-openclaw-marmot.sh" | bash -s -- --bootstrap
 ```
 
-The installer puts `dm-agent` in `~/.local/bin`, downloads the plugin tarball,
-runs `openclaw plugins install`, and enables the `marmot` channel.
+The installer puts `dm-agent` in `~/.local/bin`, downloads and verifies the plugin
+tarball, runs `openclaw plugins install`, and enables the `marmot` channel.
+Supported platforms match the Hermes installer.
 
 Then start the connector and bootstrap (same public relays as the phone app):
 
@@ -86,7 +93,7 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `authTokenFile` | `MARMOT_AGENT_AUTH_TOKEN_FILE` | — |
 | `accountIdHex` | `MARMOT_ACCOUNT_ID_HEX` | sole local account |
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
-| `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
+| `quicCandidates` | `MARMOT_QUIC_CANDIDATES` (or singular `MARMOT_QUIC_CANDIDATE`) | — (final-only); filtered to the `quic://` scheme |
 | `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
 | `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
@@ -119,8 +126,18 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   trigger (or the agent name), or the conversation is an effective DM (exactly
   two members, resolved via the `group_info` control op). Set
   `groupActivation: "always"` to reply to every message. Effective DMs always
-  reply. Membership is queried lazily (only for otherwise-unaddressed messages)
-  and fails open, so a lookup error never silently drops a message.
+  reply. Membership is queried lazily — only for otherwise-unaddressed messages,
+  so the common addressed case never pays the round-trip — and the resulting
+  `is_direct` fact is cached per (account, group), since it only changes when
+  membership changes. The cache entry is invalidated on a `group_state_changed`
+  event for that group (and cleared entirely on an inbound resync), so the next
+  unaddressed message re-reads fresh membership. On a membership-lookup error
+  the gate fails **closed** (skips the turn) under the `mention` policy: an
+  unaddressed message in a group whose membership can't be resolved is more
+  likely a multi-party conversation the agent wasn't addressed in, and an
+  unrecallable barge-in there is worse than dropping a single reply in a true
+  two-party DM (where the user can re-send or address the agent explicitly). The
+  error is not cached, so the next message retries the lookup.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
   the adapter never merges or rewrites text across sends. Each durable reply is
   **idempotent + retried**: the sink generates one `idempotency_key` per reply

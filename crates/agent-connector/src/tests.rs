@@ -34,6 +34,7 @@ use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
     control_event_from_runtime_event, inbound_message_event_from_record, resync_required_event,
+    runtime_replay_dedup_key,
 };
 use crate::{
     AgentConnector, AgentConnectorConfig, bind_connector_socket, bind_connector_socket_with_mode,
@@ -1776,6 +1777,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         stream_id_hex: begun_stream_id_hex,
         start_message_id_hex,
         quic_candidates,
+        ..
     } = begun.payload
     else {
         panic!("expected stream begun response");
@@ -2247,6 +2249,96 @@ fn inbound_message_event_from_record_projects_received_chat() {
 }
 
 #[test]
+fn inbound_message_event_from_record_projects_received_delete() {
+    // Regression for darkmatter#505: storage replay must surface a missed inbound kind-5
+    // deletion the same way the live MessageReceived path does.
+    let target = "99".repeat(32);
+    let mut record = received_chat_record("dd", "bb", "cc", "");
+    record.kind = MARMOT_APP_EVENT_KIND_DELETE;
+    record.tags = vec![vec!["e".to_owned(), target.clone()]];
+
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    assert_eq!(
+        event,
+        AgentControlEvent::MessageDeleted {
+            account_id_hex: "acct".to_owned(),
+            group_id_hex: "bb".to_owned(),
+            target_message_id_hex: target,
+            sender_account_id_hex: "cc".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn inbound_message_event_from_record_projects_group_system_row() {
+    // Regression for darkmatter#505: durable kind-1210 group-system rows synthesized from
+    // GroupStateChanged events must replay as group_state_changed control events after lag.
+    let content = cgka_traits::app_event::GroupSystemEvent::new(
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+        "Group renamed",
+        Some(serde_json::json!({
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_NAME: "Team",
+            // Subject/actor-like data must not be surfaced in the control event.
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_SUBJECT: "99".repeat(32),
+        })),
+    )
+    .to_content()
+    .unwrap();
+    let mut record = received_chat_record("ee", "bb", "", &content);
+    record.direction = "system".to_owned();
+    record.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    assert_eq!(
+        event,
+        AgentControlEvent::GroupStateChanged {
+            account_id_hex: "acct".to_owned(),
+            group_id_hex: "bb".to_owned(),
+            change: "group_renamed".to_owned(),
+            detail: Some("Team".to_owned()),
+        }
+    );
+}
+
+#[test]
+fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
+    // The live GroupStateChanged event and the synthesized storage row must share the same
+    // replay cursor id, otherwise replay after later lag would duplicate already-delivered state.
+    let group_id = GroupId::new(vec![0x22; 32]);
+    let actor = cgka_traits::MemberId::new(vec![0xbb; 32]);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: "acct".to_owned(),
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: EpochId(3),
+            actor: Some(actor.clone()),
+            change: GroupStateChange::GroupRenamed {
+                name: "Team".to_owned(),
+            },
+            origin_commit_id: None,
+        },
+    });
+
+    let expected = cgka_traits::app_event::group_system_canonical_id(
+        &group_id,
+        3,
+        Some(&actor),
+        &GroupStateChange::GroupRenamed {
+            name: "Team".to_owned(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        runtime_replay_dedup_key(&event).as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
 fn inbound_message_event_from_record_extracts_mention_and_reply() {
     // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
     // the reply target. Both let a channel gate/thread without re-parsing tags.
@@ -2342,10 +2434,16 @@ fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
     let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
     assert!(inbound_message_event_from_record("acct", self_authored, None, None).is_none());
 
-    // Non-chat kinds (reactions, agent stream starts, system events) are not user messages.
+    // Unsupported non-chat kinds (reactions, agent stream starts) are not replayed.
     let mut reaction = received_chat_record("aa", "bb", "cc", "+1");
     reaction.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
     assert!(inbound_message_event_from_record("acct", reaction, None, None).is_none());
+
+    // A group-system row that was received as an app message, rather than synthesized locally,
+    // is not treated as a durable GroupStateChanged replay event.
+    let mut received_system = received_chat_record("aa", "bb", "cc", "{}");
+    received_system.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    assert!(inbound_message_event_from_record("acct", received_system, None, None).is_none());
 
     // A mismatched group filter excludes the message.
     let other_group = received_chat_record("aa", "bb", "cc", "elsewhere");
@@ -2599,37 +2697,48 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
 fn send_idempotency_store_returns_recorded_ids_for_a_key() {
     use crate::stream_session::SendIdempotencyStore;
 
-    let store = SendIdempotencyStore::default();
-    assert_eq!(store.get("k1", 7), None, "an unseen key has no cached ids");
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let fingerprint = "fp-k1".to_owned();
+    assert_eq!(
+        store.get("k1", &fingerprint),
+        None,
+        "an unseen key has no cached ids"
+    );
 
     let ids = vec!["aa".repeat(32), "bb".repeat(32)];
-    store.record("k1".to_owned(), 7, ids.clone());
+    store.record("k1".to_owned(), fingerprint.clone(), ids.clone());
     assert_eq!(
-        store.get("k1", 7),
+        store.get("k1", &fingerprint),
         Some(ids),
         "a recorded key returns its message ids for a matching fingerprint"
     );
     assert_eq!(
-        store.get("k1", 8),
+        store.get("k1", "fp-other"),
         None,
         "a recorded key with a non-matching fingerprint is a cache miss"
     );
-    assert_eq!(store.get("k2", 7), None, "an unrelated key stays absent");
+    assert_eq!(
+        store.get("k2", &fingerprint),
+        None,
+        "an unrelated key stays absent"
+    );
 }
 
 #[test]
 fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
     use crate::stream_session::SendIdempotencyStore;
 
-    let store = SendIdempotencyStore::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
     let first = vec!["11".repeat(32)];
     let second = vec!["22".repeat(32)];
-    store.record("dup".to_owned(), 1, first.clone());
+    store.record("dup".to_owned(), "fp-first".to_owned(), first.clone());
     // A repeat record (e.g. a racing duplicate) must not overwrite the original
     // committed entry: the first successful send for a key always wins, even if
     // the later record carries a different fingerprint.
-    store.record("dup".to_owned(), 2, second);
-    assert_eq!(store.get("dup", 1), Some(first));
+    store.record("dup".to_owned(), "fp-second".to_owned(), second);
+    assert_eq!(store.get("dup", "fp-first"), Some(first));
 }
 
 #[test]
@@ -2638,20 +2747,189 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
 
     // Cap is 1024; fill past it and assert the oldest key is evicted FIFO while
     // the newest remain. This bounds memory for a long-lived connector.
-    let store = SendIdempotencyStore::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
     for n in 0..1100u32 {
-        store.record(format!("key-{n}"), u64::from(n), vec![format!("{n:064x}")]);
+        store.record(
+            format!("key-{n}"),
+            format!("fp-{n}"),
+            vec![format!("{n:064x}")],
+        );
     }
-    assert_eq!(store.get("key-0", 0), None, "oldest key must be evicted");
-    assert_eq!(store.get("key-75", 75), None, "early keys must be evicted");
     assert_eq!(
-        store.get("key-1099", 1099),
+        store.get("key-0", "fp-0"),
+        None,
+        "oldest key must be evicted"
+    );
+    assert_eq!(
+        store.get("key-75", "fp-75"),
+        None,
+        "early keys must be evicted"
+    );
+    assert_eq!(
+        store.get("key-1099", "fp-1099"),
         Some(vec![format!("{:064x}", 1099)]),
         "the newest key must still be cached"
     );
     assert_eq!(
-        store.get("key-200", 200),
+        store.get("key-200", "fp-200"),
         Some(vec![format!("{:064x}", 200)]),
         "a key within the retained window must still be cached"
     );
+}
+
+#[test]
+fn send_idempotency_store_survives_connector_restart() {
+    use crate::messaging::send_final_fingerprint;
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fingerprint = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
+    let ids = vec!["aa".repeat(32)];
+    {
+        let store = SendIdempotencyStore::new(dir.path());
+        store.record("retry-key".to_owned(), fingerprint.clone(), ids.clone());
+    }
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(
+        reloaded.get("retry-key", &fingerprint),
+        Some(ids),
+        "a persisted idempotency record must survive restart"
+    );
+    assert_eq!(
+        reloaded.get(
+            "retry-key",
+            &send_final_fingerprint("aa", "bb", "hello", None)
+        ),
+        None,
+        "a mismatched fingerprint must remain a cache miss after restart"
+    );
+}
+
+#[test]
+fn send_idempotency_store_persists_fifo_eviction() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = SendIdempotencyStore::new(dir.path());
+        for n in 0..1100u32 {
+            store.record(
+                format!("key-{n}"),
+                format!("fp-{n}"),
+                vec![format!("{n:064x}")],
+            );
+        }
+    }
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(
+        reloaded.get("key-0", "fp-0"),
+        None,
+        "oldest key must stay evicted"
+    );
+    assert_eq!(
+        reloaded.get("key-1099", "fp-1099"),
+        Some(vec![format!("{:064x}", 1099)]),
+        "newest retained key must reload from disk"
+    );
+}
+
+#[test]
+fn send_idempotency_store_ignores_corrupt_on_disk_file() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
+    std::fs::write(store.file_path(), b"{not valid json").unwrap();
+
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("missing", "fp-missing"), None);
+    reloaded.record(
+        "fresh".to_owned(),
+        "fp-fresh".to_owned(),
+        vec!["cc".repeat(32)],
+    );
+    assert_eq!(
+        reloaded.get("fresh", "fp-fresh"),
+        Some(vec!["cc".repeat(32)])
+    );
+}
+
+#[test]
+fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let temp_path = store.temp_path();
+    std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
+    std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
+
+    store.record("k1".to_owned(), "fp-k1".to_owned(), vec!["aa".repeat(32)]);
+
+    assert!(!temp_path.exists());
+    assert!(store.file_path().exists());
+    assert_eq!(
+        store.file_path().metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("k1", "fp-k1"), Some(vec!["aa".repeat(32)]));
+}
+
+#[test]
+fn send_final_fingerprint_pins_stable_digests() {
+    use crate::messaging::send_final_fingerprint;
+
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        "e252cba2c8a1728d36a0cc74a06b00502113fb22cdf10076dd73f5aa88d60f27"
+    );
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", Some("cc")),
+        "f44ab9cc17e0db7571b1e6b1d76b12f09346ea94a576a2a8711272e2caaa6588"
+    );
+}
+
+#[test]
+fn send_final_fingerprint_includes_reply_to_target() {
+    use crate::messaging::send_final_fingerprint;
+
+    let without_reply = send_final_fingerprint("aa", "bb", "hello", None);
+    let with_reply = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
+    assert_ne!(
+        without_reply, with_reply,
+        "reply target must participate in the request fingerprint"
+    );
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", Some("cc")),
+        with_reply,
+        "the same reply target must hash consistently"
+    );
+    assert_ne!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        send_final_fingerprint("aa", "bb", "hello", Some("")),
+        "missing reply target must not collide with an empty reply target"
+    );
+}
+
+#[tokio::test]
+async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
+    use std::time::{Duration, SystemTime};
+
+    use crate::media_temp::sweep_media_dirs_modified_before;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = tmp.path().join("stale-blob");
+    tokio::fs::create_dir_all(&stale).await.unwrap();
+    let cutoff = SystemTime::now() + Duration::from_secs(3600);
+    let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 1,
+        "directories older than the cutoff must be removed"
+    );
+    assert!(!stale.exists(), "stale media dir must be deleted");
 }

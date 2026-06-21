@@ -210,6 +210,55 @@ fn account_home_can_use_an_injected_secret_store() {
 }
 
 #[test]
+fn account_home_persists_reversible_sign_out_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let created = home.create_nostr_account().unwrap();
+    assert!(!created.signed_out);
+    assert!(created.is_active_local_signing());
+
+    let signed_out = home
+        .set_account_signed_out(&created.account_id_hex, true)
+        .unwrap();
+    assert!(signed_out.signed_out);
+    assert!(!signed_out.is_active_local_signing());
+
+    let reopened = AccountHome::open(dir.path());
+    let persisted = reopened.account(&created.account_id_hex).unwrap();
+    assert!(persisted.signed_out);
+    assert!(!persisted.is_active_local_signing());
+    assert_eq!(
+        reopened
+            .load_signing_keys(&created.account_id_hex)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        created.account_id_hex
+    );
+
+    let reactivated = reopened
+        .set_account_signed_out(&created.account_id_hex, false)
+        .unwrap();
+    assert!(!reactivated.signed_out);
+    assert!(reactivated.is_active_local_signing());
+}
+
+#[test]
+fn account_home_deserializes_legacy_account_records_as_signed_in() {
+    let account_id_hex = "00".repeat(32);
+    let legacy = serde_json::json!({
+        "label": "alice",
+        "account_id_hex": account_id_hex,
+        "local_signing": true,
+    });
+
+    let account: AccountSummary = serde_json::from_value(legacy).unwrap();
+    assert!(!account.signed_out);
+    assert!(account.is_active_local_signing());
+}
+
+#[test]
 fn account_home_keychain_rejects_second_label_for_same_account_id() {
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
@@ -294,6 +343,7 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
         label: "label-two".to_owned(),
         account_id_hex: account_id.clone(),
         local_signing: true,
+        signed_out: false,
     };
     let twin_dir = dir.path().join("accounts").join(&twin.label);
     std::fs::create_dir_all(&twin_dir).unwrap();
@@ -335,6 +385,76 @@ fn account_home_file_store_keeps_per_label_secrets_for_same_account_id() {
             .to_hex(),
         keys.public_key().to_hex()
     );
+}
+
+#[test]
+fn account_home_reveal_nsec_round_trips_to_stored_account_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let imported = home.import_nostr_account(nsec).unwrap();
+
+    let revealed = home.reveal_nsec(&imported.account_id_hex).unwrap();
+    assert_eq!(revealed.len(), 63);
+    assert!(revealed.starts_with("nsec1"));
+    // The revealed nsec parses back to the same public key as the account id.
+    assert_eq!(
+        nostr::Keys::parse(&revealed).unwrap().public_key().to_hex(),
+        imported.account_id_hex
+    );
+}
+
+#[test]
+fn account_home_key_security_byte_defaults_secure_and_flips_after_reveal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let created = home.create_nostr_account().unwrap();
+
+    // No reveal yet: NIP-49 "never handled insecurely".
+    assert_eq!(
+        home.key_security_byte(&created.account_id_hex).unwrap(),
+        0x02
+    );
+
+    home.reveal_nsec(&created.account_id_hex).unwrap();
+    assert_eq!(
+        home.key_security_byte(&created.account_id_hex).unwrap(),
+        0x00
+    );
+
+    // The marker is persisted: a fresh home at the same root still reads 0x00.
+    let reopened = AccountHome::open(dir.path());
+    assert_eq!(
+        reopened.key_security_byte(&created.account_id_hex).unwrap(),
+        0x00
+    );
+}
+
+#[test]
+fn account_home_reveal_nsec_rejects_unknown_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    assert!(matches!(
+        home.reveal_nsec("does-not-exist"),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+}
+
+#[test]
+fn account_home_reveal_nsec_rejects_public_only_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let public_key = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    home.add_public_account(public_key).unwrap();
+
+    assert!(matches!(
+        home.reveal_nsec(public_key),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
 }
 
 #[derive(Default)]

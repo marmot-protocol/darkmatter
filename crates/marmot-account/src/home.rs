@@ -12,6 +12,9 @@ use crate::io::{read_json, validate_account_label, write_json};
 use crate::secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
+/// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
+/// byte, never key material, so it is written with public file permissions.
+const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
@@ -64,6 +67,26 @@ pub struct AccountSummary {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    /// Durable local runtime state for reversible sign-out. A signed-out
+    /// account keeps its local signing secret and account directory but must not
+    /// be auto-started by runtime reconciliation until an explicit sign-in
+    /// clears this flag.
+    #[serde(default)]
+    pub signed_out: bool,
+}
+
+impl AccountSummary {
+    pub fn is_active_local_signing(&self) -> bool {
+        self.local_signing && !self.signed_out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct StoredKeySecurity {
+    /// NIP-49 KEY_SECURITY_BYTE. 0x02 = secure (never seen insecurely),
+    /// 0x01 = secure but was handled insecurely in the past, 0x00 = insecure
+    /// (revealed/exported in raw form). We only ever transition toward 0x00.
+    key_security_byte: u8,
 }
 
 impl AccountHome {
@@ -142,6 +165,7 @@ impl AccountHome {
             label: account_id_hex.clone(),
             account_id_hex,
             local_signing: false,
+            signed_out: false,
         };
         self.write_account_record(&account)?;
         Ok(account)
@@ -203,6 +227,31 @@ impl AccountHome {
         }
         accounts.sort_by(|a: &AccountSummary, b| a.account_id_hex.cmp(&b.account_id_hex));
         Ok(accounts)
+    }
+
+    /// Persist the reversible sign-out marker for a local-signing account.
+    ///
+    /// This deliberately does not touch the signing secret or account directory:
+    /// it only controls whether runtimes should auto-start the account worker.
+    pub fn set_account_signed_out(
+        &self,
+        account_ref: &str,
+        signed_out: bool,
+    ) -> AccountHomeResult<AccountSummary> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut account = self.account(account_ref)?;
+        if !account.local_signing {
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
+        }
+        if account.signed_out == signed_out {
+            return Ok(account);
+        }
+        account.signed_out = signed_out;
+        self.write_account_record(&account)?;
+        Ok(account)
     }
 
     /// Remove an account's entire local footprint: its on-disk account
@@ -342,6 +391,55 @@ impl AccountHome {
         Ok(keys)
     }
 
+    /// NIP-49 KEY_SECURITY_BYTE for `account_ref`. Defaults to 0x02
+    /// ("never handled insecurely") when no status has been persisted yet.
+    pub fn key_security_byte(&self, account_ref: &str) -> AccountHomeResult<u8> {
+        let account = self.account(account_ref)?;
+        let path = self
+            .account_dir(&account.label)
+            .join(ACCOUNT_KEY_SECURITY_FILE);
+        match read_json::<StoredKeySecurity>(&path) {
+            Ok(stored) => Ok(stored.key_security_byte),
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(0x02)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Mark `account_ref`'s key as handled insecurely (NIP-49 KEY_SECURITY_BYTE
+    /// 0x00). Idempotent and monotonic: once 0x00 it stays 0x00 across restarts.
+    pub fn mark_key_handled_insecurely(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        let path = self
+            .account_dir(&account.label)
+            .join(ACCOUNT_KEY_SECURITY_FILE);
+        write_json(
+            &path,
+            &StoredKeySecurity {
+                key_security_byte: 0x00,
+            },
+        )
+    }
+
+    /// Export `account_ref`'s raw private key in canonical `nsec1...` bech32
+    /// form (NIP-19). Reading the raw key out is a NIP-49 "insecure handling"
+    /// event, so this also flips the persisted KEY_SECURITY_BYTE to 0x00.
+    ///
+    /// The returned String is the only place the bech32 form exists; it is
+    /// neither cached nor logged. Caller should drop it promptly.
+    pub fn reveal_nsec(&self, account_ref: &str) -> AccountHomeResult<String> {
+        use nostr::ToBech32;
+        let keys = self.load_signing_keys(account_ref)?;
+        let nsec = keys
+            .secret_key()
+            .to_bech32()
+            .expect("nsec bech32 encode is infallible");
+        // Persist the insecure-handling marker only after a successful encode.
+        self.mark_key_handled_insecurely(account_ref)?;
+        Ok(nsec)
+    }
+
     fn write_signing_account(&self, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {
         let label = keys.public_key().to_hex();
         self.write_signing_account_for_label(&label, keys)
@@ -374,6 +472,7 @@ impl AccountHome {
             label,
             account_id_hex,
             local_signing: true,
+            signed_out: false,
         };
         self.secret_store.write_secret(&account, keys)?;
         if let Err(err) = self.write_account_record(&account) {

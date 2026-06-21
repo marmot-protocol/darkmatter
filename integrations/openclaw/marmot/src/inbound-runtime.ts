@@ -11,8 +11,8 @@
 // dm-agent's per-account allowlist so configured welcomers are accepted.
 
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
-import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 
+import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
 import { resolveSingleAccount } from "./account.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
@@ -82,7 +82,13 @@ function groupStateChangeSentence(change: string, detail?: string | null): strin
   }
 }
 
-/** Merge a debounce batch of same-key inbound messages into one turn (newline-joined text). */
+/**
+ * Merge a debounce batch of same-key inbound messages into one turn.
+ *
+ * The newest message remains the representative for ids/display metadata, while
+ * turn-signaling fields that can appear on any burst member are merged so a
+ * non-last image, mention, or reply does not disappear during debounce.
+ */
 function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMessage {
   const last = items[items.length - 1]!;
   if (items.length === 1) {
@@ -92,7 +98,27 @@ function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMe
     .map((item) => item.text)
     .filter((part) => part.length > 0)
     .join("\n");
-  return { ...last, text };
+  const media: NonNullable<MarmotInboundMessage["media"]> = [];
+  const mediaHashes = new Set<string>();
+  for (const item of items) {
+    for (const ref of item.media ?? []) {
+      if (!mediaHashes.has(ref.ciphertext_sha256)) {
+        mediaHashes.add(ref.ciphertext_sha256);
+        media.push(ref);
+      }
+    }
+  }
+  const replyToMessageIdHex =
+    items
+      .toReversed()
+      .find((item) => item.replyToMessageIdHex)?.replyToMessageIdHex ?? null;
+  return {
+    ...last,
+    text,
+    mentionsSelf: items.some((item) => item.mentionsSelf === true),
+    replyToMessageIdHex,
+    media,
+  };
 }
 
 export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;
@@ -126,6 +152,19 @@ export interface StartMarmotInboundOptions {
    * agent as quiet next-turn context. When omitted, those events are only logged.
    */
   surfaceAmbientEvent?: MarmotAmbientSurfacer;
+  /**
+   * Invalidate the dispatcher's cached `is_direct` activation fact for one group.
+   * Called when dm-agent reports a `group_state_changed` event so the next
+   * unaddressed message in that group re-reads fresh membership instead of a
+   * stale cached value. When omitted, the cache is never invalidated from here.
+   */
+  invalidateGroupActivation?: (accountIdHex: string, groupIdHex: string) => void;
+  /**
+   * Drop every cached `is_direct` activation fact. Called on an inbound resync,
+   * where dropped broadcast slots mean a `group_state_changed` for some group may
+   * have been missed, so no cached membership can be trusted.
+   */
+  clearGroupActivationCache?: () => void;
 }
 
 // The gateway can full-load the plugin in more than one in-process context
@@ -196,7 +235,10 @@ export function startMarmotInbound(
     // Per-group serialization: distinct groups dispatch concurrently while each
     // group stays FIFO. A slow/hung turn in one group no longer blocks inbound
     // dispatch for every other group (the previous inline `await dispatch` did).
-    const dispatchQueue = new KeyedAsyncQueue();
+    const dispatchQueue = new BoundedKeyedAsyncQueue(
+      DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+      (message) => api.logger.warn(message),
+    );
     const handleInbound = async (message: MarmotInboundMessage): Promise<void> => {
       if (onboardingStore) {
         const intercepted = await maybeHandleProfileOnboardingInbound({
@@ -219,9 +261,7 @@ export function startMarmotInbound(
       await dispatch(message);
     };
     const runQueued = (message: MarmotInboundMessage): void => {
-      void dispatchQueue
-        .enqueue(message.groupIdHex, () => handleInbound(message))
-        .catch(() => api.logger.warn("marmot: inbound dispatch task failed"));
+      dispatchQueue.enqueue(message.groupIdHex, () => handleInbound(message));
     };
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =
@@ -288,6 +328,10 @@ export function startMarmotInbound(
         // mapped sentence never carries a member pubkey.
         markMarmotInboundReceived(statusAccountId);
         api.logger.info("marmot: inbound group state change observed");
+        // Drop the cached is_direct activation fact for this group: a
+        // membership change can flip whether the group is an effective DM, so the
+        // next unaddressed message must re-read fresh membership.
+        options.invalidateGroupActivation?.(change.accountIdHex, change.groupIdHex);
         void Promise.resolve(
           options.surfaceAmbientEvent?.({
             accountIdHex: change.accountIdHex,
@@ -318,6 +362,9 @@ export function startMarmotInbound(
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
         );
+        // Dropped broadcast slots can include a missed group_state_changed for any
+        // group, so no cached is_direct fact can be trusted; drop them all.
+        options.clearGroupActivationCache?.();
       },
       onError: () => {
         markMarmotInboundReconnect(statusAccountId);

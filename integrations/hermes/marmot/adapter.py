@@ -11,12 +11,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
+import shutil
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, Literal, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -32,6 +34,7 @@ PROTOCOL = "marmot.agent-control.v1"
 MAX_FRAME_BYTES = 1024 * 1024
 DEFAULT_SOCKET_HOME = "~/.marmot"
 DEFAULT_STREAM_CHUNK_BYTES = 1024
+AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN = 65519
 TEXT_DELTA_RECORD = 0x01
 STATUS_RECORD = 0x03
 TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
@@ -45,10 +48,26 @@ SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512
+DEFAULT_RECONNECT_DELAY_MS = 1000
+DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000
+DEFAULT_INBOUND_DEDUPE_WINDOW = 2048
+DEFAULT_INBOUND_QUEUE_MAX_DEPTH = 32
+DEFAULT_AMBIENT_CONTEXT_WINDOW = 2048
+DEFAULT_SENT_TARGET_CACHE_SIZE = 2048
+DEFAULT_GROUP_ACTIVATION: Literal["mention", "always"] = "mention"
 MAX_PROFILE_NAME_CHARS = 80
 PROFILE_NAME_PROMPT = (
     "I do not have a public Nostr profile name yet. What should I publish as "
     'this agent\'s display name? Reply with a name, or reply "skip" to stay unnamed.'
+)
+PROFILE_PROMPT_WITH_NAME = (
+    "Hi! I can publish a public Nostr profile so I show up with a name. Want me to "
+    'publish it as "{name}"? Reply "yes" to use that, reply with a different name to '
+    'use instead, or reply "skip" to stay unnamed.'
+)
+PROFILE_PROMPT_NO_NAME = (
+    "Hi! I can publish a public Nostr profile so I show up with a name. Reply with a "
+    'name to publish, or reply "skip" to stay unnamed.'
 )
 PROFILE_NAME_PUBLISHED = "Done. I published this agent's public Nostr profile name as \"{name}\"."
 PROFILE_NAME_SKIPPED = "Okay, I will stay unnamed for now."
@@ -63,6 +82,21 @@ PROFILE_NAME_SKIP_REPLIES = {
     "not now",
     "skip",
 }
+PROFILE_NAME_AFFIRM_REPLIES = {
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "ok",
+    "okay",
+    "publish",
+    "publish it",
+    "do it",
+    "go ahead",
+}
+MARMOT_ACCOUNT_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_TOOL_PROGRESS_RE = re.compile(
     r'^\S+\s+(?P<tool>[A-Za-z0-9_.-]+)(?:\([^)]*\))?(?:(?::\s+"(?P<preview>.*)")|(?:\.\.\.))$',
     re.DOTALL,
@@ -98,36 +132,64 @@ class KeyedAsyncQueue:
     dispatcher hand a slow/hung turn in one group off to the background and keep pulling
     events for other groups instead of blocking head-of-line on every group.
 
+    When ``max_depth_per_key`` is reached for a key, the incoming turn is shed (already-
+    queued work is preserved) and ``on_shed`` is invoked with a privacy-safe message.
+
     `enqueue` is non-blocking: it schedules the work and returns immediately. Use `join` to
     wait for all currently scheduled work to drain (chiefly for tests and clean shutdown) and
     `cancel_all` to tear everything down.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_depth_per_key: int = DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+        on_shed: Optional[Any] = None,
+    ) -> None:
+        self._max_depth_per_key = max(1, int(max_depth_per_key))
+        self._on_shed = on_shed
         # Most-recently-enqueued task per key; the chain tail each new same-key task awaits.
         self._tails: Dict[Any, asyncio.Task] = {}
         # Every in-flight task, so join()/cancel_all() can act on the whole queue.
         self._pending: set[asyncio.Task] = set()
+        self._queued_depth: Dict[Any, int] = {}
 
-    def enqueue(self, key: Any, coro_factory) -> asyncio.Task:
+    def enqueue(self, key: Any, coro_factory) -> Optional[asyncio.Task]:
         """Schedule ``coro_factory()`` to run after any prior task for ``key`` completes.
 
         ``coro_factory`` is a zero-arg callable returning a coroutine; it is only invoked when
         the task actually starts, so per-key ordering is preserved without eagerly creating
         coroutines that might warn if never awaited.
+
+        Returns ``None`` when the per-key depth cap is reached and the turn is shed.
         """
 
+        depth = self._queued_depth.get(key, 0)
+        if depth >= self._max_depth_per_key:
+            if self._on_shed:
+                self._on_shed("Marmot inbound queue depth exceeded; shedding turn")
+            else:
+                logger.warning("Marmot inbound queue depth exceeded; shedding turn")
+            return None
+
+        self._queued_depth[key] = depth + 1
         predecessor = self._tails.get(key)
 
         async def _runner() -> None:
-            if predecessor is not None:
-                # Wait for the prior same-key task, but never inherit its failure/cancellation:
-                # one group's bad turn must not poison the next message in that group.
-                try:
-                    await asyncio.shield(predecessor)
-                except BaseException:
-                    pass
-            await coro_factory()
+            try:
+                if predecessor is not None:
+                    # Wait for the prior same-key task, but never inherit its failure/cancellation:
+                    # one group's bad turn must not poison the next message in that group.
+                    try:
+                        await asyncio.shield(predecessor)
+                    except BaseException:
+                        pass
+                await coro_factory()
+            finally:
+                remaining = max(0, self._queued_depth.get(key, 1) - 1)
+                if remaining == 0:
+                    self._queued_depth.pop(key, None)
+                else:
+                    self._queued_depth[key] = remaining
 
         task = asyncio.ensure_future(_runner())
         self._tails[key] = task
@@ -157,6 +219,299 @@ class KeyedAsyncQueue:
             await asyncio.gather(*pending, return_exceptions=True)
         self._pending.clear()
         self._tails.clear()
+        self._queued_depth.clear()
+
+
+class _RecentKeys:
+    """Bounded, insertion-ordered set for recent-id/-context dedupe.
+
+    Mirrors the OpenClaw ``RecentIds`` (inbound.ts): FIFO eviction once the
+    window is exceeded so a long-running subscription cannot grow unbounded.
+    """
+
+    def __init__(self, max_size: int):
+        self.max_size = int(max_size)
+        self._keys: "OrderedDict[str, None]" = OrderedDict()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._keys
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def add(self, key: str) -> None:
+        self._keys[key] = None
+        while len(self._keys) > self.max_size:
+            self._keys.popitem(last=False)
+
+
+class SentMessageTargetCache:
+    """Maps durable message ids to the account+group they were sent to.
+
+    Mirrors OpenClaw ``SentMessageTargetCache`` so a later delete can be routed
+    without an extra round-trip.
+    """
+
+    def __init__(self, max_size: int = DEFAULT_SENT_TARGET_CACHE_SIZE) -> None:
+        self.max_size = int(max_size)
+        self._entries: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
+
+    def record(self, message_id_hex: str, *, account_id_hex: str, group_id_hex: str) -> None:
+        message_id_hex = _normalize_hex(message_id_hex, "message_id_hex")
+        account_id_hex = _normalize_hex(account_id_hex, "account_id_hex")
+        group_id_hex = _normalize_hex(group_id_hex, "group_id_hex")
+        if message_id_hex in self._entries:
+            self._entries.pop(message_id_hex, None)
+        self._entries[message_id_hex] = (account_id_hex, group_id_hex)
+        while len(self._entries) > self.max_size:
+            self._entries.popitem(last=False)
+
+    def record_all(
+        self,
+        message_ids_hex: Iterable[str],
+        *,
+        account_id_hex: str,
+        group_id_hex: str,
+    ) -> None:
+        for message_id_hex in message_ids_hex:
+            self.record(
+                message_id_hex,
+                account_id_hex=account_id_hex,
+                group_id_hex=group_id_hex,
+            )
+
+    def lookup(self, message_id_hex: str) -> Optional[Tuple[str, str]]:
+        return self._entries.get(_normalize_hex(message_id_hex, "message_id_hex"))
+
+
+class GroupActivationCache:
+    """Per-(account, group) cache of the ``is_direct`` activation fact."""
+
+    def __init__(self) -> None:
+        self._is_direct: Dict[str, bool] = {}
+
+    @staticmethod
+    def _key(account_id_hex: str, group_id_hex: str) -> str:
+        return f"{account_id_hex}:{group_id_hex}"
+
+    def get(self, account_id_hex: str, group_id_hex: str) -> Optional[bool]:
+        return self._is_direct.get(self._key(account_id_hex, group_id_hex))
+
+    def set(self, account_id_hex: str, group_id_hex: str, is_direct: bool) -> None:
+        self._is_direct[self._key(account_id_hex, group_id_hex)] = bool(is_direct)
+
+    def invalidate(self, account_id_hex: str, group_id_hex: str) -> None:
+        self._is_direct.pop(self._key(account_id_hex, group_id_hex), None)
+
+    def clear(self) -> None:
+        self._is_direct.clear()
+
+
+def matches_mention_pattern(text: str, patterns: Iterable[str]) -> bool:
+    haystack = str(text or "").lower()
+    for pattern in patterns:
+        needle = str(pattern or "").strip().lower()
+        if needle and needle in haystack:
+            return True
+    return False
+
+
+def _coalesce_inbound_events(items: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge a debounce batch of same-key inbound events into one (mirrors
+    inbound-runtime.ts ``coalesceInboundMessages``).
+
+    Keeps the LAST event's ids (message_id, reply_to, sender) as the
+    representative, but carries merged text/mentions/media:
+    - text: newline-joined, skipping empty parts;
+    - ``mentions_self``: OR across the batch (true if ANY message mentions self);
+    - ``media``: deduped by ``ciphertext_sha256`` across the batch;
+    - ``reply_to_message_id_hex``: newest non-null value in the batch.
+    """
+    last = items[-1]
+    if len(items) == 1:
+        return last
+
+    merged = dict(last)
+    text_parts = [str(item.get("text") or "") for item in items]
+    merged["text"] = "\n".join(part for part in text_parts if part)
+    merged["mentions_self"] = any(bool(item.get("mentions_self")) for item in items)
+    media: list[Any] = []
+    media_hashes: set[str] = set()
+    for item in items:
+        item_media = item.get("media")
+        if not isinstance(item_media, (list, tuple)):
+            continue
+        for ref in item_media:
+            if not isinstance(ref, dict):
+                continue
+            digest = str(ref.get("ciphertext_sha256") or "").strip().lower()
+            if digest and digest in media_hashes:
+                continue
+            if digest:
+                media_hashes.add(digest)
+            media.append(ref)
+    if media:
+        merged["media"] = media
+    reply_to = None
+    for item in reversed(items):
+        candidate = item.get("reply_to_message_id_hex")
+        if candidate:
+            reply_to = candidate
+            break
+    if reply_to:
+        merged["reply_to_message_id_hex"] = reply_to
+    return merged
+
+
+def reconnect_backoff_ms(
+    attempt: int,
+    base_ms: float,
+    cap_ms: float,
+    rand: Any = None,
+) -> float:
+    """Reconnect backoff with jitter: a delay in
+    ``[base_ms, min(cap_ms, base_ms * 2**attempt)]``.
+
+    Faithful port of inbound.ts ``reconnectBackoffMs`` (lines 87-101): attempt 0
+    returns exactly ``base_ms`` (ceiling == base) so the first reconnect is as
+    prompt as the old flat delay; later attempts grow geometrically toward the
+    cap. The jitter spreads retries so a persistent failure does not spin at a
+    fixed cadence. ``rand`` defaults to :func:`random.random` and may be injected
+    for deterministic tests.
+    """
+    if base_ms <= 0:
+        return 0
+    if rand is None:
+        import random
+
+        rand = random.random
+    ceiling = min(cap_ms, base_ms * 2 ** max(0, attempt))
+    if ceiling <= base_ms:
+        return base_ms
+    return round(base_ms + rand() * (ceiling - base_ms))
+
+
+def group_state_change_sentence(change: str, detail: Optional[str] = None) -> str:
+    """Map a coarse group-state change kind to a short, privacy-safe sentence
+    for ambient agent context. NEVER includes a member pubkey; the only detail
+    surfaced is the new group name on a rename (mirrors inbound-runtime.ts
+    ``groupStateChangeSentence`` lines 62-83)."""
+    if change == "member_added":
+        return "A member was added to the group."
+    if change == "member_removed":
+        return "A member was removed from the group."
+    if change == "member_left":
+        return "A member left the group."
+    if change == "admin_added":
+        return "A member was made a group admin."
+    if change == "admin_removed":
+        return "A member is no longer a group admin."
+    if change == "group_renamed":
+        trimmed = str(detail or "").strip()
+        return f'The group was renamed to "{trimmed}".' if trimmed else "The group was renamed."
+    if change == "group_avatar_changed":
+        return "The group avatar was changed."
+    return "The group state changed."
+
+
+def normalize_welcomer_id(entry: str | int) -> str:
+    return str(entry).strip().lower().removeprefix("0x")
+
+
+async def sync_allowlist(
+    client: MarmotAgentControlClient,
+    account_id_hex: str,
+    desired: Iterable[str | int],
+) -> Dict[str, list[str]]:
+    """Reconcile dm-agent's welcomer allowlist to exactly ``desired`` hex ids."""
+    want = {
+        normalize_welcomer_id(entry)
+        for entry in desired
+        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalize_welcomer_id(entry))
+    }
+    current = await client.allowlist_list(account_id_hex)
+    have = {
+        normalize_welcomer_id(entry)
+        for entry in (current.get("welcomer_account_ids_hex") or [])
+        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalize_welcomer_id(entry))
+    }
+
+    added: list[str] = []
+    removed: list[str] = []
+    for entry in want:
+        if entry not in have:
+            await client.allowlist_add(account_id_hex, entry)
+            added.append(entry)
+    for entry in have:
+        if entry not in want:
+            await client.allowlist_remove(account_id_hex, entry)
+            removed.append(entry)
+    return {"added": added, "removed": removed}
+
+
+def resolve_marmot_home(extra: Dict[str, Any], socket_path: str | Path) -> Path:
+    home = _first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME")
+    if home:
+        return Path(str(home)).expanduser()
+    return Path(socket_path).expanduser().parent.parent
+
+
+def resolve_inbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
+    configured = _first_config_value(extra, "inbound_media_dir", env="MARMOT_INBOUND_MEDIA_DIR")
+    if configured:
+        return Path(str(configured)).expanduser()
+    return resolve_marmot_home(extra, socket_path) / "dev" / "inbound-media"
+
+
+def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) -> list[Path]:
+    configured = extra.get("media_local_roots")
+    if configured is None:
+        configured = extra.get("mediaLocalRoots")
+    if configured is None:
+        configured = os.getenv("MARMOT_MEDIA_LOCAL_ROOTS")
+    if configured is not None:
+        return [Path(entry).expanduser() for entry in _split_config_list(configured)]
+    return [resolve_inbound_media_dir(extra, socket_path)]
+
+
+def resolve_welcomer_allowlist(extra: Dict[str, Any]) -> list[str]:
+    for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
+        if key in extra:
+            return _split_config_list(extra[key])
+    configured = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
+    return _split_config_list(configured) if configured else []
+
+
+def path_is_under_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def assert_local_media_allowed(path: Path, allowed_roots: list[Path]) -> None:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise AgentControlError("Marmot media path is not a readable file")
+    if not allowed_roots:
+        raise AgentControlError("Marmot media path is outside allowed local roots")
+    if any(path_is_under_root(resolved, root) for root in allowed_roots):
+        return
+    raise AgentControlError("Marmot media path is outside allowed local roots")
+
+
+def valid_profile_name(name: Any) -> Optional[str]:
+    value = " ".join(str(name or "").split())
+    if not value or len(value) > MAX_PROFILE_NAME_CHARS:
+        return None
+    return value
+
+
+def build_profile_prompt(suggested_name: Optional[str]) -> str:
+    if suggested_name:
+        return PROFILE_PROMPT_WITH_NAME.format(name=suggested_name)
+    return PROFILE_PROMPT_NO_NAME
 
 
 class AppendOnlyTextState:
@@ -165,12 +520,23 @@ class AppendOnlyTextState:
     def __init__(self):
         self.text = ""
 
-    def suffix_for(self, next_text: str) -> str:
+    def pending_suffix_for(self, next_text: str) -> str:
+        """Validate that ``next_text`` extends the current text and return the
+        append-only suffix WITHOUT advancing ``self.text``. The caller commits
+        the advance with :meth:`commit` only after the remote append succeeds, so
+        a failed append can be retried with the same text without diverging from
+        the connector's transcript (mirrors live.ts ``update()``)."""
         next_text = str(next_text or "")
         if not next_text.startswith(self.text):
             raise NonAppendOnlyUpdate("Marmot stream update is not append-only")
-        suffix = next_text[len(self.text):]
-        self.text = next_text
+        return next_text[len(self.text):]
+
+    def commit(self, next_text: str) -> None:
+        self.text = str(next_text or "")
+
+    def suffix_for(self, next_text: str) -> str:
+        suffix = self.pending_suffix_for(next_text)
+        self.commit(next_text)
         return suffix
 
 
@@ -195,7 +561,12 @@ class ProfileNameOnboardingStore:
             },
         )
 
-    async def try_claim_prompt(self, account_id_hex: str, group_id_hex: str) -> bool:
+    async def try_claim_prompt(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        suggested_name: Optional[str] = None,
+    ) -> bool:
         """Atomically claim the one-time prompt slot for ``account_id_hex``.
 
         Mirrors OpenClaw's ``tryClaimPrompt`` (``integrations/openclaw/marmot/src/
@@ -215,6 +586,7 @@ class ProfileNameOnboardingStore:
             accounts[account_id_hex] = {
                 "status": "prompted",
                 "group_id_hex": group_id_hex,
+                **({"suggested_name": suggested_name} if suggested_name else {}),
             }
             self._write(data)
             return True
@@ -310,17 +682,36 @@ class AgentTextStreamTranscript:
 class MarmotAgentControlClient:
     """Small NDJSON client for ``crates/agent-control``."""
 
-    def __init__(self, socket_path: str | Path, *, request_timeout: float = 30.0, auth_token: Optional[str] = None):
+    def __init__(
+        self,
+        socket_path: str | Path,
+        *,
+        request_timeout: float = 30.0,
+        preview_request_timeout: float = 8.0,
+        auth_token: Optional[str] = None,
+    ):
         self.socket_path = str(Path(socket_path).expanduser())
         self.request_timeout = float(request_timeout)
+        # Best-effort live-preview ops use a short timeout so a wedged preview
+        # broker abandons the preview in a few seconds instead of pinning the
+        # agent turn for the full request_timeout per op (mirrors client.ts
+        # DEFAULT_PREVIEW_REQUEST_TIMEOUT_MS).
+        self.preview_request_timeout = float(preview_request_timeout)
         self.auth_token = str(auth_token).strip() if auth_token else None
 
-    async def request(self, payload: Dict[str, Any], *, request_id: Optional[str] = None) -> Dict[str, Any]:
+    async def request(
+        self,
+        payload: Dict[str, Any],
+        *,
+        request_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
         request_id = request_id or uuid.uuid4().hex
+        effective_timeout = self.request_timeout if timeout is None else float(timeout)
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
         try:
-            await self._write_envelope(writer, payload, request_id=request_id)
-            response = await self._read_envelope(reader)
+            await self._write_envelope(writer, payload, request_id=request_id, timeout=effective_timeout)
+            response = await self._read_envelope(reader, timeout=effective_timeout)
             self._validate_response_id(response, request_id)
             self._raise_if_error(response)
             return response
@@ -370,6 +761,98 @@ class MarmotAgentControlClient:
             payload["idempotency_key"] = key
         return await self.request(payload)
 
+    async def delete_message(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        target_message_id_hex: str,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "delete_message",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "target_message_id_hex": _normalize_hex(
+                    target_message_id_hex,
+                    "target_message_id_hex",
+                ),
+            }
+        )
+
+    async def group_info(self, account_id_hex: str, group_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "group_info",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            }
+        )
+
+    async def send_media(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        attachments: Iterable[Dict[str, Any]],
+        *,
+        caption: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "send_media",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "attachments": list(attachments),
+                "caption": str(caption) if caption is not None else None,
+            }
+        )
+
+    async def download_media(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        media: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "download_media",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "media": media,
+            }
+        )
+
+    async def allowlist_list(self, account_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "allowlist_list",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            }
+        )
+
+    async def allowlist_add(self, account_id_hex: str, welcomer_account_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "allowlist_add",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "welcomer_account_id_hex": _normalize_hex(
+                    welcomer_account_id_hex,
+                    "welcomer_account_id_hex",
+                ),
+            }
+        )
+
+    async def allowlist_remove(self, account_id_hex: str, welcomer_account_id_hex: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "allowlist_remove",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "welcomer_account_id_hex": _normalize_hex(
+                    welcomer_account_id_hex,
+                    "welcomer_account_id_hex",
+                ),
+            }
+        )
+
     async def stream_begin(
         self,
         account_id_hex: str,
@@ -385,7 +868,8 @@ class MarmotAgentControlClient:
                 "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex") if stream_id_hex else None,
                 "quic_candidates": [str(candidate).strip() for candidate in quic_candidates if str(candidate).strip()],
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def stream_append(self, stream_id_hex: str, append_text: str) -> Dict[str, Any]:
@@ -394,7 +878,8 @@ class MarmotAgentControlClient:
                 "type": "stream_append",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "append_text": str(append_text or ""),
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def stream_status(self, stream_id_hex: str, status: str) -> Dict[str, Any]:
@@ -403,16 +888,18 @@ class MarmotAgentControlClient:
                 "type": "stream_status",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "status": str(status or ""),
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
-    async def stream_tool(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
+    async def stream_progress(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
         return await self.request(
             {
-                "type": "stream_tool",
+                "type": "stream_progress",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "text": str(text or ""),
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def stream_finalize(
@@ -438,7 +925,8 @@ class MarmotAgentControlClient:
                 "type": "stream_cancel",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "reason": reason,
-            }
+            },
+            timeout=self.preview_request_timeout,
         )
 
     async def send_agent_activity(
@@ -543,7 +1031,14 @@ class MarmotAgentControlClient:
         finally:
             await _close_writer(writer)
 
-    async def _write_envelope(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, request_id: str) -> None:
+    async def _write_envelope(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: Dict[str, Any],
+        *,
+        request_id: str,
+        timeout: Optional[float] = None,
+    ) -> None:
         envelope = {
             "marmot_agent_control": PROTOCOL,
             "id": request_id,
@@ -555,8 +1050,9 @@ class MarmotAgentControlClient:
         if len(frame) > MAX_FRAME_BYTES:
             raise AgentControlError("agent control frame is too large", code="frame_too_large")
         writer.write(frame)
+        write_timeout = self.request_timeout if timeout is None else float(timeout)
         try:
-            await asyncio.wait_for(writer.drain(), timeout=self.request_timeout)
+            await asyncio.wait_for(writer.drain(), timeout=write_timeout)
         except asyncio.TimeoutError as exc:
             raise AgentControlError(
                 "timed out while writing agent control request",
@@ -660,15 +1156,23 @@ class MarmotLiveStream:
             group_id_hex=group_id_hex,
             stream_id_hex=response["stream_id_hex"],
             start_message_id_hex=response["start_message_id_hex"],
-            chunk_bytes=chunk_bytes,
+            chunk_bytes=effective_stream_chunk_bytes(
+                chunk_bytes,
+                response.get("policy_max_plaintext_frame_len"),
+            ),
         )
 
     async def append_replacement(self, next_text: str) -> None:
-        suffix = self.text.suffix_for(next_text)
+        next_text = str(next_text or "")
+        suffix = self.text.pending_suffix_for(next_text)
         if not suffix:
             return
+        # Commit local transcript/append-only state only AFTER the remote append
+        # succeeds, so a failed append leaves the stream consistent and the same
+        # text re-appendable (mirrors live.ts update() lines 99-116).
         await self.client.stream_append(self.stream_id_hex, suffix)
         self.transcript.append_text(suffix)
+        self.text.commit(next_text)
 
     async def status(self, status: str) -> None:
         await self.client.stream_status(self.stream_id_hex, status)
@@ -709,12 +1213,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.quic_candidates = resolve_quic_candidates(extra)
         self.stream_chunk_bytes = int(extra.get("stream_chunk_bytes") or DEFAULT_STREAM_CHUNK_BYTES)
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
+        self.debounce_ms = resolve_debounce_ms(extra)
+        self.group_activation = resolve_group_activation(extra)
+        self.mention_patterns = resolve_mention_patterns(extra)
+        self.agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
+        self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
+        self._allowed_media_roots = resolve_allowed_media_roots(extra, self.socket_path)
+        self._inbound_media_dir = resolve_inbound_media_dir(extra, self.socket_path)
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
         self.profile_name_onboarding = (
             ProfileNameOnboardingStore(resolve_profile_onboarding_state_path(extra, self.socket_path))
             if self.profile_name_onboarding_enabled
             else None
         )
+        self._sent_targets = SentMessageTargetCache()
+        self._activation_cache = GroupActivationCache()
         self._listener_task: Optional[asyncio.Task] = None
         self._inbound_queue = KeyedAsyncQueue()
         self._active_streams: Dict[str, MarmotLiveStream] = {}
@@ -723,6 +1236,28 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Client-side inbound dedupe: dm-agent can re-emit the same inbound
+        # message (rapid catch-up after subscribe, or across a reconnect); drop
+        # ids already seen so the same user message is not dispatched twice.
+        self._recent_inbound_ids = _RecentKeys(DEFAULT_INBOUND_DEDUPE_WINDOW)
+        # Dedupe repeated ambient surfacings (deletion / group-state change) by a
+        # context key (mirror inbound.ts contextKeys).
+        self._recent_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
+        # Pending quiet next-turn ambient context, keyed by group id. Ambient
+        # events (a deletion, a group-state change) are NOT reply triggers: they
+        # are buffered here and prepended to the next real inbound message for
+        # that group as channel_context, so the agent sees the fact on its next
+        # turn without an ambient event spuriously starting an agent turn of its
+        # own. Mirrors OpenClaw's quiet-next-turn surfacer (inbound-runtime.ts);
+        # when no message follows, the fact is only logged (also OpenClaw parity).
+        self._pending_ambient_context: Dict[str, list[str]] = {}
+        # Optional inbound debounce: coalesce rapid same-(account,group,sender)
+        # bursts into one turn. Disabled when debounce_ms <= 0.
+        self._debounce_pending: Dict[str, list[Dict[str, Any]]] = {}
+        self._debounce_tasks: Dict[str, asyncio.Task] = {}
+        # Set true once the current subscription yields/acks (healthy); used by
+        # the reconnect-backoff loop to reset its attempt counter.
+        self._inbound_established = False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -739,6 +1274,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def connect(self) -> bool:
         try:
             await self._ensure_account_id()
+            await self._sync_welcomer_allowlist()
             self._listener_task = asyncio.create_task(self._consume_inbound_loop())
             self._mark_connected()
             return True
@@ -748,6 +1284,20 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if callable(set_fatal):
                 set_fatal("marmot_connect_failed", str(exc), retryable=True)
             return False
+
+    async def _sync_welcomer_allowlist(self) -> None:
+        if not self.welcomer_allowlist:
+            return
+        try:
+            account_id = await self._ensure_account_id()
+            result = await sync_allowlist(self.client, account_id, self.welcomer_allowlist)
+            logger.debug(
+                "Marmot welcomer allowlist synced (added=%d removed=%d)",
+                len(result["added"]),
+                len(result["removed"]),
+            )
+        except Exception:
+            logger.debug("Marmot welcomer allowlist sync failed", exc_info=True)
 
     async def disconnect(self) -> None:
         if self._listener_task is not None:
@@ -759,9 +1309,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._listener_task = None
         await self._inbound_queue.cancel_all()
         await self._cancel_all_streams("adapter disconnect")
+        self._cancel_debounce_tasks()
+        self._pending_ambient_context.clear()
+        self._activation_cache.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._mark_disconnected()
+
+    def _cancel_debounce_tasks(self) -> None:
+        for task in self._debounce_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._debounce_tasks.clear()
+        self._debounce_pending.clear()
 
     async def send(
         self,
@@ -811,20 +1371,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     message_id=message_id,
                 )
             except NonAppendOnlyUpdate:
-                await self._cancel_stream(
+                return await self._abandon_preview_and_send_final(
                     chat_id,
-                    message_id,
                     stream,
-                    "final text was not append-only",
-                )
-                return await self._send_final_direct(
-                    chat_id,
                     visible_content,
+                    message_id=message_id,
+                    reason="final text was not append-only",
                     reply_to_message_id_hex=_optional_hex(reply_to),
                 )
             except Exception as exc:
                 logger.debug("Marmot live-preview finalize failed: %s", exc)
-                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+                return await self._abandon_preview_and_send_final(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                    reason="finalize_error",
+                    reply_to_message_id_hex=_optional_hex(reply_to),
+                )
 
         return await self._send_final_direct(
             chat_id,
@@ -871,12 +1435,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 message_id=message_id,
             )
         except NonAppendOnlyUpdate as exc:
-            await self._cancel_stream(chat_id, message_id, stream, str(exc))
             if finalize:
-                return await self._send_final_direct(chat_id, visible_content)
+                return await self._abandon_preview_and_send_final(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                    reason=str(exc),
+                )
+            await self._cancel_stream(chat_id, message_id, stream, str(exc))
             return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             logger.debug("Marmot live-preview edit failed: %s", exc)
+            if finalize:
+                return await self._abandon_preview_and_send_final(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                    reason="finalize_error",
+                )
             return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
 
     def supports_draft_streaming(
@@ -985,7 +1563,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if message_id:
             self._active_streams.pop(message_id, None)
         self._forget_stream(chat_id, stream)
-        return self._result_from_stream_finalize(response)
+        try:
+            result = self._result_from_stream_finalize(response)
+        except Exception as exc:
+            logger.debug("Marmot stream finalize response rejected: %s", exc)
+            await self._cancel_stream(chat_id, message_id, stream, "finalize rejected")
+            return await self._send_final_direct(chat_id, final_text)
+        account_id = await self._ensure_account_id()
+        self._sent_targets.record_all(
+            tuple(response.get("message_ids_hex") or ()),
+            account_id_hex=account_id,
+            group_id_hex=chat_id,
+        )
+        return result
 
     @staticmethod
     def _result_from_stream_finalize(response: Dict[str, Any]) -> SendResult:
@@ -1002,6 +1592,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             message_id=message_id,
             raw_response=response,
             continuation_message_ids=message_ids[:-1],
+        )
+
+    async def _abandon_preview_and_send_final(
+        self,
+        chat_id: str,
+        stream: MarmotLiveStream,
+        final_text: str,
+        *,
+        message_id: Optional[str] = None,
+        reason: str,
+        reply_to_message_id_hex: Optional[str] = None,
+    ) -> SendResult:
+        await self._cancel_stream(chat_id, message_id, stream, reason)
+        return await self._send_final_direct(
+            chat_id,
+            final_text,
+            reply_to_message_id_hex=reply_to_message_id_hex,
         )
 
     async def _send_final_direct(
@@ -1030,6 +1637,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 message_ids = tuple(response.get("message_ids_hex") or ())
                 message_id = message_ids[-1] if message_ids else None
+                self._sent_targets.record_all(
+                    message_ids,
+                    account_id_hex=account_id,
+                    group_id_hex=chat_id,
+                )
                 return SendResult(
                     success=True,
                     message_id=message_id,
@@ -1054,6 +1666,154 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             error=str(last_exc) if last_exc else "Marmot send_final failed",
             retryable=is_retryable(last_exc) if last_exc else False,
         )
+
+    async def _send_media_upload(
+        self,
+        chat_id: str,
+        *,
+        path: str,
+        media_type: str,
+        file_name: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        if reply_to:
+            return SendResult(
+                success=False,
+                error="Marmot media sends do not support reply threading yet",
+            )
+
+        local_path = Path(str(path)).expanduser()
+        try:
+            assert_local_media_allowed(local_path, self._allowed_media_roots)
+        except AgentControlError as exc:
+            return SendResult(success=False, error=str(exc))
+
+        account_id = await self._ensure_account_id()
+        chat_id = _normalize_hex(chat_id, "chat_id")
+        try:
+            response = await self.client.send_media(
+                account_id,
+                chat_id,
+                [
+                    {
+                        "path": str(local_path),
+                        "media_type": str(media_type or "application/octet-stream"),
+                        "file_name": str(file_name or local_path.name or "attachment"),
+                    }
+                ],
+                caption=caption,
+            )
+        except Exception as exc:
+            logger.debug("Marmot send_media failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+
+        message_ids = tuple(response.get("message_ids_hex") or ())
+        message_id = message_ids[-1] if message_ids else None
+        self._sent_targets.record_all(
+            message_ids,
+            account_id_hex=account_id,
+            group_id_hex=chat_id,
+        )
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response=response,
+            continuation_message_ids=message_ids[:-1],
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        path = Path(str(image_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        path = Path(str(file_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        path = Path(str(video_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        **kwargs: Any,
+    ) -> SendResult:
+        path = Path(str(audio_path)).expanduser()
+        media_type = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
+        return await self._send_media_upload(
+            chat_id,
+            path=str(path),
+            media_type=media_type,
+            file_name=path.name,
+            caption=kwargs.get("caption"),
+            reply_to=kwargs.get("reply_to"),
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        target = self._sent_targets.lookup(message_id)
+        account_id: Optional[str]
+        group_id: Optional[str]
+        if target is not None:
+            account_id, group_id = target
+        else:
+            account_id = self.account_id_hex or None
+            group_id = _optional_hex(chat_id, "chat_id")
+            if account_id is None or group_id is None:
+                return False
+        try:
+            account_id = account_id or await self._ensure_account_id()
+            await self.client.delete_message(account_id, group_id, message_id)
+            return True
+        except Exception as exc:
+            logger.debug("Marmot delete_message failed: %s", exc)
+            return False
 
     async def _send_tool_progress_events(
         self,
@@ -1278,34 +2038,67 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return self.account_id_hex
         response = await self.client.account_list()
         accounts = list(response.get("accounts") or [])
-        if len(accounts) == 1:
-            self.account_id_hex = _normalize_hex(accounts[0]["account_id_hex"], "account_id_hex")
+        signing_accounts = [account for account in accounts if account.get("local_signing")]
+        if len(signing_accounts) == 1:
+            self.account_id_hex = _normalize_hex(signing_accounts[0]["account_id_hex"], "account_id_hex")
             return self.account_id_hex
-        if not accounts:
-            raise AgentControlError("dm-agent has no local Marmot accounts; create one first", code="no_accounts")
+        if not signing_accounts:
+            raise AgentControlError(
+                "dm-agent has no local-signing Marmot account; run `dm-agent bootstrap` first",
+                code="no_accounts",
+            )
         raise AgentControlError(
-            "dm-agent has multiple accounts; set MARMOT_ACCOUNT_ID_HEX",
+            "dm-agent hosts multiple local-signing accounts; set MARMOT_ACCOUNT_ID_HEX",
             code="ambiguous_account",
         )
 
-    async def _consume_inbound_loop(self) -> None:
+    async def _consume_inbound_loop(self, *, rand: Any = None) -> None:
+        base_ms = float(DEFAULT_RECONNECT_DELAY_MS)
+        cap_ms = float(DEFAULT_MAX_RECONNECT_DELAY_MS)
+        # Clamp the base to the cap so the delay never goes above the cap when a
+        # ceiling collapses to the base (mirrors inbound.ts line 157).
+        effective_base_ms = min(base_ms, cap_ms)
+        # Consecutive reconnect attempts that have not (re)established a healthy
+        # subscription. Reset to 0 once a subscription yields/acks so a healthy
+        # connection always reconnects promptly, while a persistent failure backs
+        # off geometrically instead of spinning at a flat cadence.
+        attempt = 0
         while True:
             try:
-                await self._consume_inbound_once()
+                await self._consume_inbound_once(on_established=lambda: None)
             except asyncio.CancelledError:
                 raise
             except _ResyncRequired as exc:
                 # The connector could not auto-replay the messages dropped on broadcast lag and
                 # asked us to re-sync. Tear down and reopen the subscription: a fresh subscription
                 # re-runs the connector's catch_up_accounts() and a fresh storage-backed replay,
-                # which recovers the missed inbound messages we would otherwise never see.
+                # which recovers the missed inbound messages we would otherwise never see. A
+                # resync is just another reconnect reason and uses the same backoff.
                 logger.warning("Marmot inbound resync requested, reconnecting: %s", exc)
-                await asyncio.sleep(0.5)
             except Exception as exc:
                 logger.warning("Marmot inbound subscription failed, retrying: %s", exc)
-                await asyncio.sleep(2.0)
+            else:
+                # A clean return means the subscription was dropped (the connector
+                # closed the inbound stream with a normal EOF rather than an error).
+                # That is still a reconnect, NOT a success: fall through to the same
+                # backoff path as an error so a socket that accepts-acks-then-closes
+                # cannot pin us in a hot resubscribe loop (mirrors OpenClaw's
+                # MarmotInboundBridge.run(), which backs off after stream completion
+                # too). The _inbound_established check below keeps an established-then-
+                # idle subscription reconnecting promptly.
+                logger.debug("Marmot inbound subscription closed cleanly, reconnecting")
+            # Reset the attempt counter whenever the subscription was healthy
+            # (it established and yielded/acked at least once) so the next failure
+            # starts the backoff fresh; a subscription that never established (e.g.
+            # an immediate clean EOF) backs off geometrically instead of spinning.
+            if self._inbound_established:
+                attempt = 0
+            delay_ms = reconnect_backoff_ms(attempt, effective_base_ms, cap_ms, rand=rand)
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000)
+            attempt += 1
 
-    async def _consume_inbound_once(self, *, drain: bool = False) -> None:
+    async def _consume_inbound_once(self, *, drain: bool = False, on_established: Any = None) -> None:
         # Per-group serialization (mirrors OpenClaw's KeyedAsyncQueue): a slow/hung turn in one
         # group must not block inbound dispatch for every other group. We enqueue each inbound
         # message onto a per-group FIFO queue and keep pulling events instead of awaiting the
@@ -1318,11 +2111,20 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # every later group) hostage — the exact head-of-line blocking #513 fixes. So production
         # never drains on stream end; only an explicit shutdown (cancel_all) or a test asking to
         # observe completion (drain=True) waits on in-flight work.
+        self._inbound_established = False
         try:
             async for event in self.client.inbound_events(
                 account_id_hex=self.account_id_hex,
                 group_id_hex=self.group_id_hex,
             ):
+                # A yielded event means the subscription was acked and is healthy;
+                # mark it established so the reconnect loop resets its backoff
+                # attempt counter (a healthy-then-dropped subscription reconnects
+                # promptly; one that never establishes backs off geometrically).
+                if not self._inbound_established:
+                    self._inbound_established = True
+                    if callable(on_established):
+                        on_established()
                 await self._handle_control_event(event)
         finally:
             if drain:
@@ -1338,6 +2140,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             "Marmot connector requested resync (dropped_events=%s); reconnecting subscription",
             dropped_events,
         )
+        self._activation_cache.clear()
         raise _ResyncRequired(
             f"connector resync_required (dropped_events={dropped_events})"
         )
@@ -1347,8 +2150,32 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if event_type == "resync_required":
             await self._handle_resync_required(event)
             return
+        if event_type == "message_deleted":
+            await self._handle_message_deleted(event)
+            return
+        if event_type == "group_state_changed":
+            await self._handle_group_state_changed(event)
+            return
+        if event_type == "group_invite":
+            await self._handle_group_invite(event)
+            return
         if event_type != "inbound_message":
             logger.debug("Ignoring Marmot control event type %s", event_type)
+            return
+
+        message_id_hex = event["message_id_hex"]
+        # Client-side dedupe: the connector can re-emit the same inbound message
+        # (rapid catch-up after subscribe, or across a reconnect). Drop a repeat
+        # silently so the same user message is not dispatched twice. Record the id
+        # BEFORE dispatching (an agent turn takes long enough that record-after
+        # would let a duplicate start a second concurrent turn). Dedupe the id
+        # once regardless of whether onboarding intercepts the message.
+        if message_id_hex in self._recent_inbound_ids:
+            return
+        self._recent_inbound_ids.add(message_id_hex)
+
+        if self.debounce_ms > 0:
+            self._enqueue_debounced(event)
             return
 
         # Hand the turn off to the per-group queue and return immediately so the consume loop
@@ -1359,20 +2186,47 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             lambda evt=event: self._dispatch_inbound_message(evt),
         )
 
+    async def _handle_group_invite(self, event: Dict[str, Any]) -> None:
+        if not self.profile_name_onboarding_enabled or self.profile_name_onboarding is None:
+            return
+        try:
+            account_id_hex = _normalize_hex(event["account_id_hex"], "account_id_hex")
+            group_id_hex = _normalize_hex(event["group_id_hex"], "group_id_hex")
+        except Exception:
+            logger.debug("Ignoring Marmot group_invite with missing ids")
+            return
+        self._inbound_queue.enqueue(
+            group_id_hex,
+            lambda: self._maybe_send_profile_prompt_on_join(account_id_hex, group_id_hex),
+        )
+
     async def _dispatch_inbound_message(self, event: Dict[str, Any]) -> None:
         try:
             group_id_hex = event["group_id_hex"]
             sender_account_id_hex = event["sender_account_id_hex"]
             message_id_hex = event["message_id_hex"]
+            if not await self._should_run_turn(event):
+                logger.debug("Marmot inbound not addressed; skipping turn (groupActivation=mention)")
+                return
+            # Profile-name onboarding runs inside the queued (per-group) unit so the
+            # one-time prompt claim is serialized per group: two concurrent first
+            # messages in distinct groups race only across groups, and the loser of
+            # the claim falls through to a normal turn instead of double-prompting.
             if await self._maybe_handle_profile_name_onboarding(event):
                 return
+
+            sender_display_name = str(event.get("sender_display_name") or "").strip()
+            user_name = sender_display_name or f"Marmot {sender_account_id_hex[:12]}"
 
             source = self.build_source(
                 chat_id=group_id_hex,
                 chat_name=f"Marmot {group_id_hex[:12]}",
                 chat_type="group",
                 user_id=sender_account_id_hex,
-                user_name=f"Marmot {sender_account_id_hex[:12]}",
+                user_name=user_name,
+                # The durable reply threads on source.message_id, so set it to the
+                # inbound message id: the agent's reply threads to the message it is
+                # replying to (mirrors dispatch.ts replyToMessageIdHex = inbound id).
                 message_id=message_id_hex,
             )
             hermes_event = MessageEvent(
@@ -1382,6 +2236,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 raw_message=event,
                 message_id=message_id_hex,
             )
+            media_urls, media_types = await self._download_inbound_media(event)
+            if media_urls:
+                hermes_event.media_urls = media_urls
+                hermes_event.media_types = media_types
+            # Attach any buffered quiet ambient context (a deletion / group-state
+            # change observed since the last turn) as channel_context. The runner
+            # prepends channel_context to the trigger text as context without it
+            # being a trigger itself, so the fact reaches the agent on this turn.
+            # Set via setattr so the adapter stays compatible with a MessageEvent
+            # build that predates the channel_context field.
+            ambient = self._take_pending_ambient_context(group_id_hex)
+            if ambient and hasattr(hermes_event, "channel_context"):
+                hermes_event.channel_context = ambient
             await self.handle_message(hermes_event)
         except asyncio.CancelledError:
             raise
@@ -1389,6 +2256,195 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # A failed turn in one group must not tear down the dispatcher or the queue; log
             # privacy-safely (no ids/payloads) and let other groups keep flowing.
             logger.warning("Marmot inbound dispatch failed", exc_info=True)
+
+    async def _should_run_turn(self, event: Dict[str, Any]) -> bool:
+        if self.group_activation == "always":
+            return True
+        if bool(event.get("mentions_self")):
+            return True
+        if matches_mention_pattern(str(event.get("text") or ""), self.mention_patterns):
+            return True
+
+        account_id_hex = event.get("account_id_hex") or self.account_id_hex
+        group_id_hex = event["group_id_hex"]
+        if not account_id_hex:
+            account_id_hex = await self._ensure_account_id()
+
+        cached = self._activation_cache.get(account_id_hex, group_id_hex)
+        if cached is not None:
+            return cached
+        try:
+            response = await self.client.group_info(account_id_hex, group_id_hex)
+            is_direct = bool(response.get("is_direct"))
+            self._activation_cache.set(account_id_hex, group_id_hex, is_direct)
+            return is_direct
+        except Exception:
+            logger.debug("Marmot group membership lookup failed; skipping turn (fail-closed)")
+            return False
+
+    async def _download_inbound_media(self, event: Dict[str, Any]) -> Tuple[list[str], list[str]]:
+        media_refs = event.get("media") or []
+        if not isinstance(media_refs, list) or not media_refs:
+            return [], []
+
+        account_id_hex = event.get("account_id_hex") or self.account_id_hex
+        group_id_hex = event["group_id_hex"]
+        if not account_id_hex:
+            try:
+                account_id_hex = await self._ensure_account_id()
+            except Exception:
+                return [], []
+
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        for ref in media_refs:
+            if not isinstance(ref, dict):
+                continue
+            try:
+                response = await self.client.download_media(account_id_hex, group_id_hex, ref)
+            except Exception:
+                logger.debug("Marmot inbound media download failed; skipping attachment")
+                continue
+            path = str(response.get("path") or "").strip()
+            if not path:
+                continue
+            source_path = Path(path).expanduser()
+            if not source_path.is_file():
+                continue
+            file_name = str(response.get("file_name") or ref.get("file_name") or source_path.name or "attachment")
+            try:
+                staged_path = self._stage_inbound_media_file(source_path, file_name=file_name)
+            except Exception:
+                logger.debug("Marmot inbound media staging failed; skipping attachment")
+                continue
+            try:
+                os.unlink(source_path)
+            except OSError:
+                pass
+            media_urls.append(str(staged_path))
+            media_types.append(str(response.get("media_type") or ref.get("media_type") or "application/octet-stream"))
+        return media_urls, media_types
+
+    def _stage_inbound_media_file(self, source_path: Path, *, file_name: str) -> Path:
+        self._inbound_media_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(str(file_name or "attachment")).name or "attachment"
+        dest = self._inbound_media_dir / f"{uuid.uuid4().hex}-{safe_name}"
+        shutil.copy2(source_path, dest)
+        dest.chmod(0o600)
+        return dest
+
+    def _debounce_key(self, event: Dict[str, Any]) -> str:
+        # Mirror inbound-runtime.ts buildKey: account:group:sender.
+        return (
+            f"{event.get('account_id_hex') or ''}:"
+            f"{event.get('group_id_hex') or ''}:"
+            f"{event.get('sender_account_id_hex') or ''}"
+        )
+
+    def _enqueue_debounced(self, event: Dict[str, Any]) -> None:
+        key = self._debounce_key(event)
+        self._debounce_pending.setdefault(key, []).append(event)
+        existing = self._debounce_tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._debounce_tasks[key] = loop.create_task(self._debounce_flush_after(key))
+
+    async def _debounce_flush_after(self, key: str) -> None:
+        try:
+            await asyncio.sleep(self.debounce_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        await self._flush_debounced(key)
+
+    async def _flush_debounced(self, key: str) -> None:
+        items = self._debounce_pending.pop(key, [])
+        self._debounce_tasks.pop(key, None)
+        if not items:
+            return
+        # Route the coalesced turn through the per-group queue too, so a debounced
+        # batch stays FIFO-ordered with non-debounced messages in the same group
+        # and a slow turn does not block the debounce-flush task (mirrors the
+        # direct-dispatch path's per-group serialization).
+        merged = _coalesce_inbound_events(items)
+        group_id_hex = merged["group_id_hex"]
+        self._inbound_queue.enqueue(
+            group_id_hex,
+            lambda evt=merged: self._dispatch_inbound_message(evt),
+        )
+
+    async def _handle_message_deleted(self, event: Dict[str, Any]) -> None:
+        # A peer retracted a message. Surface it to the agent as quiet ambient
+        # (next-turn) context, never a triggered reply. Privacy-safe log: no ids.
+        logger.debug("Marmot inbound message deletion observed")
+        group_id_hex = str(event.get("group_id_hex") or "")
+        target_message_id_hex = str(event.get("target_message_id_hex") or "")
+        context_key = f"marmot:message_deleted:{group_id_hex}:{target_message_id_hex}"
+        await self._surface_ambient_context(event, "A message was deleted.", context_key)
+
+    async def _handle_group_state_changed(self, event: Dict[str, Any]) -> None:
+        # A durable group-state change (membership/admin/rename/avatar). Surfaced
+        # to the agent as quiet ambient context; the mapped sentence never carries
+        # a member pubkey. Privacy-safe log: no change contents.
+        logger.debug("Marmot inbound group state change observed")
+        change = str(event.get("change") or "")
+        group_id_hex = str(event.get("group_id_hex") or "")
+        account_id_hex = str(event.get("account_id_hex") or self.account_id_hex or "")
+        if account_id_hex and group_id_hex:
+            self._activation_cache.invalidate(account_id_hex, group_id_hex)
+        sentence = group_state_change_sentence(change, event.get("detail"))
+        context_key = f"marmot:group_state_changed:{group_id_hex}:{change}"
+        await self._surface_ambient_context(event, sentence, context_key)
+
+    async def _surface_ambient_context(
+        self,
+        event: Dict[str, Any],
+        text: str,
+        context_key: str,
+    ) -> None:
+        # Dedupe repeated surfacings of the same fact.
+        if context_key in self._recent_ambient_keys:
+            return
+        self._recent_ambient_keys.add(context_key)
+
+        group_id_hex = str(event.get("group_id_hex") or "")
+        # Quiet next-turn context: an ambient event is NEVER a reply trigger, so
+        # do NOT route it through handle_message() (which would start/queue an
+        # agent turn). Hermes' BasePlatformAdapter has no system-event surface
+        # (unlike OpenClaw's api.runtime.system.enqueueSystemEvent), so we mirror
+        # OpenClaw's quiet-context behavior by buffering the sentence per group
+        # and prepending it to the NEXT real inbound message's channel_context.
+        # If no message ever follows, the fact is only logged — matching
+        # OpenClaw's "when omitted, those events are only logged" degraded mode.
+        self._pending_ambient_context.setdefault(group_id_hex, []).append(text)
+
+    def _take_pending_ambient_context(self, group_id_hex: str) -> Optional[str]:
+        # Drain and join the buffered ambient sentences for a group. Returns None
+        # when nothing is pending so callers can leave channel_context unset.
+        pending = self._pending_ambient_context.pop(group_id_hex, None)
+        if not pending:
+            return None
+        return "\n".join(pending)
+
+    async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
+        store = self.profile_name_onboarding
+        if store is None:
+            return
+
+        suggested = valid_profile_name(self.agent_name)
+        if not await store.try_claim_prompt(account_id_hex, group_id_hex, suggested):
+            return
+
+        result = await self._send_final_direct(
+            group_id_hex,
+            build_profile_prompt(suggested),
+        )
+        if not result.success:
+            logger.debug("Marmot profile-name prompt send failed on join: %s", result.error)
+            await store.clear(account_id_hex)
 
     async def _maybe_handle_profile_name_onboarding(self, event: Dict[str, Any]) -> bool:
         store = self.profile_name_onboarding
@@ -1419,12 +2475,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # (double-prompting and swallowing both user messages). try_claim_prompt() is
             # the single-lock claim that lets exactly one caller win; everyone else returns
             # False here and falls through to a normal turn.
-            if not await store.try_claim_prompt(account_id_hex, group_id_hex):
+            if not await store.try_claim_prompt(
+                account_id_hex,
+                group_id_hex,
+                valid_profile_name(self.agent_name),
+            ):
                 return False
 
             result = await self._send_final_direct(
                 group_id_hex,
-                PROFILE_NAME_PROMPT,
+                build_profile_prompt(valid_profile_name(self.agent_name)),
                 reply_to_message_id_hex=message_id_hex,
             )
             if not result.success:
@@ -1458,7 +2518,18 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 reply_to_message_id_hex=message_id_hex,
             )
             return True
-        if action == "invalid":
+        if action == "affirm":
+            state = await store.get(account_id_hex)
+            suggested = valid_profile_name(state.get("suggested_name"))
+            if not suggested:
+                await self._send_final_direct(
+                    group_id_hex,
+                    PROFILE_NAME_EMPTY,
+                    reply_to_message_id_hex=message_id_hex,
+                )
+                return True
+            name = suggested
+        elif action == "invalid":
             await self._send_final_direct(
                 group_id_hex,
                 response,
@@ -1556,10 +2627,61 @@ async def _standalone_send(
     force_document=False,
 ):
     adapter = MarmotPlatformAdapter(pconfig)
+    if media_files:
+        results = []
+        caption = str(message or "")
+        for index, media_path in enumerate(media_files):
+            path = Path(str(media_path)).expanduser()
+            media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            result = await adapter._send_media_upload(
+                str(chat_id),
+                path=str(path),
+                media_type=media_type,
+                file_name=path.name,
+                caption=caption if index == 0 else None,
+            )
+            if not result.success:
+                return {"error": result.error or "Marmot media send failed"}
+            results.append(result.message_id)
+        return {"success": True, "message_id": results[-1] if results else None}
     result = await adapter.send(str(chat_id), str(message or ""))
     if result.success:
         return {"success": True, "message_id": result.message_id}
     return {"error": result.error or "Marmot send failed"}
+
+
+def _delete_marmot_message_tool(args: Dict[str, Any]) -> str:
+    message_id = str(args.get("message_id") or "").strip()
+    if not message_id:
+        return json.dumps({"ok": False, "error": "message_id required"})
+
+    chat_id: Optional[str] = None
+    target = str(args.get("target") or "").strip()
+    if target:
+        parts = target.split(":", 1)
+        if len(parts) == 2 and parts[0].strip().lower() == "marmot":
+            chat_id = parts[1].strip() or None
+        else:
+            chat_id = target
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from model_tools import _run_async
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        if adapter is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "delete_marmot_message requires a live Marmot adapter in the running gateway",
+                }
+            )
+        deleted = _run_async(adapter.delete_message(chat_id or "", message_id))
+        return json.dumps({"ok": bool(deleted), "deleted": bool(deleted)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
 
 
 def register(ctx):
@@ -1583,6 +2705,30 @@ def register(ctx):
         ),
         emoji="",
     )
+    register_tool = getattr(ctx, "register_tool", None)
+    if callable(register_tool):
+        register_tool(
+            name="delete_marmot_message",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Hex id of the durable Marmot message to retract (kind-5 delete).",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Optional Marmot target as marmot:<group_id_hex>. "
+                            "Omit when the send-time cache can resolve the group."
+                        ),
+                    },
+                },
+                "required": ["message_id"],
+            },
+            handler=_delete_marmot_message_tool,
+        )
 
 
 def resolve_socket_path(extra: Dict[str, Any]) -> str:
@@ -1631,6 +2777,55 @@ def resolve_quic_candidates(extra: Dict[str, Any]) -> list[str]:
     return [candidate for candidate in _split_config_list(configured) if candidate.startswith("quic://")]
 
 
+def resolve_group_activation(extra: Dict[str, Any]) -> Literal["mention", "always"]:
+    configured = _first_config_value(
+        extra,
+        "group_activation",
+        "groupActivation",
+        env="MARMOT_GROUP_ACTIVATION",
+    )
+    if configured is None:
+        return DEFAULT_GROUP_ACTIVATION
+    value = str(configured).strip().lower()
+    if value == "always":
+        return "always"
+    return "mention"
+
+
+def resolve_mention_patterns(extra: Dict[str, Any]) -> list[str]:
+    configured = extra.get("mention_patterns")
+    if configured is None:
+        configured = extra.get("mentionPatterns")
+    if configured is None:
+        configured = os.getenv("MARMOT_MENTION_PATTERNS")
+    patterns = _split_config_list(configured)
+    agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
+    if agent_name:
+        name = str(agent_name).strip()
+        if name and name not in patterns:
+            patterns.append(name)
+    return patterns
+
+
+def resolve_debounce_ms(extra: Dict[str, Any]) -> int:
+    """Resolve the optional inbound debounce window in milliseconds.
+
+    Reads ``MARMOT_DEBOUNCE_MS`` env or the ``debounce_ms`` extra config. A
+    non-negative integer; 0 or absent means disabled (current behavior). A
+    negative or non-integer value is clamped to 0 (disabled).
+    """
+    configured = os.getenv("MARMOT_DEBOUNCE_MS")
+    if configured is None or str(configured).strip() == "":
+        configured = extra.get("debounce_ms")
+    if configured is None or str(configured).strip() == "":
+        return 0
+    try:
+        value = int(str(configured).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def resolve_profile_name_onboarding_enabled(extra: Dict[str, Any]) -> bool:
     configured = os.getenv("MARMOT_PROFILE_NAME_ONBOARDING")
     if configured is None:
@@ -1663,6 +2858,8 @@ def parse_profile_name_reply(text: str) -> tuple[str, Optional[str], str]:
         return ("invalid", None, PROFILE_NAME_EMPTY)
     if value.casefold() in PROFILE_NAME_SKIP_REPLIES:
         return ("skip", None, PROFILE_NAME_SKIPPED)
+    if value.casefold() in PROFILE_NAME_AFFIRM_REPLIES:
+        return ("affirm", None, "")
     if (
         len(value) >= 2
         and value[0] == value[-1]
@@ -1674,6 +2871,23 @@ def parse_profile_name_reply(text: str) -> tuple[str, Optional[str], str]:
     if len(value) > MAX_PROFILE_NAME_CHARS:
         return ("invalid", None, PROFILE_NAME_TOO_LONG)
     return ("name", value, "")
+
+
+def effective_plaintext_cap(policy_max_plaintext_frame_len: Any) -> int:
+    try:
+        policy_cap = int(policy_max_plaintext_frame_len)
+    except (TypeError, ValueError):
+        return AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
+    if policy_cap <= 0:
+        return AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
+    return min(policy_cap, AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN)
+
+
+def effective_stream_chunk_bytes(requested_chunk_bytes: int, policy_max_plaintext_frame_len: Any) -> int:
+    requested = int(requested_chunk_bytes)
+    if requested <= 0 or requested > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN:
+        return requested
+    return min(requested, effective_plaintext_cap(policy_max_plaintext_frame_len))
 
 
 def split_text_deltas(text: str, max_chunk_bytes: int) -> list[bytes]:
