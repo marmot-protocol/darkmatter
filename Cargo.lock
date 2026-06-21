@@ -2561,13 +2561,17 @@ dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
  "async-trait",
+ "bech32",
  "cgka-engine",
  "cgka-session",
  "cgka-traits",
+ "chacha20poly1305",
  "hex",
  "keyring-core",
  "marmot-forensics",
  "nostr",
+ "rand 0.8.6",
+ "scrypt",
  "serde",
  "serde_json",
  "sha2",
@@ -2576,8 +2580,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
+ "zeroize",
 ]
 
 [[package]]
@@ -2652,6 +2658,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
