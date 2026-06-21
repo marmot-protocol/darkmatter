@@ -492,12 +492,10 @@ async fn run_app_runtime_account_worker(
                                     if sync_summary_triggers_audit_tracker_update(&summary) {
                                         shared.schedule_audit_log_tracker_update("scheduled_convergence");
                                     }
-                                    if client.has_pending_convergence_inputs(&group_id) {
-                                        scheduled_convergence
-                                            .schedule_unsettled_groups([group_id.clone()]);
-                                    } else {
-                                        scheduled_convergence.note_success(&group_id);
-                                    }
+                                    scheduled_convergence.schedule_after_pass(
+                                        &group_id,
+                                        client.has_pending_convergence_inputs(&group_id),
+                                    );
                                 }
                                 Err(err) => {
                                     let mut retry_groups = client.take_pending_convergence_groups();
@@ -1214,11 +1212,15 @@ const IDLE_CONVERGENCE_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60
 const MIN_CONVERGENCE_SETTLEMENT_DELAY: Duration = Duration::from_millis(10);
 const CONVERGENCE_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+/// After this many unsettled re-arms, fall back to error-style backoff so a
+/// never-settling input cannot keep the worker waking every ~1.1s indefinitely.
+const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
 struct ScheduledConvergence {
     delay: Duration,
     groups: HashSet<GroupId>,
     retry_attempts: HashMap<GroupId, u32>,
+    unsettled_rearm_attempts: HashMap<GroupId, u32>,
     timer: Pin<Box<Sleep>>,
 }
 
@@ -1228,7 +1230,16 @@ impl ScheduledConvergence {
             delay,
             groups: HashSet::new(),
             retry_attempts: HashMap::new(),
+            unsettled_rearm_attempts: HashMap::new(),
             timer: Box::pin(sleep(IDLE_CONVERGENCE_TIMER_DELAY)),
+        }
+    }
+
+    fn schedule_after_pass(&mut self, group_id: &GroupId, has_pending_inputs: bool) {
+        if has_pending_inputs {
+            self.schedule_unsettled_groups([group_id.clone()]);
+        } else {
+            self.note_success(group_id);
         }
     }
 
@@ -1237,6 +1248,7 @@ impl ScheduledConvergence {
         for group_id in groups {
             saw_group = true;
             self.retry_attempts.remove(&group_id);
+            self.unsettled_rearm_attempts.remove(&group_id);
             self.groups.insert(group_id);
         }
         if saw_group {
@@ -1264,12 +1276,27 @@ impl ScheduledConvergence {
     /// window). Unlike [`Self::schedule_retry_groups`], this is not an error
     /// backoff — it waits one full settlement delay before retrying.
     fn schedule_unsettled_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
-        let mut saw_group = false;
+        let mut normal_delay = false;
+        let mut retry_delay: Option<Duration> = None;
         for group_id in groups {
-            saw_group = true;
-            self.groups.insert(group_id);
+            let attempts = self
+                .unsettled_rearm_attempts
+                .entry(group_id.clone())
+                .or_insert(0);
+            *attempts = attempts.saturating_add(1);
+            self.groups.insert(group_id.clone());
+            if *attempts > CONVERGENCE_UNSETTLED_MAX_REARMS {
+                let retry_attempts = self.retry_attempts.entry(group_id).or_insert(0);
+                *retry_attempts = retry_attempts.saturating_add(1);
+                let group_delay = retry_delay_for_attempt(*retry_attempts);
+                retry_delay = Some(retry_delay.unwrap_or(group_delay).max(group_delay));
+            } else {
+                normal_delay = true;
+            }
         }
-        if saw_group {
+        if let Some(delay) = retry_delay {
+            self.timer.as_mut().reset(TokioInstant::now() + delay);
+        } else if normal_delay {
             let delay = self.normal_delay();
             self.timer.as_mut().reset(TokioInstant::now() + delay);
         }
@@ -1284,6 +1311,7 @@ impl ScheduledConvergence {
 
     fn note_success(&mut self, group_id: &GroupId) {
         self.retry_attempts.remove(group_id);
+        self.unsettled_rearm_attempts.remove(group_id);
     }
 
     fn normal_delay(&self) -> Duration {
@@ -1472,5 +1500,49 @@ mod tests {
         let ready = scheduled.take_ready();
         assert_eq!(ready, vec![group_id.clone()]);
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
+    }
+
+    #[tokio::test]
+    async fn schedule_after_pass_rearms_when_inputs_remain_pending() {
+        let group_id = test_group_id(10);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+
+        scheduled.schedule_after_pass(&group_id, true);
+
+        let ready = scheduled.take_ready();
+        assert_eq!(ready, vec![group_id.clone()]);
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
+    }
+
+    #[tokio::test]
+    async fn schedule_after_pass_notes_success_when_inputs_are_settled() {
+        let group_id = test_group_id(11);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        scheduled.schedule_unsettled_groups([group_id.clone()]);
+        assert_eq!(scheduled.unsettled_rearm_attempts.get(&group_id), Some(&1));
+        scheduled.take_ready();
+
+        scheduled.schedule_after_pass(&group_id, false);
+
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
+        assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
+        assert!(scheduled.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schedule_unsettled_groups_falls_back_to_retry_backoff_after_cap() {
+        let group_id = test_group_id(12);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+
+        for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
+            scheduled.schedule_unsettled_groups([group_id.clone()]);
+            scheduled.take_ready();
+        }
+
+        assert_eq!(
+            scheduled.unsettled_rearm_attempts.get(&group_id),
+            Some(&(CONVERGENCE_UNSETTLED_MAX_REARMS + 1))
+        );
+        assert_eq!(scheduled.retry_attempts.get(&group_id), Some(&1));
     }
 }

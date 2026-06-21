@@ -34,14 +34,14 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
+const PRODUCTION_QUIESCENCE_MS: u64 = 1_000;
+
 fn production_convergence_policy() -> CanonicalizationPolicy {
     CanonicalizationPolicy {
-        settlement_quiescence_ms: 1_000,
+        settlement_quiescence_ms: PRODUCTION_QUIESCENCE_MS,
         ..CanonicalizationPolicy::default()
     }
 }
-
-const PRODUCTION_QUIESCENCE_MS: u64 = 1_000;
 
 async fn two_member_group(
     bus: &TransportBus,

@@ -624,13 +624,18 @@ impl HarnessClient {
         let gid = self.default_group.clone().expect("group");
         self.engine.advance_convergence(&gid).await?;
         self.capture_engine_events();
-        self.drain_auto_publish_confirm().await;
+        for result in self.drain_auto_publish_confirm().await {
+            result?;
+        }
         Ok(())
     }
 
     /// Model the fixed marmot-app account worker: if a scheduled pass did not
     /// settle stored convergence inputs, wait for the quiescence window (+ the
     /// same schedule margin production uses) and run one retry pass.
+    ///
+    /// Production re-arms repeatedly until inputs settle; this helper models only
+    /// the first re-arm after a premature tick.
     pub async fn advance_convergence_with_app_retry(
         &mut self,
         quiescence_ms: u64,
