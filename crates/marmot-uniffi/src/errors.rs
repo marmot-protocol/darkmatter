@@ -116,10 +116,8 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::AccountHome(AccountHomeError::EmptyPassphrase) => Self::EmptyPassphrase,
-            AppError::AccountHome(ref err @ AccountHomeError::EncryptedSecretExport(_)) => {
-                Self::EncryptionFailed {
-                    details: err.to_string(),
-                }
+            AppError::AccountHome(AccountHomeError::EncryptedSecretExport(details)) => {
+                Self::EncryptionFailed { details }
             }
             // A filesystem IO error reading the key, appending the reveal audit
             // entry, or persisting the key-security byte — surfaced either
@@ -331,8 +329,12 @@ mod tests {
         ));
         let ffi: MarmotKitError = app_err.into();
         assert!(
-            matches!(ffi, MarmotKitError::EncryptionFailed { .. }),
-            "NIP-49 encryption failures must map to EncryptionFailed, got {ffi:?}"
+            matches!(
+                ffi,
+                MarmotKitError::EncryptionFailed { ref details }
+                    if details == "scrypt params rejected"
+            ),
+            "NIP-49 encryption failures must map to EncryptionFailed without duplicating the AccountHomeError prefix, got {ffi:?}"
         );
     }
 }
