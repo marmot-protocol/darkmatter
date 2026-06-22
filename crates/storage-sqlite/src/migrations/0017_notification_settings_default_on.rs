@@ -3,6 +3,9 @@ use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
+    // Change only the schema default for newly inserted rows. The INSERT ... SELECT
+    // below copies existing per-account values verbatim so users who already
+    // disabled local notifications stay disabled after the migration.
     tx.execute_batch(
         r#"
 CREATE TABLE notification_settings_new (

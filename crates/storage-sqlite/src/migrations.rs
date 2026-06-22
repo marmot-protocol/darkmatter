@@ -348,6 +348,9 @@ mod tests {
     #[test]
     fn notification_settings_default_migration_preserves_existing_choices() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Versions 1-16 are the schema state immediately before
+        // 0017_notification_settings_default_on.
         run(&mut conn, &MIGRATIONS[..16]).unwrap();
         assert_eq!(
             column_default(

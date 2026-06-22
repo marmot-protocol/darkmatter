@@ -824,6 +824,9 @@ fn legacy_account_projection_imports_once_into_account_storage() {
         .set_native_push_enabled("alice", &account.account_id_hex, true)
         .unwrap();
     legacy
+        .set_local_notifications_enabled("alice", &account.account_id_hex, false)
+        .unwrap();
+    legacy
         .upsert_push_registration(
             PushRegistration {
                 account_ref: "alice".to_owned(),
@@ -860,7 +863,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].plaintext, "from legacy");
     let settings = app.notification_settings("alice").unwrap();
-    assert!(settings.local_notifications_enabled);
+    assert!(!settings.local_notifications_enabled);
     assert!(settings.native_push_enabled);
     assert!(app.push_registration("alice").unwrap().is_some());
     assert_eq!(app.group_push_tokens("alice", "aa").unwrap().len(), 1);
