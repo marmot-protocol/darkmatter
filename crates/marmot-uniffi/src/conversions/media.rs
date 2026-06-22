@@ -238,6 +238,12 @@ pub(crate) fn timeline_media_references_ffi(
         .iter()
         .filter_map(|tag| {
             let tag: Vec<String> = serde_json::from_value(tag.clone()).ok()?;
+            // Match `media_attachments_from_message` (the `list_media` path):
+            // only tags marked `imeta` are resolved, so both paths reject the
+            // same malformed payloads identically.
+            if tag.first().map(String::as_str) != Some("imeta") {
+                return None;
+            }
             media_attachment_from_imeta_tag(&tag, source_epoch)
         })
         .map(Into::into)
@@ -404,6 +410,17 @@ mod tests {
 
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].file_name, "ok.png");
+    }
+
+    #[test]
+    fn timeline_media_references_ffi_rejects_tag_not_marked_imeta() {
+        // A structurally complete attachment whose marker is not "imeta" must be
+        // dropped, exactly as the `list_media` filter would drop it.
+        let mut mislabeled = imeta_tag(0x11, "image/png", "ok.png", &[]);
+        mislabeled[0] = "notimeta".to_owned();
+        let media = imeta_metadata(&[mislabeled]);
+
+        assert!(timeline_media_references_ffi(&Some(media), Some(1)).is_empty());
     }
 
     #[test]
