@@ -2783,6 +2783,58 @@ async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
 }
 
 #[tokio::test]
+async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let alice_id = home.account("alice").unwrap().account_id_hex;
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+
+    alice.update_message_retention(&group_id, 60).await.unwrap();
+
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url)
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let retention_row = alice_timeline
+        .messages
+        .iter()
+        .find(|message| {
+            message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+                && message.plaintext.contains("disappearing_timer_changed")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "alice's timeline should contain a kind-1210 retention row; got {:?}",
+                alice_timeline.messages
+            )
+        });
+    let parsed =
+        marmot_app::group_system_event_from_message(retention_row.kind, &retention_row.plaintext)
+            .expect("typed group-system payload");
+
+    assert_eq!(parsed.system_type, "disappearing_timer_changed");
+    assert_eq!(
+        parsed.actor_account_id_hex.as_deref(),
+        Some(alice_id.as_str())
+    );
+    assert_eq!(parsed.old_retention_seconds, Some(0));
+    assert_eq!(parsed.new_retention_seconds, Some(60));
+}
+
+#[tokio::test]
 async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

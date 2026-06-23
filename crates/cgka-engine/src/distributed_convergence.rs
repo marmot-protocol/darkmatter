@@ -18,9 +18,9 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 
-/// Admin pubkeys + avatar component bytes snapshotted on either side of a
-/// convergence apply, for the unattributed group-state-change diffs.
-type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2]);
+/// Admin pubkeys, avatar component bytes, and message retention snapshotted on
+/// either side of a convergence apply, for unattributed group-state-change diffs.
+type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
 
 impl<S: StorageProvider> Engine<S> {
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
@@ -314,9 +314,12 @@ impl<S: StorageProvider> Engine<S> {
         .ok()
         .flatten()?;
         let admins = crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
+        let message_retention =
+            crate::app_components::message_retention_seconds_of_group(&mls_group).ok()?;
         Some((
             admins,
             crate::message_processor::avatar_component_snapshot(&mls_group),
+            message_retention,
         ))
     }
 
@@ -353,8 +356,10 @@ impl<S: StorageProvider> Engine<S> {
         // selected-tip diff is net of commits the direct seam already applied
         // (their effects are part of the "previous" snapshot), so changes already
         // emitted attributed there do not re-emit here as duplicates.
-        if let (Some((before_admins, before_avatar)), Some((after_admins, after_avatar))) =
-            (previous_components, self.reorg_component_snapshot(group_id))
+        if let (
+            Some((before_admins, before_avatar, before_message_retention)),
+            Some((after_admins, after_avatar, after_message_retention)),
+        ) = (previous_components, self.reorg_component_snapshot(group_id))
         {
             for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
                 self.push_group_state_change(
@@ -370,6 +375,18 @@ impl<S: StorageProvider> Engine<S> {
                 Some(current_group.name.as_str()),
                 &before_avatar,
                 &after_avatar,
+            ) {
+                self.push_group_state_change(
+                    group_id,
+                    selected_tip,
+                    None,
+                    change,
+                    origin_commit_id.clone(),
+                );
+            }
+            for change in crate::group_state_changes::message_retention_changes(
+                before_message_retention,
+                after_message_retention,
             ) {
                 self.push_group_state_change(
                     group_id,
