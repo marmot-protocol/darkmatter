@@ -342,6 +342,15 @@ fn mention_classification_uses_receiver_p_tag() {
 }
 
 #[test]
+fn mention_classification_normalizes_npub_p_tags() {
+    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let npub = crate::npub_for_account_id(&receiver).unwrap();
+    let message = received_chat("hi", vec![vec!["p".to_owned(), npub]]);
+
+    assert!(message_mentions_account(&message, &receiver));
+}
+
+#[test]
 fn mention_classification_uses_inline_nip27_entities() {
     let receiver = nostr::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
@@ -371,6 +380,31 @@ fn mention_classification_ignores_non_chat_p_tags() {
     message.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
 
     assert!(!message_mentions_account(&message, &receiver));
+}
+
+#[test]
+fn mention_notification_suppresses_self_mentions() {
+    let receiver = "aa".repeat(32);
+    let message = received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]);
+
+    assert!(notification_is_mention(&message, &receiver, false));
+    assert!(!notification_is_mention(&message, &receiver, true));
+}
+
+#[test]
+fn group_invite_notification_is_not_a_mention() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 32]);
+
+    let update =
+        notification_update_from_group_join(&app, "alice", &account.account_id_hex, &group_id)
+            .unwrap();
+
+    assert!(matches!(update.trigger, NotificationTrigger::GroupInvite));
+    assert!(!update.is_mention);
 }
 
 #[test]
