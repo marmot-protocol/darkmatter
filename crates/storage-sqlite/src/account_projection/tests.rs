@@ -685,6 +685,16 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
 }
 
 #[test]
+fn delete_local_group_data_rejects_blank_group_id() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let err = store
+        .delete_local_group_data(" \t ")
+        .expect_err("blank group IDs must be rejected before opening a transaction");
+
+    assert!(format!("{err}").contains("local group delete id must not be empty"));
+}
+
+#[test]
 fn delete_local_group_data_rolls_back_all_tables_on_failure() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let state = StoredAccountState {

@@ -641,13 +641,13 @@ impl AppClient {
                 .retain(|group| group.group_id_hex != group_id_hex);
             if let Err(error) = self.refresh_routing() {
                 self.state.groups = original_groups;
-                let _ = self.refresh_routing();
+                self.refresh_routing()?;
                 return Err(error);
             }
             if let Err(error) = self.sync_runtime_groups().await {
                 self.state.groups = original_groups;
-                let _ = self.refresh_routing();
-                let _ = self.sync_runtime_groups().await;
+                self.refresh_routing()?;
+                self.sync_runtime_groups().await?;
                 return Err(error);
             }
         }
@@ -660,8 +660,8 @@ impl AppClient {
             Err(error) => {
                 if was_live {
                     self.state.groups = original_groups;
-                    let _ = self.refresh_routing();
-                    let _ = self.sync_runtime_groups().await;
+                    self.refresh_routing()?;
+                    self.sync_runtime_groups().await?;
                 }
                 Err(error)
             }
