@@ -54,6 +54,8 @@ pub const GROUP_SYSTEM_TYPE_ADMIN_ADDED: &str = "admin_added";
 pub const GROUP_SYSTEM_TYPE_ADMIN_REMOVED: &str = "admin_removed";
 pub const GROUP_SYSTEM_TYPE_GROUP_RENAMED: &str = "group_renamed";
 pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
+/// Product-facing system row for the `marmot.group.message-retention.v1` app
+/// component changing (the app calls this the disappearing-message timer).
 pub const GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED: &str = "disappearing_timer_changed";
 
 /// Human-readable fallback `text` for kind-1210 group system rows. These strings
@@ -565,7 +567,7 @@ mod tests {
         let actor = MemberId::new(vec![0xaa; 32]);
         let epoch = 3;
 
-        let cases: [(&str, GroupStateChange, Option<&MemberId>); 7] = [
+        let cases: [(&str, GroupStateChange, Option<&MemberId>); 8] = [
             (
                 "member_added",
                 GroupStateChange::MemberAdded {
@@ -613,6 +615,14 @@ mod tests {
                 GroupStateChange::GroupAvatarChanged,
                 Some(&actor),
             ),
+            (
+                "disappearing_timer_changed",
+                GroupStateChange::MessageRetentionChanged {
+                    old_seconds: 0,
+                    new_seconds: 60,
+                },
+                Some(&actor),
+            ),
         ];
 
         let expected = [
@@ -643,6 +653,10 @@ mod tests {
             (
                 "group_avatar_changed",
                 "db1158ef961902a3f979dc2d8cdf2aba51b1d2568b83e12820490b853188dc40",
+            ),
+            (
+                "disappearing_timer_changed",
+                "94c4a1dfc205b1cb52ec17e29d5a33a007a0769046356aaab47edc49bb909b66",
             ),
         ];
 
