@@ -1401,6 +1401,22 @@ fn sync_until_member_removed(
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        // A SelfRemove is a proposal first: the remaining member must advance
+        // convergence to publish the auto-commit that removes the departed
+        // member. Drive that path explicitly instead of racing the short-lived
+        // CLI process's background convergence timer.
+        let _ = run_json_with_relay(
+            home,
+            relay,
+            &[
+                "--account",
+                account,
+                "messages",
+                "retry",
+                group_id,
+                "member-removal-convergence",
+            ],
+        );
         let members = run_json(home, &["--account", account, "group", "members", group_id]);
         if !member_accounts(&members).contains(&member.to_owned()) {
             return members;
