@@ -1401,6 +1401,10 @@ fn sync_until_member_removed(
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        // Sync persists the SelfRemove convergence candidate with a due time;
+        // give that timestamp a chance to become eligible before the next CLI
+        // process explicitly advances convergence.
+        std::thread::sleep(POLL_INTERVAL);
         // A SelfRemove is a proposal first: the remaining member must advance
         // convergence to publish the auto-commit that removes the departed
         // member. Drive that path explicitly instead of racing the short-lived
