@@ -1404,7 +1404,10 @@ fn sync_until_member_removed(
         // A SelfRemove is a proposal first: the remaining member must advance
         // convergence to publish the auto-commit that removes the departed
         // member. Drive that path explicitly instead of racing the short-lived
-        // CLI process's background convergence timer.
+        // CLI process's background convergence timer. The retry command scopes
+        // work by group_id; its event_id positional is just echoed as a label.
+        // Ignore transient retry failures here because the authoritative check
+        // is the independent group-members projection below.
         let _ = run_json_with_relay(
             home,
             relay,
@@ -1414,7 +1417,7 @@ fn sync_until_member_removed(
                 "messages",
                 "retry",
                 group_id,
-                "member-removal-convergence",
+                "converge",
             ],
         );
         let members = run_json(home, &["--account", account, "group", "members", group_id]);
