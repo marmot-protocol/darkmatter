@@ -4,7 +4,7 @@ use crate::{
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
-    OptionalExtension, Transaction, params, params_from_iter,
+    Connection, OptionalExtension, Transaction, params, params_from_iter,
     types::{Type, Value},
 };
 
@@ -480,12 +480,27 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         cutoff_recorded_at: u64,
     ) -> StorageResult<usize> {
+        self.secure_prune_app_events_before(group_id_hex, cutoff_recorded_at)
+            .map(|outcome| outcome.pruned_events)
+    }
+
+    pub fn secure_prune_app_events_before(
+        &self,
+        group_id_hex: &str,
+        cutoff_recorded_at: u64,
+    ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let pruned =
-            crate::timeline::prune_app_events_before_tx(&tx, group_id_hex, cutoff_recorded_at)?;
+        let outcome = crate::timeline::secure_prune_app_events_before_tx(
+            &tx,
+            group_id_hex,
+            cutoff_recorded_at,
+        )?;
         tx.commit().storage()?;
-        Ok(pruned)
+        if outcome.pruned_events > 0 {
+            checkpoint_wal_truncate_after_secure_prune(&conn)?;
+        }
+        Ok(outcome)
     }
 
     pub fn account_import_marker(&self, name: &str) -> StorageResult<bool> {
@@ -823,6 +838,22 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         Ok(())
+    }
+}
+
+fn checkpoint_wal_truncate_after_secure_prune(conn: &Connection) -> StorageResult<()> {
+    let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .storage()?;
+    if busy == 0 {
+        Ok(())
+    } else {
+        Err(StorageError::Busy(
+            "retention secure-delete WAL checkpoint could not truncate while readers are active"
+                .to_owned(),
+        ))
     }
 }
 

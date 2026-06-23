@@ -56,7 +56,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage_sqlite::{
-    SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery, TimelineProjectionUpdate,
+    SecurePruneAppEventsResult, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
+    TimelineProjectionUpdate,
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -511,6 +512,25 @@ pub struct AppMessageQuery {
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecureDeleteExpiredResult {
+    /// Number of expired raw app-event rows securely scrubbed and pruned.
+    pub pruned_messages: u64,
+    /// Ciphertext hashes for encrypted-media attachments referenced by the
+    /// pruned rows. Host apps can use these opaque blob ids to purge their own
+    /// decrypted-media disk caches alongside the engine plaintext wipe.
+    pub media_ciphertext_sha256: Vec<String>,
+}
+
+impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
+    fn from(value: SecurePruneAppEventsResult) -> Self {
+        Self {
+            pruned_messages: value.pruned_events as u64,
+            media_ciphertext_sha256: value.media_ciphertext_sha256,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2335,15 +2355,16 @@ impl MarmotApp {
         })
     }
 
-    pub(crate) fn prune_account_app_events_before(
+    pub(crate) fn secure_prune_account_app_events_before(
         &self,
         label: &str,
         group_id_hex: &str,
         cutoff_recorded_at: u64,
-    ) -> Result<usize, AppError> {
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
         Ok(self
             .account_storage(label)?
-            .prune_app_events_before(group_id_hex, cutoff_recorded_at)?)
+            .secure_prune_app_events_before(group_id_hex, cutoff_recorded_at)?
+            .into())
     }
 
     fn migrate_legacy_account_projection_if_needed(&self, label: &str) -> Result<(), AppError> {
