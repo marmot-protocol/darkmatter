@@ -311,6 +311,68 @@ fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
     }
 }
 
+fn received_chat(plaintext: &str, tags: Vec<Vec<String>>) -> ReceivedMessage {
+    ReceivedMessage {
+        message_id_hex: "ee".repeat(32),
+        source_message_id_hex: "ee".repeat(32),
+        sender: "bb".repeat(32),
+        sender_display_name: None,
+        group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
+        source_epoch: 1,
+        plaintext: plaintext.to_owned(),
+        kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        tags,
+        recorded_at: 0,
+    }
+}
+
+#[test]
+fn mention_classification_uses_receiver_p_tag() {
+    let receiver = "aa".repeat(32);
+    let message = received_chat(
+        "hi",
+        vec![vec![
+            "p".to_owned(),
+            receiver.clone(),
+            "wss://relay.example".to_owned(),
+        ]],
+    );
+
+    assert!(message_mentions_account(&message, &receiver));
+}
+
+#[test]
+fn mention_classification_uses_inline_nip27_entities() {
+    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let npub = crate::npub_for_account_id(&receiver).unwrap();
+    let nprofile = crate::nprofile_for_account_id(&receiver, &[]).unwrap();
+
+    for token in [receiver.as_str(), npub.as_str(), nprofile.as_str()] {
+        let message = received_chat(&format!("hi nostr:{token}"), Vec::new());
+        assert!(
+            message_mentions_account(&message, &receiver),
+            "mention token form failed: {token}"
+        );
+    }
+}
+
+#[test]
+fn mention_classification_ignores_plain_preview_text() {
+    let receiver = "aa".repeat(32);
+    let message = received_chat(&format!("hi {receiver}"), Vec::new());
+
+    assert!(!message_mentions_account(&message, &receiver));
+}
+
+#[test]
+fn mention_classification_ignores_non_chat_p_tags() {
+    let receiver = "aa".repeat(32);
+    let mut message = received_chat("👍", vec![vec!["p".to_owned(), receiver.clone()]]);
+    message.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
+
+    assert!(!message_mentions_account(&message, &receiver));
+}
+
 #[test]
 fn reaction_message_carries_emoji_and_resolved_target_preview() {
     let target = timeline_target(

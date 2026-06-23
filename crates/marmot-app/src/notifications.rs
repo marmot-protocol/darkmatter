@@ -10,6 +10,7 @@ use nostr::{
     EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, UnsignedEvent,
     base64::Engine as _,
     base64::engine::general_purpose::STANDARD as BASE64_STANDARD,
+    nips::nip21::Nip21,
     secp256k1::{Parity, PublicKey as SecpPublicKey, SecretKey, XOnlyPublicKey, ecdh},
 };
 use rand::{RngCore, rngs::OsRng};
@@ -40,6 +41,7 @@ const MIP05_CIPHERTEXT_LEN: usize = MIP05_TOKEN_PLAINTEXT_LEN + 16;
 const MIP05_HKDF_SALT: &[u8] = b"mip05-v1";
 const MIP05_HKDF_INFO: &[u8] = b"mip05-token-encryption";
 const NOTIFICATION_VERSION_TAG: &str = "v";
+const PUBKEY_REF_TAG: &str = "p";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PushPlatform {
@@ -166,6 +168,11 @@ pub struct NotificationUpdate {
     pub group_id_hex: String,
     pub group_name: Option<String>,
     pub is_dm: bool,
+    /// True when this notification's receiving account is mentioned by a NIP-27
+    /// pubkey-reference (`p`) tag or inline `nostr:` pubkey entity on the inbound
+    /// app event. This is computed from event semantics, not the rendered
+    /// preview text.
+    pub is_mention: bool,
     pub message_id_hex: Option<String>,
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
@@ -702,6 +709,7 @@ fn notification_update_from_message(
         group_id_hex,
         group_name: group_name(group.as_ref()),
         is_dm: false,
+        is_mention: message_mentions_account(&event.message, &event.account_id_hex),
         message_id_hex: Some(event.message.message_id_hex.clone()),
         sender,
         receiver,
@@ -744,6 +752,7 @@ fn notification_update_from_group_join(
         group_id_hex,
         group_name: group_name(group.as_ref()),
         is_dm: false,
+        is_mention: false,
         message_id_hex: None,
         sender,
         receiver,
@@ -763,6 +772,52 @@ fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
 
 fn preview_text_for_message(message: &ReceivedMessage) -> Option<String> {
     preview_text_for_kind(message.kind, &message.plaintext)
+}
+
+fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> bool {
+    if message.kind != MARMOT_APP_EVENT_KIND_CHAT || account_id_hex.is_empty() {
+        return false;
+    }
+    if message.tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == PUBKEY_REF_TAG)
+            && tag
+                .get(1)
+                .is_some_and(|value| value.eq_ignore_ascii_case(account_id_hex))
+    }) {
+        return true;
+    }
+    inline_nip27_mentions_account(&message.plaintext, account_id_hex)
+}
+
+fn inline_nip27_mentions_account(content: &str, account_id_hex: &str) -> bool {
+    for (idx, _) in content.match_indices("nostr:") {
+        let rest = &content[idx + "nostr:".len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        if token.is_empty() {
+            continue;
+        }
+        if mention_token_pubkey_hex(token)
+            .as_deref()
+            .is_some_and(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn mention_token_pubkey_hex(token: &str) -> Option<String> {
+    if let Ok(parsed) = Nip21::parse(&format!("nostr:{token}")) {
+        return match parsed {
+            Nip21::Pubkey(pubkey) => Some(pubkey.to_hex()),
+            Nip21::Profile(profile) => Some(profile.public_key.to_hex()),
+            _ => None,
+        };
+    }
+    PublicKey::parse(token).ok().map(|pubkey| pubkey.to_hex())
 }
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
