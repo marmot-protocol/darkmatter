@@ -395,6 +395,29 @@ fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Va
     value["result"].clone()
 }
 
+fn try_run_json_with_relay(
+    home: &std::path::Path,
+    relay: &str,
+    args: &[&str],
+) -> Result<Value, String> {
+    let output = dm_with_relay(home, relay)
+        .args(args)
+        .output()
+        .map_err(|error| format!("dm command should start: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "dm failed\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
+            command_output_summary(&output)
+        ));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("stdout should be JSON: {error}"))?;
+    if value["ok"] != true {
+        return Err(format!("unexpected json response: {value}"));
+    }
+    Ok(value["result"].clone())
+}
+
 fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
     let output = dm(home)
         .args(args)
@@ -1408,7 +1431,7 @@ fn sync_until_member_removed(
         // work by group_id; its event_id positional is just echoed as a label.
         // Ignore transient retry failures here because the authoritative check
         // is the independent group-members projection below.
-        let _ = run_json_with_relay(
+        let _ = try_run_json_with_relay(
             home,
             relay,
             &[
