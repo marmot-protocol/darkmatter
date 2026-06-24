@@ -240,6 +240,7 @@ fn audit_event_round_trips_through_serde() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 7,
         wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::FullData,
         recorder_session_id: Some("recorder-1".into()),
         account_ref: Some("account-1".into()),
         engine_id: "engine-xyz".into(),
@@ -273,8 +274,13 @@ fn audit_event_round_trips_through_serde() {
 fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
     vec![
         AuditEventKind::RecorderStarted {
-            recorder_session_id: "recorder-1".into(),
             recorder: "jsonl".into(),
+        },
+        AuditEventKind::AuditDataModeChanged {
+            previous_mode: AuditDataMode::ObfuscatedSensitiveData,
+            new_mode: AuditDataMode::FullData,
+            reason: "settings_changed".into(),
+            recorder_restarted: Some(true),
         },
         AuditEventKind::EngineContext {
             context: AuditEngineContext {
@@ -478,6 +484,7 @@ fn audit_event_kind_round_trips_all_variants() {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
             seq: 0,
             wall_time_ms: 0,
+            audit_data_mode: AuditDataMode::default(),
             recorder_session_id: None,
             account_ref: None,
             engine_id: "e".into(),
@@ -494,7 +501,7 @@ fn audit_event_kind_round_trips_all_variants() {
 #[test]
 fn audit_log_event_schema_tracks_kind_catalog() {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/audit-log-event.v1.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v2.schema.json")).unwrap();
     assert_eq!(
         schema
             .pointer("/properties/schema_version/const")
@@ -522,4 +529,153 @@ fn audit_log_event_schema_tracks_kind_catalog() {
         .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(schema_tags, code_tags);
+}
+
+#[test]
+fn jsonl_recorder_defaults_to_obfuscated_mode_and_stamps_every_event() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    drop(recorder);
+
+    // Both the `recorder_started` boundary and the row above carry the mode.
+    let events: Vec<AuditEvent> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.audit_data_mode == AuditDataMode::ObfuscatedSensitiveData)
+    );
+}
+
+#[test]
+fn jsonl_recorder_opened_in_full_data_mode_stamps_full_data() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-full");
+    let recorder = JsonlRecorder::open_with_data_mode(
+        &path,
+        "engine-full".to_string(),
+        None,
+        AuditDataMode::FullData,
+    )
+    .unwrap();
+    assert_eq!(recorder.data_mode(), AuditDataMode::FullData);
+    drop(recorder);
+
+    let event: AuditEvent =
+        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(event.audit_data_mode, AuditDataMode::FullData);
+}
+
+#[test]
+fn set_data_mode_rotates_and_writes_a_clear_boundary() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    // `recorder_started` + the obfuscated send row.
+    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+
+    recorder
+        .set_data_mode(AuditDataMode::FullData, "settings_changed")
+        .unwrap();
+    assert_eq!(recorder.data_mode(), AuditDataMode::FullData);
+
+    // The rotation discards the obfuscated lines: the fresh file holds only the
+    // `recorder_started` marker and the `audit_data_mode_changed` boundary, both
+    // stamped with the new mode and starting from seq 0.
+    let events: Vec<AuditEvent> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].seq, 0);
+    assert!(matches!(
+        events[0].kind,
+        AuditEventKind::RecorderStarted { .. }
+    ));
+    assert_eq!(events[1].seq, 1);
+    match &events[1].kind {
+        AuditEventKind::AuditDataModeChanged {
+            previous_mode,
+            new_mode,
+            reason,
+            recorder_restarted,
+        } => {
+            assert_eq!(*previous_mode, AuditDataMode::ObfuscatedSensitiveData);
+            assert_eq!(*new_mode, AuditDataMode::FullData);
+            assert_eq!(reason, "settings_changed");
+            assert_eq!(*recorder_restarted, Some(true));
+        }
+        other => panic!("expected audit_data_mode_changed, got {other:?}"),
+    }
+    assert!(
+        events
+            .iter()
+            .all(|event| event.audit_data_mode == AuditDataMode::FullData),
+        "the rotated file must be entirely the new mode"
+    );
+
+    // Recording continues into the new file under the new mode.
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    drop(recorder);
+    let last: AuditEvent =
+        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().last().unwrap()).unwrap();
+    assert_eq!(last.audit_data_mode, AuditDataMode::FullData);
+}
+
+#[test]
+fn set_data_mode_is_a_no_op_when_mode_is_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let before = fs::read_to_string(&path).unwrap();
+
+    // Requesting the mode the recorder is already in must not rotate the file
+    // nor insert a spurious boundary row.
+    recorder
+        .set_data_mode(AuditDataMode::ObfuscatedSensitiveData, "noop")
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
+}
+
+#[test]
+fn noop_recorder_reports_default_mode_and_ignores_mode_change() {
+    let recorder = NoopRecorder;
+    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
+    recorder
+        .set_data_mode(AuditDataMode::FullData, "ignored")
+        .unwrap();
+    // A no-op recorder has no backing store; the default mode never changes.
+    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
 }

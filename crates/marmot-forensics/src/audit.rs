@@ -19,6 +19,21 @@
 //!
 //! Every line is tagged with [`AUDIT_LOG_SCHEMA_VERSION`]. Bump the version
 //! when adding required fields; analyzers should reject unknown versions.
+//!
+//! ## Data modes
+//!
+//! Every line also carries an [`AuditDataMode`] recording how aggressively the
+//! producing recorder withheld sensitive content:
+//!
+//! - [`AuditDataMode::ObfuscatedSensitiveData`] — the default safety posture.
+//!   Identifiers are hashed/truncated and no plaintext, decoded content, or
+//!   full pubkeys appear.
+//! - [`AuditDataMode::FullData`] — an explicit opt-in that additionally emits
+//!   decrypted message/app content and full identifiers where useful.
+//!
+//! A recorder stamps its configured mode onto every event. Switching modes
+//! ([`ForensicRecorder::set_data_mode`]) rotates the backing store so each
+//! file has a single, unambiguous mode boundary.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -29,7 +44,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v1";
+pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v2";
+
+/// How aggressively a recorder withholds sensitive content from its events.
+///
+/// Stamped onto every [`AuditEvent`] so an analyzer can tell, per line, which
+/// safety posture produced it without inspecting the whole file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDataMode {
+    /// Default/current safety posture. Identifiers are hashed or truncated;
+    /// no plaintext, decoded content, full author pubkeys, full group-state
+    /// values, or expected-recipient pubkeys are written.
+    #[default]
+    ObfuscatedSensitiveData,
+    /// Explicit opt-in. Additionally includes decrypted message/app content and
+    /// full identifiers where useful for forensic reconstruction. Never
+    /// includes bearer/upload tokens, auth headers, private keys, ciphertext,
+    /// or raw MLS bytes.
+    FullData,
+}
 
 /// Hex-encoded 16-byte account identity hash. Stable across devices for the
 /// same account when the caller supplies it.
@@ -62,6 +96,12 @@ pub struct AuditEvent {
     pub schema_version: String,
     pub seq: u64,
     pub wall_time_ms: u64,
+    /// Safety posture the producing recorder used for this line. The recorder
+    /// always serializes it explicitly; the `default` only makes a truncated or
+    /// partially-written final line still deserialize as the safe (obfuscated)
+    /// mode rather than erroring.
+    #[serde(default)]
+    pub audit_data_mode: AuditDataMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorder_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,10 +212,20 @@ pub struct AuditRecorderHealthSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditEventKind {
-    /// The JSONL recorder opened a new local recorder session.
-    RecorderStarted {
-        recorder_session_id: String,
-        recorder: String,
+    /// The JSONL recorder opened a new local recorder session. The session id
+    /// is carried on the enclosing [`AuditEvent::recorder_session_id`] rather
+    /// than duplicated here.
+    RecorderStarted { recorder: String },
+    /// The recorder's [`AuditDataMode`] changed. Emitted on the freshly-rotated
+    /// file so the boundary between modes is explicit. `recorder_restarted` is
+    /// `true` when the change rotated the backing store (always so for the
+    /// file-backed recorder).
+    AuditDataModeChanged {
+        previous_mode: AuditDataMode,
+        new_mode: AuditDataMode,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recorder_restarted: Option<bool>,
     },
     /// Engine/session settings that explain how later decisions should be read.
     EngineContext { context: AuditEngineContext },
@@ -449,6 +499,7 @@ impl AuditEventKind {
     pub fn type_tag(&self) -> &'static str {
         match self {
             AuditEventKind::RecorderStarted { .. } => "recorder_started",
+            AuditEventKind::AuditDataModeChanged { .. } => "audit_data_mode_changed",
             AuditEventKind::EngineContext { .. } => "engine_context",
             AuditEventKind::GroupContext { .. } => "group_context",
             AuditEventKind::RecorderHealth { .. } => "recorder_health",
@@ -540,6 +591,24 @@ pub trait ForensicRecorder: Send + Sync {
     fn rotate(&self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// The [`AuditDataMode`] this recorder stamps onto every event.
+    fn data_mode(&self) -> AuditDataMode {
+        AuditDataMode::default()
+    }
+
+    /// Switch the recorder's [`AuditDataMode`].
+    ///
+    /// On a real change this rotates the backing store so the file carries a
+    /// single, unambiguous mode, then records an
+    /// [`AuditEventKind::AuditDataModeChanged`] boundary row on the fresh file.
+    /// When the requested mode already matches the current one this is a no-op
+    /// (no spurious rotation). The default is a no-op for recorders with no
+    /// mode or rotatable backing store.
+    fn set_data_mode(&self, new_mode: AuditDataMode, reason: &str) -> std::io::Result<()> {
+        let _ = (new_mode, reason);
+        Ok(())
+    }
 }
 
 /// Default recorder. Drops every event without observable side effects.
@@ -568,6 +637,7 @@ struct JsonlInner {
     account_ref: Option<AccountRefHex>,
     engine_id: EngineIdHex,
     recorder_session_id: String,
+    data_mode: AuditDataMode,
     health: AuditRecorderHealthSnapshot,
 }
 
@@ -588,10 +658,24 @@ impl JsonlRecorder {
         Self::open_with_account_ref(path, engine_id, None)
     }
 
+    /// Open a recorder in the default [`AuditDataMode::ObfuscatedSensitiveData`]
+    /// posture. To start in another mode use [`open_with_data_mode`].
+    ///
+    /// [`open_with_data_mode`]: Self::open_with_data_mode
     pub fn open_with_account_ref(
         path: impl AsRef<Path>,
         engine_id: EngineIdHex,
         account_ref: Option<AccountRefHex>,
+    ) -> std::io::Result<Self> {
+        Self::open_with_data_mode(path, engine_id, account_ref, AuditDataMode::default())
+    }
+
+    /// Open a recorder that stamps `data_mode` onto every event.
+    pub fn open_with_data_mode(
+        path: impl AsRef<Path>,
+        engine_id: EngineIdHex,
+        account_ref: Option<AccountRefHex>,
+        data_mode: AuditDataMode,
     ) -> std::io::Result<Self> {
         if let Some(account_ref) = account_ref.as_deref() {
             validate_account_ref_hex(account_ref)?;
@@ -606,18 +690,22 @@ impl JsonlRecorder {
                 seq: 0,
                 account_ref,
                 engine_id,
-                recorder_session_id: recorder_session_id.clone(),
+                recorder_session_id,
+                data_mode,
                 health: AuditRecorderHealthSnapshot::default(),
             }),
         };
-        recorder.record(AuditRecord::new(
-            None,
-            AuditEventKind::RecorderStarted {
-                recorder_session_id,
-                recorder: "marmot_forensics::JsonlRecorder".to_string(),
-            },
-        ));
+        recorder.record(AuditRecord::new(None, recorder_started_kind()));
         Ok(recorder)
+    }
+}
+
+/// The `recorder_started` boundary row recorded by [`JsonlRecorder::open`] and
+/// after each rotation. The recorder session id lives on the enclosing
+/// [`AuditEvent::recorder_session_id`], so the kind only names the recorder.
+fn recorder_started_kind() -> AuditEventKind {
+    AuditEventKind::RecorderStarted {
+        recorder: "marmot_forensics::JsonlRecorder".to_string(),
     }
 }
 
@@ -684,6 +772,7 @@ impl ForensicRecorder for JsonlRecorder {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            audit_data_mode: inner.data_mode,
             recorder_session_id: Some(inner.recorder_session_id.clone()),
             account_ref: inner.account_ref.clone(),
             engine_id: inner.engine_id.clone(),
@@ -718,47 +807,93 @@ impl ForensicRecorder for JsonlRecorder {
     }
 
     fn rotate(&self) -> std::io::Result<()> {
-        // Generate the new session id up front; `record` below re-acquires the
-        // lock, so we must release it before recording the boundary line.
-        let recorder_session_id = generate_recorder_session_id();
         {
             let mut inner = match self.inner.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            // Best-effort flush of whatever is buffered into the file we are
-            // about to discard.
-            let _ = inner.writer.flush();
-            // Unlink the current file. The fd still held by `inner.writer`
-            // keeps pointing at the now-unlinked inode until it is replaced
-            // below; on Unix that is harmless and the writer is discarded
-            // immediately. A missing file is fine — the goal state is "no old
-            // file, fresh file recording".
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-            // Open a brand-new file at the same path and swap it in. Assigning
-            // to `inner.writer` drops the old `BufWriter`, closing the stale
-            // (unlinked) fd.
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
-            inner.writer = BufWriter::new(file);
-            inner.seq = 0;
-            inner.recorder_session_id = recorder_session_id.clone();
-            inner.health = AuditRecorderHealthSnapshot::default();
+            self.swap_to_fresh_file(&mut inner)?;
         }
-        // Mark the start of the fresh file, mirroring `open_with_account_ref`.
+        // Mark the start of the fresh file, mirroring `open_with_data_mode`.
+        // `record` re-acquires the lock, so this runs after the guard is
+        // dropped above.
+        self.record(AuditRecord::new(None, recorder_started_kind()));
+        Ok(())
+    }
+
+    fn data_mode(&self) -> AuditDataMode {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .data_mode
+    }
+
+    fn set_data_mode(&self, new_mode: AuditDataMode, reason: &str) -> std::io::Result<()> {
+        let previous_mode = {
+            let mut inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let previous_mode = inner.data_mode;
+            // No real change: leave the current file (and its single mode)
+            // intact rather than inserting a spurious boundary.
+            if previous_mode == new_mode {
+                return Ok(());
+            }
+            // Apply the mode before swapping so the fresh file is stamped
+            // entirely with `new_mode`, then rotate so the old mode's lines
+            // never share a file with the new mode's.
+            inner.data_mode = new_mode;
+            self.swap_to_fresh_file(&mut inner)?;
+            previous_mode
+        };
+        // Boundary rows on the fresh file: the `recorder_started` marker
+        // followed by the mode-change record, both stamped with `new_mode`.
+        self.record(AuditRecord::new(None, recorder_started_kind()));
         self.record(AuditRecord::new(
             None,
-            AuditEventKind::RecorderStarted {
-                recorder_session_id,
-                recorder: "marmot_forensics::JsonlRecorder".to_string(),
+            AuditEventKind::AuditDataModeChanged {
+                previous_mode,
+                new_mode,
+                reason: reason.to_string(),
+                recorder_restarted: Some(true),
             },
         ));
+        Ok(())
+    }
+}
+
+impl JsonlRecorder {
+    /// Discard the current backing file and reopen an empty one at the same
+    /// path, resetting the sequence, recorder session id, and health counters.
+    /// The caller must hold the inner lock; the data mode is left untouched so
+    /// both [`rotate`](ForensicRecorder::rotate) and
+    /// [`set_data_mode`](ForensicRecorder::set_data_mode) can reuse it.
+    fn swap_to_fresh_file(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
+        // Best-effort flush of whatever is buffered into the file we are about
+        // to discard.
+        let _ = inner.writer.flush();
+        // Unlink the current file. The fd still held by `inner.writer` keeps
+        // pointing at the now-unlinked inode until it is replaced below; on
+        // Unix that is harmless and the writer is discarded immediately. A
+        // missing file is fine — the goal state is "no old file, fresh file
+        // recording".
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        // Open a brand-new file at the same path and swap it in. Assigning to
+        // `inner.writer` drops the old `BufWriter`, closing the stale (unlinked)
+        // fd.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        inner.writer = BufWriter::new(file);
+        inner.seq = 0;
+        inner.recorder_session_id = generate_recorder_session_id();
+        inner.health = AuditRecorderHealthSnapshot::default();
         Ok(())
     }
 }
