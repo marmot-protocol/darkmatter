@@ -155,6 +155,20 @@ fn inline_math_skips_double_dollar_runs_while_scanning() {
     assert_eq!(parse_inlines("$a$$"), vec![t("$a$$")]);
 }
 
+#[test]
+fn inline_math_open_followed_by_space_does_not_disable_later_span() {
+    assert_eq!(parse_inlines("$ $x$"), vec![t("$ "), math("x")]);
+}
+
+#[test]
+fn many_unclosed_inline_math_candidates_stay_literal() {
+    // Regression for darkmatter#590: a valid-looking `$` opener with no valid
+    // closer used to rescan the full remaining suffix. Repeating `$x ` made
+    // parse time quadratic in the number of dollars.
+    let input = "$x ".repeat(16_000);
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
 // ----- Entities -------------------------------------------------------
 
 #[test]

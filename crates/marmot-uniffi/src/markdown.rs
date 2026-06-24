@@ -3,6 +3,7 @@
 //! The parser crate owns the real AST. These records/enums keep the generated
 //! Swift/Kotlin surface stable and host-friendly.
 
+use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
     Alignment as MdAlignment, AutolinkKind as MdAutolinkKind, Block as MdBlock,
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
@@ -11,6 +12,7 @@ use marmot_markdown::{
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
+const MAX_FFI_MARKDOWN_INPUT_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MarkdownDocumentFfi {
@@ -154,7 +156,19 @@ pub enum MarkdownNostrHrpFfi {
 }
 
 pub(crate) fn parse_markdown_document(text: &str) -> MarkdownDocumentFfi {
-    marmot_markdown::parse(text).into()
+    marmot_markdown::parse(markdown_input_within_ffi_limit(text)).into()
+}
+
+fn markdown_input_within_ffi_limit(text: &str) -> &str {
+    if text.len() <= MAX_FFI_MARKDOWN_INPUT_BYTES {
+        return text;
+    }
+
+    let mut end = MAX_FFI_MARKDOWN_INPUT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 impl From<&MdDocument> for MarkdownDocumentFfi {
@@ -408,6 +422,34 @@ mod tests {
     #[test]
     fn parses_empty_document() {
         assert_eq!(parse_markdown_document(""), MarkdownDocumentFfi::default());
+    }
+
+    #[test]
+    fn caps_markdown_input_at_plaintext_frame_limit() {
+        let input = "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES + 16);
+        let capped = markdown_input_within_ffi_limit(&input);
+
+        assert_eq!(capped.len(), MAX_FFI_MARKDOWN_INPUT_BYTES);
+    }
+
+    #[test]
+    fn markdown_input_cap_preserves_utf8_boundary() {
+        let input = format!("{}🦫", "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
+        let capped = markdown_input_within_ffi_limit(&input);
+
+        assert_eq!(capped, "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
+    }
+
+    #[test]
+    fn parse_markdown_document_applies_input_cap() {
+        let document = parse_markdown_document(&"a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES + 16));
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            &inlines[0],
+            MarkdownInlineFfi::Text { content } if content.len() == MAX_FFI_MARKDOWN_INPUT_BYTES
+        ));
     }
 
     #[test]
