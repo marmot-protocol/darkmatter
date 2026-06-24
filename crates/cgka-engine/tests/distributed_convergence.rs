@@ -2189,8 +2189,14 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         .ingest(route(commit, &group_id))
         .await
         .expect("commit is buffered by ingest");
+    // `carol` buffered these messages through `ingest`, which stamps the
+    // convergence input time with the engine's real monotonic clock
+    // (`convergence_now_ms`). Pass a logical `now_ms` far past the quiescence
+    // window (matching the other ingest-then-converge tests in this file) so the
+    // settle is deterministic: a small value like 2_000 races the real elapsed
+    // time under parallel load and only intermittently clears quiescence.
     let result = carol
-        .converge_stored_openmls_messages(&group_id, 2_000)
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
         .expect("future app witness applies after selected commit");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
