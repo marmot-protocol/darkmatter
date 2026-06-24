@@ -17,6 +17,9 @@ const MAX_FFI_MARKDOWN_INPUT_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAM
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct MarkdownDocumentFfi {
     pub blocks: Vec<MarkdownBlockFfi>,
+    /// True when the input exceeded the FFI Markdown safety cap and `blocks`
+    /// were parsed from a UTF-8-boundary prefix.
+    pub truncated: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -156,19 +159,33 @@ pub enum MarkdownNostrHrpFfi {
 }
 
 pub(crate) fn parse_markdown_document(text: &str) -> MarkdownDocumentFfi {
-    marmot_markdown::parse(markdown_input_within_ffi_limit(text)).into()
+    let input = markdown_input_within_ffi_limit(text);
+    let mut document: MarkdownDocumentFfi = marmot_markdown::parse(input.text).into();
+    document.truncated = input.truncated;
+    document
 }
 
-fn markdown_input_within_ffi_limit(text: &str) -> &str {
+struct LimitedMarkdownInput<'a> {
+    text: &'a str,
+    truncated: bool,
+}
+
+fn markdown_input_within_ffi_limit(text: &str) -> LimitedMarkdownInput<'_> {
     if text.len() <= MAX_FFI_MARKDOWN_INPUT_BYTES {
-        return text;
+        return LimitedMarkdownInput {
+            text,
+            truncated: false,
+        };
     }
 
     let mut end = MAX_FFI_MARKDOWN_INPUT_BYTES;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    &text[..end]
+    LimitedMarkdownInput {
+        text: &text[..end],
+        truncated: true,
+    }
 }
 
 impl From<&MdDocument> for MarkdownDocumentFfi {
@@ -179,6 +196,7 @@ impl From<&MdDocument> for MarkdownDocumentFfi {
                 .iter()
                 .map(|block| markdown_block_from_md(block, 0))
                 .collect(),
+            truncated: false,
         }
     }
 }
@@ -429,7 +447,8 @@ mod tests {
         let input = "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES + 16);
         let capped = markdown_input_within_ffi_limit(&input);
 
-        assert_eq!(capped.len(), MAX_FFI_MARKDOWN_INPUT_BYTES);
+        assert_eq!(capped.text.len(), MAX_FFI_MARKDOWN_INPUT_BYTES);
+        assert!(capped.truncated);
     }
 
     #[test]
@@ -437,7 +456,8 @@ mod tests {
         let input = format!("{}🦫", "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
         let capped = markdown_input_within_ffi_limit(&input);
 
-        assert_eq!(capped, "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
+        assert_eq!(capped.text, "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
+        assert!(capped.truncated);
     }
 
     #[test]
@@ -450,6 +470,7 @@ mod tests {
             &inlines[0],
             MarkdownInlineFfi::Text { content } if content.len() == MAX_FFI_MARKDOWN_INPUT_BYTES
         ));
+        assert!(document.truncated);
     }
 
     #[test]
