@@ -1047,6 +1047,18 @@ impl<S: StorageProvider> Engine<S> {
         self.recorder.rotate()
     }
 
+    /// Switch the installed forensic recorder's [`AuditDataMode`] in place. On a
+    /// real change a file-backed recorder rotates so the file carries a single,
+    /// unambiguous mode and writes an `audit_data_mode_changed` boundary row.
+    /// No-op for the [`NoopRecorder`] or when the mode is unchanged.
+    pub fn set_audit_recorder_data_mode(
+        &self,
+        mode: marmot_forensics::AuditDataMode,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        self.recorder.set_data_mode(mode, reason)
+    }
+
     /// Replace the installed forensic recorder on a live engine. Dropping the
     /// prior recorder flushes and closes any file it held. Used to start or
     /// stop audit logging in place when the audit switch is toggled, without
