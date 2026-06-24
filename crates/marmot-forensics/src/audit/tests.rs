@@ -319,6 +319,27 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             error_kind: None,
             detail: None,
         },
+        AuditEventKind::TransportReceived {
+            msg_id: Some("m".into()),
+            transport: AuditTransportWire {
+                transport: Some("nostr".into()),
+                delivery_plane: Some("group".into()),
+                wire_id: Some("e".repeat(64)),
+                wire_kind: Some(445),
+                wire_pubkey_hex: Some("f".repeat(64)),
+                transport_group_id: Some("ab".repeat(16)),
+                relay_url: Some("wss://relay.example".into()),
+                subscription_id: Some("sub-1".into()),
+                nostr_event_id: Some("e".repeat(64)),
+                nostr_kind: Some(445),
+                nostr_pubkey_hex: Some("f".repeat(64)),
+                gift_wrap_event_id: None,
+                welcome_event_id: None,
+                publish_result_id: None,
+            },
+            payload_len: 1,
+            payload_digest: "d".repeat(64),
+        },
         AuditEventKind::IngestEntry {
             msg_id: "m".into(),
             envelope_kind: "welcome".into(),
@@ -370,6 +391,12 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             target_kind: "group".into(),
             relay_urls: vec!["wss://relay.example".into()],
             required_acks: 1,
+            transport: Some(AuditTransportWire {
+                transport: Some("nostr".into()),
+                delivery_plane: Some("group".into()),
+                transport_group_id: Some("ab".repeat(16)),
+                ..Default::default()
+            }),
         },
         AuditEventKind::PublishOutcome {
             msg_id: "m".into(),
@@ -381,6 +408,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             }],
             required_acks: 1,
             met_required_acks: true,
+            transport: None,
         },
         AuditEventKind::PublishFailure {
             msg_id: "m".into(),
@@ -388,6 +416,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             target_kind: "group".into(),
             relay_urls: vec!["wss://bad.example".into()],
             reason: "insufficient publish acknowledgements".into(),
+            transport: None,
         },
         AuditEventKind::EpochConfirmed {
             from_epoch: 0,

@@ -172,6 +172,52 @@ pub struct AuditTransportContext {
     pub relay_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<String>,
+    /// Transport wire identifiers for the event that carried this message.
+    /// Diagnostic forensic evidence, never consensus input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<AuditTransportWire>,
+}
+
+/// Reusable transport "wire envelope": the transport-layer identifiers of the
+/// event that carried a Marmot message, attached to inbound (`transport_received`,
+/// `ingest_entry`) and outbound (`publish_*`) audit rows so an analyzer can
+/// correlate engine activity with raw transport traffic.
+///
+/// All fields are optional so any transport (and either direction) can populate
+/// only what it has. These are transport-layer identifiers (e.g. an ephemeral
+/// Nostr event pubkey), never the message author's account identity, so they
+/// are safe in both audit data modes. Never carries auth tokens, signatures,
+/// ciphertext, or key material.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditTransportWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_kind: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr_event_id: Option<DigestHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr_kind: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gift_wrap_event_id: Option<DigestHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_result_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +309,17 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// A transport event was received and mapped to a Marmot message, recorded
+    /// before the engine ingests it. Carries the transport wire envelope so an
+    /// analyzer can correlate raw transport traffic with the engine's later
+    /// `ingest_entry`/`ingest_outcome` rows for the same `msg_id`.
+    TransportReceived {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<MessageRefHex>,
+        transport: AuditTransportWire,
+        payload_len: u64,
+        payload_digest: DigestHex,
+    },
     /// Engine accepted a [`TransportMessage`] at `do_ingest` entry.
     IngestEntry {
         msg_id: MessageRefHex,
@@ -331,6 +388,8 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relay_urls: Vec<String>,
         required_acks: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<AuditTransportWire>,
     },
     /// Account runtime received endpoint-level publish results.
     PublishOutcome {
@@ -342,6 +401,8 @@ pub enum AuditEventKind {
         failed_relays: Vec<PublishRelayFailure>,
         required_acks: u64,
         met_required_acks: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<AuditTransportWire>,
     },
     /// Account runtime could not complete publish before endpoint receipts.
     PublishFailure {
@@ -351,6 +412,8 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relay_urls: Vec<String>,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<AuditTransportWire>,
     },
     /// `EpochManager::confirm_publish` transitioned a group's state forward.
     EpochConfirmed {
@@ -504,6 +567,7 @@ impl AuditEventKind {
             AuditEventKind::GroupContext { .. } => "group_context",
             AuditEventKind::RecorderHealth { .. } => "recorder_health",
             AuditEventKind::HumanAction { .. } => "human_action",
+            AuditEventKind::TransportReceived { .. } => "transport_received",
             AuditEventKind::IngestEntry { .. } => "ingest_entry",
             AuditEventKind::IngestOutcome { .. } => "ingest_outcome",
             AuditEventKind::IngestError { .. } => "ingest_error",

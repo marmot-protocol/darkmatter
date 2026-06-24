@@ -28,7 +28,7 @@ use cgka_traits::{
     SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditTransportContext, ForensicRecorder,
+    AuditEventContext, AuditEventKind, AuditTransportContext, AuditTransportWire, ForensicRecorder,
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
@@ -700,11 +700,54 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
 }
 
 fn audit_transport_context(source: TransportDeliverySource) -> AuditTransportContext {
+    let TransportDeliverySource {
+        transport,
+        plane,
+        endpoint,
+        subscription_id,
+        wire,
+    } = source;
+    let transport_source = transport.0;
+    let delivery_plane = delivery_plane_label(plane).to_string();
+    let relay_url = endpoint.map(|endpoint| endpoint.0);
+    // The transport-layer wire identifiers are the same values Nostr surfaces as
+    // its event id/kind/pubkey, so mirror them into the `nostr_*` envelope
+    // fields for the only transport that exists today. Generic transports leave
+    // those unset.
+    let is_nostr = transport_source == "nostr";
+    let audit_wire = wire.map(|wire| {
+        let (nostr_event_id, nostr_kind, nostr_pubkey_hex) = if is_nostr {
+            (
+                wire.wire_id.clone(),
+                wire.wire_kind,
+                wire.wire_pubkey_hex.clone(),
+            )
+        } else {
+            (None, None, None)
+        };
+        AuditTransportWire {
+            transport: Some(transport_source.clone()),
+            delivery_plane: Some(delivery_plane.clone()),
+            wire_id: wire.wire_id,
+            wire_kind: wire.wire_kind,
+            wire_pubkey_hex: wire.wire_pubkey_hex,
+            transport_group_id: wire.transport_group_id,
+            relay_url: relay_url.clone(),
+            subscription_id: subscription_id.clone(),
+            nostr_event_id,
+            nostr_kind,
+            nostr_pubkey_hex,
+            gift_wrap_event_id: wire.gift_wrap_event_id,
+            welcome_event_id: wire.welcome_event_id,
+            publish_result_id: None,
+        }
+    });
     AuditTransportContext {
-        transport_source: source.transport.0,
-        delivery_plane: Some(delivery_plane_label(source.plane).to_string()),
-        relay_url: source.endpoint.map(|endpoint| endpoint.0),
-        subscription_id: source.subscription_id,
+        transport_source,
+        delivery_plane: Some(delivery_plane),
+        relay_url,
+        subscription_id,
+        wire: audit_wire,
     }
 }
 

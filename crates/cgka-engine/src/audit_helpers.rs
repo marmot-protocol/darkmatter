@@ -291,6 +291,22 @@ pub(crate) fn epoch_state_changed_event(
     }
 }
 
+/// Build a `TransportReceived` event from an inbound transport message and the
+/// wire envelope captured by the transport layer. Emitted before `IngestEntry`
+/// so the wire identifiers are recorded ahead of engine ingest. The payload
+/// length and digest match `ingest_entry_event` for the same message.
+pub(crate) fn transport_received_event(
+    msg: &TransportMessage,
+    wire: marmot_forensics::AuditTransportWire,
+) -> AuditEventKind {
+    AuditEventKind::TransportReceived {
+        msg_id: Some(hex::encode(msg.id.as_slice())),
+        transport: wire,
+        payload_len: msg.payload.len() as u64,
+        payload_digest: hex::encode(Sha256::digest(&msg.payload)) as DigestHex,
+    }
+}
+
 /// Build an `IngestEntry` event from an inbound transport message.
 pub(crate) fn ingest_entry_event(msg: &TransportMessage) -> AuditEventKind {
     AuditEventKind::IngestEntry {

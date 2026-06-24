@@ -58,6 +58,30 @@
       "type": "string",
       "pattern": "^[0-9A-Fa-f]{32}$"
     },
+    "digestHex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "transportWireEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "transport": { "type": "string" },
+        "delivery_plane": { "type": "string" },
+        "wire_id": { "type": "string" },
+        "wire_kind": { "$ref": "#/$defs/u64" },
+        "wire_pubkey_hex": { "$ref": "#/$defs/hexString" },
+        "transport_group_id": { "type": "string" },
+        "relay_url": { "type": "string" },
+        "subscription_id": { "type": "string" },
+        "nostr_event_id": { "$ref": "#/$defs/digestHex" },
+        "nostr_kind": { "$ref": "#/$defs/u64" },
+        "nostr_pubkey_hex": { "$ref": "#/$defs/hexString" },
+        "gift_wrap_event_id": { "$ref": "#/$defs/digestHex" },
+        "welcome_event_id": { "type": "string" },
+        "publish_result_id": { "type": "string" }
+      }
+    },
     "auditDataMode": {
       "enum": ["obfuscated_sensitive_data", "full_data"]
     },
@@ -138,6 +162,9 @@
         },
         "subscription_id": {
           "type": "string"
+        },
+        "wire": {
+          "$ref": "#/$defs/transportWireEnvelope"
         }
       }
     },
@@ -277,6 +304,18 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "transport", "payload_len", "payload_digest"],
+          "properties": {
+            "type": { "const": "transport_received" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "transport": { "$ref": "#/$defs/transportWireEnvelope" },
+            "payload_len": { "$ref": "#/$defs/u64" },
+            "payload_digest": { "$ref": "#/$defs/digestHex" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "msg_id", "envelope_kind", "transport_source", "payload_len", "payload_digest"],
           "properties": {
             "type": { "const": "ingest_entry" },
@@ -383,7 +422,8 @@
             "msg_id": { "$ref": "#/$defs/hexString" },
             "target_kind": { "type": "string" },
             "relay_urls": { "$ref": "#/$defs/stringArray" },
-            "required_acks": { "$ref": "#/$defs/u64" }
+            "required_acks": { "$ref": "#/$defs/u64" },
+            "transport": { "$ref": "#/$defs/transportWireEnvelope" }
           }
         },
         {
@@ -400,7 +440,8 @@
               "items": { "$ref": "#/$defs/publishRelayFailure" }
             },
             "required_acks": { "$ref": "#/$defs/u64" },
-            "met_required_acks": { "type": "boolean" }
+            "met_required_acks": { "type": "boolean" },
+            "transport": { "$ref": "#/$defs/transportWireEnvelope" }
           }
         },
         {
@@ -413,7 +454,8 @@
             "stage": { "type": "string" },
             "target_kind": { "type": "string" },
             "relay_urls": { "$ref": "#/$defs/stringArray" },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "transport": { "$ref": "#/$defs/transportWireEnvelope" }
           }
         },
         {

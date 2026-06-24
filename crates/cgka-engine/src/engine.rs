@@ -330,6 +330,20 @@ impl<S: StorageProvider> Engine<S> {
             engine: None,
             group: None,
         };
+        // Record the transport wire evidence before ingest when the transport
+        // layer supplied it, so an analyzer sees what arrived on the wire ahead
+        // of the engine's ingest_entry/outcome for the same message.
+        if let Some(wire) = context
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.wire.clone())
+        {
+            self.audit_with_context(
+                None,
+                Some(context.clone()),
+                crate::audit_helpers::transport_received_event(&msg, wire),
+            );
+        }
         self.audit_with_context(
             None,
             Some(context.clone()),
