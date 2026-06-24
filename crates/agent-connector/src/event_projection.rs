@@ -44,21 +44,34 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
         return true;
     }
     // Fallback for a p-tag-less mention: an inline NIP-21 `nostr:` reference to
-    // the account in the body, in either hex or bech32 (`npub`) form (the
-    // displayed mention text). `nprofile` mentions still rely on the p-tag above.
+    // the account in the body, in either hex or bech32 (`npub`) form, or the
+    // bare `@npub1…` form that marmot-markdown renders as a visible mention.
+    // `nprofile` mentions still rely on the p-tag above.
     if plaintext_has_nostr_ref(plaintext, account_id_hex) {
         return true;
     }
-    marmot_app::npub_for_account_id(account_id_hex)
-        .is_ok_and(|npub| plaintext_has_nostr_ref(plaintext, &npub))
+    marmot_app::npub_for_account_id(account_id_hex).is_ok_and(|npub| {
+        plaintext_has_nostr_ref(plaintext, &npub) || plaintext_has_at_npub_ref(plaintext, &npub)
+    })
 }
 
 /// Whether `plaintext` contains a `nostr:<reference>` token that is not glued to
 /// surrounding alphanumerics (so `nostr:<hex>junk` does NOT match the reference).
 /// Case-insensitive on both sides.
 fn plaintext_has_nostr_ref(plaintext: &str, reference: &str) -> bool {
+    plaintext_has_prefixed_ref(plaintext, "nostr:", reference)
+}
+
+/// Whether `plaintext` contains a bare `@npub1…` mention token for the account.
+/// This mirrors the visible mention form accepted by marmot-markdown while still
+/// requiring token boundaries so email/user-name substrings do not match.
+fn plaintext_has_at_npub_ref(plaintext: &str, npub: &str) -> bool {
+    plaintext_has_prefixed_ref(plaintext, "@", npub)
+}
+
+fn plaintext_has_prefixed_ref(plaintext: &str, prefix: &str, reference: &str) -> bool {
     let body = plaintext.to_ascii_lowercase();
-    let needle = format!("nostr:{}", reference.to_ascii_lowercase());
+    let needle = format!("{prefix}{}", reference.to_ascii_lowercase());
     body.match_indices(&needle).any(|(start, _)| {
         let end = start + needle.len();
         let before_ok = start == 0 || !body.as_bytes()[start - 1].is_ascii_alphanumeric();

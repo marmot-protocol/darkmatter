@@ -2397,6 +2397,40 @@ fn inbound_message_event_detects_npub_bech32_mention() {
 }
 
 #[test]
+fn inbound_message_event_detects_bare_at_npub_mention() {
+    // Clients can emit the visible bare `@npub1…` handle without a p-tag or
+    // `nostr:` scheme; agent-control mention classification must still fire.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("hey @{npub} can you help?");
+    let record = received_chat_record("11", "bb", "cc", &text);
+    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(
+        mentions_self,
+        "bare @npub bech32 mention should be detected"
+    );
+}
+
+#[test]
+fn inbound_message_event_ignores_glued_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("not-a-mention@{npub}");
+    let record = received_chat_record("11", "bb", "cc", &text);
+    let event = inbound_message_event_from_record(&account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    assert!(
+        !mentions_self,
+        "glued @npub substrings should not be detected"
+    );
+}
+
+#[test]
 fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
     // The p-tag is authoritative: a mention with only the structured tag (no
     // inline nostr: reference in the body) is still detected.
