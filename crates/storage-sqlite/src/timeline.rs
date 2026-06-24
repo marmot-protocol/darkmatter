@@ -936,10 +936,7 @@ fn project_single_message_timeline_tx(
 /// events have no edges. `record_app_event` upserts the owning `app_events` row,
 /// so existing edges for this modifier are deleted first and re-inserted from
 /// the event's current tags, keeping edges consistent with any tag change.
-fn upsert_message_modifier_edges_tx(
-    tx: &Connection,
-    event: &StoredAppEvent,
-) -> StorageResult<()> {
+fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> StorageResult<()> {
     if !matches!(
         event.kind,
         MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE
@@ -1041,42 +1038,49 @@ fn deleted_reaction_ids_for_target_tx(
     if reactions.is_empty() {
         return Ok(HashSet::new());
     }
-    // One set-based query collects every (reaction id, deleting sender) pair for
+    // Set-based queries collect every (reaction id, deleting sender) pair for
     // the given reactions instead of issuing one lookup per reaction (N+1). A
     // reaction is retracted only when a non-invalidated DELETE by the SAME
-    // sender targets it.
-    let placeholders = std::iter::repeat_n("?", reactions.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT edges.target_message_id_hex, app_events.sender
-         FROM message_modifier_edges AS edges
-         JOIN app_events
-           ON app_events.group_id_hex = edges.group_id_hex
-          AND app_events.message_id_hex = edges.modifier_message_id_hex
-         WHERE edges.group_id_hex = ?
-           AND edges.kind = ?
-           AND app_events.invalidated = 0
-           AND edges.target_message_id_hex IN ({placeholders})"
-    );
-    let mut values = Vec::<rusqlite::types::Value>::with_capacity(reactions.len() + 2);
-    values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    values.push(rusqlite::types::Value::Integer(u64_to_i64(
-        MARMOT_APP_EVENT_KIND_DELETE,
-    )?));
-    values.extend(
-        reactions
-            .iter()
-            .map(|reaction| rusqlite::types::Value::Text(reaction.message_id_hex.clone())),
-    );
-    let mut stmt = tx.prepare(&sql).storage()?;
-    let delete_pairs = stmt
-        .query_map(params_from_iter(values.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
+    // sender targets it. Reaction ids are bound in fixed-size chunks so the
+    // placeholder count per statement stays well under SQLite's variable limit
+    // even on hot messages with very many reactions (same pattern as
+    // `delete_timeline_projection_rows_by_ids_tx`).
+    let mut delete_pairs = Vec::<(String, String)>::new();
+    for chunk in reactions.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT edges.target_message_id_hex, app_events.sender
+             FROM message_modifier_edges AS edges
+             JOIN app_events
+               ON app_events.group_id_hex = edges.group_id_hex
+              AND app_events.message_id_hex = edges.modifier_message_id_hex
+             WHERE edges.group_id_hex = ?
+               AND edges.kind = ?
+               AND app_events.invalidated = 0
+               AND edges.target_message_id_hex IN ({placeholders})"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
+        values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        values.push(rusqlite::types::Value::Integer(u64_to_i64(
+            MARMOT_APP_EVENT_KIND_DELETE,
+        )?));
+        values.extend(
+            chunk
+                .iter()
+                .map(|reaction| rusqlite::types::Value::Text(reaction.message_id_hex.clone())),
+        );
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_pairs = stmt
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        delete_pairs.extend(chunk_pairs);
+    }
 
     let reaction_senders: HashMap<&str, &str> = reactions
         .iter()

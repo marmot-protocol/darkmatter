@@ -1306,3 +1306,50 @@ fn pruning_modifier_event_cascades_its_edges() {
         "pruning the modifier app_event must cascade-delete its modifier edges"
     );
 }
+
+#[test]
+fn many_reactions_retract_across_bind_parameter_chunk_boundary() {
+    // Exercises the chunked deleted-reaction lookup: a single hot message with
+    // more reactions than SQLITE_BIND_PARAMETER_CHUNK forces the retract query
+    // to span multiple chunks. Every reaction author then deletes their own
+    // reaction, so the full set must be retracted regardless of which chunk a
+    // given reaction id lands in.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+
+    let count = SQLITE_BIND_PARAMETER_CHUNK + 50;
+    for i in 0..count {
+        let sender = format!("sender-{i}");
+        let reaction_id = format!("reaction-{i}");
+        store
+            .record_app_event(&reaction(&reaction_id, &sender, "target", 2, "+"))
+            .unwrap();
+    }
+
+    let message = list(&store).pop().unwrap();
+    assert_eq!(
+        message.reactions.user_reactions.len(),
+        count,
+        "every recorded reaction must appear before any retraction"
+    );
+
+    // Each reaction author retracts their own reaction. The final projection
+    // re-derives over all reaction ids, which crosses the chunk boundary.
+    for i in 0..count {
+        let sender = format!("sender-{i}");
+        let delete_id = format!("delete-{i}");
+        let target_reaction = format!("reaction-{i}");
+        store
+            .record_app_event(&delete(&delete_id, &sender, &target_reaction, 3))
+            .unwrap();
+    }
+
+    let message = list(&store).pop().unwrap();
+    assert!(
+        message.reactions.user_reactions.is_empty(),
+        "all reactions must retract even when the lookup spans multiple bind-parameter chunks"
+    );
+    assert!(message.reactions.by_emoji.is_empty());
+}
