@@ -3057,3 +3057,76 @@ async fn create_media_download_dir_rejects_non_directory_root_without_creating_c
         "no secret-named child may be created under a non-directory root"
     );
 }
+
+#[tokio::test]
+async fn create_media_download_dir_rejects_symlink_per_blob_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::media_temp::create_media_download_dir_in;
+
+    // The root itself is a valid owner-only directory, but a `<ciphertext_sha256>`
+    // child was pre-planted as a symlink to an attacker-controlled directory
+    // (the window a legacy/loose root leaves open). We must refuse to follow it,
+    // so neither the 0700 chmod nor the later 0600 plaintext write lands in the
+    // attacker's tree.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let attacker_dir = tmp.path().join("attacker-owned");
+    std::fs::create_dir(&attacker_dir).unwrap();
+    let subdir = "deadbeefcafef00d";
+    std::os::unix::fs::symlink(&attacker_dir, root.join(subdir)).unwrap();
+
+    let err = create_media_download_dir_in(&root, subdir)
+        .await
+        .expect_err("symlink per-blob child must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    // The symlink must be left as-is (not followed) and the attacker's target
+    // must not have been chmodded to 0700 by `harden_media_dir`.
+    assert!(
+        std::fs::symlink_metadata(root.join(subdir))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "we must not have replaced or followed the attacker's child symlink"
+    );
+    let attacker_mode = std::fs::metadata(&attacker_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_ne!(
+        attacker_mode, 0o700,
+        "the attacker-controlled target must not be hardened through the symlink"
+    );
+}
+
+#[tokio::test]
+async fn create_media_download_dir_rejects_non_directory_per_blob_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::media_temp::create_media_download_dir_in;
+
+    // A `<ciphertext_sha256>` child pre-planted as a plain file under an
+    // otherwise valid root must be rejected rather than written through.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let subdir = "deadbeefcafef00d";
+    std::fs::write(root.join(subdir), b"not a directory").unwrap();
+
+    let err = create_media_download_dir_in(&root, subdir)
+        .await
+        .expect_err("non-directory per-blob child must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    assert!(
+        root.join(subdir).is_file(),
+        "the pre-existing file child must be left untouched"
+    );
+}

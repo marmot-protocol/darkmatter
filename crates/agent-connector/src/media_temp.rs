@@ -86,8 +86,32 @@ pub(crate) async fn create_media_download_dir_in(
     // re-harden to stay robust if the child already existed at a looser mode.
     let dir = root.join(subdir);
     create_dir_atomic_0700(&dir).await?;
+    // `create_dir_atomic_0700` returns `Ok` when the child already exists, so a
+    // pre-planted `<ciphertext_sha256>` symlink (possible if a legacy/loose
+    // root let an attacker write before we hardened it) would otherwise be
+    // followed by `harden_media_dir` and the subsequent 0600 plaintext write,
+    // landing key material in an attacker-controlled tree. Reject a symlink or
+    // non-directory child before either operation follows it out of our tree.
+    let child_type = tokio::fs::symlink_metadata(&dir).await?.file_type();
+    ensure_real_dir(
+        child_type,
+        "marmot-media per-blob dir exists but is not a directory; refusing to use it",
+    )?;
     harden_media_dir(&dir).await?;
     Ok(dir)
+}
+
+/// Reject a pre-existing path that is a symlink or non-directory. A symlink
+/// here would let `set_permissions`/file writes follow it out of our private
+/// tree, so callers validate before hardening or writing through the path.
+fn ensure_real_dir(file_type: std::fs::FileType, message: &str) -> Result<(), std::io::Error> {
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            message,
+        ));
+    }
+    Ok(())
 }
 
 /// Ensure the `marmot-media` root exists as an owner-only (0700) real
@@ -100,13 +124,10 @@ async fn secure_media_root(root: &Path) -> Result<(), std::io::Error> {
     // redirect our private tree or have us treat their dir as ours.
     match tokio::fs::symlink_metadata(root).await {
         Ok(meta) => {
-            let file_type = meta.file_type();
-            if file_type.is_symlink() || !file_type.is_dir() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "marmot-media root exists but is not a directory; refusing to use it",
-                ));
-            }
+            ensure_real_dir(
+                meta.file_type(),
+                "marmot-media root exists but is not a directory; refusing to use it",
+            )?;
             // Pre-existing real directory: re-harden to 0700. If we cannot
             // (e.g. an attacker owns it: `set_permissions` fails with EPERM),
             // bail here, before the secret-named child is ever created.
