@@ -1096,6 +1096,8 @@ fn delete_local_group_data_rolls_back_all_tables_on_failure() {
 
 #[test]
 fn record_app_event_retries_concurrent_writer_contention() {
+    // Representative projection-writer regression: the other projection writers use the
+    // same with_transaction retry path.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("projection-contention.sqlite");
     let key = SqlCipherKey::new("projection contention key").unwrap();
@@ -1110,6 +1112,7 @@ fn record_app_event_retries_concurrent_writer_contention() {
     let blocker_path = path.clone();
     let blocker_options = options.clone();
     let blocker_key = SqlCipherKey::new("projection contention key").unwrap();
+    let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
     let blocker = std::thread::spawn(move || {
         let blocker = SqliteAccountStorage::open_encrypted_with_options(
             &blocker_path,
@@ -1119,11 +1122,16 @@ fn record_app_event_retries_concurrent_writer_contention() {
         .expect("blocker storage opens");
         let conn = blocker.lock().unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        lock_acquired_tx
+            .send(())
+            .expect("signal BEGIN IMMEDIATE acquired");
         std::thread::sleep(std::time::Duration::from_millis(200));
         conn.execute_batch("COMMIT").unwrap();
     });
 
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    lock_acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("blocker should hold BEGIN IMMEDIATE before writer starts");
 
     writer
         .record_app_event(&app_event("contended", "aa", 10))
