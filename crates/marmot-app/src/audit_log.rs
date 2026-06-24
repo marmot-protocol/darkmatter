@@ -396,7 +396,28 @@ impl MarmotApp {
             Some(account_ref_hex),
             data_mode,
         ) {
-            Ok(recorder) => Some(Box::new(recorder)),
+            Ok(recorder) => {
+                // Emit a source_context row identifying the producing account.
+                // `account_label` is a safe opaque display string in both modes;
+                // the cleartext account pubkey is full-data only. Device /
+                // platform / app-version are supplied later via the upload
+                // tracker config and travel as upload headers.
+                use marmot_forensics::ForensicRecorder as _;
+                let account_pubkey_hex = (data_mode == marmot_forensics::AuditDataMode::FullData
+                    && account_id.as_slice().len() == 32)
+                    .then(|| hex::encode(account_id.as_slice()));
+                recorder.record(marmot_forensics::AuditRecord::new(
+                    None,
+                    marmot_forensics::AuditEventKind::SourceContext {
+                        source: marmot_forensics::AuditSourceContext {
+                            account_label: Some(label.to_string()),
+                            account_pubkey_hex,
+                            ..Default::default()
+                        },
+                    },
+                ));
+                Some(Box::new(recorder))
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "marmot_app",

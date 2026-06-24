@@ -66,6 +66,92 @@
       "type": "string",
       "pattern": "^[0-9A-Fa-f]{64}$"
     },
+    "auditSourceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_label": { "type": "string" },
+        "device_label": { "type": "string" },
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "platform": { "type": "string" },
+        "app_version": { "type": "string" },
+        "upload_trigger": { "type": "string" },
+        "account_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
+        "account_npub": { "type": "string" }
+      }
+    },
+    "messageAuthor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "member_ref": { "$ref": "#/$defs/refHex16" },
+        "member_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
+        "account_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
+        "npub": { "type": "string" }
+      }
+    },
+    "attachmentMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "component_id": { "$ref": "#/$defs/u16" },
+        "content_type": { "type": "string" },
+        "file_name": { "type": "string" },
+        "byte_len": { "$ref": "#/$defs/u64" },
+        "digest": { "$ref": "#/$defs/digestHex" },
+        "metadata": { "$ref": "#/$defs/jsonObject" }
+      }
+    },
+    "decodedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_type"],
+      "properties": {
+        "content_type": { "type": "string" },
+        "text": { "type": "string" },
+        "json": { "$ref": "#/$defs/jsonValue" },
+        "bytes_b64": { "type": "string" }
+      }
+    },
+    "decodedApplicationEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format"],
+      "properties": {
+        "format": { "type": "string" },
+        "kind": { "$ref": "#/$defs/u64" },
+        "content": { "type": "string" },
+        "pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "array", "items": { "type": "string" } }
+        },
+        "created_at_ms": { "$ref": "#/$defs/u64" },
+        "client_message_id": { "type": "string" },
+        "reply_to_message_id": { "type": "string" },
+        "thread_root_message_id": { "type": "string" },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/attachmentMetadata" }
+        },
+        "raw": { "$ref": "#/$defs/jsonValue" }
+      }
+    },
+    "groupStateValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "digest": { "$ref": "#/$defs/digestHex" },
+        "len": { "$ref": "#/$defs/u64" },
+        "text": { "type": "string" },
+        "json": { "$ref": "#/$defs/jsonValue" },
+        "pubkeys_hex": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pubkeyHex" }
+        }
+      }
+    },
     "messageArtifactKind": {
       "enum": ["application_message", "commit", "proposal", "welcome", "group_info", "unknown"]
     },
@@ -253,6 +339,9 @@
         },
         "convergence": {
           "$ref": "#/$defs/auditConvergenceContext"
+        },
+        "source": {
+          "$ref": "#/$defs/auditSourceContext"
         }
       }
     },
@@ -493,6 +582,28 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "source"],
+          "properties": {
+            "type": { "const": "source_context" },
+            "source": { "$ref": "#/$defs/auditSourceContext" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "author", "decoded_payload"],
+          "properties": {
+            "type": { "const": "message_content_decoded" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "artifact_kind": { "$ref": "#/$defs/messageArtifactKind" },
+            "author": { "$ref": "#/$defs/messageAuthor" },
+            "decoded_payload": { "$ref": "#/$defs/decodedPayload" },
+            "decoded_app_event": { "$ref": "#/$defs/decodedApplicationEvent" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "msg_id", "expectation"],
           "properties": {
             "type": { "const": "recipient_expectation" },
@@ -661,12 +772,13 @@
               ]
             },
             "actor_member_ref": { "$ref": "#/$defs/refHex16" },
+            "actor_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
             "subject_member_ref": { "$ref": "#/$defs/refHex16" },
+            "subject_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
             "origin_commit_id": { "$ref": "#/$defs/hexString" },
             "fields": { "$ref": "#/$defs/stringArray" },
             "component_ids": { "$ref": "#/$defs/u16Array" },
-            "value_digest": { "$ref": "#/$defs/hexString" },
-            "value_len": { "$ref": "#/$defs/u64" }
+            "value": { "$ref": "#/$defs/groupStateValue" }
           }
         },
         {
@@ -809,5 +921,110 @@
         }
       ]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "audit_data_mode": { "const": "obfuscated_sensitive_data" } },
+        "required": ["audit_data_mode"]
+      },
+      "then": {
+        "properties": {
+          "context": {
+            "properties": {
+              "source": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["account_pubkey_hex"] },
+                    { "required": ["account_npub"] }
+                  ]
+                }
+              }
+            }
+          },
+          "kind": {
+            "not": {
+              "anyOf": [
+                {
+                  "properties": { "type": { "const": "message_content_decoded" } },
+                  "required": ["type"]
+                },
+                { "required": ["actor_pubkey_hex"] },
+                { "required": ["subject_pubkey_hex"] },
+                { "required": ["tip_committer_pubkey_hex"] },
+                {
+                  "properties": {
+                    "source": {
+                      "anyOf": [
+                        { "required": ["account_pubkey_hex"] },
+                        { "required": ["account_npub"] }
+                      ]
+                    }
+                  },
+                  "required": ["source"]
+                },
+                {
+                  "properties": {
+                    "expectation": { "required": ["expected_pubkeys_hex"] }
+                  },
+                  "required": ["expectation"]
+                },
+                {
+                  "properties": {
+                    "value": {
+                      "anyOf": [
+                        { "required": ["text"] },
+                        { "required": ["json"] },
+                        { "required": ["pubkeys_hex"] }
+                      ]
+                    }
+                  },
+                  "required": ["value"]
+                },
+                {
+                  "properties": {
+                    "outbound_messages": {
+                      "contains": {
+                        "properties": {
+                          "recipient_expectation": { "required": ["expected_pubkeys_hex"] }
+                        },
+                        "required": ["recipient_expectation"]
+                      }
+                    }
+                  },
+                  "required": ["outbound_messages"]
+                },
+                {
+                  "properties": {
+                    "candidates": {
+                      "contains": {
+                        "anyOf": [
+                          { "required": ["tip_committer_pubkey_hex"] },
+                          {
+                            "properties": {
+                              "score": { "required": ["tip_committer_pubkey_hex"] }
+                            },
+                            "required": ["score"]
+                          },
+                          {
+                            "properties": {
+                              "app_witnesses": {
+                                "contains": { "required": ["sender_pubkey_hex"] }
+                              }
+                            },
+                            "required": ["app_witnesses"]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "required": ["candidates"]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
 }

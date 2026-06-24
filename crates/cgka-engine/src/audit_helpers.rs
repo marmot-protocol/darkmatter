@@ -17,8 +17,9 @@ use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
 use marmot_forensics::{
-    AuditEventKind, ConvergenceAppWitness, ConvergenceCandidate, ConvergenceRuleEvaluation,
-    ConvergenceScore, DigestHex, MemberRefHex, MessageArtifactKind, MessageRefHex, OutboundMessage,
+    AttachmentMetadata, AuditEventKind, ConvergenceAppWitness, ConvergenceCandidate,
+    ConvergenceRuleEvaluation, ConvergenceScore, DecodedApplicationEvent, DecodedPayload,
+    DigestHex, MemberRefHex, MessageArtifactKind, MessageAuthor, MessageRefHex, OutboundMessage,
 };
 use sha2::{Digest, Sha256};
 
@@ -216,17 +217,24 @@ fn group_state_change_component_ids(change: &GroupStateChange) -> Vec<u16> {
     }
 }
 
-fn group_state_subject_member_ref(change: &GroupStateChange) -> Option<MemberRefHex> {
+fn group_state_subject_member(change: &GroupStateChange) -> Option<&MemberId> {
     match change {
         GroupStateChange::MemberAdded { member }
         | GroupStateChange::MemberRemoved { member }
         | GroupStateChange::MemberLeft { member }
         | GroupStateChange::AdminAdded { member }
-        | GroupStateChange::AdminRemoved { member } => Some(member_ref_hex(member)),
+        | GroupStateChange::AdminRemoved { member } => Some(member),
         GroupStateChange::GroupRenamed { .. }
         | GroupStateChange::GroupAvatarChanged
         | GroupStateChange::MessageRetentionChanged { .. } => None,
     }
+}
+
+/// Full member pubkey hex for `full_data` mode only. A `MemberId` in this engine
+/// is the 32-byte account identity; non-32-byte ids (test fixtures) are skipped
+/// so the output always matches the schema's pubkey pattern.
+fn member_pubkey_hex(member: &MemberId, full_data: bool) -> Option<String> {
+    (full_data && member.as_slice().len() == 32).then(|| hex::encode(member.as_slice()))
 }
 
 pub(crate) fn group_state_changed_event(
@@ -234,29 +242,41 @@ pub(crate) fn group_state_changed_event(
     actor: Option<&MemberId>,
     change: &GroupStateChange,
     origin_commit_id: Option<&MessageId>,
+    full_data: bool,
 ) -> AuditEventKind {
     let change_kind = group_state_change_kind_str(change);
-    let (value_digest, value_len) = match change {
-        GroupStateChange::GroupRenamed { name } => (
-            Some(value_digest_hex(change_kind, name.as_bytes())),
-            Some(name.len() as u64),
-        ),
-        GroupStateChange::MessageRetentionChanged { new_seconds, .. } => (
-            Some(value_digest_hex(change_kind, &new_seconds.to_be_bytes())),
-            Some(new_seconds.to_be_bytes().len() as u64),
-        ),
-        _ => (None, None),
+    // Always carry digest+len; the cleartext value (text/json) is full-data only.
+    let value = match change {
+        GroupStateChange::GroupRenamed { name } => Some(marmot_forensics::GroupStateValue {
+            digest: Some(value_digest_hex(change_kind, name.as_bytes())),
+            len: Some(name.len() as u64),
+            text: full_data.then(|| name.clone()),
+            json: None,
+            pubkeys_hex: Vec::new(),
+        }),
+        GroupStateChange::MessageRetentionChanged { new_seconds, .. } => {
+            Some(marmot_forensics::GroupStateValue {
+                digest: Some(value_digest_hex(change_kind, &new_seconds.to_be_bytes())),
+                len: Some(new_seconds.to_be_bytes().len() as u64),
+                text: None,
+                json: full_data.then(|| serde_json::json!(new_seconds)),
+                pubkeys_hex: Vec::new(),
+            })
+        }
+        _ => None,
     };
+    let subject = group_state_subject_member(change);
     AuditEventKind::GroupStateChanged {
         epoch: epoch.0,
         change_kind: change_kind.to_string(),
         actor_member_ref: actor.map(member_ref_hex),
-        subject_member_ref: group_state_subject_member_ref(change),
+        actor_pubkey_hex: actor.and_then(|actor| member_pubkey_hex(actor, full_data)),
+        subject_member_ref: subject.map(member_ref_hex),
+        subject_pubkey_hex: subject.and_then(|subject| member_pubkey_hex(subject, full_data)),
         origin_commit_id: origin_commit_id.map(|id| hex::encode(id.as_slice())),
         fields: group_state_change_fields(change),
         component_ids: group_state_change_component_ids(change),
-        value_digest,
-        value_len,
+        value,
     }
 }
 
@@ -292,6 +312,84 @@ pub(crate) fn transport_received_event(
         payload_len: msg.payload.len() as u64,
         payload_digest: hex::encode(Sha256::digest(&msg.payload)) as DigestHex,
     }
+}
+
+/// Parse NIP-94-style `imeta` tags into attachment descriptors. Only non-secret
+/// metadata (mime, size, sha-256 digest, name) is captured — never bytes or keys.
+fn parse_imeta_attachments(tags: &[Vec<String>]) -> Vec<AttachmentMetadata> {
+    tags.iter()
+        .filter(|tag| tag.first().map(|name| name == "imeta").unwrap_or(false))
+        .map(|tag| {
+            let mut attachment = AttachmentMetadata::default();
+            for field in &tag[1..] {
+                let mut parts = field.splitn(2, ' ');
+                let (key, value) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                match key {
+                    "m" => attachment.content_type = Some(value.to_string()),
+                    "size" => attachment.byte_len = value.parse::<u64>().ok(),
+                    "name" => attachment.file_name = Some(value.to_string()),
+                    "x" if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                        attachment.digest = Some(value.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            attachment
+        })
+        .collect()
+}
+
+/// Build a `MessageContentDecoded` event from a decrypted application payload.
+///
+/// FULL-DATA ONLY: callers must gate this on
+/// [`marmot_forensics::AuditDataMode::FullData`]; it carries decrypted content
+/// and full author identities. Returns `None` when the payload is not a
+/// decodable Marmot app event.
+pub(crate) fn message_content_decoded_event(
+    msg_id_hex: MessageRefHex,
+    sender: &MemberId,
+    payload: &[u8],
+) -> Option<AuditEventKind> {
+    let event = cgka_traits::app_event::MarmotAppEvent::decode(payload).ok()?;
+    let raw = serde_json::json!({
+        "id": event.id,
+        "pubkey": event.pubkey,
+        "created_at": event.created_at,
+        "kind": event.kind,
+        "tags": event.tags,
+        "content": event.content,
+    });
+    let author = MessageAuthor {
+        member_ref: Some(member_ref_hex(sender)),
+        member_pubkey_hex: (sender.as_slice().len() == 32).then(|| hex::encode(sender.as_slice())),
+        account_pubkey_hex: (!event.pubkey.is_empty()).then(|| event.pubkey.clone()),
+        npub: None,
+    };
+    let decoded_app_event = DecodedApplicationEvent {
+        format: "marmot.app_event.v1".to_string(),
+        kind: Some(event.kind),
+        content: Some(event.content.clone()),
+        pubkey_hex: (!event.pubkey.is_empty()).then(|| event.pubkey.clone()),
+        tags: event.tags.clone(),
+        created_at_ms: Some(event.created_at.saturating_mul(1000)),
+        client_message_id: None,
+        reply_to_message_id: None,
+        thread_root_message_id: None,
+        attachments: parse_imeta_attachments(&event.tags),
+        raw: Some(raw.clone()),
+    };
+    Some(AuditEventKind::MessageContentDecoded {
+        msg_id: msg_id_hex,
+        artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
+        author,
+        decoded_payload: DecodedPayload {
+            content_type: "application/x-marmot-app-event+json".to_string(),
+            text: None,
+            json: Some(raw),
+            bytes_b64: None,
+        },
+        decoded_app_event: Some(decoded_app_event),
+    })
 }
 
 /// Build an `IngestEntry` event from an inbound transport message.

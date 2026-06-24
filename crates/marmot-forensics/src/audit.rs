@@ -151,6 +151,34 @@ pub struct AuditEventContext {
     pub group: Option<AuditGroupContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convergence: Option<AuditConvergenceContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AuditSourceContext>,
+}
+
+/// Identifies the account/device/app that produced an audit log, for upload
+/// correlation. `account_pubkey_hex`/`account_npub` are full member identities
+/// and appear only in [`AuditDataMode::FullData`]; the labels are opaque,
+/// user-supplied display strings safe in both modes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSourceContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_npub: Option<String>,
 }
 
 /// Correlates every row produced during one distributed-convergence run via a
@@ -420,6 +448,95 @@ pub struct ConvergenceRuleEvaluation {
     pub rejected_branch_id: Option<String>,
 }
 
+/// The authenticated author of a decoded message. `member_ref` (salted hash) is
+/// safe in both modes; the pubkeys/npub are full member identities and appear
+/// only in [`AuditDataMode::FullData`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageAuthor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_ref: Option<MemberRefHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub npub: Option<String>,
+}
+
+/// Decrypted payload bytes, rendered as text/JSON/base64. Full-data only — the
+/// producer must not construct this in obfuscated mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedPayload {
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_b64: Option<String>,
+}
+
+/// Decoded inner application event (Marmot/Nostr-shaped). Full-data only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedApplicationEvent {
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<serde_json::Value>,
+}
+
+/// Attachment metadata decoded from an application event's tags. Non-secret
+/// descriptors only — never the attachment bytes or decryption keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<DigestHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// The value of a group-state change. `digest`/`len` are safe in both modes;
+/// `text`/`json`/`pubkeys_hex` carry the cleartext value and appear only in
+/// [`AuditDataMode::FullData`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStateValue {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<DigestHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pubkeys_hex: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecorderHealthSnapshot {
     pub serialization_failures: u64,
@@ -518,6 +635,21 @@ pub enum AuditEventKind {
     },
     /// Engine accepted a `SendIntent` at `do_send` entry.
     SendEntry { intent_kind: String },
+    /// Identifies the account/device/app that produced this log. Emitted once
+    /// per recorder session; the cleartext account identity (`account_pubkey_hex`
+    /// / `account_npub`) is full-data only.
+    SourceContext { source: AuditSourceContext },
+    /// Decrypted message content surfaced after a successful MLS/app decode.
+    /// Full-data only — the producer must not emit this in obfuscated mode.
+    MessageContentDecoded {
+        msg_id: MessageRefHex,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<MessageArtifactKind>,
+        author: MessageAuthor,
+        decoded_payload: DecodedPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decoded_app_event: Option<DecodedApplicationEvent>,
+    },
     /// A per-message recipient expectation derived from authenticated group
     /// membership at send time: normal group messages/commits target all other
     /// current members; welcomes target only the added member.
@@ -627,7 +759,11 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor_member_ref: Option<MemberRefHex>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_pubkey_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         subject_member_ref: Option<MemberRefHex>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_pubkey_hex: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_commit_id: Option<MessageRefHex>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -635,9 +771,7 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         component_ids: Vec<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        value_digest: Option<DigestHex>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        value_len: Option<u64>,
+        value: Option<GroupStateValue>,
     },
     /// Session open found an OpenMLS staged commit persisted under the
     /// publish-before-apply contract with no in-memory pending state to
@@ -767,6 +901,8 @@ impl AuditEventKind {
             AuditEventKind::IngestEntry { .. } => "ingest_entry",
             AuditEventKind::IngestOutcome { .. } => "ingest_outcome",
             AuditEventKind::IngestError { .. } => "ingest_error",
+            AuditEventKind::SourceContext { .. } => "source_context",
+            AuditEventKind::MessageContentDecoded { .. } => "message_content_decoded",
             AuditEventKind::RecipientExpectation { .. } => "recipient_expectation",
             AuditEventKind::SendEntry { .. } => "send_entry",
             AuditEventKind::SendOutcome { .. } => "send_outcome",
