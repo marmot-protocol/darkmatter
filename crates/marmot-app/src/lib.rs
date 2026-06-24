@@ -520,14 +520,16 @@ pub struct SecureDeleteExpiredResult {
     pub pruned_messages: u64,
     /// Ciphertext hashes for encrypted-media attachments referenced by the
     /// pruned rows. Host apps can use these opaque blob ids to purge their own
-    /// decrypted-media disk caches alongside the engine plaintext wipe.
+    /// decrypted-media disk caches alongside the engine plaintext wipe. The
+    /// list is sorted for deterministic output, but callers should treat it as
+    /// an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
 }
 
 impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
     fn from(value: SecurePruneAppEventsResult) -> Self {
         Self {
-            pruned_messages: value.pruned_events as u64,
+            pruned_messages: value.pruned_messages as u64,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
         }
     }

@@ -1,6 +1,6 @@
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, bool_i64, tags_from_json, unix_now_ms,
-    unix_now_seconds_i64, usize_to_i64,
+    SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy, tags_from_json,
+    unix_now_ms, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
@@ -481,7 +481,7 @@ impl SqliteAccountStorage {
         cutoff_recorded_at: u64,
     ) -> StorageResult<usize> {
         self.secure_prune_app_events_before(group_id_hex, cutoff_recorded_at)
-            .map(|outcome| outcome.pruned_events)
+            .map(|outcome| outcome.pruned_messages)
     }
 
     pub fn secure_prune_app_events_before(
@@ -497,8 +497,16 @@ impl SqliteAccountStorage {
             cutoff_recorded_at,
         )?;
         tx.commit().storage()?;
-        if outcome.pruned_events > 0 {
-            checkpoint_wal_truncate_after_secure_prune(&conn)?;
+        if outcome.pruned_messages > 0
+            && let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn)
+        {
+            tracing::warn!(
+                target: "storage_sqlite::retention",
+                method = "secure_prune_app_events_before",
+                pruned_messages = outcome.pruned_messages,
+                error = %error,
+                "retention secure-delete WAL checkpoint failed after committed prune"
+            );
         }
         Ok(outcome)
     }
@@ -842,19 +850,21 @@ impl SqliteAccountStorage {
 }
 
 fn checkpoint_wal_truncate_after_secure_prune(conn: &Connection) -> StorageResult<()> {
-    let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .storage()?;
-    if busy == 0 {
-        Ok(())
-    } else {
-        Err(StorageError::Busy(
-            "retention secure-delete WAL checkpoint could not truncate while readers are active"
-                .to_owned(),
-        ))
-    }
+    retry_on_busy(|| {
+        let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .storage()?;
+        if busy == 0 {
+            Ok(())
+        } else {
+            Err(StorageError::Busy(
+                "retention secure-delete WAL checkpoint could not truncate while readers are active"
+                    .to_owned(),
+            ))
+        }
+    })
 }
 
 fn account_group_components(
