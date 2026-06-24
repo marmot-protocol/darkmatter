@@ -543,6 +543,10 @@ impl NostrRelayClient for NostrSdkRelayClient {
         for endpoint in parsed_endpoints {
             let transport_endpoint = TransportEndpoint(endpoint.to_string());
             if !self.client.relays().await.contains_key(&endpoint) {
+                // Best-effort cleanup ownership: concurrent publishes can race
+                // on the same new endpoint, so only the add_write_relay winner
+                // tracks it for cleanup. A pool-wide refcount would be needed
+                // if same-endpoint publish concurrency becomes common.
                 // Publish targets are one-shot write relays. Do not use
                 // add_relay here: READ relays inherit pool subscriptions in
                 // nostr-sdk, which would leak account/group filters to a relay
@@ -943,6 +947,25 @@ mod tests {
 
         assert_eq!(outcome.accepted.len(), 1);
         assert_eq!(outcome.accepted[0].endpoint, reachable);
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publish_event_cleans_one_shot_relay_after_overall_timeout() {
+        let silent = TransportEndpoint(silent_relay_url().await);
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        let sdk = NostrSdkRelayClient::new(client);
+        // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
+        // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
+        let dto = signed_group_event_dto();
+
+        let err = sdk
+            .publish_event(std::slice::from_ref(&silent), &dto, 1)
+            .await
+            .expect_err("silent relay should miss the required ack deadline");
+
+        assert!(err.to_string().contains("publish timed out"));
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
 
