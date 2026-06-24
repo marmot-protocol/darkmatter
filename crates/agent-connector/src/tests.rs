@@ -2463,6 +2463,18 @@ fn inbound_message_event_ignores_different_account_bare_at_npub_mention() {
 }
 
 #[test]
+fn inbound_message_event_ignores_bare_at_npub_in_image_alt_text() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("![hey @{npub}](https://example.invalid/a.png)");
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "image alt text should not count as a visible addressed mention"
+    );
+}
+
+#[test]
 fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
     // The p-tag is authoritative: a mention with only the structured tag (no
     // inline nostr: reference in the body) is still detected.

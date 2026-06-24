@@ -98,7 +98,9 @@ fn markdown_inlines_have_npub_ref(inlines: &[Inline], npub: &str) -> bool {
             markdown_inlines_have_npub_ref(children, npub)
         }
         Inline::Link { children, .. } => markdown_inlines_have_npub_ref(children, npub),
-        Inline::Image { alt, .. } => markdown_inlines_have_npub_ref(alt, npub),
+        // Image alt text is metadata for fallback/rendering, not a visible
+        // addressed mention in the message body.
+        Inline::Image { .. } => false,
         Inline::Text(_)
         | Inline::SoftBreak
         | Inline::HardBreak
