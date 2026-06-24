@@ -361,11 +361,35 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::SendEntry {
             intent_kind: "app_message".into(),
         },
+        AuditEventKind::RecipientExpectation {
+            msg_id: "m".into(),
+            expectation: RecipientExpectation {
+                artifact_kind: MessageArtifactKind::Commit,
+                recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
+                membership_epoch: Some(3),
+                basis_commit_id: None,
+                expected_member_refs: vec!["a".repeat(32), "b".repeat(32)],
+                expected_pubkeys_hex: vec!["c".repeat(64)],
+                expected_count: Some(2),
+            },
+        },
         AuditEventKind::SendOutcome {
             intent_kind: "invite".into(),
             result_kind: "group_evolution".into(),
-            outbound_msg_id: Some("m".into()),
-            outbound_welcome_msg_ids: vec!["w1".into(), "w2".into()],
+            outbound_messages: vec![
+                OutboundMessage {
+                    msg_id: "m".into(),
+                    artifact_kind: MessageArtifactKind::Commit,
+                    transport: None,
+                    recipient_expectation: None,
+                },
+                OutboundMessage {
+                    msg_id: "w1".into(),
+                    artifact_kind: MessageArtifactKind::Welcome,
+                    transport: None,
+                    recipient_expectation: None,
+                },
+            ],
         },
         AuditEventKind::SendError {
             intent_kind: "invite".into(),
@@ -380,7 +404,20 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::CreateGroupOutcome {
             result_kind: "group_created".into(),
-            outbound_welcome_msg_ids: vec!["w1".into()],
+            outbound_messages: vec![OutboundMessage {
+                msg_id: "w1".into(),
+                artifact_kind: MessageArtifactKind::Welcome,
+                transport: None,
+                recipient_expectation: Some(RecipientExpectation {
+                    artifact_kind: MessageArtifactKind::Welcome,
+                    recipient_scope: RecipientScope::AddedMemberOnly,
+                    membership_epoch: Some(1),
+                    basis_commit_id: None,
+                    expected_member_refs: vec!["a".repeat(32)],
+                    expected_pubkeys_hex: Vec::new(),
+                    expected_count: Some(1),
+                }),
+            }],
         },
         AuditEventKind::CreateGroupError {
             error_kind: "missing_required_capabilities".into(),

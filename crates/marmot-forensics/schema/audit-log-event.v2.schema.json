@@ -62,6 +62,54 @@
       "type": "string",
       "pattern": "^[0-9A-Fa-f]{64}$"
     },
+    "pubkeyHex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "messageArtifactKind": {
+      "enum": ["application_message", "commit", "proposal", "welcome", "group_info", "unknown"]
+    },
+    "recipientScope": {
+      "enum": [
+        "all_current_group_members",
+        "all_other_current_group_members",
+        "added_member_only",
+        "explicit_members",
+        "self_only",
+        "unknown"
+      ]
+    },
+    "recipientExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "recipient_scope"],
+      "properties": {
+        "artifact_kind": { "$ref": "#/$defs/messageArtifactKind" },
+        "recipient_scope": { "$ref": "#/$defs/recipientScope" },
+        "membership_epoch": { "$ref": "#/$defs/u64" },
+        "basis_commit_id": { "$ref": "#/$defs/hexString" },
+        "expected_member_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/refHex16" }
+        },
+        "expected_pubkeys_hex": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pubkeyHex" }
+        },
+        "expected_count": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "outboundMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["msg_id", "artifact_kind"],
+      "properties": {
+        "msg_id": { "$ref": "#/$defs/hexString" },
+        "artifact_kind": { "$ref": "#/$defs/messageArtifactKind" },
+        "transport": { "$ref": "#/$defs/transportWireEnvelope" },
+        "recipient_expectation": { "$ref": "#/$defs/recipientExpectation" }
+      }
+    },
     "transportWireEnvelope": {
       "type": "object",
       "additionalProperties": false,
@@ -361,13 +409,25 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "msg_id", "expectation"],
+          "properties": {
+            "type": { "const": "recipient_expectation" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "expectation": { "$ref": "#/$defs/recipientExpectation" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "intent_kind", "result_kind"],
           "properties": {
             "type": { "const": "send_outcome" },
             "intent_kind": { "type": "string" },
             "result_kind": { "type": "string" },
-            "outbound_msg_id": { "$ref": "#/$defs/hexString" },
-            "outbound_welcome_msg_ids": { "$ref": "#/$defs/messageRefArray" }
+            "outbound_messages": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/outboundMessage" }
+            }
           }
         },
         {
@@ -400,7 +460,10 @@
           "properties": {
             "type": { "const": "create_group_outcome" },
             "result_kind": { "type": "string" },
-            "outbound_welcome_msg_ids": { "$ref": "#/$defs/messageRefArray" }
+            "outbound_messages": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/outboundMessage" }
+            }
           }
         },
         {

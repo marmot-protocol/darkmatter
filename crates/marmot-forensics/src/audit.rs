@@ -248,6 +248,63 @@ pub struct AuditGroupContext {
     pub convergence_max_rewind_commits: Option<u64>,
 }
 
+/// What kind of artifact an outbound message is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageArtifactKind {
+    ApplicationMessage,
+    Commit,
+    Proposal,
+    Welcome,
+    GroupInfo,
+    Unknown,
+}
+
+/// Who an outbound message is expected to reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipientScope {
+    AllCurrentGroupMembers,
+    AllOtherCurrentGroupMembers,
+    AddedMemberOnly,
+    ExplicitMembers,
+    SelfOnly,
+    Unknown,
+}
+
+/// The set of recipients an outbound message is expected to reach, derived from
+/// authenticated group membership at send time. `expected_pubkeys_hex` carries
+/// full member identities and is only populated in
+/// [`AuditDataMode::FullData`]; `expected_member_refs` (salted hashes) and
+/// `expected_count` are safe in both modes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecipientExpectation {
+    pub artifact_kind: MessageArtifactKind,
+    pub recipient_scope: RecipientScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_commit_id: Option<MessageRefHex>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_member_refs: Vec<MemberRefHex>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_pubkeys_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_count: Option<u64>,
+}
+
+/// One message produced by a send/create operation, for the `outbound_messages`
+/// inventory on `send_outcome` / `create_group_outcome`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundMessage {
+    pub msg_id: MessageRefHex,
+    pub artifact_kind: MessageArtifactKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<AuditTransportWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_expectation: Option<RecipientExpectation>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecorderHealthSnapshot {
     pub serialization_failures: u64,
@@ -346,14 +403,19 @@ pub enum AuditEventKind {
     },
     /// Engine accepted a `SendIntent` at `do_send` entry.
     SendEntry { intent_kind: String },
+    /// A per-message recipient expectation derived from authenticated group
+    /// membership at send time: normal group messages/commits target all other
+    /// current members; welcomes target only the added member.
+    RecipientExpectation {
+        msg_id: MessageRefHex,
+        expectation: RecipientExpectation,
+    },
     /// Engine returned a `SendResult` from `do_send`.
     SendOutcome {
         intent_kind: String,
         result_kind: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        outbound_msg_id: Option<MessageRefHex>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        outbound_welcome_msg_ids: Vec<MessageRefHex>,
+        outbound_messages: Vec<OutboundMessage>,
     },
     /// Engine returned an error from `do_send`.
     SendError {
@@ -373,7 +435,7 @@ pub enum AuditEventKind {
     CreateGroupOutcome {
         result_kind: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        outbound_welcome_msg_ids: Vec<MessageRefHex>,
+        outbound_messages: Vec<OutboundMessage>,
     },
     /// Engine returned an error from create-group.
     CreateGroupError {
@@ -571,6 +633,7 @@ impl AuditEventKind {
             AuditEventKind::IngestEntry { .. } => "ingest_entry",
             AuditEventKind::IngestOutcome { .. } => "ingest_outcome",
             AuditEventKind::IngestError { .. } => "ingest_error",
+            AuditEventKind::RecipientExpectation { .. } => "recipient_expectation",
             AuditEventKind::SendEntry { .. } => "send_entry",
             AuditEventKind::SendOutcome { .. } => "send_outcome",
             AuditEventKind::SendError { .. } => "send_error",

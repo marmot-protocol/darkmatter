@@ -383,6 +383,7 @@ impl<S: StorageProvider> Engine<S> {
         let operation_id = self.next_audit_operation_id();
         let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
         let group_ref = crate::audit_helpers::send_intent_group_ref(&intent);
+        let recipient_group_id = crate::audit_helpers::send_intent_group_id(&intent);
         let mut context = context.unwrap_or_default();
         context.operation_id = Some(operation_id);
         self.recorder.record(AuditRecord {
@@ -398,10 +399,22 @@ impl<S: StorageProvider> Engine<S> {
         match &result {
             Ok(send_result) => {
                 self.recorder.record(AuditRecord {
-                    group_ref,
-                    context: Some(context),
+                    group_ref: group_ref.clone(),
+                    context: Some(context.clone()),
                     kind: crate::audit_helpers::send_outcome_event(intent_kind, send_result),
                 });
+                for (msg_id, expectation) in
+                    self.recipient_expectation_records(&recipient_group_id, send_result)
+                {
+                    self.recorder.record(AuditRecord {
+                        group_ref: group_ref.clone(),
+                        context: Some(context.clone()),
+                        kind: AuditEventKind::RecipientExpectation {
+                            msg_id,
+                            expectation,
+                        },
+                    });
+                }
             }
             Err(err) => {
                 self.recorder.record(AuditRecord {
@@ -441,13 +454,25 @@ impl<S: StorageProvider> Engine<S> {
         let result = self.do_create_group(req).await;
         match &result {
             Ok((group_id, send_result)) => {
-                let mut outcome_context = context;
+                let mut outcome_context = context.clone();
                 outcome_context.group = self.audit_group_context_snapshot(group_id);
                 self.audit_group_with_context(
                     group_id,
-                    outcome_context,
+                    outcome_context.clone(),
                     crate::audit_helpers::create_group_outcome_event(send_result),
                 );
+                for (msg_id, expectation) in
+                    self.recipient_expectation_records(group_id, send_result)
+                {
+                    self.audit_group_with_context(
+                        group_id,
+                        outcome_context.clone(),
+                        AuditEventKind::RecipientExpectation {
+                            msg_id,
+                            expectation,
+                        },
+                    );
+                }
                 self.audit_group_context(group_id, "create_group");
             }
             Err(err) => {
@@ -463,6 +488,108 @@ impl<S: StorageProvider> Engine<S> {
         }
         self.current_audit_context = None;
         result
+    }
+
+    /// Compute per-message recipient expectations for a completed send/create,
+    /// derived from authenticated membership: the main message (commit, app
+    /// message, or proposal) targets all OTHER current group members; each
+    /// welcome targets only its added member. Full member pubkeys are included
+    /// only in [`AuditDataMode::FullData`]; member refs (salted hashes) and
+    /// counts are always safe.
+    fn recipient_expectation_records(
+        &self,
+        group_id: &GroupId,
+        result: &SendResult,
+    ) -> Vec<(
+        marmot_forensics::MessageRefHex,
+        marmot_forensics::RecipientExpectation,
+    )> {
+        use cgka_traits::transport::TransportEnvelope;
+        use marmot_forensics::{MessageArtifactKind, RecipientExpectation, RecipientScope};
+
+        let full_data = self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData;
+        let membership_epoch = self
+            .audit_group_context_snapshot(group_id)
+            .and_then(|ctx| ctx.epoch);
+        let mut rows = Vec::new();
+
+        let main = match result {
+            SendResult::ApplicationMessage { msg } => {
+                Some((msg, MessageArtifactKind::ApplicationMessage))
+            }
+            SendResult::Proposal { msg } => Some((msg, MessageArtifactKind::Proposal)),
+            SendResult::GroupEvolution { msg, .. } => Some((msg, MessageArtifactKind::Commit)),
+            SendResult::GroupCreated { .. } | SendResult::Queued { .. } => None,
+        };
+        if let Some((msg, artifact_kind)) = main {
+            let self_id = self.identity.self_id();
+            let members = self.do_members(group_id).unwrap_or_default();
+            let others: Vec<_> = members.iter().filter(|m| &m.id != self_id).collect();
+            let expected_pubkeys_hex = if full_data {
+                others
+                    .iter()
+                    .filter(|m| m.credential.len() == 32)
+                    .map(|m| hex::encode(&m.credential))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            rows.push((
+                hex::encode(msg.id.as_slice()),
+                RecipientExpectation {
+                    artifact_kind,
+                    recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
+                    membership_epoch,
+                    basis_commit_id: None,
+                    expected_member_refs: others
+                        .iter()
+                        .map(|m| crate::audit_helpers::member_ref_hex(&m.id))
+                        .collect(),
+                    expected_pubkeys_hex,
+                    expected_count: Some(others.len() as u64),
+                },
+            ));
+        }
+
+        let welcomes = match result {
+            SendResult::GroupEvolution { welcomes, .. }
+            | SendResult::GroupCreated { welcomes, .. } => welcomes.as_slice(),
+            _ => [].as_slice(),
+        };
+        for welcome in welcomes {
+            let recipient = match &welcome.envelope {
+                TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
+                TransportEnvelope::GroupMessage { .. } => None,
+            };
+            let (expected_member_refs, expected_pubkeys_hex, expected_count) = match &recipient {
+                Some(recipient) => {
+                    let pubkeys = if full_data && recipient.as_slice().len() == 32 {
+                        vec![hex::encode(recipient.as_slice())]
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        vec![crate::audit_helpers::member_ref_hex(recipient)],
+                        pubkeys,
+                        Some(1),
+                    )
+                }
+                None => (Vec::new(), Vec::new(), None),
+            };
+            rows.push((
+                hex::encode(welcome.id.as_slice()),
+                RecipientExpectation {
+                    artifact_kind: MessageArtifactKind::Welcome,
+                    recipient_scope: RecipientScope::AddedMemberOnly,
+                    membership_epoch,
+                    basis_commit_id: None,
+                    expected_member_refs,
+                    expected_pubkeys_hex,
+                    expected_count,
+                },
+            ));
+        }
+        rows
     }
 
     /// Restore stable epoch state for groups already present in storage.

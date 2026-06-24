@@ -16,7 +16,9 @@ use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
-use marmot_forensics::{AuditEventKind, DigestHex, MemberRefHex, MessageRefHex};
+use marmot_forensics::{
+    AuditEventKind, DigestHex, MemberRefHex, MessageArtifactKind, MessageRefHex, OutboundMessage,
+};
 use sha2::{Digest, Sha256};
 
 use crate::epoch_manager::PendingKind;
@@ -100,13 +102,18 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
 }
 
 pub(crate) fn send_intent_group_ref(intent: &SendIntent) -> Option<String> {
+    Some(hex::encode(send_intent_group_id(intent).as_slice()))
+}
+
+/// The group a send intent targets. Every `SendIntent` variant is group-scoped.
+pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
-        | SendIntent::UpdateGroupData { group_id, .. } => Some(hex::encode(group_id.as_slice())),
+        | SendIntent::UpdateGroupData { group_id, .. } => group_id.clone(),
     }
 }
 
@@ -117,31 +124,6 @@ pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
         SendResult::Proposal { .. } => "proposal",
         SendResult::GroupEvolution { .. } => "group_evolution",
         SendResult::GroupCreated { .. } => "group_created",
-    }
-}
-
-pub(crate) fn send_outbound_ids(
-    result: &SendResult,
-) -> (Option<MessageRefHex>, Vec<MessageRefHex>) {
-    match result {
-        SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
-            (Some(hex::encode(msg.id.as_slice())), Vec::new())
-        }
-        SendResult::GroupEvolution { msg, welcomes, .. } => (
-            Some(hex::encode(msg.id.as_slice())),
-            welcomes
-                .iter()
-                .map(|w| hex::encode(w.id.as_slice()))
-                .collect(),
-        ),
-        SendResult::GroupCreated { welcomes, .. } => (
-            None,
-            welcomes
-                .iter()
-                .map(|w| hex::encode(w.id.as_slice()))
-                .collect(),
-        ),
-        SendResult::Queued { .. } => (None, Vec::new()),
     }
 }
 
@@ -365,22 +347,62 @@ pub(crate) fn message_state_transition_event(
     }
 }
 
+/// Map a `SendResult` to its outbound message inventory (id + artifact kind).
+///
+/// Per-message recipient expectations are emitted as separate
+/// `recipient_expectation` rows (see `Engine::recipient_expectation_records`)
+/// because they need the engine's authenticated membership roster, which is not
+/// available from the `SendResult` alone.
+pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage> {
+    fn outbound(msg: &TransportMessage, artifact_kind: MessageArtifactKind) -> OutboundMessage {
+        OutboundMessage {
+            msg_id: hex::encode(msg.id.as_slice()),
+            artifact_kind,
+            transport: None,
+            recipient_expectation: None,
+        }
+    }
+    let mut messages = Vec::new();
+    match result {
+        SendResult::ApplicationMessage { msg } => {
+            messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
+        }
+        SendResult::Proposal { msg } => {
+            messages.push(outbound(msg, MessageArtifactKind::Proposal));
+        }
+        SendResult::GroupEvolution { msg, welcomes, .. } => {
+            messages.push(outbound(msg, MessageArtifactKind::Commit));
+            messages.extend(
+                welcomes
+                    .iter()
+                    .map(|w| outbound(w, MessageArtifactKind::Welcome)),
+            );
+        }
+        SendResult::GroupCreated { welcomes, .. } => {
+            messages.extend(
+                welcomes
+                    .iter()
+                    .map(|w| outbound(w, MessageArtifactKind::Welcome)),
+            );
+        }
+        SendResult::Queued { .. } => {}
+    }
+    messages
+}
+
 /// Build a `SendOutcome` event from a `SendResult`.
 pub(crate) fn send_outcome_event(intent_kind: String, result: &SendResult) -> AuditEventKind {
-    let (outbound_msg_id, outbound_welcome_msg_ids) = send_outbound_ids(result);
     AuditEventKind::SendOutcome {
         intent_kind,
         result_kind: send_result_kind_str(result).to_string(),
-        outbound_msg_id,
-        outbound_welcome_msg_ids,
+        outbound_messages: send_outbound_messages(result),
     }
 }
 
 pub(crate) fn create_group_outcome_event(result: &SendResult) -> AuditEventKind {
-    let (_outbound_msg_id, outbound_welcome_msg_ids) = send_outbound_ids(result);
     AuditEventKind::CreateGroupOutcome {
         result_kind: send_result_kind_str(result).to_string(),
-        outbound_welcome_msg_ids,
+        outbound_messages: send_outbound_messages(result),
     }
 }
 
