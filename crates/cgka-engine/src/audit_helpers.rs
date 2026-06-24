@@ -17,10 +17,15 @@ use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, MemberId, MessageId};
 use marmot_forensics::{
-    AuditEventKind, DigestHex, MemberRefHex, MessageArtifactKind, MessageRefHex, OutboundMessage,
+    AuditEventKind, ConvergenceAppWitness, ConvergenceCandidate, ConvergenceRuleEvaluation,
+    ConvergenceScore, DigestHex, MemberRefHex, MessageArtifactKind, MessageRefHex, OutboundMessage,
 };
 use sha2::{Digest, Sha256};
 
+use crate::convergence::{
+    AppWitness, BranchScore, BranchSelectionTrace, CandidateEvaluation, RuleEvaluation,
+    tip_priority_str,
+};
 use crate::epoch_manager::PendingKind;
 use openmls::prelude::Proposal;
 
@@ -468,5 +473,118 @@ pub(crate) fn epoch_rolled_back_event(
         pending_epoch: pending_epoch.0,
         restored_epoch: restored_epoch.0,
         pending_kind: pending_kind.to_string(),
+    }
+}
+
+/// Build a `ConvergenceDecision` audit event from a branch-selection trace.
+/// Full committer/witness pubkeys are included only in `full_data` mode; member
+/// refs (salted hashes) and digests are always emitted.
+pub(crate) fn convergence_decision_event(
+    current_tip_epoch: u64,
+    max_rewind_commits: u64,
+    trace: Option<&BranchSelectionTrace>,
+    error_kinds: Vec<String>,
+    full_data: bool,
+) -> AuditEventKind {
+    let Some(trace) = trace else {
+        return AuditEventKind::ConvergenceDecision {
+            current_tip_epoch,
+            max_rewind_commits,
+            candidates: Vec::new(),
+            rule_trace: Vec::new(),
+            selected_branch_id: None,
+            selected_fork_epoch: None,
+            selected_tip_epoch: None,
+            losing_branch_ids: Vec::new(),
+            error_kinds,
+        };
+    };
+    let selected = trace
+        .selected_branch_id
+        .as_ref()
+        .and_then(|id| trace.candidates.iter().find(|c| &c.branch_id == id));
+    AuditEventKind::ConvergenceDecision {
+        current_tip_epoch,
+        max_rewind_commits,
+        candidates: trace
+            .candidates
+            .iter()
+            .map(|candidate| convergence_candidate(candidate, full_data))
+            .collect(),
+        rule_trace: trace.rule_trace.iter().map(convergence_rule_eval).collect(),
+        selected_branch_id: trace.selected_branch_id.clone(),
+        selected_fork_epoch: selected.map(|c| c.fork_epoch),
+        selected_tip_epoch: selected.map(|c| c.tip_epoch),
+        losing_branch_ids: trace.losing_branch_ids.clone(),
+        error_kinds,
+    }
+}
+
+fn committer_ref(committer: &[u8]) -> Option<MemberRefHex> {
+    (!committer.is_empty()).then(|| member_ref_hex(&MemberId::new(committer.to_vec())))
+}
+
+fn committer_pubkey_hex(committer: &[u8], full_data: bool) -> Option<String> {
+    (full_data && committer.len() == 32).then(|| hex::encode(committer))
+}
+
+fn convergence_candidate(candidate: &CandidateEvaluation, full_data: bool) -> ConvergenceCandidate {
+    ConvergenceCandidate {
+        branch_id: candidate.branch_id.clone(),
+        fork_epoch: candidate.fork_epoch,
+        tip_epoch: candidate.tip_epoch,
+        commit_ids: Vec::new(),
+        commit_count: None,
+        tip_digest: Some(hex::encode(candidate.tip_digest)),
+        tip_priority: Some(tip_priority_str(candidate.tip_priority).to_string()),
+        tip_committer_ref: committer_ref(&candidate.tip_committer),
+        tip_committer_pubkey_hex: committer_pubkey_hex(&candidate.tip_committer, full_data),
+        retained_anchor_status: None,
+        eligible: Some(candidate.eligible),
+        rejection_reasons: candidate.rejection_reasons.clone(),
+        score: Some(convergence_score(&candidate.score, full_data)),
+        app_witnesses: candidate
+            .app_witnesses
+            .iter()
+            .map(|witness| convergence_app_witness(witness, full_data))
+            .collect(),
+    }
+}
+
+fn convergence_score(score: &BranchScore, full_data: bool) -> ConvergenceScore {
+    ConvergenceScore {
+        valid_commit_depth: Some(score.valid_commit_depth),
+        effective_commit_depth: Some(score.effective_commit_depth),
+        witness_quorum_met: Some(score.witness_quorum_met),
+        app_witness_score: Some(score.app_witness_score as u64),
+        tip_priority: Some(tip_priority_str(score.tip_priority).to_string()),
+        tip_committer_ref: committer_ref(&score.tip_committer),
+        tip_committer_pubkey_hex: committer_pubkey_hex(&score.tip_committer, full_data),
+        tip_digest: Some(hex::encode(score.tip_digest)),
+    }
+}
+
+fn convergence_app_witness(witness: &AppWitness, full_data: bool) -> ConvergenceAppWitness {
+    ConvergenceAppWitness {
+        epoch: witness.epoch,
+        sender_ref: committer_ref(&witness.sender),
+        sender_pubkey_hex: committer_pubkey_hex(&witness.sender, full_data),
+    }
+}
+
+fn convergence_rule_eval(rule: &RuleEvaluation) -> ConvergenceRuleEvaluation {
+    ConvergenceRuleEvaluation {
+        rule_name: rule.rule_name.to_string(),
+        scope: Some("candidate_pair".to_string()),
+        candidate_branch_id: Some(rule.winner_branch_id.clone()),
+        other_candidate_branch_id: Some(rule.other_branch_id.clone()),
+        inputs: None,
+        result: serde_json::json!({
+            "winner": rule.winner_value,
+            "other": rule.other_value,
+        }),
+        decisive: Some(rule.decisive),
+        selected_branch_id: rule.decisive.then(|| rule.winner_branch_id.clone()),
+        rejected_branch_id: rule.decisive.then(|| rule.other_branch_id.clone()),
     }
 }

@@ -329,6 +329,7 @@ impl<S: StorageProvider> Engine<S> {
             transport: transport_context,
             engine: None,
             group: None,
+            convergence: None,
         };
         // Record the transport wire evidence before ingest when the transport
         // layer supplied it, so an analyzer sees what arrived on the wire ahead

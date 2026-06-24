@@ -133,6 +133,87 @@
     "auditDataMode": {
       "enum": ["obfuscated_sensitive_data", "full_data"]
     },
+    "jsonValue": {},
+    "jsonObject": {
+      "type": "object"
+    },
+    "convergencePhase": {
+      "enum": ["started", "waiting", "evaluating", "selected", "blocked", "applied", "failed", "stable", "unrecoverable"]
+    },
+    "auditConvergenceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "phase": { "$ref": "#/$defs/convergencePhase" },
+        "inferred": { "type": "boolean" }
+      }
+    },
+    "convergenceAppWitness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epoch"],
+      "properties": {
+        "epoch": { "$ref": "#/$defs/u64" },
+        "sender_ref": { "$ref": "#/$defs/refHex16" },
+        "sender_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" }
+      }
+    },
+    "convergenceScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "valid_commit_depth": { "$ref": "#/$defs/u64" },
+        "effective_commit_depth": { "$ref": "#/$defs/u64" },
+        "witness_quorum_met": { "type": "boolean" },
+        "app_witness_score": { "$ref": "#/$defs/u64" },
+        "tip_priority": { "type": "string" },
+        "tip_committer_ref": { "$ref": "#/$defs/refHex16" },
+        "tip_committer_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
+        "tip_digest": { "$ref": "#/$defs/digestHex" }
+      }
+    },
+    "convergenceCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch_id", "fork_epoch", "tip_epoch"],
+      "properties": {
+        "branch_id": { "type": "string" },
+        "fork_epoch": { "$ref": "#/$defs/u64" },
+        "tip_epoch": { "$ref": "#/$defs/u64" },
+        "commit_ids": { "$ref": "#/$defs/messageRefArray" },
+        "commit_count": { "$ref": "#/$defs/u64" },
+        "tip_digest": { "$ref": "#/$defs/digestHex" },
+        "tip_priority": { "type": "string" },
+        "tip_committer_ref": { "$ref": "#/$defs/refHex16" },
+        "tip_committer_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
+        "retained_anchor_status": { "type": "string" },
+        "eligible": { "type": "boolean" },
+        "rejection_reasons": { "$ref": "#/$defs/stringArray" },
+        "score": { "$ref": "#/$defs/convergenceScore" },
+        "app_witnesses": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/convergenceAppWitness" }
+        }
+      }
+    },
+    "convergenceRuleEvaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_name", "result"],
+      "properties": {
+        "rule_name": { "type": "string" },
+        "scope": { "enum": ["run", "candidate", "candidate_pair"] },
+        "candidate_branch_id": { "type": "string" },
+        "other_candidate_branch_id": { "type": "string" },
+        "inputs": { "$ref": "#/$defs/jsonObject" },
+        "result": { "$ref": "#/$defs/jsonValue" },
+        "decisive": { "type": "boolean" },
+        "selected_branch_id": { "type": "string" },
+        "rejected_branch_id": { "type": "string" }
+      }
+    },
     "stringArray": {
       "type": "array",
       "items": {
@@ -169,6 +250,9 @@
         },
         "group": {
           "$ref": "#/$defs/auditGroupContext"
+        },
+        "convergence": {
+          "$ref": "#/$defs/auditConvergenceContext"
         }
       }
     },
@@ -640,16 +724,36 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "current_tip_epoch", "candidate_count", "eligible_count", "max_rewind_commits"],
+          "required": ["type", "phase"],
+          "properties": {
+            "type": { "const": "convergence_run_state" },
+            "phase": { "$ref": "#/$defs/convergencePhase" },
+            "current_tip_epoch": { "$ref": "#/$defs/u64" },
+            "retained_anchor_horizon": { "$ref": "#/$defs/u64" },
+            "reason": { "type": "string" },
+            "error_kind": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "current_tip_epoch", "max_rewind_commits"],
           "properties": {
             "type": { "const": "convergence_decision" },
             "current_tip_epoch": { "$ref": "#/$defs/u64" },
-            "candidate_count": { "$ref": "#/$defs/u64" },
-            "eligible_count": { "$ref": "#/$defs/u64" },
             "max_rewind_commits": { "$ref": "#/$defs/u64" },
+            "candidates": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/convergenceCandidate" }
+            },
+            "rule_trace": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/convergenceRuleEvaluation" }
+            },
             "selected_branch_id": { "type": "string" },
             "selected_fork_epoch": { "$ref": "#/$defs/u64" },
             "selected_tip_epoch": { "$ref": "#/$defs/u64" },
+            "losing_branch_ids": { "$ref": "#/$defs/stringArray" },
             "error_kinds": { "$ref": "#/$defs/stringArray" }
           }
         },

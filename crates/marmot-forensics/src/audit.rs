@@ -149,6 +149,35 @@ pub struct AuditEventContext {
     pub engine: Option<AuditEngineContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<AuditGroupContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<AuditConvergenceContext>,
+}
+
+/// Correlates every row produced during one distributed-convergence run via a
+/// stable `run_id`, so an analyzer can group a run's `convergence_run_state`
+/// lifecycle and `convergence_decision` together.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditConvergenceContext {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ConvergencePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred: Option<bool>,
+}
+
+/// Lifecycle phase of a convergence run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvergencePhase {
+    Started,
+    Waiting,
+    Evaluating,
+    Selected,
+    Blocked,
+    Applied,
+    Failed,
+    Stable,
+    Unrecoverable,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +332,92 @@ pub struct OutboundMessage {
     pub transport: Option<AuditTransportWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_expectation: Option<RecipientExpectation>,
+}
+
+/// One witness application message observed at a future epoch, used by the
+/// witness-quorum convergence rule. `sender_pubkey_hex` is full-data only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceAppWitness {
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_ref: Option<MemberRefHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_pubkey_hex: Option<String>,
+}
+
+/// The score the selector computed for a convergence candidate. Mirrors the
+/// engine's `BranchScore`. `tip_committer_pubkey_hex` is full-data only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceScore {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_commit_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_commit_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_quorum_met: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_witness_score: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_committer_ref: Option<MemberRefHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_committer_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_digest: Option<DigestHex>,
+}
+
+/// One branch the convergence selector evaluated.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceCandidate {
+    pub branch_id: String,
+    pub fork_epoch: u64,
+    pub tip_epoch: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_ids: Vec<MessageRefHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_digest: Option<DigestHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_committer_ref: Option<MemberRefHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_committer_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_anchor_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejection_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<ConvergenceScore>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_witnesses: Vec<ConvergenceAppWitness>,
+}
+
+/// One selector rule evaluation, recording its inputs, result, and whether it
+/// was the decisive rule that picked the winner. `inputs`/`result` are free-form
+/// JSON so each rule can carry its own shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceRuleEvaluation {
+    pub rule_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_candidate_branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<serde_json::Value>,
+    pub result: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_branch_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,18 +676,37 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invalidated_msg_id: Option<MessageRefHex>,
     },
-    /// `select_canonical_branch` evaluated a candidate set.
+    /// A distributed-convergence run changed lifecycle phase. Correlated with
+    /// its `convergence_decision` via the `convergence.run_id` context.
+    ConvergenceRunState {
+        phase: ConvergencePhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_tip_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retained_anchor_horizon: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+    },
+    /// `select_canonical_branch` evaluated a candidate set. Carries every
+    /// candidate with its score, the full `rule_trace` (each selector rule and
+    /// which one was decisive), the selected branch, and the losing branches.
     ConvergenceDecision {
         current_tip_epoch: u64,
-        candidate_count: usize,
-        eligible_count: usize,
         max_rewind_commits: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        candidates: Vec<ConvergenceCandidate>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rule_trace: Vec<ConvergenceRuleEvaluation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected_branch_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected_fork_epoch: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected_tip_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        losing_branch_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         error_kinds: Vec<String>,
     },
@@ -654,6 +788,7 @@ impl AuditEventKind {
             AuditEventKind::GroupHydrationRecovered { .. } => "group_hydration_recovered",
             AuditEventKind::SnapshotCreated { .. } => "snapshot_created",
             AuditEventKind::ForkResolution { .. } => "fork_resolution",
+            AuditEventKind::ConvergenceRunState { .. } => "convergence_run_state",
             AuditEventKind::ConvergenceDecision { .. } => "convergence_decision",
             AuditEventKind::PeelerOutcome { .. } => "peeler_outcome",
             AuditEventKind::AutoCommitDecision { .. } => "auto_commit_decision",

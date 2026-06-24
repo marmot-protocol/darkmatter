@@ -3707,3 +3707,80 @@ fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
         "expected InvalidPolicy, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn convergence_emits_run_state_and_decision_with_run_id_context() {
+    // Requirement #10: a convergence run emits a convergence_run_state(started)
+    // lifecycle row and a convergence_decision, correlated by a stable run_id on
+    // the convergence context.
+    use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-conv".to_string()).unwrap();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = EngineBuilder::new(storage)
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "conv".into(),
+            description: "".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = create {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    alice
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("converge");
+    drop(alice);
+
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let started = events
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.kind,
+                AuditEventKind::ConvergenceRunState {
+                    phase: marmot_forensics::ConvergencePhase::Started,
+                    ..
+                }
+            )
+        })
+        .expect("convergence_run_state(started) recorded");
+    let decision = events
+        .iter()
+        .find(|e| matches!(e.kind, AuditEventKind::ConvergenceDecision { .. }))
+        .expect("convergence_decision recorded");
+
+    // Both rows carry the convergence run id, and it is the same run.
+    let run_id_of = |event: &AuditEvent| {
+        event
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.convergence.as_ref())
+            .map(|c| c.run_id.clone())
+    };
+    let started_run = run_id_of(started).expect("started carries a run_id");
+    let decision_run = run_id_of(decision).expect("decision carries a run_id");
+    assert_eq!(started_run, decision_run, "rows share one run_id");
+    assert!(started_run.starts_with("conv-"));
+}
