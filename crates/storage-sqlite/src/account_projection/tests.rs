@@ -1,9 +1,13 @@
 use super::*;
-use crate::StoredAppEvent;
+use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
 };
+
+fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+    false
+}
 
 fn group(id: &str, name: &str) -> StoredAccountGroup {
     StoredAccountGroup {
@@ -419,7 +423,9 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         format!("locator blossom-v1 https://blossom.example/{media_hash}"),
     ]];
     store.record_app_event(&old).unwrap();
-    store.refresh_chat_list_row("alice-account", "aa").unwrap();
+    store
+        .refresh_chat_list_row("alice-account", "aa", &no_mentions)
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         let (busy, _, _): (i64, i64, i64) = conn
@@ -548,7 +554,9 @@ fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
     let mut old = app_event("old-aa", "aa", 10);
     old.plaintext = "chat list should not retain this".to_owned();
     store.record_app_event(&old).unwrap();
-    store.refresh_chat_list_row("alice-account", "aa").unwrap();
+    store
+        .refresh_chat_list_row("alice-account", "aa", &no_mentions)
+        .unwrap();
     assert_eq!(
         store
             .chat_list_row("aa")
@@ -1084,6 +1092,45 @@ fn delete_local_group_data_rolls_back_all_tables_on_failure() {
     ] {
         assert!(group_row_count(&store, table, "aa") > 0, "{table}");
     }
+}
+
+#[test]
+fn record_app_event_retries_concurrent_writer_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("projection-contention.sqlite");
+    let key = SqlCipherKey::new("projection contention key").unwrap();
+    let options = SqliteStorageOptions {
+        busy_timeout_ms: 50,
+        ..SqliteStorageOptions::default()
+    };
+
+    let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+        .expect("writer storage opens");
+
+    let blocker_path = path.clone();
+    let blocker_options = options.clone();
+    let blocker_key = SqlCipherKey::new("projection contention key").unwrap();
+    let blocker = std::thread::spawn(move || {
+        let blocker = SqliteAccountStorage::open_encrypted_with_options(
+            &blocker_path,
+            &blocker_key,
+            blocker_options,
+        )
+        .expect("blocker storage opens");
+        let conn = blocker.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(40));
+
+    writer
+        .record_app_event(&app_event("contended", "aa", 10))
+        .expect("projection writer should wait out transient sqlite write-lock contention");
+
+    blocker.join().unwrap();
+    assert_eq!(writer.app_message_count().unwrap(), 1);
 }
 
 fn insert_group_push_token(store: &SqliteAccountStorage, group_id_hex: &str, member_id_hex: &str) {
