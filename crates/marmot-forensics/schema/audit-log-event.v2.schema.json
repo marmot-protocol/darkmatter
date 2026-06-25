@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.marmot.dev/forensics/audit-log-event.v2.schema.json",
   "title": "Marmot forensic audit log event v2",
-  "description": "Schema for one line in a Marmot append-only forensic audit JSONL file. Version 2 introduces explicit audit data modes (obfuscated_sensitive_data vs full_data) stamped on every line and a mode-change boundary row. Later phases extend it with transport wire evidence, recipient expectations, decoded full-data content, and convergence decision traces.",
+  "description": "Schema for one line in a Marmot append-only forensic audit JSONL file. Version 2 adds explicit audit data modes, transport wire evidence, recipient expectations, decoded full-data message content, and convergence decision traces.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "seq", "wall_time_ms", "audit_data_mode", "engine_id", "kind"],
@@ -16,12 +16,12 @@
     "wall_time_ms": {
       "$ref": "#/$defs/u64"
     },
-    "audit_data_mode": {
-      "$ref": "#/$defs/auditDataMode"
-    },
     "recorder_session_id": {
       "type": "string",
       "minLength": 1
+    },
+    "audit_data_mode": {
+      "$ref": "#/$defs/auditDataMode"
     },
     "account_ref": {
       "$ref": "#/$defs/refHex16"
@@ -62,243 +62,13 @@
       "type": "string",
       "pattern": "^[0-9A-Fa-f]{64}$"
     },
+    "messageId": {
+      "description": "Canonical Marmot message artifact id. For MLS content-bearing artifacts this is the SHA-256 digest of the MLS content bytes. Transport and on-wire ids must be recorded in transportWireEnvelope instead of overloading msg_id.",
+      "$ref": "#/$defs/digestHex"
+    },
     "pubkeyHex": {
       "type": "string",
       "pattern": "^[0-9A-Fa-f]{64}$"
-    },
-    "auditSourceContext": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "account_label": { "type": "string" },
-        "device_label": { "type": "string" },
-        "device_id": { "type": "string" },
-        "device_name": { "type": "string" },
-        "platform": { "type": "string" },
-        "app_version": { "type": "string" },
-        "upload_trigger": { "type": "string" },
-        "account_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-        "account_npub": { "type": "string" }
-      }
-    },
-    "messageAuthor": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "member_ref": { "$ref": "#/$defs/refHex16" },
-        "member_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-        "account_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-        "npub": { "type": "string" }
-      }
-    },
-    "attachmentMetadata": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "component_id": { "$ref": "#/$defs/u16" },
-        "content_type": { "type": "string" },
-        "file_name": { "type": "string" },
-        "byte_len": { "$ref": "#/$defs/u64" },
-        "digest": { "$ref": "#/$defs/digestHex" },
-        "metadata": { "$ref": "#/$defs/jsonObject" }
-      }
-    },
-    "decodedPayload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["content_type"],
-      "properties": {
-        "content_type": { "type": "string" },
-        "text": { "type": "string" },
-        "json": { "$ref": "#/$defs/jsonValue" },
-        "bytes_b64": { "type": "string" }
-      }
-    },
-    "decodedApplicationEvent": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["format"],
-      "properties": {
-        "format": { "type": "string" },
-        "kind": { "$ref": "#/$defs/u64" },
-        "content": { "type": "string" },
-        "pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-        "tags": {
-          "type": "array",
-          "items": { "type": "array", "items": { "type": "string" } }
-        },
-        "created_at_ms": { "$ref": "#/$defs/u64" },
-        "client_message_id": { "type": "string" },
-        "reply_to_message_id": { "type": "string" },
-        "thread_root_message_id": { "type": "string" },
-        "attachments": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/attachmentMetadata" }
-        },
-        "raw": { "$ref": "#/$defs/jsonValue" }
-      }
-    },
-    "groupStateValue": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "digest": { "$ref": "#/$defs/digestHex" },
-        "len": { "$ref": "#/$defs/u64" },
-        "text": { "type": "string" },
-        "json": { "$ref": "#/$defs/jsonValue" },
-        "pubkeys_hex": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/pubkeyHex" }
-        }
-      }
-    },
-    "messageArtifactKind": {
-      "enum": ["application_message", "commit", "proposal", "welcome", "group_info", "unknown"]
-    },
-    "recipientScope": {
-      "enum": [
-        "all_current_group_members",
-        "all_other_current_group_members",
-        "added_member_only",
-        "explicit_members",
-        "self_only",
-        "unknown"
-      ]
-    },
-    "recipientExpectation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["artifact_kind", "recipient_scope"],
-      "properties": {
-        "artifact_kind": { "$ref": "#/$defs/messageArtifactKind" },
-        "recipient_scope": { "$ref": "#/$defs/recipientScope" },
-        "membership_epoch": { "$ref": "#/$defs/u64" },
-        "basis_commit_id": { "$ref": "#/$defs/hexString" },
-        "expected_member_refs": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/refHex16" }
-        },
-        "expected_pubkeys_hex": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/pubkeyHex" }
-        },
-        "expected_count": { "$ref": "#/$defs/u64" }
-      }
-    },
-    "outboundMessage": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["msg_id", "artifact_kind"],
-      "properties": {
-        "msg_id": { "$ref": "#/$defs/hexString" },
-        "artifact_kind": { "$ref": "#/$defs/messageArtifactKind" },
-        "transport": { "$ref": "#/$defs/transportWireEnvelope" },
-        "recipient_expectation": { "$ref": "#/$defs/recipientExpectation" }
-      }
-    },
-    "transportWireEnvelope": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "transport": { "type": "string" },
-        "delivery_plane": { "type": "string" },
-        "wire_id": { "type": "string" },
-        "wire_kind": { "$ref": "#/$defs/u64" },
-        "wire_pubkey_hex": { "$ref": "#/$defs/hexString" },
-        "transport_group_id": { "type": "string" },
-        "relay_url": { "type": "string" },
-        "subscription_id": { "type": "string" },
-        "nostr_event_id": { "$ref": "#/$defs/digestHex" },
-        "nostr_kind": { "$ref": "#/$defs/u64" },
-        "nostr_pubkey_hex": { "$ref": "#/$defs/hexString" },
-        "gift_wrap_event_id": { "$ref": "#/$defs/digestHex" },
-        "welcome_event_id": { "type": "string" },
-        "publish_result_id": { "type": "string" }
-      }
-    },
-    "auditDataMode": {
-      "enum": ["obfuscated_sensitive_data", "full_data"]
-    },
-    "jsonValue": {},
-    "jsonObject": {
-      "type": "object"
-    },
-    "convergencePhase": {
-      "enum": ["started", "waiting", "evaluating", "selected", "blocked", "applied", "failed", "stable", "unrecoverable"]
-    },
-    "auditConvergenceContext": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["run_id"],
-      "properties": {
-        "run_id": { "type": "string", "minLength": 1 },
-        "phase": { "$ref": "#/$defs/convergencePhase" },
-        "inferred": { "type": "boolean" }
-      }
-    },
-    "convergenceAppWitness": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["epoch"],
-      "properties": {
-        "epoch": { "$ref": "#/$defs/u64" },
-        "sender_ref": { "$ref": "#/$defs/refHex16" },
-        "sender_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" }
-      }
-    },
-    "convergenceScore": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "valid_commit_depth": { "$ref": "#/$defs/u64" },
-        "effective_commit_depth": { "$ref": "#/$defs/u64" },
-        "witness_quorum_met": { "type": "boolean" },
-        "app_witness_score": { "$ref": "#/$defs/u64" },
-        "tip_priority": { "type": "string" },
-        "tip_committer_ref": { "$ref": "#/$defs/refHex16" },
-        "tip_committer_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-        "tip_digest": { "$ref": "#/$defs/digestHex" }
-      }
-    },
-    "convergenceCandidate": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["branch_id", "fork_epoch", "tip_epoch"],
-      "properties": {
-        "branch_id": { "type": "string" },
-        "fork_epoch": { "$ref": "#/$defs/u64" },
-        "tip_epoch": { "$ref": "#/$defs/u64" },
-        "commit_ids": { "$ref": "#/$defs/messageRefArray" },
-        "commit_count": { "$ref": "#/$defs/u64" },
-        "tip_digest": { "$ref": "#/$defs/digestHex" },
-        "tip_priority": { "type": "string" },
-        "tip_committer_ref": { "$ref": "#/$defs/refHex16" },
-        "tip_committer_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-        "retained_anchor_status": { "type": "string" },
-        "eligible": { "type": "boolean" },
-        "rejection_reasons": { "$ref": "#/$defs/stringArray" },
-        "score": { "$ref": "#/$defs/convergenceScore" },
-        "app_witnesses": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/convergenceAppWitness" }
-        }
-      }
-    },
-    "convergenceRuleEvaluation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["rule_name", "result"],
-      "properties": {
-        "rule_name": { "type": "string" },
-        "scope": { "enum": ["run", "candidate", "candidate_pair"] },
-        "candidate_branch_id": { "type": "string" },
-        "other_candidate_branch_id": { "type": "string" },
-        "inputs": { "$ref": "#/$defs/jsonObject" },
-        "result": { "$ref": "#/$defs/jsonValue" },
-        "decisive": { "type": "boolean" },
-        "selected_branch_id": { "type": "string" },
-        "rejected_branch_id": { "type": "string" }
-      }
     },
     "stringArray": {
       "type": "array",
@@ -306,17 +76,14 @@
         "type": "string"
       }
     },
-    "u16Array": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/u16"
-      }
-    },
     "messageRefArray": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/hexString"
+        "$ref": "#/$defs/messageId"
       }
+    },
+    "auditDataMode": {
+      "enum": ["obfuscated_sensitive_data", "full_data"]
     },
     "auditEventContext": {
       "type": "object",
@@ -360,7 +127,10 @@
           "$ref": "#/$defs/stringArray"
         },
         "component_ids": {
-          "$ref": "#/$defs/u16Array"
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/u16"
+          }
         },
         "target_count": {
           "$ref": "#/$defs/u64"
@@ -431,6 +201,471 @@
         }
       }
     },
+    "auditConvergenceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id"],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "phase": {
+          "$ref": "#/$defs/convergencePhase"
+        },
+        "inferred": {
+          "type": "boolean"
+        }
+      }
+    },
+    "auditSourceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_label": {
+          "type": "string"
+        },
+        "device_label": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "device_name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "app_version": {
+          "type": "string"
+        },
+        "upload_trigger": {
+          "type": "string"
+        },
+        "account_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "account_npub": {
+          "type": "string"
+        }
+      }
+    },
+    "transportWireEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "transport": {
+          "type": "string"
+        },
+        "delivery_plane": {
+          "type": "string"
+        },
+        "wire_id": {
+          "type": "string"
+        },
+        "wire_kind": {
+          "type": "string"
+        },
+        "wire_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "transport_group_id": {
+          "type": "string"
+        },
+        "relay_url": {
+          "type": "string"
+        },
+        "subscription_id": {
+          "type": "string"
+        },
+        "nostr_event_id": {
+          "$ref": "#/$defs/digestHex"
+        },
+        "nostr_kind": {
+          "$ref": "#/$defs/u64"
+        },
+        "nostr_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "gift_wrap_event_id": {
+          "$ref": "#/$defs/digestHex"
+        },
+        "welcome_nostr_event_id": {
+          "description": "Outer Nostr event id for a transport-level welcome envelope, when the welcome is carried as a Nostr event.",
+          "$ref": "#/$defs/digestHex"
+        },
+        "welcome_rumor_event_id": {
+          "description": "Inner Nostr rumor event id for a gift-wrapped welcome, when available after unwrapping.",
+          "$ref": "#/$defs/digestHex"
+        },
+        "welcome_key_package_tag": {
+          "description": "KeyPackage e-tag or equivalent welcome target tag that links the welcome to the added member/key package.",
+          "type": "string"
+        },
+        "publish_result_id": {
+          "type": "string"
+        }
+      }
+    },
+    "messageArtifactKind": {
+      "enum": ["application_message", "commit", "proposal", "welcome", "group_info", "unknown"]
+    },
+    "recipientScope": {
+      "enum": [
+        "all_current_group_members",
+        "all_other_current_group_members",
+        "added_member_only",
+        "explicit_members",
+        "self_only",
+        "unknown"
+      ]
+    },
+    "recipientExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "recipient_scope"],
+      "properties": {
+        "artifact_kind": {
+          "$ref": "#/$defs/messageArtifactKind"
+        },
+        "recipient_scope": {
+          "$ref": "#/$defs/recipientScope"
+        },
+        "membership_epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "basis_commit_id": {
+          "$ref": "#/$defs/messageId"
+        },
+        "expected_member_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/refHex16"
+          }
+        },
+        "expected_pubkeys_hex": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pubkeyHex"
+          }
+        },
+        "expected_count": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "outboundMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["msg_id", "artifact_kind"],
+      "properties": {
+        "msg_id": {
+          "$ref": "#/$defs/messageId"
+        },
+        "artifact_kind": {
+          "$ref": "#/$defs/messageArtifactKind"
+        },
+        "transport": {
+          "$ref": "#/$defs/transportWireEnvelope"
+        },
+        "recipient_expectation": {
+          "$ref": "#/$defs/recipientExpectation"
+        }
+      }
+    },
+    "decodedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_type"],
+      "properties": {
+        "content_type": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "json": {
+          "$ref": "#/$defs/jsonValue"
+        },
+        "bytes_b64": {
+          "type": "string"
+        }
+      }
+    },
+    "decodedApplicationEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format"],
+      "properties": {
+        "format": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/u64"
+        },
+        "content": {
+          "type": "string"
+        },
+        "pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "client_message_id": {
+          "type": "string"
+        },
+        "reply_to_message_id": {
+          "type": "string"
+        },
+        "thread_root_message_id": {
+          "type": "string"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attachmentMetadata"
+          }
+        },
+        "raw": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      }
+    },
+    "messageAuthor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "member_ref": {
+          "$ref": "#/$defs/refHex16"
+        },
+        "member_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "account_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "npub": {
+          "type": "string"
+        }
+      }
+    },
+    "attachmentMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "component_id": {
+          "$ref": "#/$defs/u16"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "file_name": {
+          "type": "string"
+        },
+        "byte_len": {
+          "$ref": "#/$defs/u64"
+        },
+        "digest": {
+          "$ref": "#/$defs/digestHex"
+        },
+        "metadata": {
+          "$ref": "#/$defs/jsonObject"
+        }
+      }
+    },
+    "groupStateChangeKind": {
+      "enum": [
+        "member_added",
+        "member_removed",
+        "member_left",
+        "admin_added",
+        "admin_removed",
+        "group_renamed",
+        "topic_changed",
+        "group_avatar_changed",
+        "message_retention_changed"
+      ]
+    },
+    "membershipChangeSource": {
+      "description": "Explains membership-removal attribution when change_kind alone is not enough. For example, member_removed with admin_action and an actor is an admin removal; member_removed with convergence and no actor is a convergence-resolved departure that must not be rendered as an admin action.",
+      "enum": ["self_leave", "admin_action", "convergence", "remote_commit", "unknown"]
+    },
+    "groupStateValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/digestHex"
+        },
+        "len": {
+          "$ref": "#/$defs/u64"
+        },
+        "text": {
+          "type": "string"
+        },
+        "json": {
+          "$ref": "#/$defs/jsonValue"
+        },
+        "pubkeys_hex": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pubkeyHex"
+          }
+        }
+      }
+    },
+    "convergencePhase": {
+      "enum": ["started", "waiting", "evaluating", "selected", "blocked", "applied", "failed", "stable", "unrecoverable"]
+    },
+    "convergenceCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch_id", "fork_epoch", "tip_epoch"],
+      "properties": {
+        "branch_id": {
+          "type": "string"
+        },
+        "fork_epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "tip_epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "commit_ids": {
+          "$ref": "#/$defs/messageRefArray"
+        },
+        "commit_count": {
+          "$ref": "#/$defs/u64"
+        },
+        "state_digest": {
+          "$ref": "#/$defs/digestHex"
+        },
+        "tip_digest": {
+          "$ref": "#/$defs/digestHex"
+        },
+        "tip_priority": {
+          "type": "string"
+        },
+        "tip_committer_ref": {
+          "$ref": "#/$defs/refHex16"
+        },
+        "tip_committer_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "retained_anchor_status": {
+          "type": "string"
+        },
+        "last_input_time_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "eligible": {
+          "type": "boolean"
+        },
+        "rejection_reasons": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "score": {
+          "$ref": "#/$defs/convergenceScore"
+        },
+        "app_witnesses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/appWitness"
+          }
+        }
+      }
+    },
+    "convergenceScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "valid_commit_depth": {
+          "$ref": "#/$defs/u64"
+        },
+        "effective_commit_depth": {
+          "$ref": "#/$defs/u64"
+        },
+        "witness_quorum_met": {
+          "type": "boolean"
+        },
+        "app_witness_score": {
+          "$ref": "#/$defs/u64"
+        },
+        "tip_priority": {
+          "type": "string"
+        },
+        "tip_committer_ref": {
+          "$ref": "#/$defs/refHex16"
+        },
+        "tip_committer_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        },
+        "tip_digest": {
+          "$ref": "#/$defs/digestHex"
+        }
+      }
+    },
+    "appWitness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epoch"],
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "sender_ref": {
+          "$ref": "#/$defs/refHex16"
+        },
+        "sender_pubkey_hex": {
+          "$ref": "#/$defs/pubkeyHex"
+        }
+      }
+    },
+    "convergenceRuleEvaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_name", "result"],
+      "properties": {
+        "rule_name": {
+          "type": "string"
+        },
+        "scope": {
+          "enum": ["run", "candidate", "candidate_pair"]
+        },
+        "candidate_branch_id": {
+          "type": "string"
+        },
+        "other_candidate_branch_id": {
+          "type": "string"
+        },
+        "inputs": {
+          "$ref": "#/$defs/jsonObject"
+        },
+        "result": {
+          "$ref": "#/$defs/jsonValue"
+        },
+        "decisive": {
+          "type": "boolean"
+        },
+        "selected_branch_id": {
+          "type": "string"
+        },
+        "rejected_branch_id": {
+          "type": "string"
+        }
+      }
+    },
     "publishRelayFailure": {
       "type": "object",
       "additionalProperties": false,
@@ -444,11 +679,33 @@
         }
       }
     },
-    "forkWinner": {
-      "enum": ["candidate", "incumbent", "missing_snapshot"]
-    },
     "peelerOutcomeKind": {
       "enum": ["success", "decrypt_failed", "stale_epoch", "malformed", "other"]
+    },
+    "jsonScalar": {
+      "type": ["string", "number", "integer", "boolean", "null"]
+    },
+    "jsonValue": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/jsonScalar"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        {
+          "$ref": "#/$defs/jsonObject"
+        }
+      ]
+    },
+    "jsonObject": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/jsonValue"
+      }
     },
     "auditEventKind": {
       "oneOf": [
@@ -457,8 +714,12 @@
           "additionalProperties": false,
           "required": ["type", "recorder"],
           "properties": {
-            "type": { "const": "recorder_started" },
-            "recorder": { "type": "string" }
+            "type": {
+              "const": "recorder_started"
+            },
+            "recorder": {
+              "type": "string"
+            }
           }
         },
         {
@@ -466,117 +727,21 @@
           "additionalProperties": false,
           "required": ["type", "previous_mode", "new_mode", "reason"],
           "properties": {
-            "type": { "const": "audit_data_mode_changed" },
-            "previous_mode": { "$ref": "#/$defs/auditDataMode" },
-            "new_mode": { "$ref": "#/$defs/auditDataMode" },
-            "reason": { "type": "string" },
-            "recorder_restarted": { "type": "boolean" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "context"],
-          "properties": {
-            "type": { "const": "engine_context" },
-            "context": { "$ref": "#/$defs/auditEngineContext" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "reason", "context"],
-          "properties": {
-            "type": { "const": "group_context" },
-            "reason": { "type": "string" },
-            "context": { "$ref": "#/$defs/auditGroupContext" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "serialization_failures", "write_failures", "flush_failures"],
-          "properties": {
-            "type": { "const": "recorder_health" },
-            "serialization_failures": { "$ref": "#/$defs/u64" },
-            "write_failures": { "$ref": "#/$defs/u64" },
-            "flush_failures": { "$ref": "#/$defs/u64" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "action", "origin", "phase"],
-          "properties": {
-            "type": { "const": "human_action" },
-            "action": { "type": "string" },
-            "origin": { "type": "string" },
-            "phase": { "type": "string" },
-            "fields": { "$ref": "#/$defs/stringArray" },
-            "component_ids": { "$ref": "#/$defs/u16Array" },
-            "target_count": { "$ref": "#/$defs/u64" },
-            "message_ids": { "$ref": "#/$defs/messageRefArray" },
-            "from_epoch": { "$ref": "#/$defs/u64" },
-            "to_epoch": { "$ref": "#/$defs/u64" },
-            "error_kind": { "type": "string" },
-            "detail": { "type": "string" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "transport", "payload_len", "payload_digest"],
-          "properties": {
-            "type": { "const": "transport_received" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "transport": { "$ref": "#/$defs/transportWireEnvelope" },
-            "payload_len": { "$ref": "#/$defs/u64" },
-            "payload_digest": { "$ref": "#/$defs/digestHex" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "msg_id", "envelope_kind", "transport_source", "payload_len", "payload_digest"],
-          "properties": {
-            "type": { "const": "ingest_entry" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "envelope_kind": { "type": "string" },
-            "transport_source": { "type": "string" },
-            "payload_len": { "$ref": "#/$defs/u64" },
-            "payload_digest": { "$ref": "#/$defs/hexString" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "msg_id", "outcome_kind"],
-          "properties": {
-            "type": { "const": "ingest_outcome" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "outcome_kind": { "type": "string" },
-            "stale_reason": { "type": "string" },
-            "epoch": { "$ref": "#/$defs/u64" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "msg_id", "error_kind"],
-          "properties": {
-            "type": { "const": "ingest_error" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "error_kind": { "type": "string" },
-            "detail": { "type": "string" }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "intent_kind"],
-          "properties": {
-            "type": { "const": "send_entry" },
-            "intent_kind": { "type": "string" }
+            "type": {
+              "const": "audit_data_mode_changed"
+            },
+            "previous_mode": {
+              "$ref": "#/$defs/auditDataMode"
+            },
+            "new_mode": {
+              "$ref": "#/$defs/auditDataMode"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "recorder_restarted": {
+              "type": "boolean"
+            }
           }
         },
         {
@@ -584,8 +749,197 @@
           "additionalProperties": false,
           "required": ["type", "source"],
           "properties": {
-            "type": { "const": "source_context" },
-            "source": { "$ref": "#/$defs/auditSourceContext" }
+            "type": {
+              "const": "source_context"
+            },
+            "source": {
+              "$ref": "#/$defs/auditSourceContext"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "context"],
+          "properties": {
+            "type": {
+              "const": "engine_context"
+            },
+            "context": {
+              "$ref": "#/$defs/auditEngineContext"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "reason", "context"],
+          "properties": {
+            "type": {
+              "const": "group_context"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "context": {
+              "$ref": "#/$defs/auditGroupContext"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "serialization_failures", "write_failures", "flush_failures"],
+          "properties": {
+            "type": {
+              "const": "recorder_health"
+            },
+            "serialization_failures": {
+              "$ref": "#/$defs/u64"
+            },
+            "write_failures": {
+              "$ref": "#/$defs/u64"
+            },
+            "flush_failures": {
+              "$ref": "#/$defs/u64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "action", "origin", "phase"],
+          "properties": {
+            "type": {
+              "const": "human_action"
+            },
+            "action": {
+              "type": "string"
+            },
+            "origin": {
+              "type": "string"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "fields": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "component_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/u16"
+              }
+            },
+            "target_count": {
+              "$ref": "#/$defs/u64"
+            },
+            "message_ids": {
+              "$ref": "#/$defs/messageRefArray"
+            },
+            "from_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "to_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "error_kind": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "transport", "payload_len", "payload_digest"],
+          "properties": {
+            "type": {
+              "const": "transport_received"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "transport": {
+              "$ref": "#/$defs/transportWireEnvelope"
+            },
+            "payload_len": {
+              "$ref": "#/$defs/u64"
+            },
+            "payload_digest": {
+              "$ref": "#/$defs/digestHex"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "envelope_kind", "transport_source", "payload_len", "payload_digest"],
+          "properties": {
+            "type": {
+              "const": "ingest_entry"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "envelope_kind": {
+              "type": "string"
+            },
+            "transport_source": {
+              "type": "string"
+            },
+            "transport": {
+              "$ref": "#/$defs/transportWireEnvelope"
+            },
+            "payload_len": {
+              "$ref": "#/$defs/u64"
+            },
+            "payload_digest": {
+              "$ref": "#/$defs/digestHex"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "outcome_kind"],
+          "properties": {
+            "type": {
+              "const": "ingest_outcome"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "outcome_kind": {
+              "type": "string"
+            },
+            "stale_reason": {
+              "type": "string"
+            },
+            "epoch": {
+              "$ref": "#/$defs/u64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "error_kind"],
+          "properties": {
+            "type": {
+              "const": "ingest_error"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "error_kind": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
           }
         },
         {
@@ -593,12 +947,24 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "author", "decoded_payload"],
           "properties": {
-            "type": { "const": "message_content_decoded" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "artifact_kind": { "$ref": "#/$defs/messageArtifactKind" },
-            "author": { "$ref": "#/$defs/messageAuthor" },
-            "decoded_payload": { "$ref": "#/$defs/decodedPayload" },
-            "decoded_app_event": { "$ref": "#/$defs/decodedApplicationEvent" }
+            "type": {
+              "const": "message_content_decoded"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "artifact_kind": {
+              "$ref": "#/$defs/messageArtifactKind"
+            },
+            "author": {
+              "$ref": "#/$defs/messageAuthor"
+            },
+            "decoded_payload": {
+              "$ref": "#/$defs/decodedPayload"
+            },
+            "decoded_app_event": {
+              "$ref": "#/$defs/decodedApplicationEvent"
+            }
           }
         },
         {
@@ -606,9 +972,28 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "expectation"],
           "properties": {
-            "type": { "const": "recipient_expectation" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "expectation": { "$ref": "#/$defs/recipientExpectation" }
+            "type": {
+              "const": "recipient_expectation"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "expectation": {
+              "$ref": "#/$defs/recipientExpectation"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "intent_kind"],
+          "properties": {
+            "type": {
+              "const": "send_entry"
+            },
+            "intent_kind": {
+              "type": "string"
+            }
           }
         },
         {
@@ -616,12 +1001,20 @@
           "additionalProperties": false,
           "required": ["type", "intent_kind", "result_kind"],
           "properties": {
-            "type": { "const": "send_outcome" },
-            "intent_kind": { "type": "string" },
-            "result_kind": { "type": "string" },
+            "type": {
+              "const": "send_outcome"
+            },
+            "intent_kind": {
+              "type": "string"
+            },
+            "result_kind": {
+              "type": "string"
+            },
             "outbound_messages": {
               "type": "array",
-              "items": { "$ref": "#/$defs/outboundMessage" }
+              "items": {
+                "$ref": "#/$defs/outboundMessage"
+              }
             }
           }
         },
@@ -630,10 +1023,18 @@
           "additionalProperties": false,
           "required": ["type", "intent_kind", "error_kind"],
           "properties": {
-            "type": { "const": "send_error" },
-            "intent_kind": { "type": "string" },
-            "error_kind": { "type": "string" },
-            "detail": { "type": "string" }
+            "type": {
+              "const": "send_error"
+            },
+            "intent_kind": {
+              "type": "string"
+            },
+            "error_kind": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
           }
         },
         {
@@ -641,11 +1042,21 @@
           "additionalProperties": false,
           "required": ["type", "member_count", "required_feature_count", "app_component_count", "initial_admin_count"],
           "properties": {
-            "type": { "const": "create_group_entry" },
-            "member_count": { "$ref": "#/$defs/u64" },
-            "required_feature_count": { "$ref": "#/$defs/u64" },
-            "app_component_count": { "$ref": "#/$defs/u64" },
-            "initial_admin_count": { "$ref": "#/$defs/u64" }
+            "type": {
+              "const": "create_group_entry"
+            },
+            "member_count": {
+              "$ref": "#/$defs/u64"
+            },
+            "required_feature_count": {
+              "$ref": "#/$defs/u64"
+            },
+            "app_component_count": {
+              "$ref": "#/$defs/u64"
+            },
+            "initial_admin_count": {
+              "$ref": "#/$defs/u64"
+            }
           }
         },
         {
@@ -653,11 +1064,17 @@
           "additionalProperties": false,
           "required": ["type", "result_kind"],
           "properties": {
-            "type": { "const": "create_group_outcome" },
-            "result_kind": { "type": "string" },
+            "type": {
+              "const": "create_group_outcome"
+            },
+            "result_kind": {
+              "type": "string"
+            },
             "outbound_messages": {
               "type": "array",
-              "items": { "$ref": "#/$defs/outboundMessage" }
+              "items": {
+                "$ref": "#/$defs/outboundMessage"
+              }
             }
           }
         },
@@ -666,9 +1083,15 @@
           "additionalProperties": false,
           "required": ["type", "error_kind"],
           "properties": {
-            "type": { "const": "create_group_error" },
-            "error_kind": { "type": "string" },
-            "detail": { "type": "string" }
+            "type": {
+              "const": "create_group_error"
+            },
+            "error_kind": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
           }
         },
         {
@@ -676,12 +1099,30 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "target_kind", "required_acks"],
           "properties": {
-            "type": { "const": "publish_attempt" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "target_kind": { "type": "string" },
-            "relay_urls": { "$ref": "#/$defs/stringArray" },
-            "required_acks": { "$ref": "#/$defs/u64" },
-            "transport": { "$ref": "#/$defs/transportWireEnvelope" }
+            "type": {
+              "const": "publish_attempt"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "artifact_kind": {
+              "$ref": "#/$defs/messageArtifactKind"
+            },
+            "target_kind": {
+              "type": "string"
+            },
+            "transport": {
+              "$ref": "#/$defs/transportWireEnvelope"
+            },
+            "relay_url": {
+              "type": "string"
+            },
+            "relay_urls": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "required_acks": {
+              "$ref": "#/$defs/u64"
+            }
           }
         },
         {
@@ -689,17 +1130,39 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "target_kind", "required_acks", "met_required_acks"],
           "properties": {
-            "type": { "const": "publish_outcome" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "target_kind": { "type": "string" },
-            "accepted_relay_urls": { "$ref": "#/$defs/stringArray" },
+            "type": {
+              "const": "publish_outcome"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "artifact_kind": {
+              "$ref": "#/$defs/messageArtifactKind"
+            },
+            "target_kind": {
+              "type": "string"
+            },
+            "transport": {
+              "$ref": "#/$defs/transportWireEnvelope"
+            },
+            "relay_url": {
+              "type": "string"
+            },
+            "accepted_relay_urls": {
+              "$ref": "#/$defs/stringArray"
+            },
             "failed_relays": {
               "type": "array",
-              "items": { "$ref": "#/$defs/publishRelayFailure" }
+              "items": {
+                "$ref": "#/$defs/publishRelayFailure"
+              }
             },
-            "required_acks": { "$ref": "#/$defs/u64" },
-            "met_required_acks": { "type": "boolean" },
-            "transport": { "$ref": "#/$defs/transportWireEnvelope" }
+            "required_acks": {
+              "$ref": "#/$defs/u64"
+            },
+            "met_required_acks": {
+              "type": "boolean"
+            }
           }
         },
         {
@@ -707,13 +1170,39 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "stage", "target_kind", "reason"],
           "properties": {
-            "type": { "const": "publish_failure" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "stage": { "type": "string" },
-            "target_kind": { "type": "string" },
-            "relay_urls": { "$ref": "#/$defs/stringArray" },
-            "reason": { "type": "string" },
-            "transport": { "$ref": "#/$defs/transportWireEnvelope" }
+            "type": {
+              "const": "publish_failure"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "artifact_kind": {
+              "$ref": "#/$defs/messageArtifactKind"
+            },
+            "stage": {
+              "type": "string"
+            },
+            "target_kind": {
+              "type": "string"
+            },
+            "transport": {
+              "$ref": "#/$defs/transportWireEnvelope"
+            },
+            "relay_url": {
+              "type": "string"
+            },
+            "relay_urls": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "required_acks": {
+              "$ref": "#/$defs/u64"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
           }
         },
         {
@@ -721,10 +1210,21 @@
           "additionalProperties": false,
           "required": ["type", "from_epoch", "to_epoch", "pending_kind"],
           "properties": {
-            "type": { "const": "epoch_confirmed" },
-            "from_epoch": { "$ref": "#/$defs/u64" },
-            "to_epoch": { "$ref": "#/$defs/u64" },
-            "pending_kind": { "type": "string" }
+            "type": {
+              "const": "epoch_confirmed"
+            },
+            "from_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "to_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "pending_kind": {
+              "type": "string"
+            },
+            "origin_commit_id": {
+              "$ref": "#/$defs/messageId"
+            }
           }
         },
         {
@@ -732,10 +1232,18 @@
           "additionalProperties": false,
           "required": ["type", "pending_epoch", "restored_epoch", "pending_kind"],
           "properties": {
-            "type": { "const": "epoch_rolled_back" },
-            "pending_epoch": { "$ref": "#/$defs/u64" },
-            "restored_epoch": { "$ref": "#/$defs/u64" },
-            "pending_kind": { "type": "string" }
+            "type": {
+              "const": "epoch_rolled_back"
+            },
+            "pending_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "restored_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "pending_kind": {
+              "type": "string"
+            }
           }
         },
         {
@@ -743,13 +1251,27 @@
           "additionalProperties": false,
           "required": ["type", "new_state", "epoch", "reason"],
           "properties": {
-            "type": { "const": "epoch_state_changed" },
-            "previous_state": { "type": "string" },
-            "new_state": { "type": "string" },
-            "epoch": { "$ref": "#/$defs/u64" },
-            "reason": { "type": "string" },
-            "pending_ref": { "$ref": "#/$defs/u64" },
-            "pending_kind": { "type": "string" }
+            "type": {
+              "const": "epoch_state_changed"
+            },
+            "previous_state": {
+              "type": "string"
+            },
+            "new_state": {
+              "type": "string"
+            },
+            "epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "pending_ref": {
+              "$ref": "#/$defs/u64"
+            },
+            "pending_kind": {
+              "type": "string"
+            }
           }
         },
         {
@@ -757,28 +1279,45 @@
           "additionalProperties": false,
           "required": ["type", "epoch", "change_kind"],
           "properties": {
-            "type": { "const": "group_state_changed" },
-            "epoch": { "$ref": "#/$defs/u64" },
-            "change_kind": {
-              "enum": [
-                "member_added",
-                "member_removed",
-                "member_left",
-                "admin_added",
-                "admin_removed",
-                "group_renamed",
-                "group_avatar_changed",
-                "message_retention_changed"
-              ]
+            "type": {
+              "const": "group_state_changed"
             },
-            "actor_member_ref": { "$ref": "#/$defs/refHex16" },
-            "actor_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-            "subject_member_ref": { "$ref": "#/$defs/refHex16" },
-            "subject_pubkey_hex": { "$ref": "#/$defs/pubkeyHex" },
-            "origin_commit_id": { "$ref": "#/$defs/hexString" },
-            "fields": { "$ref": "#/$defs/stringArray" },
-            "component_ids": { "$ref": "#/$defs/u16Array" },
-            "value": { "$ref": "#/$defs/groupStateValue" }
+            "epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "change_kind": {
+              "$ref": "#/$defs/groupStateChangeKind"
+            },
+            "membership_change_source": {
+              "$ref": "#/$defs/membershipChangeSource"
+            },
+            "actor_member_ref": {
+              "$ref": "#/$defs/refHex16"
+            },
+            "actor_pubkey_hex": {
+              "$ref": "#/$defs/pubkeyHex"
+            },
+            "subject_member_ref": {
+              "$ref": "#/$defs/refHex16"
+            },
+            "subject_pubkey_hex": {
+              "$ref": "#/$defs/pubkeyHex"
+            },
+            "origin_commit_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "fields": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "component_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/u16"
+              }
+            },
+            "value": {
+              "$ref": "#/$defs/groupStateValue"
+            }
           }
         },
         {
@@ -786,8 +1325,12 @@
           "additionalProperties": false,
           "required": ["type", "recovered_epoch"],
           "properties": {
-            "type": { "const": "pending_commit_recovered_on_open" },
-            "recovered_epoch": { "$ref": "#/$defs/u64" }
+            "type": {
+              "const": "pending_commit_recovered_on_open"
+            },
+            "recovered_epoch": {
+              "$ref": "#/$defs/u64"
+            }
           }
         },
         {
@@ -795,9 +1338,15 @@
           "additionalProperties": false,
           "required": ["type", "group_digest", "reason"],
           "properties": {
-            "type": { "const": "group_hydration_quarantined" },
-            "group_digest": { "$ref": "#/$defs/hexString" },
-            "reason": { "type": "string" }
+            "type": {
+              "const": "group_hydration_quarantined"
+            },
+            "group_digest": {
+              "$ref": "#/$defs/digestHex"
+            },
+            "reason": {
+              "type": "string"
+            }
           }
         },
         {
@@ -805,8 +1354,12 @@
           "additionalProperties": false,
           "required": ["type", "group_digest"],
           "properties": {
-            "type": { "const": "group_hydration_recovered" },
-            "group_digest": { "$ref": "#/$defs/hexString" }
+            "type": {
+              "const": "group_hydration_recovered"
+            },
+            "group_digest": {
+              "$ref": "#/$defs/digestHex"
+            }
           }
         },
         {
@@ -814,10 +1367,21 @@
           "additionalProperties": false,
           "required": ["type", "snapshot_name", "source_epoch", "reason"],
           "properties": {
-            "type": { "const": "snapshot_created" },
-            "snapshot_name": { "type": "string" },
-            "source_epoch": { "$ref": "#/$defs/u64" },
-            "reason": { "type": "string" }
+            "type": {
+              "const": "snapshot_created"
+            },
+            "snapshot_name": {
+              "type": "string"
+            },
+            "source_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state_digest": {
+              "$ref": "#/$defs/digestHex"
+            }
           }
         },
         {
@@ -825,12 +1389,24 @@
           "additionalProperties": false,
           "required": ["type", "source_epoch", "candidate_digest", "winner"],
           "properties": {
-            "type": { "const": "fork_resolution" },
-            "source_epoch": { "$ref": "#/$defs/u64" },
-            "candidate_digest": { "$ref": "#/$defs/hexString" },
-            "incumbent_digest": { "$ref": "#/$defs/hexString" },
-            "winner": { "$ref": "#/$defs/forkWinner" },
-            "invalidated_msg_id": { "$ref": "#/$defs/hexString" }
+            "type": {
+              "const": "fork_resolution"
+            },
+            "source_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "candidate_digest": {
+              "$ref": "#/$defs/digestHex"
+            },
+            "incumbent_digest": {
+              "$ref": "#/$defs/digestHex"
+            },
+            "winner": {
+              "enum": ["candidate", "incumbent", "missing_snapshot"]
+            },
+            "invalidated_msg_id": {
+              "$ref": "#/$defs/messageId"
+            }
           }
         },
         {
@@ -838,35 +1414,67 @@
           "additionalProperties": false,
           "required": ["type", "phase"],
           "properties": {
-            "type": { "const": "convergence_run_state" },
-            "phase": { "$ref": "#/$defs/convergencePhase" },
-            "current_tip_epoch": { "$ref": "#/$defs/u64" },
-            "retained_anchor_horizon": { "$ref": "#/$defs/u64" },
-            "reason": { "type": "string" },
-            "error_kind": { "type": "string" }
+            "type": {
+              "const": "convergence_run_state"
+            },
+            "phase": {
+              "$ref": "#/$defs/convergencePhase"
+            },
+            "current_tip_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "retained_anchor_horizon": {
+              "$ref": "#/$defs/u64"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "error_kind": {
+              "type": "string"
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "current_tip_epoch", "max_rewind_commits"],
+          "required": ["type", "current_tip_epoch", "max_rewind_commits", "candidates"],
           "properties": {
-            "type": { "const": "convergence_decision" },
-            "current_tip_epoch": { "$ref": "#/$defs/u64" },
-            "max_rewind_commits": { "$ref": "#/$defs/u64" },
+            "type": {
+              "const": "convergence_decision"
+            },
+            "current_tip_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "max_rewind_commits": {
+              "$ref": "#/$defs/u64"
+            },
             "candidates": {
               "type": "array",
-              "items": { "$ref": "#/$defs/convergenceCandidate" }
+              "items": {
+                "$ref": "#/$defs/convergenceCandidate"
+              }
             },
             "rule_trace": {
               "type": "array",
-              "items": { "$ref": "#/$defs/convergenceRuleEvaluation" }
+              "items": {
+                "$ref": "#/$defs/convergenceRuleEvaluation"
+              }
             },
-            "selected_branch_id": { "type": "string" },
-            "selected_fork_epoch": { "$ref": "#/$defs/u64" },
-            "selected_tip_epoch": { "$ref": "#/$defs/u64" },
-            "losing_branch_ids": { "$ref": "#/$defs/stringArray" },
-            "error_kinds": { "$ref": "#/$defs/stringArray" }
+            "selected_branch_id": {
+              "type": "string"
+            },
+            "selected_fork_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "selected_tip_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "losing_branch_ids": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "error_kinds": {
+              "$ref": "#/$defs/stringArray"
+            }
           }
         },
         {
@@ -874,15 +1482,36 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "outcome", "fallback_snapshot_used"],
           "properties": {
-            "type": { "const": "peeler_outcome" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "outcome": { "$ref": "#/$defs/peelerOutcomeKind" },
-            "fallback_snapshot_used": { "type": "boolean" },
-            "fallback_snapshot_name": { "type": "string" },
-            "fallback_snapshot_source_epoch": { "$ref": "#/$defs/u64" },
-            "fallback_attempt_count": { "$ref": "#/$defs/u64" },
-            "error_kind": { "type": "string" },
-            "detail": { "type": "string" }
+            "type": {
+              "const": "peeler_outcome"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "outcome": {
+              "$ref": "#/$defs/peelerOutcomeKind"
+            },
+            "artifact_kind": {
+              "$ref": "#/$defs/messageArtifactKind"
+            },
+            "fallback_snapshot_used": {
+              "type": "boolean"
+            },
+            "fallback_snapshot_name": {
+              "type": "string"
+            },
+            "fallback_snapshot_source_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "fallback_attempt_count": {
+              "$ref": "#/$defs/u64"
+            },
+            "error_kind": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
           }
         },
         {
@@ -890,10 +1519,18 @@
           "additionalProperties": false,
           "required": ["type", "proposal_kind", "decision"],
           "properties": {
-            "type": { "const": "auto_commit_decision" },
-            "proposal_kind": { "type": "string" },
-            "decision": { "type": "string" },
-            "reason": { "type": "string" }
+            "type": {
+              "const": "auto_commit_decision"
+            },
+            "proposal_kind": {
+              "type": "string"
+            },
+            "decision": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
           }
         },
         {
@@ -901,12 +1538,27 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "new_state", "reason"],
           "properties": {
-            "type": { "const": "message_state_changed" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "previous_state": { "type": "string" },
-            "new_state": { "type": "string" },
-            "epoch": { "$ref": "#/$defs/u64" },
-            "reason": { "type": "string" }
+            "type": {
+              "const": "message_state_changed"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "artifact_kind": {
+              "$ref": "#/$defs/messageArtifactKind"
+            },
+            "previous_state": {
+              "type": "string"
+            },
+            "new_state": {
+              "type": "string"
+            },
+            "epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "reason": {
+              "type": "string"
+            }
           }
         },
         {
@@ -914,9 +1566,15 @@
           "additionalProperties": false,
           "required": ["type", "msg_id", "reason"],
           "properties": {
-            "type": { "const": "rejection" },
-            "msg_id": { "$ref": "#/$defs/hexString" },
-            "reason": { "type": "string" }
+            "type": {
+              "const": "rejection"
+            },
+            "msg_id": {
+              "$ref": "#/$defs/messageId"
+            },
+            "reason": {
+              "type": "string"
+            }
           }
         }
       ]
@@ -925,7 +1583,11 @@
   "allOf": [
     {
       "if": {
-        "properties": { "audit_data_mode": { "const": "obfuscated_sensitive_data" } },
+        "properties": {
+          "audit_data_mode": {
+            "const": "obfuscated_sensitive_data"
+          }
+        },
         "required": ["audit_data_mode"]
       },
       "then": {
@@ -935,8 +1597,12 @@
               "source": {
                 "not": {
                   "anyOf": [
-                    { "required": ["account_pubkey_hex"] },
-                    { "required": ["account_npub"] }
+                    {
+                      "required": ["account_pubkey_hex"]
+                    },
+                    {
+                      "required": ["account_npub"]
+                    }
                   ]
                 }
               }
@@ -946,18 +1612,32 @@
             "not": {
               "anyOf": [
                 {
-                  "properties": { "type": { "const": "message_content_decoded" } },
+                  "properties": {
+                    "type": {
+                      "const": "message_content_decoded"
+                    }
+                  },
                   "required": ["type"]
                 },
-                { "required": ["actor_pubkey_hex"] },
-                { "required": ["subject_pubkey_hex"] },
-                { "required": ["tip_committer_pubkey_hex"] },
+                {
+                  "required": ["actor_pubkey_hex"]
+                },
+                {
+                  "required": ["subject_pubkey_hex"]
+                },
+                {
+                  "required": ["tip_committer_pubkey_hex"]
+                },
                 {
                   "properties": {
                     "source": {
                       "anyOf": [
-                        { "required": ["account_pubkey_hex"] },
-                        { "required": ["account_npub"] }
+                        {
+                          "required": ["account_pubkey_hex"]
+                        },
+                        {
+                          "required": ["account_npub"]
+                        }
                       ]
                     }
                   },
@@ -965,7 +1645,9 @@
                 },
                 {
                   "properties": {
-                    "expectation": { "required": ["expected_pubkeys_hex"] }
+                    "expectation": {
+                      "required": ["expected_pubkeys_hex"]
+                    }
                   },
                   "required": ["expectation"]
                 },
@@ -973,9 +1655,15 @@
                   "properties": {
                     "value": {
                       "anyOf": [
-                        { "required": ["text"] },
-                        { "required": ["json"] },
-                        { "required": ["pubkeys_hex"] }
+                        {
+                          "required": ["text"]
+                        },
+                        {
+                          "required": ["json"]
+                        },
+                        {
+                          "required": ["pubkeys_hex"]
+                        }
                       ]
                     }
                   },
@@ -986,7 +1674,9 @@
                     "outbound_messages": {
                       "contains": {
                         "properties": {
-                          "recipient_expectation": { "required": ["expected_pubkeys_hex"] }
+                          "recipient_expectation": {
+                            "required": ["expected_pubkeys_hex"]
+                          }
                         },
                         "required": ["recipient_expectation"]
                       }
@@ -999,17 +1689,23 @@
                     "candidates": {
                       "contains": {
                         "anyOf": [
-                          { "required": ["tip_committer_pubkey_hex"] },
+                          {
+                            "required": ["tip_committer_pubkey_hex"]
+                          },
                           {
                             "properties": {
-                              "score": { "required": ["tip_committer_pubkey_hex"] }
+                              "score": {
+                                "required": ["tip_committer_pubkey_hex"]
+                              }
                             },
                             "required": ["score"]
                           },
                           {
                             "properties": {
                               "app_witnesses": {
-                                "contains": { "required": ["sender_pubkey_hex"] }
+                                "contains": {
+                                  "required": ["sender_pubkey_hex"]
+                                }
                               }
                             },
                             "required": ["app_witnesses"]

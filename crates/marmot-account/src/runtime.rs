@@ -20,7 +20,7 @@ use cgka_traits::{
     TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditTransportWire, PublishRelayFailure,
+    AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
 };
 
 use crate::error::{AccountError, AccountResult};
@@ -512,6 +512,13 @@ where
         // produced inside the transport adapter and are not available here, so
         // only the transport source and transport group id are recorded.
         let wire = publish_wire_metadata(&message);
+        // A welcome is unambiguously a welcome; a group message could be a
+        // commit/proposal/app message, which is not distinguishable from the
+        // transport envelope alone, so it is left unattributed here.
+        let artifact_kind = match &message.envelope {
+            TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
+            TransportEnvelope::GroupMessage { .. } => None,
+        };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
         let target = match self.routing.publish_target(&message) {
@@ -522,10 +529,14 @@ where
                     Some(publish_context),
                     AuditEventKind::PublishFailure {
                         msg_id: msg_id_hex,
+                        artifact_kind,
                         stage: "routing".into(),
                         target_kind: "unknown".into(),
+                        relay_url: None,
                         relay_urls: Vec::new(),
+                        required_acks: None,
                         reason: e.to_string(),
+                        detail: None,
                         transport: Some(wire),
                     },
                 );
@@ -545,7 +556,9 @@ where
             Some(publish_context.clone()),
             AuditEventKind::PublishAttempt {
                 msg_id: msg_id_hex.clone(),
+                artifact_kind,
                 target_kind: target_kind.clone(),
+                relay_url: None,
                 relay_urls: relay_urls.clone(),
                 required_acks: required_acks as u64,
                 transport: Some(wire.clone()),
@@ -568,10 +581,14 @@ where
                     Some(publish_context),
                     AuditEventKind::PublishFailure {
                         msg_id: msg_id_hex,
+                        artifact_kind,
                         stage: "adapter".into(),
                         target_kind,
+                        relay_url: None,
                         relay_urls,
+                        required_acks: Some(required_acks as u64),
                         reason: e.to_string(),
+                        detail: None,
                         transport: Some(wire),
                     },
                 );
@@ -589,7 +606,9 @@ where
             Some(publish_context.clone()),
             AuditEventKind::PublishOutcome {
                 msg_id: hex::encode(report.message_id.as_slice()),
+                artifact_kind,
                 target_kind: target_kind.clone(),
+                relay_url: None,
                 accepted_relay_urls: report
                     .accepted
                     .iter()
@@ -614,10 +633,14 @@ where
                 Some(publish_context),
                 AuditEventKind::PublishFailure {
                     msg_id: hex::encode(report.message_id.as_slice()),
+                    artifact_kind,
                     stage: "required_acks".into(),
                     target_kind,
+                    relay_url: None,
                     relay_urls,
+                    required_acks: Some(report.required_acks as u64),
                     reason: "insufficient publish acknowledgements".into(),
+                    detail: None,
                     transport: Some(wire),
                 },
             );

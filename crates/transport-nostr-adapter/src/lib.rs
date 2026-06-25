@@ -48,10 +48,9 @@ fn inbound_wire_metadata(
         wire_pubkey_hex: Some(event.pubkey.clone()),
         transport_group_id,
         // For a NIP-59 gift wrap the carrying event id is the gift-wrap id; the
-        // interior rumor (welcome) id is only known after peeling, so it is left
-        // unset here.
+        // interior rumor (welcome) id is only known after peeling, so it is not
+        // surfaced on this inbound carrier.
         gift_wrap_event_id: is_gift_wrap.then(|| event.id.clone()),
-        welcome_event_id: None,
     }
 }
 

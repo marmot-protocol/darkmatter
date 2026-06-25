@@ -175,6 +175,8 @@ impl<S: StorageProvider> Engine<S> {
                     &group_id,
                     marmot_forensics::AuditEventKind::PeelerOutcome {
                         msg_id: msg_id_hex.clone(),
+                        // Artifact kind is unknown until after the peel succeeds.
+                        artifact_kind: None,
                         outcome: raw_outcome,
                         fallback_snapshot_used: false,
                         fallback_snapshot_name: None,
@@ -206,6 +208,7 @@ impl<S: StorageProvider> Engine<S> {
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
                                 msg_id: msg_id_hex.clone(),
+                                artifact_kind: None,
                                 outcome: marmot_forensics::PeelerOutcomeKind::Success,
                                 fallback_snapshot_used: true,
                                 fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
@@ -249,6 +252,7 @@ impl<S: StorageProvider> Engine<S> {
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
                                 msg_id: msg_id_hex.clone(),
+                                artifact_kind: None,
                                 outcome: marmot_forensics::PeelerOutcomeKind::Success,
                                 fallback_snapshot_used: true,
                                 fallback_snapshot_name: Some(recovery.snapshot_name.clone()),

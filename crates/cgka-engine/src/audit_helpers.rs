@@ -19,7 +19,8 @@ use cgka_traits::types::{EpochId, MemberId, MessageId};
 use marmot_forensics::{
     AttachmentMetadata, AuditEventKind, ConvergenceAppWitness, ConvergenceCandidate,
     ConvergenceRuleEvaluation, ConvergenceScore, DecodedApplicationEvent, DecodedPayload,
-    DigestHex, MemberRefHex, MessageArtifactKind, MessageAuthor, MessageRefHex, OutboundMessage,
+    DigestHex, MemberRefHex, MembershipChangeSource, MessageArtifactKind, MessageAuthor,
+    MessageRefHex, OutboundMessage,
 };
 use sha2::{Digest, Sha256};
 
@@ -266,9 +267,27 @@ pub(crate) fn group_state_changed_event(
         _ => None,
     };
     let subject = group_state_subject_member(change);
+    // Attribute membership changes: a self-leave, an admin action (an actor is
+    // present), or — for a removal with no attributable actor — a
+    // convergence-resolved departure. Non-membership changes carry no source.
+    let membership_change_source = match change {
+        GroupStateChange::MemberLeft { .. } => Some(MembershipChangeSource::SelfLeave),
+        GroupStateChange::MemberRemoved { .. } => Some(if actor.is_some() {
+            MembershipChangeSource::AdminAction
+        } else {
+            MembershipChangeSource::Convergence
+        }),
+        GroupStateChange::MemberAdded { .. } => Some(if actor.is_some() {
+            MembershipChangeSource::AdminAction
+        } else {
+            MembershipChangeSource::RemoteCommit
+        }),
+        _ => None,
+    };
     AuditEventKind::GroupStateChanged {
         epoch: epoch.0,
         change_kind: change_kind.to_string(),
+        membership_change_source,
         actor_member_ref: actor.map(member_ref_hex),
         actor_pubkey_hex: actor.and_then(|actor| member_pubkey_hex(actor, full_data)),
         subject_member_ref: subject.map(member_ref_hex),
@@ -427,6 +446,7 @@ pub(crate) fn message_state_changed_event(
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
+        artifact_kind: None,
         previous_state: None,
         new_state: message_state_str(state).to_string(),
         epoch: None,
@@ -443,6 +463,7 @@ pub(crate) fn message_state_transition_event(
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
+        artifact_kind: None,
         previous_state: previous_state.map(message_state_str).map(str::to_string),
         new_state: message_state_str(state).to_string(),
         epoch: epoch.map(|epoch| epoch.0),
@@ -558,6 +579,10 @@ pub(crate) fn epoch_confirmed_event(
         from_epoch: from_epoch.0,
         to_epoch: to_epoch.0,
         pending_kind: pending_kind.to_string(),
+        // The confirming commit's origin id is not threaded to this call site;
+        // the same commit is attributed on the accompanying group_state_changed
+        // row's origin_commit_id.
+        origin_commit_id: None,
     }
 }
 
@@ -633,11 +658,17 @@ fn convergence_candidate(candidate: &CandidateEvaluation, full_data: bool) -> Co
         tip_epoch: candidate.tip_epoch,
         commit_ids: Vec::new(),
         commit_count: None,
+        // Per-candidate full MLS-state digest is intentionally not computed
+        // (materializing each branch's state is too costly for the hot path).
+        state_digest: None,
         tip_digest: Some(hex::encode(candidate.tip_digest)),
         tip_priority: Some(tip_priority_str(candidate.tip_priority).to_string()),
         tip_committer_ref: committer_ref(&candidate.tip_committer),
         tip_committer_pubkey_hex: committer_pubkey_hex(&candidate.tip_committer, full_data),
         retained_anchor_status: None,
+        // Selector input timing is a per-run value carried on convergence_run_state,
+        // not duplicated per candidate.
+        last_input_time_ms: None,
         eligible: Some(candidate.eligible),
         rejection_reasons: candidate.rejection_reasons.clone(),
         score: Some(convergence_score(&candidate.score, full_data)),

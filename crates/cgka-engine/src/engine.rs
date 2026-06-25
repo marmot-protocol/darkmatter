@@ -1284,6 +1284,7 @@ impl<S: StorageProvider> Engine<S> {
                 snapshot_name: snapshot_name.to_string(),
                 source_epoch: source_epoch.0,
                 reason: reason.to_string(),
+                state_digest: None,
             },
         );
     }

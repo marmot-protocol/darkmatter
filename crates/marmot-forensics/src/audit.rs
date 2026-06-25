@@ -253,8 +253,10 @@ pub struct AuditTransportWire {
     pub delivery_plane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_id: Option<String>,
+    /// Transport-layer "kind" of the carrying event as a string (e.g. the
+    /// stringified Nostr kind). The numeric Nostr kind is on `nostr_kind`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wire_kind: Option<u64>,
+    pub wire_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_pubkey_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,8 +273,15 @@ pub struct AuditTransportWire {
     pub nostr_pubkey_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift_wrap_event_id: Option<DigestHex>,
+    /// Outer Nostr event id for a transport-level welcome envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub welcome_event_id: Option<String>,
+    pub welcome_nostr_event_id: Option<DigestHex>,
+    /// Inner gift-wrapped welcome rumor event id, when available after unwrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_rumor_event_id: Option<DigestHex>,
+    /// KeyPackage e-tag (or equivalent) linking a welcome to the added member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_key_package_tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_result_id: Option<String>,
 }
@@ -314,6 +323,19 @@ pub enum MessageArtifactKind {
     Proposal,
     Welcome,
     GroupInfo,
+    Unknown,
+}
+
+/// Attribution for a membership change, used when `change_kind` alone is
+/// ambiguous (e.g. a `member_removed` from an admin action vs a
+/// convergence-resolved departure that must not render as an admin action).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipChangeSource {
+    SelfLeave,
+    AdminAction,
+    Convergence,
+    RemoteCommit,
     Unknown,
 }
 
@@ -406,6 +428,8 @@ pub struct ConvergenceCandidate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_digest: Option<DigestHex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_digest: Option<DigestHex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_priority: Option<String>,
@@ -415,6 +439,8 @@ pub struct ConvergenceCandidate {
     pub tip_committer_pubkey_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_anchor_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_input_time_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -693,7 +719,11 @@ pub enum AuditEventKind {
     /// Account runtime is about to publish one transport message.
     PublishAttempt {
         msg_id: MessageRefHex,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<MessageArtifactKind>,
         target_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relay_urls: Vec<String>,
         required_acks: u64,
@@ -703,7 +733,11 @@ pub enum AuditEventKind {
     /// Account runtime received endpoint-level publish results.
     PublishOutcome {
         msg_id: MessageRefHex,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<MessageArtifactKind>,
         target_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         accepted_relay_urls: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -716,11 +750,19 @@ pub enum AuditEventKind {
     /// Account runtime could not complete publish before endpoint receipts.
     PublishFailure {
         msg_id: MessageRefHex,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<MessageArtifactKind>,
         stage: String,
         target_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         relay_urls: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_acks: Option<u64>,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<AuditTransportWire>,
     },
@@ -729,6 +771,8 @@ pub enum AuditEventKind {
         from_epoch: u64,
         to_epoch: u64,
         pending_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_commit_id: Option<MessageRefHex>,
     },
     /// `EpochManager::rollback_publish` rewound a pending publish.
     EpochRolledBack {
@@ -756,6 +800,8 @@ pub enum AuditEventKind {
     GroupStateChanged {
         epoch: u64,
         change_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        membership_change_source: Option<MembershipChangeSource>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor_member_ref: Option<MemberRefHex>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -798,6 +844,8 @@ pub enum AuditEventKind {
         snapshot_name: String,
         source_epoch: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state_digest: Option<DigestHex>,
     },
     /// `ForkRecoveryManager::resolve` returned a verdict for a same-epoch
     /// candidate.
@@ -829,7 +877,7 @@ pub enum AuditEventKind {
     ConvergenceDecision {
         current_tip_epoch: u64,
         max_rewind_commits: u64,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        // Always serialized (schema-required), even when empty.
         candidates: Vec<ConvergenceCandidate>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         rule_trace: Vec<ConvergenceRuleEvaluation>,
@@ -847,6 +895,8 @@ pub enum AuditEventKind {
     /// Transport peeler returned a result at the engine boundary.
     PeelerOutcome {
         msg_id: MessageRefHex,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<MessageArtifactKind>,
         outcome: PeelerOutcomeKind,
         fallback_snapshot_used: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -870,6 +920,8 @@ pub enum AuditEventKind {
     /// A stored message transitioned to a new `MessageState`.
     MessageStateChanged {
         msg_id: MessageRefHex,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<MessageArtifactKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_state: Option<String>,
         new_state: String,

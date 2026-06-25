@@ -220,8 +220,6 @@ pub struct TransportWireMetadata {
     pub transport_group_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift_wrap_event_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub welcome_event_id: Option<String>,
 }
 
 /// Adapter-side delivery metadata. This is diagnostic/routing context, never

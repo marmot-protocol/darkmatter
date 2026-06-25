@@ -729,7 +729,9 @@ fn audit_transport_context(source: TransportDeliverySource) -> AuditTransportCon
             transport: Some(transport_source.clone()),
             delivery_plane: Some(delivery_plane.clone()),
             wire_id: wire.wire_id,
-            wire_kind: wire.wire_kind,
+            // The audit envelope carries the wire kind as a string; the numeric
+            // Nostr kind stays on `nostr_kind`.
+            wire_kind: wire.wire_kind.map(|kind| kind.to_string()),
             wire_pubkey_hex: wire.wire_pubkey_hex,
             transport_group_id: wire.transport_group_id,
             relay_url: relay_url.clone(),
@@ -738,7 +740,11 @@ fn audit_transport_context(source: TransportDeliverySource) -> AuditTransportCon
             nostr_kind,
             nostr_pubkey_hex,
             gift_wrap_event_id: wire.gift_wrap_event_id,
-            welcome_event_id: wire.welcome_event_id,
+            // Welcome rumor / key-package-tag ids are only known after peeling a
+            // gift wrap; the inbound carrier does not surface them here.
+            welcome_nostr_event_id: None,
+            welcome_rumor_event_id: None,
+            welcome_key_package_tag: None,
             publish_result_id: None,
         }
     });

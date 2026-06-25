@@ -338,7 +338,7 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
         transport: Some("nostr".into()),
         delivery_plane: Some("account_inbox".into()),
         wire_id: Some("a".repeat(64)),
-        wire_kind: Some(1059),
+        wire_kind: Some("1059".into()),
         wire_pubkey_hex: Some("b".repeat(64)),
         relay_url: Some("wss://relay.example".into()),
         subscription_id: Some("sub-xyz".into()),
@@ -388,7 +388,8 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
             payload_digest,
         } => {
             assert!(msg_id.is_some());
-            assert_eq!(transport.wire_kind, Some(1059));
+            assert_eq!(transport.wire_kind.as_deref(), Some("1059"));
+            assert_eq!(transport.nostr_kind, Some(1059));
             assert_eq!(
                 transport.nostr_event_id.as_deref(),
                 Some("a".repeat(64).as_str())

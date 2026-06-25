@@ -327,7 +327,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 transport: Some("nostr".into()),
                 delivery_plane: Some("group".into()),
                 wire_id: Some("e".repeat(64)),
-                wire_kind: Some(445),
+                wire_kind: Some("445".into()),
                 wire_pubkey_hex: Some("f".repeat(64)),
                 transport_group_id: Some("ab".repeat(16)),
                 relay_url: Some("wss://relay.example".into()),
@@ -336,7 +336,9 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 nostr_kind: Some(445),
                 nostr_pubkey_hex: Some("f".repeat(64)),
                 gift_wrap_event_id: None,
-                welcome_event_id: None,
+                welcome_nostr_event_id: None,
+                welcome_rumor_event_id: None,
+                welcome_key_package_tag: None,
                 publish_result_id: None,
             },
             payload_len: 1,
@@ -427,7 +429,9 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::PublishAttempt {
             msg_id: "m".into(),
+            artifact_kind: Some(MessageArtifactKind::Commit),
             target_kind: "group".into(),
+            relay_url: None,
             relay_urls: vec!["wss://relay.example".into()],
             required_acks: 1,
             transport: Some(AuditTransportWire {
@@ -439,7 +443,9 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::PublishOutcome {
             msg_id: "m".into(),
+            artifact_kind: Some(MessageArtifactKind::Commit),
             target_kind: "group".into(),
+            relay_url: None,
             accepted_relay_urls: vec!["wss://relay.example".into()],
             failed_relays: vec![PublishRelayFailure {
                 relay_url: "wss://bad.example".into(),
@@ -451,16 +457,21 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::PublishFailure {
             msg_id: "m".into(),
+            artifact_kind: Some(MessageArtifactKind::Welcome),
             stage: "required_acks".into(),
             target_kind: "group".into(),
+            relay_url: None,
             relay_urls: vec!["wss://bad.example".into()],
+            required_acks: Some(1),
             reason: "insufficient publish acknowledgements".into(),
+            detail: None,
             transport: None,
         },
         AuditEventKind::EpochConfirmed {
             from_epoch: 0,
             to_epoch: 1,
             pending_kind: "create_group".into(),
+            origin_commit_id: Some("m".into()),
         },
         AuditEventKind::EpochRolledBack {
             pending_epoch: 1,
@@ -478,6 +489,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::GroupStateChanged {
             epoch: 2,
             change_kind: "member_added".into(),
+            membership_change_source: Some(MembershipChangeSource::AdminAction),
             actor_member_ref: Some("a".repeat(32)),
             actor_pubkey_hex: Some("a".repeat(64)),
             subject_member_ref: Some("b".repeat(32)),
@@ -554,6 +566,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             snapshot_name: "fork-1-2-abc".into(),
             source_epoch: 0,
             reason: "pre_commit".into(),
+            state_digest: Some("e".repeat(64)),
         },
         AuditEventKind::ForkResolution {
             source_epoch: 2,
@@ -578,11 +591,13 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 tip_epoch: 3,
                 commit_ids: vec!["m".into()],
                 commit_count: Some(1),
+                state_digest: None,
                 tip_digest: Some("a".repeat(64)),
                 tip_priority: Some("ordinary".into()),
                 tip_committer_ref: Some("b".repeat(32)),
                 tip_committer_pubkey_hex: None,
                 retained_anchor_status: Some("at_or_after".into()),
+                last_input_time_ms: Some(1_700_000_000_000),
                 eligible: Some(true),
                 rejection_reasons: Vec::new(),
                 score: Some(ConvergenceScore {
@@ -620,6 +635,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::PeelerOutcome {
             msg_id: "m".into(),
+            artifact_kind: None,
             outcome: PeelerOutcomeKind::DecryptFailed,
             fallback_snapshot_used: true,
             fallback_snapshot_name: Some("fork-anchor-1".into()),
@@ -635,6 +651,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         },
         AuditEventKind::MessageStateChanged {
             msg_id: "m".into(),
+            artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
             previous_state: Some("created".into()),
             new_state: "epoch_invalidated".into(),
             epoch: Some(3),
@@ -848,4 +865,157 @@ fn noop_recorder_reports_default_mode_and_ignores_mode_change() {
         .unwrap();
     // A no-op recorder has no backing store; the default mode never changes.
     assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
+}
+
+/// Minimal recursive JSON-Schema conformance check for the subset our schema
+/// uses ($ref, properties, additionalProperties:false, items, and oneOf
+/// discriminated by a `type` const). It does not validate value patterns; its
+/// job is to prove every key we serialize is a key the schema allows — i.e. that
+/// darkmatter never emits a field that Goggles' `additionalProperties: false`
+/// would reject.
+fn resolve_ref<'a>(
+    schema: &'a serde_json::Value,
+    defs: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    if let Some(reference) = schema.get("$ref").and_then(|v| v.as_str())
+        && let Some(name) = reference.strip_prefix("#/$defs/")
+        && let Some(def) = defs.get(name)
+    {
+        return resolve_ref(def, defs);
+    }
+    schema
+}
+
+fn assert_keys_within_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    defs: &serde_json::Value,
+    path: &str,
+) {
+    let schema = resolve_ref(schema, defs);
+    if let Some(one_of) = schema.get("oneOf").and_then(|v| v.as_array()) {
+        // Discriminated union: match the branch by its `type` const. A oneOf
+        // without a type discriminant (e.g. jsonValue) is treated as permissive.
+        if let Some(tag) = value.get("type").and_then(|v| v.as_str()) {
+            for branch in one_of {
+                if branch
+                    .pointer("/properties/type/const")
+                    .and_then(|v| v.as_str())
+                    == Some(tag)
+                {
+                    assert_keys_within_schema(value, branch, defs, path);
+                    return;
+                }
+            }
+            panic!("{path}: no schema branch for type {tag}");
+        }
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            let props = schema.get("properties").and_then(|v| v.as_object());
+            let closed = matches!(
+                schema.get("additionalProperties"),
+                Some(serde_json::Value::Bool(false))
+            );
+            for (key, child) in map {
+                match props.and_then(|p| p.get(key)) {
+                    Some(child_schema) => assert_keys_within_schema(
+                        child,
+                        child_schema,
+                        defs,
+                        &format!("{path}.{key}"),
+                    ),
+                    None => assert!(!closed, "{path}.{key}: key not allowed by schema"),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for (i, item) in items.iter().enumerate() {
+                    assert_keys_within_schema(item, item_schema, defs, &format!("{path}[{i}]"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn sample_events_serialize_within_schema_property_names() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v2.schema.json")).unwrap();
+    let defs = schema["$defs"].clone();
+
+    // Every sample kind, wrapped in a full event, must serialize using only keys
+    // the schema allows (recursively, including nested wire/candidate/value/etc.).
+    for kind in sample_audit_event_kinds() {
+        let event = AuditEvent {
+            schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+            seq: 0,
+            wall_time_ms: 0,
+            audit_data_mode: AuditDataMode::FullData,
+            recorder_session_id: Some("r".into()),
+            account_ref: Some("0".repeat(32)),
+            engine_id: "e".into(),
+            group_ref: Some("ab".into()),
+            context: None,
+            kind,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_keys_within_schema(&value, &schema, &defs, "event");
+    }
+
+    // Also exercise a fully-populated context (transport wire + convergence +
+    // source + human_action), which the kind samples don't cover.
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 0,
+        wall_time_ms: 0,
+        audit_data_mode: AuditDataMode::FullData,
+        recorder_session_id: None,
+        account_ref: None,
+        engine_id: "e".into(),
+        group_ref: None,
+        context: Some(AuditEventContext {
+            operation_id: Some("op".into()),
+            human_action: Some(AuditHumanActionContext {
+                action: "send_message".into(),
+                origin: "local_user".into(),
+                fields: vec!["name".into()],
+                component_ids: vec![0x8001],
+                target_count: Some(1),
+            }),
+            transport: Some(AuditTransportContext {
+                transport_source: "nostr".into(),
+                delivery_plane: Some("group".into()),
+                relay_url: Some("wss://relay.example".into()),
+                subscription_id: Some("sub".into()),
+                wire: Some(AuditTransportWire {
+                    transport: Some("nostr".into()),
+                    wire_kind: Some("445".into()),
+                    nostr_kind: Some(445),
+                    nostr_event_id: Some("a".repeat(64)),
+                    ..Default::default()
+                }),
+            }),
+            engine: Some(AuditEngineContext::default()),
+            group: Some(AuditGroupContext::default()),
+            convergence: Some(AuditConvergenceContext {
+                run_id: "conv-1".into(),
+                phase: Some(ConvergencePhase::Evaluating),
+                inferred: Some(false),
+            }),
+            source: Some(AuditSourceContext {
+                account_label: Some("Alice".into()),
+                account_pubkey_hex: Some("a".repeat(64)),
+                ..Default::default()
+            }),
+        }),
+        kind: AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    };
+    let value = serde_json::to_value(&event).unwrap();
+    assert_keys_within_schema(&value, &schema, &defs, "event");
 }
