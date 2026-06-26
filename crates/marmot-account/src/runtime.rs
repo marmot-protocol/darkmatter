@@ -413,7 +413,7 @@ where
                         target: TRACE_TARGET,
                         method = "confirm_published_retrying",
                         attempt,
-                        "confirm hit transient backend contention; retrying"
+                        "confirm hit a transient backend lock; retrying"
                     );
                 }
                 Err(e) => return Err(e.into()),
