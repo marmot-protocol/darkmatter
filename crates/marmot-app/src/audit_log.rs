@@ -243,9 +243,7 @@ impl MarmotApp {
         &self,
         config: config::AuditLogTrackerConfig,
     ) -> Result<config::AuditLogTrackerConfig, AppError> {
-        let config = config
-            .normalize()
-            .map_err(AppError::AuditLogUpload)?;
+        let config = config.normalize().map_err(AppError::AuditLogUpload)?;
         *self
             .audit_log_tracker_config
             .lock()
@@ -862,7 +860,11 @@ mod tests {
         assert_eq!(source["device_name"], "Jeff iPhone");
         assert_eq!(source["platform"], "ios");
         assert_eq!(source["app_version"], "2026.6.8");
-        assert!(source["device_id"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(
+            source["device_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
     }
 
     #[test]
