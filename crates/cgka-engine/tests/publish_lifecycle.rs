@@ -975,23 +975,29 @@ impl StorageProvider for FaultStorage {
     }
 }
 
-fn build_fault_engine(id: &[u8], fault: ProcessedFault) -> cgka_engine::Engine<FaultStorage> {
-    EngineBuilder::new(FaultStorage {
-        inner: SqliteAccountStorage::in_memory().unwrap(),
-        fault,
-    })
-    .identity(pad32(id))
-    .account_identity_proof_signer(proof_signer(id))
-    .feature_registry(registry_with_reactions())
-    .peeler(Box::new(MockPeeler))
-    .build()
-    .unwrap()
+/// Returns the engine plus a storage handle that shares the same underlying
+/// connection (`SqliteAccountStorage` is `Clone` over a shared connection), so
+/// the test can read durable state out-of-band to assert the rollback invariant.
+fn build_fault_engine(
+    id: &[u8],
+    fault: ProcessedFault,
+) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let engine = EngineBuilder::new(FaultStorage { inner, fault })
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, handle)
 }
 
 #[tokio::test]
 async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
     let fault = ProcessedFault::default();
-    let mut alice = build_fault_engine(b"alice", fault.clone());
+    let (mut alice, storage) = build_fault_engine(b"alice", fault.clone());
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
 
@@ -1029,6 +1035,13 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
         _ => panic!("expected GroupEvolution"),
     };
 
+    // Durable baseline before the confirm: the invite is staged but unmerged, so
+    // the persisted Marmot record still sits at the pre-merge epoch. (`epoch()`
+    // reports the *projected* epoch during pending, so it can't witness the
+    // rollback — the persisted record can.)
+    let persisted_epoch_before = storage.get_group(&gid).unwrap().epoch.0;
+    assert_eq!(persisted_epoch_before, 1, "record unmerged before confirm");
+
     // Arm the lock for the confirm's `Processed` write, then confirm.
     fault.arm(1);
     let first = alice.confirm_published(inv_pending).await;
@@ -1039,10 +1052,16 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
     );
 
     // The durable transaction (merge + record mirror + `Processed` write) rolled
-    // back as a unit, and the pending slot was never consumed — the engine is
-    // still in `PendingPublish` and reports the projected epoch, exactly as
-    // before the confirm attempt. (epoch() reflects the projection during
-    // pending, so the meaningful proof is that the retry below converges.)
+    // back as a unit: the persisted record is still at the pre-merge epoch, so no
+    // partial write survived the injected lock. This is the rollback invariant —
+    // without it, a half-applied merge could persist while the slot stayed
+    // retryable, diverging the record from the MLS state.
+    assert_eq!(
+        storage.get_group(&gid).unwrap().epoch.0,
+        persisted_epoch_before,
+        "rolled-back confirm must leave the persisted record unchanged"
+    );
+    // The pending slot was never consumed either, so the retry below converges.
 
     // Retrying the SAME pending must now succeed — this is the orphan check.
     // Before the fix, the pending slot was already consumed and this returned

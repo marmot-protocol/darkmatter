@@ -119,14 +119,17 @@ impl<S: StorageProvider> Engine<S> {
                 // Now the MLS group is at the new epoch. Mirror the Marmot
                 // record (epoch + members + RequiredCapabilities + app-component
                 // state) and refresh the self-cache (commits can rotate own leaf
-                // via force_self_update).
-                if let Ok(mut g) = storage.get_group(&group_id) {
-                    g.epoch = EpochId(mls_group.epoch().as_u64());
-                    g.members = crate::group_lifecycle::marmot_members(&mls_group);
-                    g.required_capabilities = required_capabilities_from_group(&mls_group);
-                    crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-                    storage.put_group(&g)?;
-                }
+                // via force_self_update). The record is always written at create
+                // time (group_lifecycle::do_create_group), so propagate a read
+                // failure here rather than swallowing it: a transient backend
+                // error must roll back the whole transaction and stay retryable,
+                // never commit the merge + `Processed` write with a stale record.
+                let mut g = storage.get_group(&group_id)?;
+                g.epoch = EpochId(mls_group.epoch().as_u64());
+                g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                g.required_capabilities = required_capabilities_from_group(&mls_group);
+                crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+                storage.put_group(&g)?;
                 crate::capability_manager::cache_self_capabilities(
                     storage,
                     &group_id,
