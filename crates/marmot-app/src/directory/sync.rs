@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use sha2::{Digest, Sha256};
 
 use cgka_traits::TransportEndpoint;
@@ -46,6 +51,7 @@ pub(crate) struct DirectorySyncRunSummary {
 pub(crate) struct DirectorySyncHandle {
     commands: mpsc::Sender<DirectorySyncCommand>,
     abort: AbortHandle,
+    rebuild_queued: Arc<AtomicBool>,
 }
 
 enum DirectorySyncCommand {
@@ -107,20 +113,35 @@ impl DirectorySyncHandle {
     pub(crate) fn spawn(app: MarmotApp, relay_plane: MarmotRelayPlane) -> Self {
         let (commands, command_rx) = mpsc::channel(32);
         let directory_events = relay_plane.subscribe_directory_events();
+        let rebuild_queued = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(run_directory_sync_worker(
             app,
             relay_plane,
             command_rx,
             directory_events,
+            rebuild_queued.clone(),
         ));
         let abort = task.abort_handle();
-        Self { commands, abort }
+        Self {
+            commands,
+            abort,
+            rebuild_queued,
+        }
     }
 
     pub(crate) fn request_rebuild(&self) {
-        let _ = self
+        if self.rebuild_queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match self
             .commands
-            .try_send(DirectorySyncCommand::Rebuild { respond: None });
+            .try_send(DirectorySyncCommand::Rebuild { respond: None })
+        {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.rebuild_queued.store(false, Ordering::SeqCst);
+            }
+        }
     }
 
     pub(crate) async fn request_rebuild_and_wait(
@@ -152,12 +173,14 @@ async fn run_directory_sync_worker(
     mut directory_events: tokio::sync::broadcast::Receiver<
         crate::relay_plane::DirectoryRelayEventRecord,
     >,
+    rebuild_queued: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
             command = commands.recv() => {
                 match command {
                     Some(DirectorySyncCommand::Rebuild { respond }) => {
+                        rebuild_queued.store(false, Ordering::SeqCst);
                         let result = run_directory_sync_once(app.clone(), relay_plane.clone()).await;
                         if let Some(respond) = respond {
                             let _ = respond.send(result.map_err(|err| err.to_string()));
@@ -245,5 +268,39 @@ mod tests {
             plan.batches[0].subscription_id,
             plan.batches[1].subscription_id
         );
+    }
+
+    #[tokio::test]
+    async fn background_rebuild_requests_are_coalesced_until_worker_takes_command() {
+        let (commands, mut rx) = mpsc::channel(32);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = DirectorySyncHandle {
+            commands,
+            abort: task.abort_handle(),
+            rebuild_queued: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        handle.request_rebuild();
+        handle.request_rebuild();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DirectorySyncCommand::Rebuild { respond: None })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        handle
+            .rebuild_queued
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        handle.request_rebuild();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DirectorySyncCommand::Rebuild { respond: None })
+        ));
+
+        task.abort();
     }
 }
