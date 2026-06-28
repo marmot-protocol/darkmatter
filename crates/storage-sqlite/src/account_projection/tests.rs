@@ -164,6 +164,8 @@ fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     {
         let conn = store.lock().unwrap();
+        // Seed tiny historical timestamps so the real save timestamp deterministically
+        // refreshes `repeat` to the newest row before the LRU prune runs.
         conn.execute(
             "INSERT INTO seen_events (event_id, seen_at) VALUES (?1, ?2)",
             params!["repeat", 1_i64],
