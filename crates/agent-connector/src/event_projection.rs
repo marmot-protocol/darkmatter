@@ -62,14 +62,63 @@ fn plaintext_has_nostr_hex_ref(plaintext: &str, reference: &str) -> bool {
     plaintext_has_prefixed_ref(plaintext, "nostr:", reference)
 }
 
+/// Upper bound on the plaintext fed to the Markdown parser for visible-mention
+/// detection. The parser has super-linear behavior on hostile emphasis/bracket
+/// input, and this caller runs on attacker-controlled inbound plaintext outside
+/// the UniFFI surface that enforces `MAX_FFI_MARKDOWN_INPUT_BYTES`. A real
+/// mention only needs the prefix-and-npub token, so a frame-sized window is far
+/// more than enough; bounding it keeps a hostile message from driving the parse
+/// super-linearly (darkmatter#663). Mirrors the UniFFI cap.
+const MAX_MENTION_MARKDOWN_INPUT_BYTES: usize =
+    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+
 /// Whether `plaintext` contains a visible npub mention token for the account.
 ///
-/// Use the display parser instead of duplicating its token-boundary rules here:
-/// this keeps `AgentControlEvent::InboundMessage.mentions_self` aligned with the
-/// markdown surface that humans actually see (`nostr:npub1…` URIs and bare
-/// `@npub1…` mentions, with the same lowercase and `_`/`/` boundary rules).
+/// Cheap guard first: every visible mention form parsed by marmot-markdown
+/// (`@npub1…`, `nostr:npub1…`, and bare `npub1…`) carries the lowercase npub as
+/// a token-bounded substring, so an `O(n)` scan that finds no such token proves
+/// no parse could yield a mention. This short-circuits the dominant inbound
+/// case — including a hostile emphasis/bracket bomb with no npub — without ever
+/// invoking the super-linear Markdown parser (darkmatter#663).
+///
+/// Only when a candidate token is present do we run the display parser to apply
+/// its exact visible-mention semantics (e.g. image alt text and `@`/`nostr:`
+/// prefix-decline rules are not visible mentions). That parse is length-capped
+/// so the rare candidate-plus-bomb message still cannot run the parser
+/// unbounded. Using the parser for the final decision keeps
+/// `AgentControlEvent::InboundMessage.mentions_self` aligned with the markdown
+/// surface humans actually see.
 fn plaintext_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
-    markdown_blocks_have_npub_ref(&marmot_markdown::parse(plaintext).blocks, npub)
+    if !plaintext_has_npub_token(plaintext, npub) {
+        return false;
+    }
+    let bounded = mention_markdown_input(plaintext);
+    markdown_blocks_have_npub_ref(&marmot_markdown::parse(bounded).blocks, npub)
+}
+
+/// Cheap, sound superset of the parser's visible-npub matcher: true if the
+/// lowercase npub appears in `plaintext` as a right-token-bounded substring
+/// (the npub is fixed-length lowercase bech32). The parser's left-boundary and
+/// container rules are applied by the confirming parse, so this only has to
+/// avoid false negatives, never false positives.
+fn plaintext_has_npub_token(plaintext: &str, npub: &str) -> bool {
+    plaintext.match_indices(npub).any(|(start, _)| {
+        let end = start + npub.len();
+        end == plaintext.len() || token_boundary_ok(plaintext.as_bytes()[end])
+    })
+}
+
+/// Cap the parser input on a UTF-8 boundary so a hostile long message cannot
+/// drive the (super-linear) Markdown parse unbounded.
+fn mention_markdown_input(plaintext: &str) -> &str {
+    if plaintext.len() <= MAX_MENTION_MARKDOWN_INPUT_BYTES {
+        return plaintext;
+    }
+    let mut end = MAX_MENTION_MARKDOWN_INPUT_BYTES;
+    while !plaintext.is_char_boundary(end) {
+        end -= 1;
+    }
+    &plaintext[..end]
 }
 
 fn markdown_blocks_have_npub_ref(blocks: &[Block], npub: &str) -> bool {
