@@ -531,7 +531,9 @@ where
         .find(|candidate| candidate.trim().starts_with("quic://"))
         .ok_or(DmError::MissingQuicCandidate)?;
     let candidate = parse_quic_candidate(candidate)?;
-    let candidate_addr = resolve_quic_candidate_addr(&candidate).await?;
+    // Only an explicit local `--insecure-local` opt-in may resolve to a
+    // local/private endpoint; otherwise reject unsafe sender-provided candidates.
+    let candidate_addr = resolve_quic_candidate_addr(&candidate, insecure_local).await?;
     let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
     let stream_id_hex = start_payload.stream_id_hex.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
@@ -713,8 +715,18 @@ pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidat
     })
 }
 
+/// Resolve a sender-provided `quic://` candidate to a socket address.
+///
+/// Sender-controlled candidates must not be able to steer the client into
+/// connecting to loopback, private, link-local, ULA, multicast, unspecified, or
+/// broadcast endpoints (SSRF). When `allow_local_endpoint` is false, any resolved
+/// address that is not a safe public unicast address is rejected. The local user
+/// only opts into local endpoints via explicit `--insecure-local`, which sets
+/// `allow_local_endpoint` to true; loopback enforcement for the actual trust mode
+/// still happens in `broker_trust` / `stream_trust`.
 pub(crate) async fn resolve_quic_candidate_addr(
     candidate: &ParsedQuicCandidate,
+    allow_local_endpoint: bool,
 ) -> Result<SocketAddr, DmError> {
     let mut addrs = tokio::net::lookup_host(&candidate.authority)
         .await
@@ -722,9 +734,71 @@ pub(crate) async fn resolve_quic_candidate_addr(
             candidate: candidate.original.clone(),
             source,
         })?;
-    addrs
+    let addr = addrs
         .next()
-        .ok_or_else(|| DmError::InvalidQuicCandidate(candidate.original.clone()))
+        .ok_or_else(|| DmError::InvalidQuicCandidate(candidate.original.clone()))?;
+    if !allow_local_endpoint && socket_addr_is_unsafe(addr) {
+        return Err(DmError::UnsafeQuicCandidateEndpoint {
+            candidate: candidate.original.clone(),
+            addr,
+        });
+    }
+    Ok(addr)
+}
+
+/// Whether a resolved candidate address must never be reached from a
+/// sender-controlled `quic://` candidate without explicit local opt-in. Uses
+/// stable `std::net` classification only.
+fn socket_addr_is_unsafe(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ipv4_addr_is_unsafe(ip),
+        IpAddr::V6(ip) => ipv6_addr_is_unsafe(ip),
+    }
+}
+
+fn ipv4_addr_is_unsafe(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _d] = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local() // includes 169.254.0.0/16 (e.g. 169.254.169.254)
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (b & 0b1100_0000) == 0b0100_0000) // 100.64.0.0/10 shared address space
+        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 IETF protocol assignments
+        || (a == 192 && b == 0 && c == 2) // TEST-NET-1
+        || (a == 198 && (b == 18 || b == 19)) // benchmarking
+        || (a == 198 && b == 51 && c == 100) // TEST-NET-2
+        || (a == 203 && b == 0 && c == 113) // TEST-NET-3
+        || a >= 240 // reserved, including limited broadcast
+}
+
+fn ipv6_addr_is_unsafe(ip: std::net::Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || is_unique_local_v6(ip)
+        || is_unicast_link_local_v6(ip)
+        || is_documentation_v6(ip)
+}
+
+/// IPv6 unique-local address (ULA, `fc00::/7`). `Ipv6Addr::is_unique_local` is
+/// not yet stable, so classify on the stable octet representation.
+fn is_unique_local_v6(ip: std::net::Ipv6Addr) -> bool {
+    (ip.octets()[0] & 0xfe) == 0xfc
+}
+
+/// IPv6 unicast link-local address (`fe80::/10`). `is_unicast_link_local` is not
+/// yet stable, so classify on the stable segment representation.
+fn is_unicast_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// IPv6 documentation prefix (`2001:db8::/32`).
+fn is_documentation_v6(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 fn candidate_server_name(authority: &str) -> Result<String, DmError> {
