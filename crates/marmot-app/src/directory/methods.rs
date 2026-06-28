@@ -921,6 +921,12 @@ impl MarmotApp {
             }
         }
         if shared_entry_matches && caches_match {
+            // Do not call `put_with_reason` just to refresh
+            // `directory_known_user_reasons.last_seen_at`: this is the receive
+            // hot path for duplicate senders, and a write-per-message would
+            // recreate the amplification this guard prevents. Today the reason
+            // table is provenance for persisted directory entries, not an
+            // activity log.
             return Ok(());
         }
         shared_storage.put_public_directory_user(&public_entry)?;

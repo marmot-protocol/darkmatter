@@ -239,6 +239,19 @@ mod tests {
         format!("{value:064x}")
     }
 
+    async fn wait_for_background_rebuild_flag_to_clear(handle: &DirectorySyncHandle) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle
+                .rebuild_queued
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should clear queued rebuild flag after dequeuing the rebuild command");
+    }
+
     #[test]
     fn sync_plan_chunks_known_users_with_privacy_safe_ids() {
         let users = vec![account_id(3), account_id(1), account_id(2), account_id(1)];
@@ -299,6 +312,61 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(DirectorySyncCommand::Rebuild { respond: None })
+        ));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_clears_background_rebuild_flag_when_dequeuing_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(
+            std::time::Duration::from_secs(30),
+        );
+        let handle = DirectorySyncHandle::spawn(app, relay_plane);
+
+        handle.request_rebuild();
+        wait_for_background_rebuild_flag_to_clear(&handle).await;
+
+        handle.request_rebuild();
+        wait_for_background_rebuild_flag_to_clear(&handle).await;
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_rebuild_channel_coalesces_with_pending_foreground_rebuild() {
+        let (commands, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let (respond, _response) = oneshot::channel();
+        commands
+            .try_send(DirectorySyncCommand::Rebuild {
+                respond: Some(respond),
+            })
+            .expect("foreground rebuild should fill the one-command channel");
+        let handle = DirectorySyncHandle {
+            commands,
+            abort: task.abort_handle(),
+            rebuild_queued: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        handle.request_rebuild();
+        assert!(
+            handle
+                .rebuild_queued
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a full command channel should keep the coalescing flag set until an existing rebuild runs"
+        );
+        handle.request_rebuild();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DirectorySyncCommand::Rebuild { respond: Some(_) })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
         ));
 
         task.abort();
