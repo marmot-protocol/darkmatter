@@ -51,6 +51,9 @@ impl AgentTextStreamReceiveAccumulator {
     }
 
     pub fn observe_wire_record(&mut self) -> Result<(), AgentTextStreamReceiveLimitError> {
+        // Direct point-to-point streams do not expect legitimate in-stream
+        // replay/backlog volume, so every decoded wire record spends the same
+        // `max_records` budget before duplicate or low-sequence discard.
         let wire_records = self.wire_records.checked_add(1).ok_or(
             AgentTextStreamReceiveLimitError::RecordLimitExceeded {
                 attempted: u64::MAX,
