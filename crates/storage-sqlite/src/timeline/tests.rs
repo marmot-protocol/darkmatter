@@ -107,6 +107,8 @@ fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> Store
 }
 
 fn fail_on_timeline_delete(store: &SqliteAccountStorage) {
+    // This deliberately trips on any materialized-row delete. Use it only in
+    // tests that should upsert existing timeline rows, not remove targeted rows.
     let conn = store.lock().unwrap();
     conn.execute_batch(
         "CREATE TRIGGER panic_message_timeline_delete
@@ -696,6 +698,19 @@ fn re_targeting_reaction_reprojects_old_and_new_targets() {
     assert!(changed_ids.contains(&"old-target"));
     assert!(changed_ids.contains(&"new-target"));
 
+    let changed_triggers = update
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            TimelineMessageChange::Upsert { trigger, message } => {
+                Some((message.message_id_hex.as_str(), trigger))
+            }
+            TimelineMessageChange::Remove { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(changed_triggers.contains(&("old-target", &TimelineUpdateTrigger::ReactionRemoved)));
+    assert!(changed_triggers.contains(&("new-target", &TimelineUpdateTrigger::ReactionAdded)));
+
     let messages = list(&store);
     let old_target = messages
         .iter()
@@ -707,6 +722,40 @@ fn re_targeting_reaction_reprojects_old_and_new_targets() {
         .find(|message| message.message_id_hex == "new-target")
         .unwrap();
     assert_eq!(new_target.reactions.user_reactions.len(), 1);
+}
+
+#[test]
+fn upserting_modifier_as_non_modifier_clears_stale_edges() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    assert_eq!(modifier_edge_count(&store, "reaction-1"), 1);
+    fail_on_timeline_delete(&store);
+
+    let update = store
+        .record_app_event(&chat("reaction-1", "bob", 3, "not a reaction"))
+        .unwrap();
+
+    assert_eq!(modifier_edge_count(&store, "reaction-1"), 0);
+    let messages = list(&store);
+    let target = messages
+        .iter()
+        .find(|message| message.message_id_hex == "target")
+        .unwrap();
+    assert!(target.reactions.user_reactions.is_empty());
+    assert!(update.changes.iter().any(|change| {
+        matches!(
+            change,
+            TimelineMessageChange::Upsert {
+                trigger: TimelineUpdateTrigger::ReactionRemoved,
+                message,
+            } if message.message_id_hex == "target"
+        )
+    }));
 }
 
 #[test]
