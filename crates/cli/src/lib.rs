@@ -1607,21 +1607,27 @@ mod tests {
         // loopback/private/link-local/ULA must be rejected unless the local user
         // explicitly opts into local endpoints.
         for candidate in [
-            "quic://127.0.0.1:4450",       // IPv4 loopback
-            "quic://10.0.0.1:4450",        // RFC1918 private
-            "quic://192.168.1.1:4450",     // RFC1918 private
-            "quic://100.64.0.1:4450",      // shared address space
-            "quic://169.254.169.254:4450", // link-local cloud metadata
-            "quic://192.0.2.1:4450",       // documentation range
-            "quic://198.18.0.1:4450",      // benchmarking range
-            "quic://224.0.0.1:4450",       // multicast
-            "quic://255.255.255.255:4450", // limited broadcast
-            "quic://[::1]:4450",           // IPv6 loopback
-            "quic://[fd00::1]:4450",       // IPv6 unique-local (ULA)
-            "quic://[fe80::1]:4450",       // IPv6 unicast link-local
-            "quic://[ff02::1]:4450",       // IPv6 multicast
-            "quic://[2001:db8::1]:4450",   // IPv6 documentation range
-            "quic://0.0.0.0:4450",         // unspecified
+            "quic://127.0.0.1:4450",          // IPv4 loopback
+            "quic://10.0.0.1:4450",           // RFC1918 private
+            "quic://192.168.1.1:4450",        // RFC1918 private
+            "quic://100.64.0.1:4450",         // shared address space
+            "quic://169.254.169.254:4450",    // link-local cloud metadata
+            "quic://192.0.2.1:4450",          // documentation range
+            "quic://192.88.99.1:4450",        // 6to4 relay anycast
+            "quic://198.18.0.1:4450",         // benchmarking range
+            "quic://224.0.0.1:4450",          // multicast
+            "quic://255.255.255.255:4450",    // limited broadcast
+            "quic://[::1]:4450",              // IPv6 loopback
+            "quic://[::ffff:127.0.0.1]:4450", // IPv4-mapped loopback
+            "quic://[::ffff:10.0.0.1]:4450",  // IPv4-mapped private
+            "quic://[fd00::1]:4450",          // IPv6 unique-local (ULA)
+            "quic://[fe80::1]:4450",          // IPv6 unicast link-local
+            "quic://[ff02::1]:4450",          // IPv6 multicast
+            "quic://[2001::1]:4450",          // Teredo transition prefix
+            "quic://[2001:db8::1]:4450",      // IPv6 documentation range
+            "quic://[2002::1]:4450",          // 6to4 transition prefix
+            "quic://[3fff::1]:4450",          // IPv6 documentation range
+            "quic://0.0.0.0:4450",            // unspecified
         ] {
             let parsed = parse_quic_candidate(candidate).expect("candidate parses");
             let result = resolve_quic_candidate_addr(&parsed, false).await;

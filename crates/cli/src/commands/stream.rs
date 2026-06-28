@@ -3,6 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use cgka_traits::app_components::is_public_ip;
 use cgka_traits::app_event::{STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_TAG};
 use cgka_traits::{GroupId, MessageId};
 use marmot_account::AccountHome;
@@ -747,58 +748,11 @@ pub(crate) async fn resolve_quic_candidate_addr(
 }
 
 /// Whether a resolved candidate address must never be reached from a
-/// sender-controlled `quic://` candidate without explicit local opt-in. Uses
-/// stable `std::net` classification only.
+/// sender-controlled `quic://` candidate without explicit local opt-in. Delegates
+/// to the canonical Marmot host-safety classifier so QUIC candidate filtering
+/// cannot drift from the shared SSRF hardening rules.
 fn socket_addr_is_unsafe(addr: SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V4(ip) => ipv4_addr_is_unsafe(ip),
-        IpAddr::V6(ip) => ipv6_addr_is_unsafe(ip),
-    }
-}
-
-fn ipv4_addr_is_unsafe(ip: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _d] = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local() // includes 169.254.0.0/16 (e.g. 169.254.169.254)
-        || ip.is_multicast()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || a == 0 // 0.0.0.0/8 "this network"
-        || (a == 100 && (b & 0b1100_0000) == 0b0100_0000) // 100.64.0.0/10 shared address space
-        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 IETF protocol assignments
-        || (a == 192 && b == 0 && c == 2) // TEST-NET-1
-        || (a == 198 && (b == 18 || b == 19)) // benchmarking
-        || (a == 198 && b == 51 && c == 100) // TEST-NET-2
-        || (a == 203 && b == 0 && c == 113) // TEST-NET-3
-        || a >= 240 // reserved, including limited broadcast
-}
-
-fn ipv6_addr_is_unsafe(ip: std::net::Ipv6Addr) -> bool {
-    ip.is_loopback()
-        || ip.is_multicast()
-        || ip.is_unspecified()
-        || is_unique_local_v6(ip)
-        || is_unicast_link_local_v6(ip)
-        || is_documentation_v6(ip)
-}
-
-/// IPv6 unique-local address (ULA, `fc00::/7`). `Ipv6Addr::is_unique_local` is
-/// not yet stable, so classify on the stable octet representation.
-fn is_unique_local_v6(ip: std::net::Ipv6Addr) -> bool {
-    (ip.octets()[0] & 0xfe) == 0xfc
-}
-
-/// IPv6 unicast link-local address (`fe80::/10`). `is_unicast_link_local` is not
-/// yet stable, so classify on the stable segment representation.
-fn is_unicast_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
-    (ip.segments()[0] & 0xffc0) == 0xfe80
-}
-
-/// IPv6 documentation prefix (`2001:db8::/32`).
-fn is_documentation_v6(ip: std::net::Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0db8
+    !is_public_ip(addr.ip())
 }
 
 fn candidate_server_name(authority: &str) -> Result<String, DmError> {
