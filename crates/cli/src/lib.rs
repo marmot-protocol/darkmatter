@@ -1206,6 +1206,14 @@ mod tests {
 
     #[test]
     fn npub_for_account_id_rejects_invalid_input_without_panicking() {
+        let npub =
+            npub_for_account_id("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .expect("valid account ids must render as npub");
+        assert_eq!(
+            npub,
+            "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
+        );
+
         let err = npub_for_account_id("not-a-public-key")
             .expect_err("invalid account ids must surface as a CLI error");
         let rendered = super::dm_error_json(&err);
