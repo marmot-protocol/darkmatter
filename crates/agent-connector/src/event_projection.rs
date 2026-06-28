@@ -17,7 +17,6 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     STREAM_TAG, group_system_canonical_id,
 };
-use marmot_markdown::{Block, Inline, NostrHrp};
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
 /// account was mentioned/addressed in the message.
@@ -62,101 +61,152 @@ fn plaintext_has_nostr_hex_ref(plaintext: &str, reference: &str) -> bool {
     plaintext_has_prefixed_ref(plaintext, "nostr:", reference)
 }
 
-/// Upper bound on the plaintext fed to the Markdown parser for visible-mention
-/// detection. The parser has super-linear behavior on hostile emphasis/bracket
-/// input, and this caller runs on attacker-controlled inbound plaintext outside
-/// the UniFFI surface that enforces `MAX_FFI_MARKDOWN_INPUT_BYTES`. A real
-/// mention only needs the prefix-and-npub token, so a frame-sized window is far
-/// more than enough; bounding it keeps a hostile message from driving the parse
-/// super-linearly (darkmatter#663). Mirrors the UniFFI cap.
-const MAX_MENTION_MARKDOWN_INPUT_BYTES: usize =
+/// Upper bound for the plaintext scanned for visible `npub` mention tokens.
+/// Mention classification runs on attacker-controlled inbound plaintext during
+/// live delivery and replay, so keep the per-message work bounded even though
+/// the scanner below is linear. Mirrors the UniFFI Markdown cap/frame size.
+const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 /// Whether `plaintext` contains a visible npub mention token for the account.
 ///
-/// Cheap guard first: every visible mention form parsed by marmot-markdown
-/// (`@npub1…`, `nostr:npub1…`, and bare `npub1…`) carries the lowercase npub as
-/// a token-bounded substring, so an `O(n)` scan that finds no such token proves
-/// no parse could yield a mention. This short-circuits the dominant inbound
-/// case — including a hostile emphasis/bracket bomb with no npub — without ever
-/// invoking the super-linear Markdown parser (darkmatter#663).
-///
-/// Only when a candidate token is present do we run the display parser to apply
-/// its exact visible-mention semantics (e.g. image alt text and `@`/`nostr:`
-/// prefix-decline rules are not visible mentions). That parse is length-capped
-/// so the rare candidate-plus-bomb message still cannot run the parser
-/// unbounded. Using the parser for the final decision keeps
-/// `AgentControlEvent::InboundMessage.mentions_self` aligned with the markdown
-/// surface humans actually see.
+/// This deliberately avoids `marmot_markdown::parse`: the parser has
+/// super-linear behavior on hostile emphasis/bracket input, and this caller is
+/// fed decrypted inbound message plaintext from other group members. The mention
+/// decision only needs the visible Nostr token shapes that the Markdown surface
+/// recognizes (`@npub1…`, `nostr:npub1…`, and bare `npub1…`), so a bounded
+/// token-boundary scan is enough and keeps replay/live drain work predictable
+/// (darkmatter#663).
 fn plaintext_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
-    if !plaintext_has_npub_token(plaintext, npub) {
-        return false;
+    plaintext_scan_has_visible_npub_ref(mention_plaintext_scan_input(plaintext), npub)
+}
+
+fn plaintext_scan_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
+    let bytes = plaintext.as_bytes();
+    let npub_bytes = npub.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if let Some(end) = skip_markdown_image(bytes, i) {
+            i = end;
+            continue;
+        }
+        if is_visible_at_npub_ref(bytes, i, npub_bytes)
+            || is_visible_nostr_npub_ref(bytes, i, npub_bytes)
+            || is_visible_bare_npub_ref(bytes, i, npub_bytes)
+        {
+            return true;
+        }
+        i += 1;
     }
-    let bounded = mention_markdown_input(plaintext);
-    markdown_blocks_have_npub_ref(&marmot_markdown::parse(bounded).blocks, npub)
+
+    false
 }
 
-/// Cheap, sound superset of the parser's visible-npub matcher: true if the
-/// lowercase npub appears in `plaintext` as a right-token-bounded substring
-/// (the npub is fixed-length lowercase bech32). The parser's left-boundary and
-/// container rules are applied by the confirming parse, so this only has to
-/// avoid false negatives, never false positives.
-fn plaintext_has_npub_token(plaintext: &str, npub: &str) -> bool {
-    plaintext.match_indices(npub).any(|(start, _)| {
-        let end = start + npub.len();
-        end == plaintext.len() || token_boundary_ok(plaintext.as_bytes()[end])
-    })
-}
-
-/// Cap the parser input on a UTF-8 boundary so a hostile long message cannot
-/// drive the (super-linear) Markdown parse unbounded.
-fn mention_markdown_input(plaintext: &str) -> &str {
-    if plaintext.len() <= MAX_MENTION_MARKDOWN_INPUT_BYTES {
+/// Cap the scan input on a UTF-8 boundary so replay never spends unbounded time
+/// on one hostile message.
+fn mention_plaintext_scan_input(plaintext: &str) -> &str {
+    if plaintext.len() <= MAX_MENTION_PLAINTEXT_SCAN_BYTES {
         return plaintext;
     }
-    let mut end = MAX_MENTION_MARKDOWN_INPUT_BYTES;
+    let mut end = MAX_MENTION_PLAINTEXT_SCAN_BYTES;
     while !plaintext.is_char_boundary(end) {
         end -= 1;
     }
     &plaintext[..end]
 }
 
-fn markdown_blocks_have_npub_ref(blocks: &[Block], npub: &str) -> bool {
-    blocks.iter().any(|block| match block {
-        Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
-            markdown_inlines_have_npub_ref(inlines, npub)
-        }
-        Block::BlockQuote { blocks } => markdown_blocks_have_npub_ref(blocks, npub),
-        Block::List { items, .. } => items
-            .iter()
-            .any(|item| markdown_blocks_have_npub_ref(&item.blocks, npub)),
-        Block::Table { header, rows, .. } => header
-            .iter()
-            .chain(rows.iter().flatten())
-            .any(|cell| markdown_inlines_have_npub_ref(&cell.inlines, npub)),
-        Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => false,
-    })
+fn skip_markdown_image(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i..i + 2) != Some(b"![") {
+        return None;
+    }
+    let alt_end = match find_unescaped_byte(bytes, i + 2, b']') {
+        Some(end) => end,
+        // A malformed image opener is not a visible mention container, and
+        // skipping the rest avoids rescanning the same hostile prefix.
+        None => return Some(bytes.len()),
+    };
+    match bytes.get(alt_end + 1) {
+        Some(b'(') => Some(skip_inline_link_destination(bytes, alt_end + 2)),
+        Some(b'[') => Some(skip_reference_label(bytes, alt_end + 2)),
+        _ => None,
+    }
 }
 
-fn markdown_inlines_have_npub_ref(inlines: &[Inline], npub: &str) -> bool {
-    inlines.iter().any(|inline| match inline {
-        Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
-            entity.hrp == NostrHrp::Npub && entity.bech32 == npub
+fn skip_inline_link_destination(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(bytes.len()),
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    return i + 1;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
         }
-        Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
-            markdown_inlines_have_npub_ref(children, npub)
+    }
+    bytes.len()
+}
+
+fn skip_reference_label(bytes: &[u8], start: usize) -> usize {
+    find_unescaped_byte(bytes, start, b']').map_or(bytes.len(), |end| end + 1)
+}
+
+fn find_unescaped_byte(bytes: &[u8], start: usize, needle: u8) -> Option<usize> {
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
         }
-        Inline::Link { children, .. } => markdown_inlines_have_npub_ref(children, npub),
-        // Image alt text is metadata for fallback/rendering, not a visible
-        // addressed mention in the message body.
-        Inline::Image { .. } => false,
-        Inline::Text(_)
-        | Inline::SoftBreak
-        | Inline::HardBreak
-        | Inline::Code(_)
-        | Inline::Autolink { .. }
-        | Inline::Math(_) => false,
-    })
+        if bytes[i] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_visible_at_npub_ref(bytes: &[u8], i: usize, npub: &[u8]) -> bool {
+    bytes.get(i) == Some(&b'@')
+        && bytes.get(i + 1..i + 1 + npub.len()) == Some(npub)
+        && mention_left_boundary_ok(before_byte(bytes, i))
+        && mention_right_boundary_ok(bytes.get(i + 1 + npub.len()).copied())
+}
+
+fn is_visible_nostr_npub_ref(bytes: &[u8], i: usize, npub: &[u8]) -> bool {
+    bytes.get(i..i + 6) == Some(b"nostr:")
+        && bytes.get(i + 6..i + 6 + npub.len()) == Some(npub)
+        && mention_left_boundary_ok(before_byte(bytes, i))
+        && mention_right_boundary_ok(bytes.get(i + 6 + npub.len()).copied())
+}
+
+fn is_visible_bare_npub_ref(bytes: &[u8], i: usize, npub: &[u8]) -> bool {
+    bytes.get(i..i + npub.len()) == Some(npub)
+        && before_byte(bytes, i) != Some(b'@')
+        && !(i >= 6 && bytes.get(i - 6..i) == Some(b"nostr:"))
+        && mention_left_boundary_ok(before_byte(bytes, i))
+        && mention_right_boundary_ok(bytes.get(i + npub.len()).copied())
+}
+
+fn before_byte(bytes: &[u8], i: usize) -> Option<u8> {
+    i.checked_sub(1).and_then(|prev| bytes.get(prev).copied())
+}
+
+fn mention_left_boundary_ok(prev: Option<u8>) -> bool {
+    prev.is_none_or(token_boundary_ok)
+}
+
+fn mention_right_boundary_ok(next: Option<u8>) -> bool {
+    next.is_none_or(token_boundary_ok)
 }
 
 fn plaintext_has_prefixed_ref(plaintext: &str, prefix: &str, reference: &str) -> bool {
@@ -171,7 +221,7 @@ fn plaintext_has_prefixed_ref(plaintext: &str, prefix: &str, reference: &str) ->
 }
 
 fn token_boundary_ok(b: u8) -> bool {
-    !matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/')
+    !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/')
 }
 
 /// The replied-to message id from the first `e` tag, if present. The tag value is
