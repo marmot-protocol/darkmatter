@@ -1175,6 +1175,40 @@ fn push_token(
 }
 
 #[test]
+fn apply_group_push_token_keeps_sibling_leaves_distinct() {
+    // Two devices of one account (same member id, same platform+server, different
+    // leaf index) must coexist: leaf_index is part of the record key, so neither
+    // leaf's token overwrites the other's and a removal for one leaf does not
+    // touch the sibling. Regression for the pre-migration 4-tuple key that
+    // collapsed sibling devices (#628).
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    let leaf = |leaf_index: u32, owner_ts: i64, digest: &str| AccountGroupPushToken {
+        leaf_index,
+        ..push_token(&g, &m, owner_ts, digest)
+    };
+
+    assert!(store.apply_group_push_token(&leaf(1, 100, "d1")).unwrap());
+    assert!(store.apply_group_push_token(&leaf(2, 100, "d2")).unwrap());
+    assert_eq!(
+        store.group_push_tokens(&g).unwrap().len(),
+        2,
+        "both sibling leaves are stored side by side"
+    );
+
+    // A removal targeting leaf 1 must leave leaf 2's record intact.
+    assert!(
+        store
+            .apply_group_push_token_tombstone(&g, &m, 1, 1, &"cc".repeat(32), 200, "r1", 200)
+            .unwrap()
+    );
+    let stored = store.group_push_tokens(&g).unwrap();
+    assert_eq!(stored.len(), 1, "only the targeted leaf is removed");
+    assert_eq!(stored[0].leaf_index, 2);
+}
+
+#[test]
 fn apply_group_push_token_rejects_stale_stamp_rollback() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let g = "aa".repeat(32);
