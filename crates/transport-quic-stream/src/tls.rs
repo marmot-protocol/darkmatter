@@ -42,6 +42,9 @@ pub(crate) fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStre
 
 fn direct_transport_config() -> Result<TransportConfig, QuicTextStreamError> {
     let mut transport = TransportConfig::default();
+    // Keepalive must stay below the idle timeout so healthy but app-silent
+    // senders ACK keepalive packets, while transport-dead peers still hit the
+    // explicit idle backstop.
     transport
         .max_idle_timeout(Some(DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT.try_into()?))
         .keep_alive_interval(Some(DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL));
