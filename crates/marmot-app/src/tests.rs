@@ -11,6 +11,8 @@ use cgka_traits::app_event::{
     STREAM_TYPE_TAG,
 };
 use marmot_account::AccountHomeError;
+use nostr::base64::Engine as _;
+use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use storage_sqlite::StoredRelayTelemetrySettings;
 use transport_quic_broker::BrokerServerTrust;
 
@@ -912,6 +914,55 @@ fn legacy_account_projection_imports_once_into_account_storage() {
         })
         .unwrap();
     assert_eq!(app.messages("alice").unwrap().len(), 1);
+}
+
+#[test]
+fn push_token_447_spoofed_member_does_not_reach_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let _account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 32]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender = "aa".repeat(32);
+    let victim = "bb".repeat(32);
+    let attacker_server = "cc".repeat(32);
+    let encrypted_token = BASE64_STANDARD.encode(vec![0_u8; MIP05_ENCRYPTED_TOKEN_LEN]);
+    let payload = serde_json::json!({
+        "v": MIP05_VERSION,
+        "tokens": [{
+            "member_id_hex": victim.clone(),
+            "leaf_index": 0,
+            "platform": "apns",
+            "token_fingerprint": "sha256:000000000000000000000000",
+            "server_pubkey_hex": attacker_server,
+            "relay_hint": "wss://attacker.example",
+            "encrypted_token": encrypted_token,
+        }]
+    })
+    .to_string();
+    let message = ReceivedMessage {
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        sender: sender.clone(),
+        sender_display_name: None,
+        group_id,
+        source_epoch: 1,
+        plaintext: payload,
+        kind: MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+        tags: vec![vec!["v".to_owned(), MIP05_VERSION.to_owned()]],
+        recorded_at: 1,
+    };
+
+    app.ingest_push_gossip_message("alice", &message, &[sender.clone(), victim.clone()])
+        .unwrap();
+
+    assert!(
+        app.group_push_tokens("alice", &group_id_hex)
+            .unwrap()
+            .is_empty(),
+        "kind-447 self-updates must not store token records for a different active member"
+    );
 }
 
 #[test]

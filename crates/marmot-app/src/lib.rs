@@ -1465,16 +1465,31 @@ impl MarmotApp {
             .collect()
     }
 
+    /// Ingest an inbound push-token gossip app event (kinds 447/448/449) into
+    /// `group_push_tokens`. `active_member_ids` is the current MLS member set for
+    /// the group, used to bind each record to verified group state: a kind-447
+    /// self-update may only name the authenticated `message.sender`, and no kind
+    /// may store or remove records for members that are not currently in the
+    /// group. See `notifications::authorize_push_gossip`.
     pub(crate) fn ingest_push_gossip_message(
         &self,
         account_ref: &str,
         message: &ReceivedMessage,
+        active_member_ids: &[String],
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
         let storage = self.account_storage(&account.label)?;
-        match notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)? {
+        let action =
+            notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)?;
+        let action = notifications::authorize_push_gossip(
+            action,
+            message.kind,
+            &message.sender,
+            active_member_ids,
+        );
+        match action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
                     storage.upsert_group_push_token(&account_group_push_token_from_app(&record))?;

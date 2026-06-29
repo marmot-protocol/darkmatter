@@ -273,6 +273,121 @@ fn unsupported_push_gossip_kind_returns_error_not_panic() {
     assert!(matches!(err, AppError::InvalidPushGossip(_)));
 }
 
+fn token_record(member_id_hex: &str, server: &str) -> GroupPushTokenRecord {
+    GroupPushTokenRecord {
+        group_id_hex: "ee".repeat(32),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index: 0,
+        platform: PushPlatform::Apns,
+        token_fingerprint: "sha256:000000000000000000000000".to_owned(),
+        server_pubkey_hex: server.to_owned(),
+        relay_hint: None,
+        encrypted_token: vec![1, 2, 3],
+        updated_at_ms: 0,
+    }
+}
+
+fn removal_record(member_id_hex: &str, server: &str) -> PushTokenRemovalRecord {
+    PushTokenRemovalRecord {
+        member_id_hex: member_id_hex.to_owned(),
+        platform: PushPlatform::Apns,
+        token_fingerprint: "sha256:000000000000000000000000".to_owned(),
+        server_pubkey_hex: server.to_owned(),
+    }
+}
+
+#[test]
+fn kind_447_naming_other_member_is_dropped() {
+    // Member A (sender) publishes a self-update that names member B and an
+    // attacker-controlled server. The B-named entry must be dropped so it can
+    // never reach group_push_tokens, even though B is a current member.
+    let member_a = "aa".repeat(32);
+    let member_b = "bb".repeat(32);
+    let attacker_server = "cc".repeat(32);
+    let action = PushGossipAction::Upsert(vec![token_record(&member_b, &attacker_server)]);
+    let authorized = authorize_push_gossip(
+        action,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+        &member_a,
+        &[member_a.clone(), member_b.clone()],
+    );
+    assert_eq!(authorized, PushGossipAction::Upsert(vec![]));
+}
+
+#[test]
+fn kind_447_naming_own_member_is_kept() {
+    let member_a = "aa".repeat(32);
+    let server = "dd".repeat(32);
+    let record = token_record(&member_a, &server);
+    let action = PushGossipAction::Upsert(vec![record.clone()]);
+    let authorized = authorize_push_gossip(
+        action,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+        &member_a,
+        std::slice::from_ref(&member_a),
+    );
+    assert_eq!(authorized, PushGossipAction::Upsert(vec![record]));
+}
+
+#[test]
+fn kind_448_accepts_records_for_other_current_members() {
+    // A list response legitimately carries other members' records; the sender
+    // binding does not apply, only the current-member check.
+    let sender = "aa".repeat(32);
+    let member_b = "bb".repeat(32);
+    let member_c = "cc".repeat(32);
+    let server = "dd".repeat(32);
+    let records = vec![
+        token_record(&member_b, &server),
+        token_record(&member_c, &server),
+    ];
+    let action = PushGossipAction::Upsert(records.clone());
+    let authorized = authorize_push_gossip(
+        action,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        &sender,
+        &[sender.clone(), member_b.clone(), member_c.clone()],
+    );
+    assert_eq!(authorized, PushGossipAction::Upsert(records));
+}
+
+#[test]
+fn push_gossip_records_for_non_members_are_dropped() {
+    let sender = "aa".repeat(32);
+    let non_member = "bb".repeat(32);
+    let server = "dd".repeat(32);
+    // kind 448 carrying a non-member record.
+    let authorized = authorize_push_gossip(
+        PushGossipAction::Upsert(vec![token_record(&non_member, &server)]),
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        &sender,
+        std::slice::from_ref(&sender),
+    );
+    assert_eq!(authorized, PushGossipAction::Upsert(vec![]));
+    // kind 449 removal naming a non-member.
+    let authorized = authorize_push_gossip(
+        PushGossipAction::Remove(vec![removal_record(&non_member, &server)]),
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        &sender,
+        std::slice::from_ref(&sender),
+    );
+    assert_eq!(authorized, PushGossipAction::Remove(vec![]));
+}
+
+#[test]
+fn kind_449_removal_for_current_member_is_kept() {
+    let sender = "aa".repeat(32);
+    let server = "dd".repeat(32);
+    let removal = removal_record(&sender, &server);
+    let authorized = authorize_push_gossip(
+        PushGossipAction::Remove(vec![removal.clone()]),
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        &sender,
+        std::slice::from_ref(&sender),
+    );
+    assert_eq!(authorized, PushGossipAction::Remove(vec![removal]));
+}
+
 #[test]
 fn token_fingerprint_is_redacted_and_stable() {
     let token = b"provider-token-secret";
