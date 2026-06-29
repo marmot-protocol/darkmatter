@@ -179,7 +179,12 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
                     connect_task = None;
                     match connect_result {
                         Ok(Ok(mut connected)) => {
-                            if let Err(err) = live_broker_deadline(
+                            if live_error.is_some() {
+                                // Live preview was already disabled (for example by
+                                // pending-buffer overflow); drop the late publisher
+                                // instead of retaining an unused connection.
+                                pending_live_records.clear();
+                            } else if let Err(err) = live_broker_deadline(
                                 live_write_timeout,
                                 flush_pending_live_records(
                                     &mut connected,
@@ -327,12 +332,20 @@ impl PendingLiveRecords {
 
     fn push_bounded(&mut self, record_type: u8, text: String) -> Result<(), String> {
         let record_bytes = text.len();
-        if self.records.len() >= MAX_PENDING_LIVE_RECORDS
-            || self.bytes.saturating_add(record_bytes) > MAX_PENDING_LIVE_RECORD_BYTES
-        {
+        // Pending records are only a provisional live preview while the broker
+        // connects. Once either cap is exceeded, discard them and disable live
+        // preview for the rest of the session; the local transcript still
+        // preserves the full final report.
+        if self.records.len() >= MAX_PENDING_LIVE_RECORDS {
             self.clear();
             return Err(format!(
-                "pending live stream buffer exceeded {MAX_PENDING_LIVE_RECORDS} records or {MAX_PENDING_LIVE_RECORD_BYTES} bytes before broker connect completed"
+                "pending live stream buffer exceeded {MAX_PENDING_LIVE_RECORDS} records before broker connect completed"
+            ));
+        }
+        if self.bytes.saturating_add(record_bytes) > MAX_PENDING_LIVE_RECORD_BYTES {
+            self.clear();
+            return Err(format!(
+                "pending live stream buffer exceeded {MAX_PENDING_LIVE_RECORD_BYTES} bytes before broker connect completed"
             ));
         }
 
