@@ -512,7 +512,10 @@ fn push_signed_record_bytes(
     buf.push(platform_byte);
     buf.extend_from_slice(&server_pubkey);
     buf.extend_from_slice(&fingerprint);
-    buf.extend_from_slice(&(owner_ts as u64).to_be_bytes());
+    // owner_ts is i64 throughout (codebase timestamp convention + SQLite INTEGER).
+    // For a non-negative millisecond timestamp its two's-complement big-endian
+    // bytes are identical to the spec's `u64` encoding, so no cast is needed.
+    buf.extend_from_slice(&owner_ts.to_be_bytes());
     buf.extend_from_slice(&relay_len.to_be_bytes());
     buf.extend_from_slice(relay_bytes);
     if let Some(token) = encrypted_token {

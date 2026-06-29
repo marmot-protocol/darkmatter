@@ -987,20 +987,22 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         member_id_hex: &str,
     ) -> StorageResult<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM group_push_tokens
+        self.connection.with_transaction(|| -> StorageResult<()> {
+            let conn = self.lock()?;
+            conn.execute(
+                "DELETE FROM group_push_tokens
                  WHERE group_id_hex = ?1 AND member_id_hex = ?2",
-            params![group_id_hex, member_id_hex],
-        )
-        .storage()?;
-        conn.execute(
-            "DELETE FROM group_push_token_tombstones
+                params![group_id_hex, member_id_hex],
+            )
+            .storage()?;
+            conn.execute(
+                "DELETE FROM group_push_token_tombstones
                  WHERE group_id_hex = ?1 AND member_id_hex = ?2",
-            params![group_id_hex, member_id_hex],
-        )
-        .storage()?;
-        Ok(())
+                params![group_id_hex, member_id_hex],
+            )
+            .storage()?;
+            Ok(())
+        })
     }
 
     pub fn remove_stale_group_push_tokens(
@@ -1008,47 +1010,50 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         active_members: &[String],
     ) -> StorageResult<usize> {
-        let conn = self.lock()?;
-        if active_members.is_empty() {
-            conn.execute(
-                "DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1",
-                params![group_id_hex],
-            )
-            .storage()?;
-            return conn
-                .execute(
-                    "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
-                    params![group_id_hex],
+        self.connection
+            .with_transaction(|| -> StorageResult<usize> {
+                let conn = self.lock()?;
+                if active_members.is_empty() {
+                    conn.execute(
+                        "DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .storage()?;
+                    return conn
+                        .execute(
+                            "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
+                            params![group_id_hex],
+                        )
+                        .storage();
+                }
+                let placeholders = std::iter::repeat_n("?", active_members.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut values = Vec::with_capacity(active_members.len() + 1);
+                values.push(Value::Text(group_id_hex.to_owned()));
+                values.extend(active_members.iter().cloned().map(Value::Text));
+                // Clear tombstones for departed members too: once a member is gone, no
+                // relayed record for them can verify against current membership, so their
+                // tombstones are no longer load-bearing.
+                conn.execute(
+                    &format!(
+                        "DELETE FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?
+                   AND member_id_hex NOT IN ({placeholders})"
+                    ),
+                    params_from_iter(values.iter()),
                 )
-                .storage();
-        }
-        let placeholders = std::iter::repeat_n("?", active_members.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut values = Vec::with_capacity(active_members.len() + 1);
-        values.push(Value::Text(group_id_hex.to_owned()));
-        values.extend(active_members.iter().cloned().map(Value::Text));
-        // Clear tombstones for departed members too: once a member is gone, no
-        // relayed record for them can verify against current membership, so their
-        // tombstones are no longer load-bearing.
-        conn.execute(
-            &format!(
-                "DELETE FROM group_push_token_tombstones
+                .storage()?;
+                conn.execute(
+                    &format!(
+                        "DELETE FROM group_push_tokens
                  WHERE group_id_hex = ?
                    AND member_id_hex NOT IN ({placeholders})"
-            ),
-            params_from_iter(values.iter()),
-        )
-        .storage()?;
-        conn.execute(
-            &format!(
-                "DELETE FROM group_push_tokens
-                 WHERE group_id_hex = ?
-                   AND member_id_hex NOT IN ({placeholders})"
-            ),
-            params_from_iter(values.iter()),
-        )
-        .storage()
+                    ),
+                    params_from_iter(values.iter()),
+                )
+                .storage()
+            })
     }
 
     fn ensure_notification_settings(
