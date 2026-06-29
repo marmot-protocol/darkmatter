@@ -18,7 +18,18 @@ use transport_quic_stream::effective_plaintext_cap;
 /// so a live `Abort` record can be published before the session shuts down.
 const CANCEL_CONNECT_GRACE: Duration = Duration::from_secs(2);
 
-const DEFAULT_LIVE_BROKER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_LIVE_BROKER_TIMEOUTS: LiveBrokerTimeouts = LiveBrokerTimeouts {
+    connect: Duration::from_secs(5),
+    write: Duration::from_secs(5),
+};
+const MAX_PENDING_LIVE_RECORDS: usize = 256;
+const MAX_PENDING_LIVE_RECORD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct LiveBrokerTimeouts {
+    connect: Duration,
+    write: Duration,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamComposeReport {
@@ -115,7 +126,7 @@ pub async fn run_stream_compose_session(
         rx,
         cancel_rx,
         report,
-        DEFAULT_LIVE_BROKER_WRITE_TIMEOUT,
+        DEFAULT_LIVE_BROKER_TIMEOUTS,
     )
     .await;
 }
@@ -127,7 +138,7 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
     mut rx: mpsc::Receiver<StreamComposeCommand>,
     mut cancel_rx: mpsc::Receiver<()>,
     mut report: StreamComposeReport,
-    live_write_timeout: Duration,
+    live_timeouts: LiveBrokerTimeouts,
 ) where
     P: LiveBrokerPublisher,
     C: Future<Output = Result<P, E>> + Send + 'static,
@@ -136,10 +147,12 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
     let chunk_bytes =
         effective_stream_compose_chunk_bytes(chunk_bytes, open.max_plaintext_frame_len);
     let mut transcript = LocalComposeTranscript::new(&open);
-    let mut pending_live_records = VecDeque::new();
+    let mut pending_live_records = PendingLiveRecords::default();
     let mut publisher = None;
+    let live_connect_timeout = live_timeouts.connect;
+    let live_write_timeout = live_timeouts.write;
     let mut connect_task = Some(tokio::spawn(async move {
-        connect.await.map_err(|err| err.to_string())
+        live_broker_connect_deadline(live_connect_timeout, connect).await
     }));
     let mut live_error = None;
 
@@ -300,6 +313,42 @@ struct PendingComposeRecord {
     text: String,
 }
 
+#[derive(Default)]
+struct PendingLiveRecords {
+    records: VecDeque<PendingComposeRecord>,
+    bytes: usize,
+}
+
+impl PendingLiveRecords {
+    fn clear(&mut self) {
+        self.records.clear();
+        self.bytes = 0;
+    }
+
+    fn push_bounded(&mut self, record_type: u8, text: String) -> Result<(), String> {
+        let record_bytes = text.len();
+        if self.records.len() >= MAX_PENDING_LIVE_RECORDS
+            || self.bytes.saturating_add(record_bytes) > MAX_PENDING_LIVE_RECORD_BYTES
+        {
+            self.clear();
+            return Err(format!(
+                "pending live stream buffer exceeded {MAX_PENDING_LIVE_RECORDS} records or {MAX_PENDING_LIVE_RECORD_BYTES} bytes before broker connect completed"
+            ));
+        }
+
+        self.bytes += record_bytes;
+        self.records
+            .push_back(PendingComposeRecord { record_type, text });
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<PendingComposeRecord> {
+        let record = self.records.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(record.text.len());
+        Some(record)
+    }
+}
+
 impl LocalComposeTranscript {
     fn new(open: &OpenBrokerTextPublisher) -> Self {
         Self {
@@ -430,7 +479,7 @@ async fn append_stream_compose_progress<P: LiveBrokerPublisher>(
 
 struct ComposeLiveSink<'a, P> {
     publisher: &'a mut Option<P>,
-    pending_live_records: &'a mut VecDeque<PendingComposeRecord>,
+    pending_live_records: &'a mut PendingLiveRecords,
     live_error: &'a mut Option<String>,
     live_write_timeout: Duration,
 }
@@ -473,9 +522,8 @@ async fn append_live_record<P: LiveBrokerPublisher>(
                 *live.publisher = None;
                 live.pending_live_records.clear();
             }
-        } else {
-            live.pending_live_records
-                .push_back(PendingComposeRecord { record_type, text });
+        } else if let Err(err) = live.pending_live_records.push_bounded(record_type, text) {
+            *live.live_error = Some(err);
         }
     }
 }
@@ -525,7 +573,7 @@ async fn finish_stream_compose_report<P: LiveBrokerPublisher>(
 
 async fn flush_pending_live_records<P: LiveBrokerPublisher>(
     publisher: &mut P,
-    pending_live_records: &mut VecDeque<PendingComposeRecord>,
+    pending_live_records: &mut PendingLiveRecords,
     chunk_bytes: usize,
 ) -> Result<(), String> {
     while let Some(record) = pending_live_records.pop_front() {
@@ -538,6 +586,22 @@ async fn flush_pending_live_records<P: LiveBrokerPublisher>(
         }
     }
     Ok(())
+}
+
+async fn live_broker_connect_deadline<P, E>(
+    live_connect_timeout: Duration,
+    connect: impl Future<Output = Result<P, E>>,
+) -> Result<P, String>
+where
+    E: ToString,
+{
+    if live_connect_timeout.is_zero() {
+        return connect.await.map_err(|err| err.to_string());
+    }
+    tokio::time::timeout(live_connect_timeout, connect)
+        .await
+        .map_err(|_| format!("live broker connect timed out after {live_connect_timeout:?}"))?
+        .map_err(|err| err.to_string())
 }
 
 async fn live_broker_deadline<T>(

@@ -424,7 +424,7 @@ async fn append_live_record_times_out_stalled_publisher_and_drops_it() {
     let mut publisher = Some(StalledPublisher {
         append_started: None,
     });
-    let mut pending_live_records = std::collections::VecDeque::new();
+    let mut pending_live_records = super::PendingLiveRecords::default();
     let mut live_error = None;
 
     super::append_live_record(
@@ -441,12 +441,88 @@ async fn append_live_record_times_out_stalled_publisher_and_drops_it() {
     .await;
 
     assert!(publisher.is_none(), "stalled publisher should be dropped");
-    assert!(pending_live_records.is_empty());
+    assert!(pending_live_records.records.is_empty());
     assert!(
         live_error
             .as_deref()
             .is_some_and(|err| err.contains("timed out")),
         "append should record live timeout: {live_error:?}"
+    );
+}
+
+#[tokio::test]
+async fn append_live_record_disables_live_preview_when_pending_record_cap_is_exceeded() {
+    let mut publisher: Option<StalledPublisher> = None;
+    let mut pending_live_records = super::PendingLiveRecords::default();
+    let mut live_error = None;
+
+    for idx in 0..super::MAX_PENDING_LIVE_RECORDS {
+        super::append_live_record(
+            &mut super::ComposeLiveSink {
+                publisher: &mut publisher,
+                pending_live_records: &mut pending_live_records,
+                live_error: &mut live_error,
+                live_write_timeout: Duration::from_millis(10),
+            },
+            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+            format!("record-{idx}"),
+            8,
+        )
+        .await;
+        assert!(live_error.is_none());
+    }
+    assert_eq!(
+        pending_live_records.records.len(),
+        super::MAX_PENDING_LIVE_RECORDS
+    );
+
+    super::append_live_record(
+        &mut super::ComposeLiveSink {
+            publisher: &mut publisher,
+            pending_live_records: &mut pending_live_records,
+            live_error: &mut live_error,
+            live_write_timeout: Duration::from_millis(10),
+        },
+        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+        "overflow".to_owned(),
+        8,
+    )
+    .await;
+
+    assert!(pending_live_records.records.is_empty());
+    assert!(
+        live_error
+            .as_deref()
+            .is_some_and(|err| err.contains("pending live stream buffer exceeded")),
+        "pending record overflow should disable live preview: {live_error:?}"
+    );
+}
+
+#[tokio::test]
+async fn append_live_record_disables_live_preview_when_pending_byte_cap_is_exceeded() {
+    let mut publisher: Option<StalledPublisher> = None;
+    let mut pending_live_records = super::PendingLiveRecords::default();
+    let mut live_error = None;
+
+    super::append_live_record(
+        &mut super::ComposeLiveSink {
+            publisher: &mut publisher,
+            pending_live_records: &mut pending_live_records,
+            live_error: &mut live_error,
+            live_write_timeout: Duration::from_millis(10),
+        },
+        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+        "x".repeat(super::MAX_PENDING_LIVE_RECORD_BYTES + 1),
+        8,
+    )
+    .await;
+
+    assert!(pending_live_records.records.is_empty());
+    assert!(
+        live_error
+            .as_deref()
+            .is_some_and(|err| err.contains("pending live stream buffer exceeded")),
+        "pending byte overflow should disable live preview: {live_error:?}"
     );
 }
 
@@ -479,7 +555,7 @@ async fn finish_report_times_out_stalled_live_finish_and_uses_local_transcript()
     let mut report = test_stream_compose_report(&stream_id);
     let transcript = super::LocalComposeTranscript::new(&open);
     let mut publisher = Some(StalledFinishPublisher);
-    let mut pending_live_records = std::collections::VecDeque::new();
+    let mut pending_live_records = super::PendingLiveRecords::default();
     let mut live_error = None;
 
     let finished = super::finish_stream_compose_report(
@@ -534,7 +610,10 @@ async fn compose_session_times_out_stalled_live_flush_and_still_finishes() {
         rx,
         cancel_rx,
         report,
-        Duration::from_millis(10),
+        super::LiveBrokerTimeouts {
+            write: Duration::from_millis(10),
+            connect: Duration::from_secs(5),
+        },
     ));
 
     let (append_tx, append_rx) = oneshot::channel();
@@ -587,6 +666,101 @@ async fn compose_session_times_out_stalled_live_flush_and_still_finishes() {
                 &stream_id,
                 &start_event_id,
                 &["hello"],
+                8,
+            )
+            .as_str()
+        )
+    );
+
+    session.await.unwrap();
+}
+
+#[tokio::test]
+async fn compose_session_times_out_pending_broker_connect_and_disables_live_preview() {
+    let stream_id = vec![0x6a; 32];
+    let start_event_id = MessageId::new(vec![0x6b; 32]);
+    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+    let report = test_stream_compose_report(&stream_id);
+    let (tx, rx) = mpsc::channel(4);
+    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+    let session = tokio::spawn(super::run_stream_compose_session_with_connector(
+        open,
+        future::pending::<Result<StalledPublisher, String>>(),
+        8,
+        rx,
+        cancel_rx,
+        report,
+        super::LiveBrokerTimeouts {
+            write: Duration::from_millis(50),
+            connect: Duration::from_millis(10),
+        },
+    ));
+
+    let (first_tx, first_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Append {
+        text: "buffered".to_owned(),
+        respond: first_tx,
+    })
+    .await
+    .unwrap();
+    let first = tokio::time::timeout(Duration::from_millis(250), first_rx)
+        .await
+        .expect("append should use local transcript while broker connect is pending")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.text, "buffered");
+    assert_eq!(first.error, None);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (second_tx, second_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Append {
+        text: " after timeout".to_owned(),
+        respond: second_tx,
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(Duration::from_millis(250), second_rx)
+        .await
+        .expect("append should complete after broker connect timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.text, "buffered after timeout");
+    assert!(
+        second
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("live broker connect timed out")),
+        "append should report broker connect timeout: {:?}",
+        second.error
+    );
+
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
+        .await
+        .unwrap();
+    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("finish should complete after broker connect timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.status, "finished");
+    assert_eq!(finished.text, "buffered after timeout");
+    assert!(
+        finished
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("live broker connect timed out")),
+        "finish should preserve broker connect timeout: {:?}",
+        finished.error
+    );
+    assert_eq!(
+        finished.transcript_hash.as_deref(),
+        Some(
+            expected_stream_transcript_hash_for_appends(
+                &stream_id,
+                &start_event_id,
+                &["buffered", " after timeout"],
                 8,
             )
             .as_str()
