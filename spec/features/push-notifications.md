@@ -141,12 +141,17 @@ A kind `447` event with a non-empty `tokens` array is a self-update: the sender 
 record, normally as exactly one entry. A kind `447` event whose `tokens` array is empty is a token request: it carries
 no records and asks other members to share theirs.
 
-A recipient processes both forms with the same rule — apply every listed entry — so an empty request changes no state.
+A recipient processes both forms with the same owner-authenticated rule: apply only entries whose `member_id_hex`
+matches the MLS-authenticated sender and names a current group member. Other entries are advisory-invalid and ignored,
+so an empty request changes no state.
 
 ### List response (kind 448)
 
 A kind `448` event is a response listing the responder's current view of the group's active token records, one entry
-per record, including its own. A recipient applies the same entry rule as for kind `447`.
+per record, including its own. In `mip05-v1`, token entries do not carry independently authenticated provenance for
+other members' self-updates, so a recipient applies only entries whose `member_id_hex` matches the MLS-authenticated
+responder and names a current group member. Entries naming other members MAY be present for diagnostics or future
+compatibility, but recipients MUST ignore them unless a later version defines verifiable original-owner provenance.
 
 ### Removal (kind 449)
 
@@ -170,7 +175,8 @@ per record, including its own. A recipient applies the same entry rule as for ki
   entry MUST carry `leaf_index` so it targets exactly one device's record and cannot revoke a sibling leaf's active
   token for the same account, platform, and server.
 
-A recipient deletes the stored token record matching all five values.
+A recipient deletes the stored token record matching all five values only when the removal's `member_id_hex` matches the
+MLS-authenticated sender and names a current group member. Other removals are advisory-invalid and ignored.
 
 ### Record state
 

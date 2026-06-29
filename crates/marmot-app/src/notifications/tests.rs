@@ -330,14 +330,17 @@ fn kind_447_naming_own_member_is_kept() {
 }
 
 #[test]
-fn kind_448_accepts_records_for_other_current_members() {
-    // A list response legitimately carries other members' records; the sender
-    // binding does not apply, only the current-member check.
+fn kind_448_drops_records_for_other_current_members() {
+    // A list response may report the responder's view of multiple records, but
+    // v1 entries carry no independently authenticated provenance for records
+    // owned by other members. Only sender-owned entries may mutate storage.
     let sender = "aa".repeat(32);
     let member_b = "bb".repeat(32);
     let member_c = "cc".repeat(32);
     let server = "dd".repeat(32);
+    let sender_record = token_record(&sender, &server);
     let records = vec![
+        sender_record.clone(),
         token_record(&member_b, &server),
         token_record(&member_c, &server),
     ];
@@ -348,7 +351,7 @@ fn kind_448_accepts_records_for_other_current_members() {
         &sender,
         &[sender.clone(), member_b.clone(), member_c.clone()],
     );
-    assert_eq!(authorized, PushGossipAction::Upsert(records));
+    assert_eq!(authorized, PushGossipAction::Upsert(vec![sender_record]));
 }
 
 #[test]
@@ -386,6 +389,20 @@ fn kind_449_removal_for_current_member_is_kept() {
         std::slice::from_ref(&sender),
     );
     assert_eq!(authorized, PushGossipAction::Remove(vec![removal]));
+}
+
+#[test]
+fn kind_449_removal_for_other_current_member_is_dropped() {
+    let sender = "aa".repeat(32);
+    let victim = "bb".repeat(32);
+    let server = "dd".repeat(32);
+    let authorized = authorize_push_gossip(
+        PushGossipAction::Remove(vec![removal_record(&victim, &server)]),
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        &sender,
+        &[sender.clone(), victim],
+    );
+    assert_eq!(authorized, PushGossipAction::Remove(vec![]));
 }
 
 #[test]

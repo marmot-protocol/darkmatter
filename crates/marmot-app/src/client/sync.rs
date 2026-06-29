@@ -350,8 +350,8 @@ impl AppClient {
             ) {
                 if notifications::is_push_gossip_kind(message.kind) {
                     // Bind inbound gossip to the MLS-authenticated member set so
-                    // a kind-447 from one member cannot rewrite another member's
-                    // token routing, and no kind can touch non-members.
+                    // one member cannot rewrite another member's token routing,
+                    // and no kind can touch non-members.
                     let ingest_result = self
                         .runtime
                         .members(&message.group_id)

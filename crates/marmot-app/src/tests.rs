@@ -966,6 +966,55 @@ fn push_token_447_spoofed_member_does_not_reach_storage() {
 }
 
 #[test]
+fn push_token_448_spoofed_member_does_not_reach_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let _account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 32]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender = "aa".repeat(32);
+    let victim = "bb".repeat(32);
+    let attacker_server = "cc".repeat(32);
+    let encrypted_token = BASE64_STANDARD.encode(vec![0_u8; MIP05_ENCRYPTED_TOKEN_LEN]);
+    let payload = serde_json::json!({
+        "v": MIP05_VERSION,
+        "tokens": [{
+            "member_id_hex": victim.clone(),
+            "leaf_index": 0,
+            "platform": "apns",
+            "token_fingerprint": "sha256:000000000000000000000000",
+            "server_pubkey_hex": attacker_server,
+            "relay_hint": "wss://attacker.example",
+            "encrypted_token": encrypted_token,
+        }]
+    })
+    .to_string();
+    let message = ReceivedMessage {
+        message_id_hex: "33".repeat(32),
+        source_message_id_hex: "44".repeat(32),
+        sender: sender.clone(),
+        sender_display_name: None,
+        group_id,
+        source_epoch: 1,
+        plaintext: payload,
+        kind: MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        tags: vec![vec!["v".to_owned(), MIP05_VERSION.to_owned()]],
+        recorded_at: 1,
+    };
+
+    app.ingest_push_gossip_message("alice", &message, &[sender.clone(), victim.clone()])
+        .unwrap();
+
+    assert!(
+        app.group_push_tokens("alice", &group_id_hex)
+            .unwrap()
+            .is_empty(),
+        "kind-448 list responses must not store token records for a different active member"
+    );
+}
+
+#[test]
 fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
     let local_pubkey = "11".repeat(32);
     let known_event_id = "22".repeat(32);

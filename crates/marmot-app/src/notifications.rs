@@ -542,12 +542,14 @@ pub(crate) fn parse_push_gossip(
 ///
 /// - kind 447 (self-update): only the sender's own `member_id_hex` is accepted,
 ///   so member A cannot publish a 447 that rewrites member B's token routing.
-/// - kind 448 (list response): records for any current group member are
-///   accepted, since a list legitimately carries other members' records.
-/// - kind 449 (removal): only removals for current group members are applied.
+/// - kind 448 (list response): MIP-05 v1 entries do not carry independently
+///   authenticated provenance for other members, so a responder cannot introduce
+///   or overwrite another member's token routing; only the sender-owned entries
+///   in the list are applied.
+/// - kind 449 (removal): only the sender's own removals are applied.
 ///
 /// All kinds additionally require the named member to be a current member, so a
-/// 448/449 cannot store or remove records for non-members. Filtering is silent
+/// sender cannot store or remove records for non-members. Filtering is silent
 /// (per-entry) so a single unauthorized entry cannot poison the whole batch.
 pub(crate) fn authorize_push_gossip(
     action: PushGossipAction,
@@ -556,14 +558,20 @@ pub(crate) fn authorize_push_gossip(
     active_members: &[String],
 ) -> PushGossipAction {
     let active: HashSet<&str> = active_members.iter().map(String::as_str).collect();
-    let is_self_update = kind == MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE;
+    let is_sender_owned_kind = matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE
+            | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST
+            | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL
+    );
     match action {
         PushGossipAction::Upsert(records) => PushGossipAction::Upsert(
             records
                 .into_iter()
                 .filter(|record| {
-                    active.contains(record.member_id_hex.as_str())
-                        && (!is_self_update || record.member_id_hex == sender_id_hex)
+                    is_sender_owned_kind
+                        && active.contains(record.member_id_hex.as_str())
+                        && record.member_id_hex == sender_id_hex
                 })
                 .collect(),
         ),
@@ -571,8 +579,9 @@ pub(crate) fn authorize_push_gossip(
             removals
                 .into_iter()
                 .filter(|removal| {
-                    active.contains(removal.member_id_hex.as_str())
-                        && (!is_self_update || removal.member_id_hex == sender_id_hex)
+                    is_sender_owned_kind
+                        && active.contains(removal.member_id_hex.as_str())
+                        && removal.member_id_hex == sender_id_hex
                 })
                 .collect(),
         ),
