@@ -1141,12 +1141,128 @@ fn record_app_event_retries_concurrent_writer_contention() {
     assert_eq!(writer.app_message_count().unwrap(), 1);
 }
 
+fn push_token(
+    group_id_hex: &str,
+    member_id_hex: &str,
+    owner_ts: i64,
+    record_digest: &str,
+) -> AccountGroupPushToken {
+    AccountGroupPushToken {
+        group_id_hex: group_id_hex.to_owned(),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index: 0,
+        platform: 1,
+        token_fingerprint: "sha256:000000000000000000000000".to_owned(),
+        server_pubkey_hex: "cc".repeat(32),
+        relay_hint: None,
+        encrypted_token: vec![1, 2, 3],
+        owner_ts,
+        owner_sig: "sig".to_owned(),
+        record_digest: record_digest.to_owned(),
+        updated_at_ms: owner_ts,
+    }
+}
+
+#[test]
+fn apply_group_push_token_rejects_stale_stamp_rollback() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 100, "d2"))
+            .unwrap()
+    );
+    // Lower owner_ts loses (rollback attempt).
+    assert!(
+        !store
+            .apply_group_push_token(&push_token(&g, &m, 50, "d9"))
+            .unwrap()
+    );
+    // Equal owner_ts, lower digest loses (tie-break).
+    assert!(
+        !store
+            .apply_group_push_token(&push_token(&g, &m, 100, "d1"))
+            .unwrap()
+    );
+    // Equal owner_ts, higher digest wins.
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 100, "d3"))
+            .unwrap()
+    );
+    // Strictly greater owner_ts wins.
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 101, "d0"))
+            .unwrap()
+    );
+    let stored = store.group_push_tokens(&g).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].owner_ts, 101);
+}
+
+#[test]
+fn removal_tombstone_blocks_stale_resurrection_until_fresh_record() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 100, "d1"))
+            .unwrap()
+    );
+    // Removal at a higher stamp tombstones the key and clears the live row.
+    assert!(
+        store
+            .apply_group_push_token_tombstone(&g, &m, 0, 1, &"cc".repeat(32), 200, "r2", 200)
+            .unwrap()
+    );
+    assert!(store.group_push_tokens(&g).unwrap().is_empty());
+    // A stale (lower-stamped) record relayed in a later kind 448 cannot resurrect.
+    assert!(
+        !store
+            .apply_group_push_token(&push_token(&g, &m, 150, "d5"))
+            .unwrap()
+    );
+    assert!(store.group_push_tokens(&g).unwrap().is_empty());
+    // A strictly-greater record clears the tombstone and re-establishes the key.
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 250, "d7"))
+            .unwrap()
+    );
+    let stored = store.group_push_tokens(&g).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].owner_ts, 250);
+}
+
+#[test]
+fn member_cleanup_clears_tokens_and_tombstones() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    store
+        .apply_group_push_token_tombstone(&g, &m, 0, 1, &"cc".repeat(32), 200, "r2", 200)
+        .unwrap();
+    // Departed member: both the (empty) live set and the durable tombstone go.
+    store.remove_group_push_tokens_for_member(&g, &m).unwrap();
+    // With the tombstone gone, an old record could apply again — which is safe
+    // because the member is no longer in the group and verify_push_gossip would
+    // drop it upstream. Here we just confirm the tombstone no longer blocks.
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 10, "d1"))
+            .unwrap()
+    );
+}
+
 fn insert_group_push_token(store: &SqliteAccountStorage, group_id_hex: &str, member_id_hex: &str) {
     store
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO group_push_tokens (\n                group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,\n                server_pubkey_hex, relay_hint, encrypted_token, updated_at_ms\n             ) VALUES (?1, ?2, 0, 1, 'token', ?3, NULL, x'0102', 123)",
+            "INSERT INTO group_push_tokens (\n                group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,\n                server_pubkey_hex, relay_hint, encrypted_token, owner_ts, owner_sig,\n                record_digest, updated_at_ms\n             ) VALUES (?1, ?2, 0, 1, 'token', ?3, NULL, x'0102', 123, 'sig', 'digest', 123)",
             rusqlite::params![group_id_hex, member_id_hex, "cc".repeat(32)],
         )
         .unwrap();
