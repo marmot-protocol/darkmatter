@@ -24,6 +24,11 @@ pub const QUIC_STREAM_ALPN_V1: &[u8] = QUIC_STREAM_PROTOCOL_V1.as_bytes();
 pub const AGENT_TEXT_STREAM_FRAME_ALLOWANCE: usize = 1024;
 pub(crate) const MAX_FRAME_SIZE: usize =
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + AGENT_TEXT_STREAM_FRAME_ALLOWANCE;
+/// Direct QUIC idle backstop. The post-setup record quiet-gap deadline is 120s,
+/// but QUIC liveness should still reap a fully silent dead peer explicitly.
+pub(crate) const DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Keep-alive cadence for otherwise idle direct QUIC preview connections.
+pub(crate) const DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const SEND_CLOSE_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const AEAD_TAG_LEN: usize = AGENT_TEXT_STREAM_AEAD_TAG_LEN;
 pub(crate) const AGENT_TEXT_STREAM_SECRET_LEN: usize = 32;
