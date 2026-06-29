@@ -1284,11 +1284,10 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
         return;
     }
 
-    // Stable delimiter links for the active slice. We keep `delims` itself in
-    // source order so existing indices remain usable for links/images outside
-    // this processing window.
-    let mut links = DelimLinks::new(stack_bottom, delims.len());
-    let mut last = None;
+    // Find the active delimiter window before allocating the link scratch.
+    // Per-link emphasis calls often have no active delimiter above
+    // `stack_bottom`; returning before `DelimLinks::new` keeps those empty
+    // windows allocation-free.
     let mut first = None;
     let mut arena_start = usize::MAX;
     for (idx, delim) in delims.iter().enumerate().skip(stack_bottom) {
@@ -1299,14 +1298,25 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
             first = Some(idx);
         }
         arena_start = arena_start.min(delim.out_pos);
+    }
+    let Some(first) = first else {
+        return;
+    };
+
+    // Stable delimiter links for the active slice. We keep `delims` itself in
+    // source order so existing indices remain usable for links/images outside
+    // this processing window.
+    let mut links = DelimLinks::new(stack_bottom, delims.len());
+    let mut last = None;
+    for (idx, delim) in delims.iter().enumerate().skip(stack_bottom) {
+        if !delim.active {
+            continue;
+        }
         links.set_prev(idx, last);
         if let Some(p) = last {
             links.set_next(p, Some(idx));
         }
         last = Some(idx);
-    }
-    if first.is_none() {
-        return;
     }
 
     // The CommonMark delimiter algorithm removes delimiter nodes and wraps
@@ -1328,7 +1338,7 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
     use std::collections::HashMap;
     let mut openers_bottom: HashMap<(u8, bool, usize), usize> = HashMap::new();
 
-    let mut closer_cursor = first;
+    let mut closer_cursor = Some(first);
     while let Some(closer_idx) = closer_cursor {
         let closer = delims[closer_idx];
         if !is_run(closer.kind) || !closer.can_close || !closer.active {
