@@ -13,7 +13,10 @@
 //! once the cap is reached. A re-inserted id is a no-op (it does not refresh
 //! recency or consume another slot), so duplicate traffic cannot inflate the
 //! cap accounting. Eviction only affects the in-memory fallback; durable storage
-//! still classifies any id that ages out of the cache.
+//! still classifies ids that age out of the cache. For outbound OpenMLS bytes,
+//! the engine persists both the transport id and a content-derived `Sent`
+//! marker so re-wrapped own echoes remain `OwnEcho` after cache eviction or
+//! restart.
 
 use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
@@ -24,8 +27,10 @@ use std::hash::Hash;
 /// `MessageRecord` store, not as full message history. 100k 32-byte ids plus
 /// the FIFO/Set bookkeeping is on the order of a few MiB per cache — large
 /// enough that practically all live duplicate/echo traffic stays in-cache, but
-/// bounded so RSS can no longer climb with total lifetime message volume. An id
-/// that ages out of the cache is still classified by durable storage.
+/// bounded so RSS can no longer climb with total lifetime message volume. IDs
+/// that age out of the cache are still classified by durable storage; outbound
+/// OpenMLS sends persist a content-derived `Sent` marker for re-wrapped own
+/// echoes whose transport id changed.
 pub(crate) const DEDUP_CACHE_CAPACITY: usize = 100_000;
 
 /// A capacity-bounded FIFO membership set. Insertion-ordered eviction: once
