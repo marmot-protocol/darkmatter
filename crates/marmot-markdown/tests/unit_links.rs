@@ -18,6 +18,20 @@ fn image(dest: &str, title: Option<&str>, alt: Vec<Inline>) -> Inline {
     }
 }
 
+fn count_links(inlines: &[Inline]) -> usize {
+    inlines
+        .iter()
+        .map(|inline| match inline {
+            Inline::Link { children, .. } => 1 + count_links(children),
+            Inline::Image { alt, .. } => count_links(alt),
+            Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
+                count_links(children)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
 // ----- Inline links ---------------------------------------------------
 
 #[test]
@@ -75,6 +89,32 @@ fn inline_link_with_emphasis_in_text() {
         parse_inlines("[*foo*](/u)"),
         vec![link("/u", None, vec![Inline::Emph(vec![t("foo")])])]
     );
+}
+
+#[test]
+fn many_emphasis_delimiters_interleaved_with_links_stay_bounded() {
+    // Regression for darkmatter#686: each link used to rescan the full
+    // delimiter stack just to deactivate earlier `[` openers, so unrelated
+    // accumulated `*` delimiters made `*[a](b)` repeated in one paragraph
+    // quadratic. Keep the shape large enough to catch obvious regressions in
+    // the unit-suite timeout while asserting deterministic structure here.
+    let links = 16_000;
+    let parsed = parse_inlines(&"*[a](b)".repeat(links));
+
+    assert_eq!(count_links(&parsed), links);
+    assert!(matches!(parsed.first(), Some(Inline::Emph(_))));
+}
+
+#[test]
+fn many_emphasis_delimiters_with_emphasis_inside_links_stay_bounded() {
+    // The per-link emphasis pass must only process the current link-text
+    // suffix. Rebuilding all previous output for each `[*a*](b)` link made the
+    // same outer `*` accumulator quadratic with a much larger constant.
+    let links = 8_000;
+    let parsed = parse_inlines(&"*[*a*](b)".repeat(links));
+
+    assert_eq!(count_links(&parsed), links);
+    assert!(matches!(parsed.first(), Some(Inline::Emph(_))));
 }
 
 #[test]
