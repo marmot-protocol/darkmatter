@@ -22,6 +22,11 @@ struct StoredAccountSecret {
     secret_key_hex: StoredSecretKeyHex,
 }
 
+/// Zeroizing wrapper for the `secret_key_hex` JSON string field.
+///
+/// The custom serde impls intentionally preserve the old on-disk wire format:
+/// `"secret_key_hex"` remains a plain JSON string, while Rust-owned buffers
+/// zeroize the decoded secret hex when dropped.
 struct StoredSecretKeyHex(Zeroizing<String>);
 
 impl StoredSecretKeyHex {

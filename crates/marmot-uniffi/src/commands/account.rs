@@ -269,9 +269,12 @@ impl Marmot {
     /// SENSITIVE: revealing the raw key is logged to the per-account audit log
     /// and permanently marks the account's NIP-49 KEY_SECURITY_BYTE as 0x00
     /// ("handled insecurely"). The returned string is computed on demand and is
-    /// never cached by the engine; the caller should display it transiently and
-    /// drop it. Refuses unknown / public-only / cross-account refs via the
-    /// existing keystore validation.
+    /// never cached by the engine. The Rust runtime keeps the nsec in
+    /// `Zeroizing<String>` until this UniFFI return boundary. UniFFI can lower
+    /// only a plain `String`, so the final clone here is the intentional point
+    /// where Rust's zeroizing guarantee stops; the caller should display the
+    /// host-owned string transiently and drop it. Refuses unknown / public-only
+    /// / cross-account refs via the existing keystore validation.
     pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError> {
         let nsec = self
             .runtime

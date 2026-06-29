@@ -445,9 +445,10 @@ impl AccountHome {
     /// form (NIP-19). Reading the raw key out is a NIP-49 "insecure handling"
     /// event, so this also flips the persisted KEY_SECURITY_BYTE to 0x00.
     ///
-    /// The returned value is zeroized on drop; callers that must hand the nsec
-    /// across a non-Rust boundary should unwrap it only at that final boundary
-    /// and ensure the host-side string is displayed transiently.
+    /// The returned value is zeroized on drop for Rust callers. That guarantee
+    /// stops once a caller clones or converts it into a plain `String`, including
+    /// at the UniFFI boundary; unwrap it only there and keep the host-side string
+    /// transient.
     pub fn reveal_nsec(&self, account_ref: &str) -> AccountHomeResult<Zeroizing<String>> {
         use nostr::ToBech32;
         let keys = self.load_signing_keys(account_ref)?;
