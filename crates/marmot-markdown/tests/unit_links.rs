@@ -227,6 +227,24 @@ fn unmatched_close_bracket_is_text() {
 }
 
 #[test]
+fn many_unmatched_link_brackets_stay_literal_without_quadratic_work() {
+    // Regression for darkmatter#654: `"[" * N + "]" * N` used to keep every
+    // `[` on the delimiter stack and then spend quadratic time scanning and
+    // shifting that stack on the closing `]` run. The parser now caps the open
+    // bracket stack and advances one opener per unmatched close.
+    let n = 100_000;
+    let input = format!("{}{}", "[".repeat(n), "]".repeat(n));
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
+fn many_unmatched_image_brackets_stay_literal_without_quadratic_work() {
+    let n = 50_000;
+    let input = format!("{}{}", "![".repeat(n), "]".repeat(n));
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
 fn no_matching_paren_falls_through() {
     // `[foo](/url` — never closes; no link, all literal.
     assert_eq!(parse_inlines("[foo](/url"), vec![t("[foo](/url")]);
