@@ -273,9 +273,10 @@ impl Marmot {
     /// drop it. Refuses unknown / public-only / cross-account refs via the
     /// existing keystore validation.
     pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError> {
-        Ok(self
+        let nsec = self
             .runtime
-            .reveal_nsec(&account_ref, "marmot_uniffi::Marmot::reveal_nsec")?)
+            .reveal_nsec(&account_ref, "marmot_uniffi::Marmot::reveal_nsec")?;
+        Ok(nsec.to_string())
     }
 
     /// Export the active account's private key as a password-encrypted NIP-49
