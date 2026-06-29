@@ -82,11 +82,6 @@ impl QuicTextStreamReceiver {
         let mut next_record_timeout = limits.read_timeout;
 
         while let Some(record) = read_record(&mut recv, max_frame_len, next_record_timeout).await? {
-            // The first record is part of direct-stream setup. Once a peer has
-            // produced it, subsequent record reads use the more generous
-            // quiet-gap deadline so long-running live agents can be silent
-            // between records without aborting a healthy preview.
-            next_record_timeout = limits.record_read_timeout;
             limit_state.observe_wire_record()?;
             if record.seq <= high_water {
                 continue;
@@ -104,6 +99,11 @@ impl QuicTextStreamReceiver {
             };
             limit_state.observe(&record)?;
             high_water = record.seq;
+            // The first accepted in-order record completes direct-stream setup.
+            // Subsequent reads use the more generous quiet-gap deadline so
+            // long-running live agents can be silent between records without
+            // aborting a healthy preview.
+            next_record_timeout = limits.record_read_timeout;
 
             if let Some(existing) = &stream_id {
                 if existing != &record.stream_id {

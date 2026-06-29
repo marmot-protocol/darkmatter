@@ -520,6 +520,39 @@ async fn receiver_allows_quiet_gap_after_first_record_longer_than_setup_deadline
 }
 
 #[tokio::test]
+async fn receiver_keeps_setup_deadline_after_discarded_initial_replay_record() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        read_timeout: Duration::from_millis(50),
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
+
+    let endpoint = client_endpoint(ServerTrust::CertificateDer(server_cert), server_addr).unwrap();
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+    let discarded = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 0, b"dupe".to_vec());
+    write_record(&mut send, &discarded).await.unwrap();
+    sleep(Duration::from_millis(150)).await;
+    let accepted = AgentTextStreamRecordV1::text_delta(stream_id, 1, b"hel".to_vec());
+    let _ = write_record(&mut send, &accepted).await;
+    let _ = send.finish();
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    let err = receive.await.unwrap().unwrap_err();
+    assert!(matches!(err, QuicTextStreamError::ReadTimeout));
+}
+
+#[tokio::test]
 async fn receiver_reports_gap_when_record_is_ahead_of_high_water() {
     let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
     let server_addr = receiver.local_addr().unwrap();
