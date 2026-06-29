@@ -232,9 +232,19 @@ signatures it does not hold.
 - `owner_ts` and `owner_sig` are the owner-signed ordering stamp and signature, using the removal `domain_tag` and the
   removal `SignedRecord` form (no `encrypted_token`) from "Owner authentication".
 
-A recipient deletes the stored token record matching all five values only when the removal passes "Owner
-authentication" and `member_id_hex` is a current member. A removal that fails verification or names a non-member is
-dropped as advisory-invalid.
+A recipient deletes the stored token record for the removal's record key (`member_id_hex`, `leaf_index`, `platform`,
+`server_pubkey_hex`) only when the removal passes "Owner authentication", `member_id_hex` is a current member, and the
+removal wins the record key's ordering primitive (see "Record key and ordering primitive"). A removal that fails
+verification, names a non-member, or loses the ordering race is dropped as advisory-invalid.
+
+The `token_fingerprint` is part of the owner-signed `SignedRecord`, so it is authenticated and states which token
+instance the owner intends to revoke, but it is **not** part of the record key and does not gate the delete: the
+`(owner_ts, record digest)` stamp is the single arbiter of which write to a record key wins. This is deliberate. A
+removal only deletes a record older than itself (it must win the ordering race), so the realistic re-registration race —
+an old token, its removal, and a newer token with a different fingerprint on the same key — converges correctly on the
+newest record by stamp alone, and a relayed stale removal can never revoke a newer token because it loses the race. A
+fingerprint-gated delete would not improve this and would weaken tombstones (a fingerprint-scoped tombstone could not
+suppress a differently-fingerprinted stale record from resurrecting the key).
 
 ### Record state
 

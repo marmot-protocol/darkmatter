@@ -394,6 +394,7 @@ impl SqliteAccountStorage {
                 "chat_list_rows",
                 "account_group_app_components",
                 "group_push_tokens",
+                "group_push_token_tombstones",
                 "encrypted_media_epoch_secrets",
                 "account_groups",
             ] {

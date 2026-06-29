@@ -1009,6 +1009,15 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
     insert_group_push_token(&store, "aa", "member-aa");
     insert_group_push_token(&store, "bb", "member-bb");
+    // Tombstones on a distinct leaf so they don't collide with the live rows
+    // above; a local wipe must clear these too, or stale tombstones keep
+    // rejecting relayed records after the group is re-bootstrapped.
+    store
+        .apply_group_push_token_tombstone("aa", "member-aa", 9, 1, &"cc".repeat(32), 500, "rd", 500)
+        .unwrap();
+    store
+        .apply_group_push_token_tombstone("bb", "member-bb", 9, 1, &"cc".repeat(32), 500, "rd", 500)
+        .unwrap();
     insert_read_and_chat_rows(&store, "aa");
     insert_protocol_group_marker(&store, &[0xaa]);
 
@@ -1023,6 +1032,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "conversation_read_state",
         "chat_list_rows",
         "group_push_tokens",
+        "group_push_token_tombstones",
         "encrypted_media_epoch_secrets",
     ] {
         assert_eq!(group_row_count(&store, table, "aa"), 0, "{table}");
@@ -1033,6 +1043,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "app_events",
         "message_timeline",
         "group_push_tokens",
+        "group_push_token_tombstones",
         "encrypted_media_epoch_secrets",
     ] {
         assert!(group_row_count(&store, table, "bb") > 0, "{table}");
