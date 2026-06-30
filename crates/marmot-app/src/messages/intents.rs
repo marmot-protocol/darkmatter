@@ -146,6 +146,18 @@ fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     tags
 }
 
+/// Filter host-supplied `extra_tags` down to well-formed nostr tags before they
+/// ride on the outgoing event. A nostr tag must have at least a name element, so
+/// empty tags are dropped; everything else is carried verbatim. Marmot stays
+/// agnostic about what the tags mean — the host app owns that convention.
+fn sanitized_extra_tags(extra_tags: &[Vec<String>]) -> Vec<Vec<String>> {
+    extra_tags
+        .iter()
+        .filter(|tag| !tag.is_empty())
+        .cloned()
+        .collect()
+}
+
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.
@@ -159,6 +171,11 @@ const STREAM_FINAL_KIND_CHAT: &str = "9";
 pub(crate) enum AppMessageIntent {
     Chat {
         content: String,
+        /// Extra application-defined tags appended verbatim to the kind-9 event
+        /// (after the protocol-derived ones). Lets host apps carry out-of-band
+        /// metadata — e.g. a message-effect key — as a real nostr tag instead of
+        /// smuggling it into the visible body. Empty for a plain chat.
+        extra_tags: Vec<Vec<String>>,
     },
     Reaction {
         target_message_id: String,
@@ -170,6 +187,8 @@ pub(crate) enum AppMessageIntent {
     Reply {
         target_message_id: String,
         text: String,
+        /// See [`AppMessageIntent::Chat::extra_tags`].
+        extra_tags: Vec<Vec<String>>,
     },
     Edit {
         target_message_id: String,
@@ -241,11 +260,14 @@ pub(crate) fn build_inner_event(
         )
     };
     match intent {
-        AppMessageIntent::Chat { content } => Ok(event(
-            MARMOT_APP_EVENT_KIND_CHAT,
-            mention_p_tags(content),
-            content.clone(),
-        )),
+        AppMessageIntent::Chat {
+            content,
+            extra_tags,
+        } => {
+            let mut tags = mention_p_tags(content);
+            tags.extend(sanitized_extra_tags(extra_tags));
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, content.clone()))
+        }
         AppMessageIntent::Reaction {
             target_message_id,
             emoji,
@@ -265,6 +287,7 @@ pub(crate) fn build_inner_event(
         AppMessageIntent::Reply {
             target_message_id,
             text,
+            extra_tags,
         } => {
             validate_message_ref(target_message_id)?;
             if text.trim().is_empty() {
@@ -277,6 +300,7 @@ pub(crate) fn build_inner_event(
                 vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
             ];
             tags.extend(mention_p_tags(text));
+            tags.extend(sanitized_extra_tags(extra_tags));
             Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, text.clone()))
         }
         AppMessageIntent::Edit {
@@ -675,9 +699,48 @@ mod mention_tests {
         let npub = npub_for_account_id(&hex).unwrap();
         let intent = AppMessageIntent::Chat {
             content: format!("yo nostr:{npub}"),
+            extra_tags: Vec::new(),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn chat_intent_appends_extra_tags_verbatim_and_drops_empty() {
+        let intent = AppMessageIntent::Chat {
+            content: "hello".to_owned(),
+            extra_tags: vec![
+                vec!["effect".to_owned(), "fire".to_owned()],
+                Vec::new(), // malformed — must be dropped
+            ],
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert_eq!(event.content, "hello", "body must stay clean");
+        assert!(
+            event
+                .tags
+                .contains(&vec!["effect".to_owned(), "fire".to_owned()])
+        );
+        assert!(
+            event.tags.iter().all(|t| !t.is_empty()),
+            "empty tags must be filtered out"
+        );
+    }
+
+    #[test]
+    fn reply_intent_appends_extra_tags() {
+        let target = "ff".repeat(32);
+        let intent = AppMessageIntent::Reply {
+            target_message_id: target.clone(),
+            text: "re".to_owned(),
+            extra_tags: vec![vec!["effect".to_owned(), "love".to_owned()]],
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert!(
+            event
+                .tags
+                .contains(&vec!["effect".to_owned(), "love".to_owned()])
+        );
     }
 
     #[test]
@@ -688,6 +751,7 @@ mod mention_tests {
         let intent = AppMessageIntent::Reply {
             target_message_id: target.clone(),
             text: format!("re nostr:{npub}"),
+            extra_tags: Vec::new(),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(
