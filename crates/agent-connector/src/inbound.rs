@@ -236,9 +236,19 @@ impl AgentConnector {
         };
         let mut events = Vec::new();
         for account in accounts {
+            // #609/#747: bound the replay to the newest `DELIVERED_INBOUND_CURSOR_CAPACITY`
+            // rows instead of `limit: None` (the entire per-account history). Lag
+            // recovery only needs to look back as far as the delivered cursor can
+            // dedup against (4096), and the broadcast ring that overflowed is far
+            // smaller (1024) — so a window of the cursor capacity comfortably covers
+            // anything that could have been dropped, while keeping replay O(window)
+            // instead of O(history) on the same task that must keep draining the
+            // broadcast channel. The `limit` path returns the newest N rows (see
+            // `SqliteAccountStorage::app_messages`), which is exactly the recent
+            // window a lagged subscription missed.
             let query = AppMessageQuery {
                 group_id_hex: group_filter.map(str::to_owned),
-                limit: None,
+                limit: Some(crate::DELIVERED_INBOUND_CURSOR_CAPACITY),
             };
             let records = self.runtime.messages_with_query(&account.label, query)?;
             for record in records {

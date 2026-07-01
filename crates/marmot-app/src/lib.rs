@@ -507,6 +507,12 @@ pub struct AppMessageRecord {
     pub source_epoch: Option<u64>,
     pub recorded_at: u64,
     pub received_at: u64,
+    /// Local `app_events` insert order (rowid). The final LOCAL tiebreak of the
+    /// raw-event replay cursor used by lag-recovery watermark/suppression (#630);
+    /// not part of the cross-client display order. `#[serde(default)]` keeps
+    /// older serialized records readable.
+    #[serde(default)]
+    pub insert_order: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2154,8 +2160,20 @@ impl MarmotApp {
         &self,
         account_id_hex: &str,
     ) -> Result<Option<String>, AppError> {
-        if let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
-            && let Some(name) = display_name_for_profile(entry.profile.as_ref())
+        let entry = self.directory_entry_for_account_id(account_id_hex)?;
+        self.display_name_from_directory_entry(account_id_hex, entry.as_ref())
+    }
+
+    /// Resolve a display name from an ALREADY-FETCHED directory entry, falling
+    /// back to a local account's label. Split out so callers that already hold
+    /// the entry (e.g. notification building, #639) don't re-query
+    /// `directory_entry_for_account_id`.
+    pub(crate) fn display_name_from_directory_entry(
+        &self,
+        account_id_hex: &str,
+        entry: Option<&UserDirectoryRecord>,
+    ) -> Result<Option<String>, AppError> {
+        if let Some(name) = display_name_for_profile(entry.and_then(|entry| entry.profile.as_ref()))
         {
             return Ok(Some(name));
         }
