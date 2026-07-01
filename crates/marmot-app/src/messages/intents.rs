@@ -165,7 +165,7 @@ fn sanitized_extra_tags(extra_tags: &[Vec<String>]) -> Vec<Vec<String>> {
     extra_tags
         .iter()
         .filter(|tag| {
-            matches!(tag.as_slice(), [name, value, ..] if name == EFFECT_TAG && !value.is_empty())
+            matches!(tag.as_slice(), [name, value] if name == EFFECT_TAG && !value.is_empty())
         })
         .cloned()
         .collect()
@@ -726,12 +726,13 @@ mod mention_tests {
             content: "hello".to_owned(),
             extra_tags: vec![
                 vec!["effect".to_owned(), "fire".to_owned()],
-                Vec::new(),                                     // malformed — dropped
-                vec!["effect".to_owned()],                      // no value — dropped
-                vec!["effect".to_owned(), String::new()],       // empty value — dropped
-                vec!["e".to_owned(), "ff".repeat(32)],          // reserved reply ref — dropped
+                Vec::new(),                               // malformed — dropped
+                vec!["effect".to_owned()],                // no value — dropped
+                vec!["effect".to_owned(), String::new()], // empty value — dropped
+                vec!["effect".to_owned(), "fire".to_owned(), "x".to_owned()], // trailing field — dropped
+                vec!["e".to_owned(), "ff".repeat(32)], // reserved reply ref — dropped
                 vec!["imeta".to_owned(), "url ...".to_owned()], // reserved media — dropped
-                vec!["stream".to_owned(), "x".to_owned()],      // reserved stream — dropped
+                vec!["stream".to_owned(), "x".to_owned()], // reserved stream — dropped
             ],
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
