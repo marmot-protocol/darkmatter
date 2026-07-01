@@ -30,3 +30,24 @@ pub struct Member {
     pub id: MemberId,
     pub credential: Vec<u8>,
 }
+
+/// The local identity's participation in a group — a dimension orthogonal to
+/// the convergence lifecycle (`Stable`/`Recovering`/`Unrecoverable`/…).
+///
+/// This is the shared vocabulary for the group participation states defined in
+/// `spec/protocol-core/group-state.md`. Ingest, convergence, and public group
+/// accessors map to it so a caller can tell a live group from one this identity
+/// has been evicted from, or one being withheld pending recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupParticipation {
+    /// The local identity is present in the group's canonical roster; the only
+    /// state in which local commits or delivered app payloads are allowed.
+    Member,
+    /// The local identity is authoritatively no longer a member — an applied
+    /// removal, or an observed `SelfEvicted` outcome when the removal commit
+    /// itself was never applied. The group is inactive for this identity.
+    Evicted,
+    /// The group is excluded from the live group set pending an explicit
+    /// recovery transition; neither trusted as `Member` nor asserted `Evicted`.
+    Quarantined,
+}
