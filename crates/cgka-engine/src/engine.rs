@@ -180,6 +180,29 @@ pub struct Engine<S: StorageProvider> {
     /// added by [`Self::quarantine_stored_group_on_hydrate`] and removed by a
     /// successful [`Self::retry_hydrate_quarantined_group`].
     pub(crate) quarantined_groups: HashMap<GroupId, GroupHydrationQuarantineReason>,
+
+    /// Authoritative `transport_group_id -> GroupId` resolver for inbound
+    /// routing (#740). A Nostr-routed group's `transport_group_id`
+    /// (`nostr_group_id`) differs from its MLS group id, so the direct
+    /// `get_group` lookup in `group_id_for_transport_group_id` misses on the
+    /// normal production path; this index answers that in O(1) instead of the
+    /// former O(groups) scan that deserialized EVERY joined `MlsGroup` — a scan
+    /// that ran BEFORE payload authentication, so an unauthenticated peer could
+    /// flood unknown `transport_group_id`s to force attacker-paced CPU + storage
+    /// I/O. Populated for every group at hydration
+    /// ([`Self::hydrate_one_stored_group`]) and establishment (`do_create_group`
+    /// / `do_join_welcome`); a `transport_group_id` is immutable for a group's
+    /// lifetime (routing-component updates are out of scope), so no per-commit
+    /// maintenance is needed. If routing rotation is ever implemented, this
+    /// index MUST be updated at the rotation site.
+    pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
+
+    /// #636: cached hex-encoded snapshot of `seen_message_ids` for the
+    /// convergence `CanonicalizationState`, tagged with the seen-set generation
+    /// it was built from. A convergence drain runs the pass up to 16× and
+    /// previously re-hex-encoded the whole (up to 100k-entry) set every pass;
+    /// this rebuilds only when the set actually changed. `None` until first use.
+    pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -318,6 +341,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
+            transport_group_id_index: HashMap::new(),
+            seen_message_ids_hex_cache: None,
         })
     }
 }
@@ -776,6 +801,18 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.leave_requests.remove(group_id);
             self.leaving_groups.remove(group_id);
+        }
+
+        // #740: record this group's transport routing id so inbound resolution
+        // is an O(1) index hit rather than a pre-auth O(groups) MlsGroup-load
+        // scan. `mls_group` is owned here (not borrowing `self`), and the
+        // `provider` borrow is already released, so this direct field insert is
+        // disjoint from the storage/crypto borrows above.
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
         }
 
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);
