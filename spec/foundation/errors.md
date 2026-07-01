@@ -21,6 +21,8 @@ An input that does not produce application content SHOULD map to one of these ca
 - `unsupported_required_feature`: the group requires a feature the client does not understand.
 - `authorization_failed`: the sender or committer is not allowed to make the change.
 - `missing_history`: the client would need retained state it no longer has.
+- `evicted`: the local identity is authoritatively no longer a member of the group.
+- `pre_membership`: the input predates the local identity's membership and can never be decrypted by this client.
 - `transport_rejected`: publication or delivery failed at the transport layer.
 
 Protocol-core docs can split these into more detailed outcomes when needed.
@@ -61,11 +63,21 @@ Protocol-core documents name some outcomes in `PascalCase`. Each maps to one dis
 | ----------------------- | ----------- | ----------------- | ----------------------------------------------------------- |
 | `BeyondAnchor`          | `stale`     | `stale_epoch`     | [retained-history.md](../protocol-core/retained-history.md) |
 | `MissingRetainedAnchor` | `deferred`  | `missing_history` | [retained-history.md](../protocol-core/retained-history.md) |
+| `SelfEvicted`           | `stale`     | `evicted`         | [group-state.md](../protocol-core/group-state.md)           |
+| `PreMembership`         | `stale`     | `pre_membership`  | [inbound-processing.md](../protocol-core/inbound-processing.md) |
 
 `BeyondAnchor` is window exclusion by design: the source epoch is older than the retained anchor, and the input will
 never be processed. `MissingRetainedAnchor` is storage loss: required retained state inside the rollback horizon is
 gone, canonical group state does not change, and the group moves to `Unrecoverable` (a group lifecycle state, not a
 disposition) until a verified repair path exists; the input stays deferred rather than terminal.
+
+`SelfEvicted` is authoritative removal observed without applying the removal commit: MLS reports that the local identity
+has been evicted while the client processes a later message. The triggering input is `stale` — it can no longer affect
+the group for this identity — but the client MUST also transition participation to `Evicted` (see
+[group-state.md](../protocol-core/group-state.md)); it MUST NOT be treated as an ordinary peel failure and discarded.
+
+`PreMembership` is terminal by design: the input predates the local identity's membership, so this client can never hold
+the keys to decrypt it. Unlike `MissingRetainedAnchor`, it MUST NOT be deferred or retried as missing history.
 
 ## Protocol and local errors
 

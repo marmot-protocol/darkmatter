@@ -128,3 +128,61 @@ outbound work.
 Queued group-state changes are regenerated after convergence status reaches `Settled` and the lifecycle state allows
 outbound work. A staged commit created before branch selection MUST NOT be reused after convergence changes the
 canonical state.
+
+## Participation
+
+The lifecycle states and convergence status above describe how a client converges on the group's canonical MLS state.
+They do not describe whether the local identity is still a live member of that group. That is a separate, orthogonal
+dimension: a group can be `Stable` and `Settled` and yet no longer include the local identity.
+
+Participation has three states:
+
+- `Member`: the local identity is present in the group's canonical roster. This is the only participation state in
+  which a client MAY prepare local group-state commits or emit delivered app payloads for the group.
+- `Evicted`: the local identity is authoritatively no longer a member of the group. The group is inactive for this
+  identity: the client MUST NOT prepare commits, MUST NOT send app payloads, and SHOULD present the group as removed.
+- `Quarantined`: the group is excluded from live processing and from the live group set pending an explicit recovery
+  transition. A quarantined group is neither trusted as `Member` nor asserted as `Evicted`; it is withheld.
+
+Participation is orthogonal to the lifecycle state, but two couplings hold. `Evicted` and `Quarantined` are terminal for
+normal processing the same way `Unrecoverable` is: a client MUST NOT apply group-state changes or release outbound work
+while in them. Unlike `Unrecoverable` — a convergence failure the client MAY repair from retained material — `Evicted`
+reflects the canonical group's authoritative decision about membership and clears only when the identity is added again
+(a new welcome, or an add commit that reinstates it).
+
+### Authoritative eviction
+
+A client becomes `Evicted` when it observes an authoritative statement that the local identity is no longer a member.
+There are two such statements, and a client MUST honor both:
+
+1. **Applied removal.** The client applies the commit that removes the local identity; the roster diff shows self in the
+   removed set. This is the clean path.
+2. **Observed eviction without the removal commit.** The client never applied the specific removal commit — relay
+   timing or ordering meant a later, post-eviction message arrived first — and MLS reports that the local identity has
+   been evicted (the `SelfEvicted` outcome in [../foundation/errors.md](../foundation/errors.md)). The MLS layer stating
+   "you have been evicted" is authoritative. A client MUST NOT discard it: it MUST transition participation to `Evicted`
+   even though the exact removal commit was never applied, rather than leaving the group readable as `Member`.
+
+Because the removal commit is not guaranteed to arrive before a post-eviction message, path 2 is a required fallback, not
+an edge case. A client that surfaces eviction only on path 1 will silently keep an evicted group active.
+
+### Quarantine
+
+A client places a group in `Quarantined` when it cannot safely treat the group as live but has no authoritative eviction
+signal — for example, stored group material fails to load or validate, or a durable invariant check fails. Quarantine is
+a hold, not a verdict about membership.
+
+While a group is `Quarantined`:
+
+- it MUST be excluded from the live group set and from live inbound and convergence processing;
+- every group accessor MUST agree that the group is withheld: a client MUST NOT expose a durable roster through one
+  accessor while another accessor reports the group as unknown. Either all live accessors reflect the quarantine, or the
+  group is exposed only through an explicit quarantine accessor;
+- the group MUST NOT return to live processing except through an explicit recovery transition. Ordinary inbound or
+  convergence input MUST NOT silently re-activate a quarantined group.
+
+### Participation and public surfaces
+
+Public group APIs MUST let a caller distinguish `Member`, `Evicted`, `Quarantined`, and "no such group" from one
+another. Collapsing `Evicted` or `Quarantined` into either "active member" or "unknown group" is a defect: the first
+keeps a dead group usable; the second loses the fact that the group existed and why it is no longer live.

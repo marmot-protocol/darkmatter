@@ -78,6 +78,14 @@ Input that cannot affect the group MUST receive a stale disposition. This includ
 - commits that fork from outside the rollback horizon: these are ineligible for branch selection (see
   [convergence.md](./convergence.md), "Eligibility") and, when their source epoch is also older than the retained
   anchor, are reported as `BeyondAnchor`.
+- messages that predate the local identity's membership and can never be decrypted by this client
+  (`PreMembership` -> `pre_membership`). Unlike a deferred `MissingRetainedAnchor`, a pre-membership message is
+  terminal: the client was not a member when it was sent, so no future state makes it processable and it MUST NOT be
+  retried.
+
+An authoritative eviction observed while processing a later message (`SelfEvicted` -> `evicted`) is likewise stale for
+this identity: the triggering input can no longer affect the group. It additionally drives the participation transition
+to `Evicted` in [group-state.md](./group-state.md); the input MUST NOT be silently discarded as a generic peel failure.
 
 The `snake_case` names in parentheses are the shared categories in [../foundation/errors.md](../foundation/errors.md);
 `BeyondAnchor` is a named convergence outcome that maps to the `stale` disposition and the `stale_epoch` category.
