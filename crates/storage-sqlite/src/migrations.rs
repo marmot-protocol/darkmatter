@@ -40,8 +40,10 @@ mod migration_0019_chat_list_unread_mention_count;
 mod migration_0020_message_modifier_edges;
 #[path = "migrations/0021_push_token_owner_signatures.rs"]
 mod migration_0021_push_token_owner_signatures;
-#[path = "migrations/0022_chat_list_projection_version.rs"]
-mod migration_0022_chat_list_projection_version;
+#[path = "migrations/0022_chat_list_self_membership.rs"]
+mod migration_0022_chat_list_self_membership;
+#[path = "migrations/0023_chat_list_projection_version.rs"]
+mod migration_0023_chat_list_projection_version;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -161,8 +163,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 22,
-        name: "0022_chat_list_projection_version",
-        apply: migration_0022_chat_list_projection_version::apply,
+        name: "0022_chat_list_self_membership",
+        apply: migration_0022_chat_list_self_membership::apply,
+    },
+    Migration {
+        version: 23,
+        name: "0023_chat_list_projection_version",
+        apply: migration_0023_chat_list_projection_version::apply,
     },
 ];
 
@@ -504,6 +511,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_membership, "member");
+    }
+
+    #[test]
+    fn chat_list_self_membership_migration_adds_member_defaulted_column() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Versions 1-21 are the schema state immediately before
+        // 0022_chat_list_self_membership.
+        run(&mut conn, &MIGRATIONS[..21]).unwrap();
+        assert!(!connection_has_column(
+            &conn,
+            "chat_list_rows",
+            "self_membership"
+        ));
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert!(connection_has_column(
+            &conn,
+            "chat_list_rows",
+            "self_membership"
+        ));
+        assert_eq!(
+            column_default(&conn, "chat_list_rows", "self_membership").as_deref(),
+            Some("'member'")
+        );
     }
 
     #[test]

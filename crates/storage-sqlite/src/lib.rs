@@ -18,7 +18,7 @@ mod timeline;
 
 pub use account_projection::{
     AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
-    AccountStoredPushRegistration, AppEventReplayCursor, StoredAccountGroup,
+    AccountStoredPushRegistration, AppEventReplayCursor, SelfMembership, StoredAccountGroup,
     StoredAccountGroupComponent, StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
 };
 pub use chat_list::{
