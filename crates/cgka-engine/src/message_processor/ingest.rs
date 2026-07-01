@@ -768,6 +768,11 @@ impl<S: StorageProvider> Engine<S> {
                         );
                         self.storage.put_group(&g)?;
                     }
+                    // #740 rotation: a peer's applied commit may have changed the
+                    // Nostr routing component; additively refresh the transport-id
+                    // index so the new nostr_group_id resolves (prior id retained
+                    // for the overlap window). No-op when routing was unchanged.
+                    self.reindex_transport_group_id(&group_id);
                     // Refresh self-cache since our own leaf may have been
                     // updated by the commit's path.
                     crate::capability_manager::cache_self_capabilities(

@@ -388,6 +388,11 @@ impl<S: StorageProvider> Engine<S> {
             &result,
             max_retained_anchor_rewind,
         )?;
+        // #740 rotation: a routing-component update commit applied through
+        // convergence may have changed this group's nostr_group_id; additively
+        // refresh the transport-id index so it resolves on the inbound path
+        // (prior id retained for the overlap window).
+        self.reindex_transport_group_id(group_id);
         let origin_commit_id = single_accepted_commit_id(&result);
         let origin_commit_actor =
             single_accepted_commit_actor(&observations, origin_commit_id.as_ref());

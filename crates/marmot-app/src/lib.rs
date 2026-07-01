@@ -2785,16 +2785,26 @@ impl AppTransportRouting {
         }
     }
 
-    fn add_group(&self, group: TransportGroupSubscription) {
+    /// Insert or replace the route for a group, returning whether the route set
+    /// changed. Replaces by `group_id` (rather than early-returning on a
+    /// duplicate) so an in-place `nostr_group_id` / relay rotation on an existing
+    /// group actually switches the subscription (Finding 2). Returns `false`
+    /// when the group's subscription is already present and identical.
+    fn add_group(&self, group: TransportGroupSubscription) -> bool {
         let mut state = self.write();
-        if state
+        if let Some(existing) = state
             .group_routes
-            .iter()
-            .any(|existing| existing.group_id == group.group_id)
+            .iter_mut()
+            .find(|existing| existing.group_id == group.group_id)
         {
-            return;
+            if *existing == group {
+                return false;
+            }
+            *existing = group;
+            return true;
         }
         state.group_routes.push(group);
+        true
     }
 
     fn snapshot(&self) -> AppRoutingState {

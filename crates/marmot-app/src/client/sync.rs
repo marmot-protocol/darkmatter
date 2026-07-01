@@ -128,11 +128,14 @@ impl AppClient {
                 routes_dirty = true;
             }
         }
-        // #695: coalesce. A batch with N membership-changing events previously ran
-        // a full transport resync (over ALL group subscriptions) once per such
-        // event; resync once after the batch drains instead.
-        if routes_dirty {
-            self.refresh_group_routes()?;
+        // #695 + rotation: reconcile transport routes once after the batch drains
+        // instead of per membership-changing event. refresh_group_routes upserts
+        // every group's current subscription — picking up a join's new route AND
+        // an in-place nostr_group_id / relay rotation on an existing group
+        // (Finding 2) — and reports whether anything changed; a membership count
+        // change (join/leave) also forces the single resync.
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
         self.app.save_state(&self.state)?;
@@ -538,11 +541,13 @@ impl AppClient {
                 .messages
                 .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
         }
-        // #695: coalesce the per-event full transport resync into one resync after
-        // the batch drains (was once per membership-changing event, each over ALL
-        // group subscriptions).
-        if routes_dirty {
-            self.refresh_group_routes()?;
+        // #695 + rotation: reconcile transport routes once after the batch drains.
+        // refresh_group_routes upserts every group's current subscription (a
+        // join's new route AND an in-place nostr_group_id / relay rotation on an
+        // existing group, Finding 2) and reports whether anything changed; a
+        // membership count change (join/leave) also forces the single resync.
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
         // Synthesize durable kind-1210 system rows from authenticated state

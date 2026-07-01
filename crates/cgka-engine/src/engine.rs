@@ -192,14 +192,17 @@ pub struct Engine<S: StorageProvider> {
     /// I/O. Populated for every group at hydration
     /// ([`Self::hydrate_one_stored_group`]) and establishment (`do_create_group`
     /// / `do_join_welcome`); a `transport_group_id` is immutable for a group's
-    /// lifetime (routing-component updates are out of scope), so no per-commit
-    /// maintenance is needed. The engine has no group-deletion path today
-    /// (`StorageProvider::delete_group` is never called from engine code; a left
-    /// group's record is retained), so an entry cannot outlive its group here —
-    /// and even a hypothetical stale entry is self-correcting, since the
-    /// resolved `GroupId` is loaded by the caller and a missing group is dropped
-    /// as unknown. If engine-side group deletion OR routing rotation is ever
-    /// added, that site MUST remove/update the corresponding index entry.
+    /// maintenance is needed for a static route. A `transport_group_id` CAN
+    /// change via a Nostr routing-component update commit (rotation); every
+    /// commit-apply site therefore calls [`Self::reindex_transport_group_id`],
+    /// which additively inserts the new id while leaving the prior id in place
+    /// for the rotation overlap window (this map is intentionally many-to-one).
+    /// The engine has no group-deletion path today (`StorageProvider::delete_group`
+    /// is never called from engine code; a left group's record is retained), so an
+    /// entry cannot outlive its group — and even a hypothetical stale entry is
+    /// self-correcting, since the resolved `GroupId` is loaded by the caller and a
+    /// missing group is dropped as unknown. If engine-side group deletion is ever
+    /// added, that site MUST remove the corresponding index entries.
     pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
 
     /// #636: cached hex-encoded snapshot of `seen_message_ids` for the
@@ -665,6 +668,43 @@ impl<S: StorageProvider> Engine<S> {
     /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
     /// scope crash-recovery to staged commits that remove no members, matching
     /// the prior (pre-recovery) behaviour for removal-bearing commits.
+    /// Additively refresh a group's `transport_group_id_index` entry from live
+    /// MLS state after a commit that may have changed the Nostr routing
+    /// component (#740 rotation). Inserts the group's CURRENT `transport_group_id`;
+    /// any prior id is left in place so inbound messages still addressed to the
+    /// pre-rotation route during the overlap window keep resolving (the map is
+    /// many-to-one, matching the spec's "publish to the prior routing address"
+    /// overlap model). Called at the commit-apply sites (`do_confirm_published`
+    /// for local rotation, remote-commit ingest, and convergence apply); these
+    /// only fire on commit application, not per app message, so the extra
+    /// `MlsGroup::load` is cost-appropriate. Best-effort: a load / routing-read
+    /// failure just forfeits the fast path for this group (inbound would fall to
+    /// the unknown-group disposition), never fails the merge.
+    pub(crate) fn reindex_transport_group_id(&mut self, group_id: &GroupId) {
+        let mls_group = {
+            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                &self.crypto,
+                self.storage.mls_storage(),
+            );
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            match openmls::group::MlsGroup::load(
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+                &mls_gid,
+            ) {
+                Ok(Some(group)) => group,
+                _ => return,
+            }
+        };
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
+        }
+    }
+
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             if let Err(reason) = self.hydrate_one_stored_group(&group_id) {
