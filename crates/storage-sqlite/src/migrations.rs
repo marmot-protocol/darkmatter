@@ -40,6 +40,8 @@ mod migration_0019_chat_list_unread_mention_count;
 mod migration_0020_message_modifier_edges;
 #[path = "migrations/0021_push_token_owner_signatures.rs"]
 mod migration_0021_push_token_owner_signatures;
+#[path = "migrations/0022_chat_list_projection_version.rs"]
+mod migration_0022_chat_list_projection_version;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -156,6 +158,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 21,
         name: "0021_push_token_owner_signatures",
         apply: migration_0021_push_token_owner_signatures::apply,
+    },
+    Migration {
+        version: 22,
+        name: "0022_chat_list_projection_version",
+        apply: migration_0022_chat_list_projection_version::apply,
     },
 ];
 

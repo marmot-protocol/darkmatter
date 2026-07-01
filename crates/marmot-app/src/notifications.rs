@@ -1159,11 +1159,16 @@ fn notification_user_from_message(
 }
 
 fn notification_user(app: &MarmotApp, account_id_hex: &str) -> Result<NotificationUser, AppError> {
-    let profile = app.directory_entry_for_account_id(account_id_hex)?;
+    // #639: fetch the directory entry ONCE and derive both the display name and
+    // picture from it, instead of calling `directory_entry_for_account_id` here
+    // and again inside `display_name_for_account_id` (each re-opens the directory
+    // caches and fans across every account's SQLCipher cache).
+    let entry = app.directory_entry_for_account_id(account_id_hex)?;
+    let display_name = app.display_name_from_directory_entry(account_id_hex, entry.as_ref())?;
     Ok(NotificationUser {
         account_id_hex: account_id_hex.to_owned(),
-        display_name: app.display_name_for_account_id(account_id_hex)?,
-        picture_url: profile.and_then(|entry| entry.profile.and_then(|profile| profile.picture)),
+        display_name,
+        picture_url: entry.and_then(|entry| entry.profile.and_then(|profile| profile.picture)),
     })
 }
 

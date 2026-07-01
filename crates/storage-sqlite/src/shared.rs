@@ -283,24 +283,69 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 
     pub fn public_directory_users(&self) -> StorageResult<Vec<PublicDirectoryUserRecord>> {
-        let ids = {
-            let conn = self.lock();
+        // #761: two batched queries + Rust bucketing instead of a 2N+1 (one user
+        // row query plus one follows query per user). Preserves the full result
+        // set and ordering (users by account_id_hex; each user's follows by
+        // position then follow id).
+        let conn = self.lock();
+        let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        {
             let mut stmt = self
                 .conn_ref(&conn)
-                .prepare("SELECT account_id_hex FROM directory_users ORDER BY account_id_hex")
+                .prepare(
+                    "SELECT account_id_hex, follow_account_id_hex FROM directory_user_follows
+                     ORDER BY account_id_hex, position, follow_account_id_hex",
+                )
                 .storage()?;
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .storage()?
-                .collect::<Result<Vec<_>, _>>()
-                .storage()?
-        };
-        let mut records = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(record) = self.public_directory_user(&id)? {
-                records.push(record);
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .storage()?;
+            for row in rows {
+                let (account_id_hex, follow) = row.storage()?;
+                follows_by_account
+                    .entry(account_id_hex)
+                    .or_default()
+                    .push(follow);
             }
         }
-        Ok(records)
+        let mut stmt = self
+            .conn_ref(&conn)
+            .prepare(
+                "SELECT account_id_hex, npub, profile_json, relay_lists_json,
+                        key_package_json, event_id_hex, event_kind, event_created_at
+                 FROM directory_users
+                 ORDER BY account_id_hex",
+            )
+            .storage()?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(PublicDirectoryUserRecord {
+                    account_id_hex: row.get(0)?,
+                    npub: row.get(1)?,
+                    profile_json: row.get(2)?,
+                    relay_lists_json: row.get(3)?,
+                    key_package_json: row.get(4)?,
+                    event_id_hex: row.get(5)?,
+                    event_kind: optional_i64_to_u64(row.get::<_, Option<i64>>(6)?),
+                    event_created_at: optional_i64_to_u64(row.get::<_, Option<i64>>(7)?),
+                    follows: Vec::new(),
+                })
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        Ok(records
+            .into_iter()
+            .map(|mut record| {
+                record.follows = follows_by_account
+                    .remove(&record.account_id_hex)
+                    .unwrap_or_default();
+                record
+            })
+            .collect())
     }
 
     pub fn relay_telemetry_settings(&self) -> StorageResult<StoredRelayTelemetrySettings> {
