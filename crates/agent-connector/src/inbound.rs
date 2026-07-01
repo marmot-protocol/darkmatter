@@ -112,15 +112,43 @@ impl AgentConnector {
                             )
                             .map(|event| (event, replay_id))
                         }
+                        Err(broadcast::error::RecvError::Lagged(dropped))
+                            if dropped > crate::DELIVERED_INBOUND_CURSOR_CAPACITY as u64 =>
+                        {
+                            // The lag exceeded the bounded storage-replay window: the
+                            // newest-window replay (capped at DELIVERED_INBOUND_CURSOR_CAPACITY
+                            // rows) cannot be guaranteed to include every dropped message —
+                            // missed messages older than that window fall outside it. Emit
+                            // resync_required so the agent performs a full reconcile rather than
+                            // resuming with older messages silently omitted, instead of treating
+                            // a necessarily-partial replay as complete.
+                            tracing::warn!(
+                                target: "agent_connector",
+                                method = "stream_inbound_events",
+                                dropped_events = dropped,
+                                replay_window = crate::DELIVERED_INBOUND_CURSOR_CAPACITY,
+                                "inbound broadcast lag exceeded the bounded replay window; emitting resync_required"
+                            );
+                            Some((
+                                resync_required_event(
+                                    account_id_hex.as_deref(),
+                                    group_id_hex.as_deref(),
+                                    dropped,
+                                ),
+                                None,
+                            ))
+                        }
                         Err(broadcast::error::RecvError::Lagged(dropped)) => {
                             // The broadcast channel overflowed: `dropped` events were evicted
                             // before we could deliver them and are gone from the channel for
-                            // good (catch-up never re-emits already-broadcast messages). Recover
-                            // the missed inbound messages from durable storage and re-deliver
-                            // them on the existing InboundMessage path the consumer already
-                            // handles, so a reconnect backlog never silently loses user
-                            // messages. The delivered-id cursor guarantees we re-deliver only
-                            // messages this subscription has not already emitted.
+                            // good (catch-up never re-emits already-broadcast messages). The
+                            // drop count is within the bounded replay window (checked above), so
+                            // the newest-window storage replay fully covers the gap. Recover the
+                            // missed inbound messages from durable storage and re-deliver them on
+                            // the existing InboundMessage path the consumer already handles, so a
+                            // reconnect backlog never silently loses user messages. The
+                            // delivered-id cursor guarantees we re-deliver only messages this
+                            // subscription has not already emitted.
                             match self.replay_missed_inbound(
                                 account_id_hex.as_deref(),
                                 group_id_hex.as_deref(),

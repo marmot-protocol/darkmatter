@@ -193,8 +193,13 @@ pub struct Engine<S: StorageProvider> {
     /// ([`Self::hydrate_one_stored_group`]) and establishment (`do_create_group`
     /// / `do_join_welcome`); a `transport_group_id` is immutable for a group's
     /// lifetime (routing-component updates are out of scope), so no per-commit
-    /// maintenance is needed. If routing rotation is ever implemented, this
-    /// index MUST be updated at the rotation site.
+    /// maintenance is needed. The engine has no group-deletion path today
+    /// (`StorageProvider::delete_group` is never called from engine code; a left
+    /// group's record is retained), so an entry cannot outlive its group here —
+    /// and even a hypothetical stale entry is self-correcting, since the
+    /// resolved `GroupId` is loaded by the caller and a missing group is dropped
+    /// as unknown. If engine-side group deletion OR routing rotation is ever
+    /// added, that site MUST remove/update the corresponding index entry.
     pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
 
     /// #636: cached hex-encoded snapshot of `seen_message_ids` for the
