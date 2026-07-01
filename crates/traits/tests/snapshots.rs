@@ -18,7 +18,7 @@ use cgka_traits::engine::{
     SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, GroupParticipation, Member};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
@@ -611,6 +611,15 @@ fn snapshot_group_and_member() {
             required_capabilities: GroupCapabilities::default(),
         }
     );
+}
+
+#[test]
+fn snapshot_group_participation() {
+    // Locks the serialized variant casing: this enum crosses the FFI boundary,
+    // so its wire shape must not drift silently.
+    insta::assert_json_snapshot!("participation_member", GroupParticipation::Member);
+    insta::assert_json_snapshot!("participation_evicted", GroupParticipation::Evicted);
+    insta::assert_json_snapshot!("participation_quarantined", GroupParticipation::Quarantined);
 }
 
 #[test]
