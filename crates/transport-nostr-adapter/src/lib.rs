@@ -709,7 +709,10 @@ struct DeliveryRoute {
 
 #[derive(Clone, Default)]
 struct AccountRoutes {
-    inbox_endpoints: Vec<TransportEndpoint>,
+    /// Pre-canonicalized so the Welcome/inbox arm of `routes_for` never re-parses
+    /// the same stored inbox endpoint per event (#698/#752), mirroring the group
+    /// arm's `by_transport_group` entries.
+    inbox_endpoints: Vec<CanonicalEndpoint>,
     groups: Vec<TransportGroupSubscription>,
 }
 
@@ -732,10 +735,23 @@ impl CanonicalEndpoint {
         }
     }
 
-    /// Normalization-safe match against an inbound endpoint, reusing this entry's
-    /// cached parse and the inbound endpoint's single parse. Mirrors
-    /// [`endpoints_match`] exactly (byte-equality fast path, else canonical
-    /// `RelayUrl` equality, else no match), but without re-parsing either side.
+    /// Compare this stored route endpoint against the endpoint an inbound event
+    /// arrived on, normalization-safe and without re-parsing either side.
+    ///
+    /// Routing must not depend on callers pre-canonicalizing relay URLs. Inbound
+    /// endpoints are built from a parsed nostr `RelayUrl` (`sdk_client`), while
+    /// stored group/inbox endpoints carry the verbatim signed routing strings
+    /// (`marmot.transport.nostr.routing.v1`), which are intentionally never
+    /// rewritten. A raw `==` therefore drops events whenever the two differ only
+    /// by a `url`-canonicalizable detail (trailing slash, host case, default
+    /// port, percent-encoding) — see darkmatter#482.
+    ///
+    /// Fast path is byte equality against the verbatim string. Otherwise both
+    /// sides are compared by their cached/parsed `RelayUrl` value, folding those
+    /// canonicalization differences together. If either side has no parse (e.g. a
+    /// non-Nostr transport endpoint), fall back to byte inequality so behavior is
+    /// never looser than exact match. Read-side only; the verbatim stored string
+    /// is left untouched, preserving the signed-routing invariant.
     fn matches(&self, endpoint: &TransportEndpoint, parsed_endpoint: Option<&RelayUrl>) -> bool {
         if self.verbatim == *endpoint {
             return true;
@@ -772,36 +788,6 @@ struct AdapterState {
     sync: RelaySyncTelemetry,
 }
 
-/// Compare a stored route endpoint against the endpoint an inbound event
-/// arrived on, normalization-safe.
-///
-/// Routing must not depend on callers pre-canonicalizing relay URLs. Inbound
-/// endpoints are built from a parsed nostr `RelayUrl` (`sdk_client`), while
-/// stored group/inbox endpoints carry the verbatim signed routing strings
-/// (`marmot.transport.nostr.routing.v1`), which are intentionally never
-/// rewritten. A raw `==` therefore drops events whenever the two differ only
-/// by a `url`-canonicalizable detail (trailing slash, host case, default
-/// port, percent-encoding) — see darkmatter#482.
-///
-/// Fast path is byte equality. Otherwise both sides are parsed as `RelayUrl`
-/// and compared by value, which folds those canonicalization differences
-/// together. If either side fails to parse as a relay URL (e.g. a non-Nostr
-/// transport endpoint), fall back to the byte comparison so behavior is never
-/// looser than exact match. This is a read-side comparison only; stored
-/// endpoints are left untouched, preserving the signed-routing invariant.
-fn endpoints_match(candidate: &TransportEndpoint, endpoint: &TransportEndpoint) -> bool {
-    if candidate == endpoint {
-        return true;
-    }
-    match (
-        RelayUrl::parse(candidate.as_str()),
-        RelayUrl::parse(endpoint.as_str()),
-    ) {
-        (Ok(candidate), Ok(endpoint)) => candidate == endpoint,
-        _ => false,
-    }
-}
-
 impl AdapterState {
     /// Rebuild the derived `by_transport_group` index from the authoritative
     /// `accounts` routing state. Called after every mutation so the index cannot
@@ -829,7 +815,11 @@ impl AdapterState {
         self.accounts.insert(
             activation.account_id,
             AccountRoutes {
-                inbox_endpoints: activation.inbox_endpoints,
+                inbox_endpoints: activation
+                    .inbox_endpoints
+                    .iter()
+                    .map(CanonicalEndpoint::new)
+                    .collect(),
                 groups: activation.group_subscriptions,
             },
         );
@@ -944,22 +934,26 @@ impl AdapterState {
                     })
                     .collect()
             }
-            TransportEnvelope::Welcome { recipient } => self
-                .accounts
-                .iter()
-                .filter(|(account_id, routes)| {
-                    *account_id == recipient
-                        && routes
-                            .inbox_endpoints
-                            .iter()
-                            .any(|candidate| endpoints_match(candidate, endpoint))
-                })
-                .map(|(account_id, _)| DeliveryRoute {
-                    account_id: account_id.clone(),
-                    group_id_hint: None,
-                    plane: TransportDeliveryPlane::AccountInbox,
-                })
-                .collect(),
+            TransportEnvelope::Welcome { recipient } => {
+                // #698/#752: parse the inbound endpoint once (not per candidate,
+                // not per account) and match against pre-canonicalized inbox
+                // endpoints, mirroring the group arm above.
+                let parsed_endpoint = RelayUrl::parse(endpoint.as_str()).ok();
+                self.accounts
+                    .iter()
+                    .filter(|(account_id, routes)| {
+                        *account_id == recipient
+                            && routes.inbox_endpoints.iter().any(|candidate| {
+                                candidate.matches(endpoint, parsed_endpoint.as_ref())
+                            })
+                    })
+                    .map(|(account_id, _)| DeliveryRoute {
+                        account_id: account_id.clone(),
+                        group_id_hint: None,
+                        plane: TransportDeliveryPlane::AccountInbox,
+                    })
+                    .collect()
+            }
         }
     }
 }
