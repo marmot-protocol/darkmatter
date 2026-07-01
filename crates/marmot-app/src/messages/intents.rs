@@ -146,14 +146,27 @@ fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     tags
 }
 
-/// Filter host-supplied `extra_tags` down to well-formed nostr tags before they
-/// ride on the outgoing event. A nostr tag must have at least a name element, so
-/// empty tags are dropped; everything else is carried verbatim. Marmot stays
-/// agnostic about what the tags mean — the host app owns that convention.
+/// The one host-defined `extra_tags` tag name Marmot will carry today: a
+/// message effect, e.g. `["effect", "fire"]`.
+const EFFECT_TAG: &str = "effect";
+
+/// Filter host-supplied `extra_tags` down to the tags Marmot is willing to
+/// carry on an outgoing chat/reply event.
+///
+/// `extra_tags` is a public authoring escape hatch, but a kind-9 event's tags
+/// are load-bearing on the receive side: `e`/`q` mark a row as a reply, `imeta`
+/// marks it as media, `stream*` marks it as an agent-stream final. Carrying
+/// arbitrary tags verbatim would let a plain text send be projected as a
+/// reply/media/stream message, so we whitelist rather than blacklist: only a
+/// well-formed `["effect", <value>]` tag survives. Everything else — reserved
+/// protocol tags, unknown names, and malformed effect tags — is dropped. When
+/// the set of app-defined tags grows, widen this whitelist deliberately.
 fn sanitized_extra_tags(extra_tags: &[Vec<String>]) -> Vec<Vec<String>> {
     extra_tags
         .iter()
-        .filter(|tag| !tag.is_empty())
+        .filter(|tag| {
+            matches!(tag.as_slice(), [name, value, ..] if name == EFFECT_TAG && !value.is_empty())
+        })
         .cloned()
         .collect()
 }
@@ -171,10 +184,12 @@ const STREAM_FINAL_KIND_CHAT: &str = "9";
 pub(crate) enum AppMessageIntent {
     Chat {
         content: String,
-        /// Extra application-defined tags appended verbatim to the kind-9 event
-        /// (after the protocol-derived ones). Lets host apps carry out-of-band
-        /// metadata — e.g. a message-effect key — as a real nostr tag instead of
-        /// smuggling it into the visible body. Empty for a plain chat.
+        /// Extra application-defined tags appended to the kind-9 event (after the
+        /// protocol-derived ones). Lets host apps carry out-of-band metadata as a
+        /// real nostr tag instead of smuggling it into the visible body. Only a
+        /// well-formed `["effect", <value>]` tag is carried today; every other
+        /// tag (reserved protocol tags included) is dropped by
+        /// [`sanitized_extra_tags`]. Empty for a plain chat.
         extra_tags: Vec<Vec<String>>,
     },
     Reaction {
@@ -706,12 +721,17 @@ mod mention_tests {
     }
 
     #[test]
-    fn chat_intent_appends_extra_tags_verbatim_and_drops_empty() {
+    fn chat_intent_carries_effect_tag_and_drops_everything_else() {
         let intent = AppMessageIntent::Chat {
             content: "hello".to_owned(),
             extra_tags: vec![
                 vec!["effect".to_owned(), "fire".to_owned()],
-                Vec::new(), // malformed — must be dropped
+                Vec::new(),                                     // malformed — dropped
+                vec!["effect".to_owned()],                      // no value — dropped
+                vec!["effect".to_owned(), String::new()],       // empty value — dropped
+                vec!["e".to_owned(), "ff".repeat(32)],          // reserved reply ref — dropped
+                vec!["imeta".to_owned(), "url ...".to_owned()], // reserved media — dropped
+                vec!["stream".to_owned(), "x".to_owned()],      // reserved stream — dropped
             ],
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
@@ -722,8 +742,35 @@ mod mention_tests {
                 .contains(&vec!["effect".to_owned(), "fire".to_owned()])
         );
         assert!(
-            event.tags.iter().all(|t| !t.is_empty()),
-            "empty tags must be filtered out"
+            event
+                .tags
+                .iter()
+                .all(|t| t.first().map(String::as_str) != Some("e")),
+            "reserved 'e' tag must not be injectable via extra_tags"
+        );
+        assert!(
+            event
+                .tags
+                .iter()
+                .all(|t| t.first().map(String::as_str) != Some("imeta")),
+            "reserved 'imeta' tag must not be injectable via extra_tags"
+        );
+        assert!(
+            event
+                .tags
+                .iter()
+                .all(|t| t.first().map(String::as_str) != Some("stream")),
+            "reserved 'stream' tag must not be injectable via extra_tags"
+        );
+        // Only the one well-formed effect tag rode along beside the derived p-tags.
+        assert_eq!(
+            event
+                .tags
+                .iter()
+                .filter(|t| t.first().map(String::as_str) == Some("effect"))
+                .count(),
+            1,
+            "only the well-formed effect tag survives"
         );
     }
 
