@@ -96,6 +96,7 @@ impl AppClient {
         // (see `schema_valid_message_ids`).
         let source_message_id_hex = String::new();
         let source_recorded_at = unix_now_seconds();
+        let mut routes_dirty = false;
         for event in &effects.events {
             let before = self.state.groups.len();
             let previous_group =
@@ -124,9 +125,15 @@ impl AppClient {
                 &source_message_id_hex,
             );
             if self.state.groups.len() != before {
-                self.refresh_group_routes()?;
-                self.sync_runtime_groups().await?;
+                routes_dirty = true;
             }
+        }
+        // #695: coalesce. A batch with N membership-changing events previously ran
+        // a full transport resync (over ALL group subscriptions) once per such
+        // event; resync once after the batch drains instead.
+        if routes_dirty {
+            self.refresh_group_routes()?;
+            self.sync_runtime_groups().await?;
         }
         self.app.save_state(&self.state)?;
         Ok(summary)
@@ -315,6 +322,11 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
+        let mut routes_dirty = false;
+        // #760: collect push-gossip ids and strip them from `summary.messages` in
+        // ONE pass after the loop. The previous per-message `retain` was O(n) per
+        // gossip event → O(n²) over a batch a relay could flood with kind-448s.
+        let mut gossip_message_ids: HashSet<String> = HashSet::new();
         for event in &effects.events {
             let before = self.state.groups.len();
             let previous_group =
@@ -378,9 +390,7 @@ impl AppClient {
                             "ignoring malformed push token gossip: {err}",
                         );
                     }
-                    summary
-                        .messages
-                        .retain(|candidate| candidate.message_id_hex != message.message_id_hex);
+                    gossip_message_ids.insert(message.message_id_hex.clone());
                     continue;
                 }
                 if message.kind == MARMOT_APP_EVENT_KIND_CHAT
@@ -475,8 +485,7 @@ impl AppClient {
                 summary.projection_updates.push(projection_update);
             }
             if self.state.groups.len() != before {
-                self.refresh_group_routes()?;
-                self.sync_runtime_groups().await?;
+                routes_dirty = true;
             }
             if let cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id,
@@ -517,6 +526,19 @@ impl AppClient {
                 self.app
                     .set_group_self_membership(&self.state.label, &group_id_hex, false)?;
             }
+        }
+        // #760: strip all collected push-gossip messages in one pass.
+        if !gossip_message_ids.is_empty() {
+            summary
+                .messages
+                .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
+        }
+        // #695: coalesce the per-event full transport resync into one resync after
+        // the batch drains (was once per membership-changing event, each over ALL
+        // group subscriptions).
+        if routes_dirty {
+            self.refresh_group_routes()?;
+            self.sync_runtime_groups().await?;
         }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
