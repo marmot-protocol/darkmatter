@@ -147,8 +147,11 @@ Participation has three states:
 Participation is orthogonal to the lifecycle state, but two couplings hold. `Evicted` and `Quarantined` are terminal for
 normal processing the same way `Unrecoverable` is: a client MUST NOT apply group-state changes or release outbound work
 while in them. Unlike `Unrecoverable` — a convergence failure the client MAY repair from retained material — `Evicted`
-reflects the canonical group's authoritative decision about membership and clears only when the identity is added again
-(a new welcome, or an add commit that reinstates it).
+reflects the canonical group's authoritative decision about membership. It clears only through a verified rejoin or
+reinstatement path — normally a new Welcome to a later epoch, or another explicit protocol-defined reinstatement. An
+evicted client does not clear `Evicted` by resuming normal in-group processing: it was removed from the ratchet, so it
+cannot apply a later add commit for that group, and it MUST NOT try. Reinstatement returns the identity to `Member`
+through a fresh membership grant, not through the evicted group's own inbound stream.
 
 ### Authoritative eviction
 
