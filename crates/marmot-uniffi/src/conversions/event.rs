@@ -23,7 +23,8 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::GroupUnrecoverable { group_id, .. }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
         | GroupEvent::GroupHydrationQuarantined { group_id, .. }
-        | GroupEvent::GroupHydrationRecovered { group_id, .. } => group_id,
+        | GroupEvent::GroupHydrationRecovered { group_id, .. }
+        | GroupEvent::ParticipationChanged { group_id, .. } => group_id,
     }
 }
 
@@ -124,6 +125,31 @@ pub enum GroupEventKindFfi {
     GroupHydrationRecovered {
         recovered_epoch: u64,
     },
+    ParticipationChanged {
+        /// Stable, low-cardinality participation tag (see
+        /// [`group_participation_tag`]); clients gate the composer and group
+        /// list on it.
+        participation: String,
+    },
+}
+
+/// Stable, low-cardinality tag for a [`cgka_traits::GroupParticipation`].
+/// String-tagged like [`group_state_change_tag`] so the FFI surface stays
+/// additive when new participation states or quarantine reasons appear.
+pub(crate) fn group_participation_tag(
+    participation: &cgka_traits::GroupParticipation,
+) -> &'static str {
+    match participation {
+        cgka_traits::GroupParticipation::Member => "member",
+        cgka_traits::GroupParticipation::Left => "left",
+        cgka_traits::GroupParticipation::Evicted => "evicted",
+        cgka_traits::GroupParticipation::Quarantined {
+            reason: cgka_traits::QuarantineReason::PendingMembership,
+        } => "quarantined_pending_membership",
+        cgka_traits::GroupParticipation::Quarantined {
+            reason: cgka_traits::QuarantineReason::IntegrityHold,
+        } => "quarantined_integrity_hold",
+    }
 }
 
 /// Stable, low-cardinality tag for a [`GroupStateChange`] — surfaced to FFI in
@@ -230,6 +256,9 @@ impl From<GroupEvent> for GroupEventKindFfi {
                 recovered_epoch, ..
             } => Self::GroupHydrationRecovered {
                 recovered_epoch: recovered_epoch.0,
+            },
+            GroupEvent::ParticipationChanged { participation, .. } => Self::ParticipationChanged {
+                participation: group_participation_tag(&participation).to_string(),
             },
         }
     }

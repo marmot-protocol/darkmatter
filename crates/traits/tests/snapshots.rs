@@ -609,8 +609,22 @@ fn snapshot_group_and_member() {
                 credential: vec![],
             }],
             required_capabilities: GroupCapabilities::default(),
+            participation: GroupParticipation::Member,
         }
     );
+    // Records persisted before the participation field existed must load as
+    // `Member` (spec: participation defaults to live membership for legacy
+    // records; the serialized form is self-describing JSON in storage).
+    let legacy = serde_json::json!({
+        "id": gid(),
+        "name": "ops",
+        "description": "for ops talk",
+        "epoch": 3,
+        "members": [],
+        "required_capabilities": GroupCapabilities::default(),
+    });
+    let decoded: Group = serde_json::from_value(legacy).expect("legacy record decodes");
+    assert_eq!(decoded.participation, GroupParticipation::Member);
 }
 
 #[test]

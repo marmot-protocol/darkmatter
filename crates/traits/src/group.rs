@@ -19,6 +19,15 @@ pub struct Group {
     pub epoch: EpochId,
     pub members: Vec<Member>,
     pub required_capabilities: GroupCapabilities,
+    /// The local identity's participation in this group (see
+    /// `spec/protocol-core/group-state.md`, "Participation"). Lives on the
+    /// durable record — not the MLS tree — so it survives live-OpenMLS-state
+    /// teardown after a removal, and so fork-recovery snapshot rollback
+    /// restores it together with the rest of the group state (a rolled-back
+    /// removal commit must also roll back the non-member transition).
+    /// Defaults to `Member` for records written before this field existed.
+    #[serde(default)]
+    pub participation: GroupParticipation,
 }
 
 /// One member of a group, as storage sees it.
@@ -38,10 +47,11 @@ pub struct Member {
 /// `spec/protocol-core/group-state.md`. Ingest, convergence, and public group
 /// accessors map to it so a caller can tell a live group from one this identity
 /// has been evicted from, or one being withheld pending recovery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupParticipation {
     /// The local identity is present in the group's canonical roster; the only
     /// state in which local commits or delivered app payloads are allowed.
+    #[default]
     Member,
     /// The local identity voluntarily departed (its SelfRemove was committed).
     /// Non-member; the group is inactive for this identity. Kept distinct from

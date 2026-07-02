@@ -172,6 +172,12 @@ pub enum OpenMlsReplayObservation {
         priority: CommitOrderingPriority,
         committer: Vec<u8>,
         consumed_proposal_refs: Vec<String>,
+        /// Credential identities of the members whose SelfRemove proposals
+        /// this commit consumed. Lets the convergence emission path attribute
+        /// a departure to the leaver (`MemberLeft` / participation `Left`)
+        /// instead of collapsing every removal into `MemberRemoved`, matching
+        /// the direct-ingest seam.
+        self_remove_senders: Vec<Vec<u8>>,
     },
     ApplicationProcessed {
         message_id: String,
@@ -319,6 +325,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
                 priority,
                 committer,
                 consumed_proposal_refs: commit_consumed_proposal_refs,
+                self_remove_senders: _,
             } = observation
             else {
                 continue;
@@ -1473,6 +1480,17 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
                     .collect::<Result<Vec<_>, _>>()?;
                 consumed_proposal_refs.sort();
+                // Resolved against the pre-merge group, like the direct-ingest
+                // seam: the leaving leaves disappear once the merge lands.
+                let mut self_remove_senders: Vec<Vec<u8>> = staged
+                    .queued_proposals()
+                    .filter(|queued| matches!(queued.proposal(), Proposal::SelfRemove))
+                    .filter_map(|queued| {
+                        crate::identity::member_id_of_sender(queued.sender(), &mls_group)
+                            .map(|id| id.as_slice().to_vec())
+                    })
+                    .collect();
+                self_remove_senders.sort();
                 observations.push(OpenMlsReplayObservation::CommitStaged {
                     message_id,
                     source_epoch,
@@ -1480,6 +1498,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     priority,
                     committer,
                     consumed_proposal_refs,
+                    self_remove_senders,
                 });
                 mls_group
                     .merge_staged_commit(&provider, *staged)

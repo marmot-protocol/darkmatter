@@ -81,6 +81,31 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// Invariant repair for the inactive-group ingest arms: an inactive MLS
+    /// group implies a merged removal already ended our membership, so a
+    /// durable record still claiming `Member` lost its participation
+    /// transition. Hold it as `Quarantined(IntegrityHold)` — the Left/Evicted
+    /// reason is only readable from the removal commit, and this arm does not
+    /// have it (spec group-state.md, "Reaching a non-member state"). Records
+    /// already non-member (or quarantined) are left untouched.
+    fn repair_participation_if_member_claims_inactive_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let Ok(group) = self.storage.get_group(group_id) else {
+            return Ok(());
+        };
+        if group.participation == cgka_traits::GroupParticipation::Member {
+            self.set_group_participation(
+                group_id,
+                cgka_traits::GroupParticipation::Quarantined {
+                    reason: cgka_traits::QuarantineReason::IntegrityHold,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn ingest_group_message(
         &mut self,
         msg: &TransportMessage,
@@ -127,6 +152,14 @@ impl<S: StorageProvider> Engine<S> {
             // group returns to Stable.
             let current_epoch = EpochId(mls_group.epoch().as_u64());
             if !mls_group.is_active() {
+                // An inactive MLS group means a merged removal already ended
+                // our membership, so participation must already be non-member.
+                // A durable record still claiming `Member` here lost the
+                // transition (legacy record or storage inconsistency): hold it
+                // as Quarantined(IntegrityHold) rather than fabricating a
+                // Left/Evicted reason we did not read from an applied commit
+                // (spec group-state.md, "Reaching a non-member state").
+                self.repair_participation_if_member_claims_inactive_group(&group_id)?;
                 self.persist_transport_message(
                     msg,
                     &group_id,
@@ -558,6 +591,12 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
                 Err(ProcessMessageError::GroupStateError(MlsGroupStateError::UseAfterEviction)) => {
+                    // Path-1 aftermath, not a fresh eviction discovery: this
+                    // guard only fires once a merged removal already made the
+                    // group inactive (spec group-state.md). Participation must
+                    // already be non-member; repair a record that lost the
+                    // transition instead of silently swallowing the signal.
+                    self.repair_participation_if_member_claims_inactive_group(&group_id)?;
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
@@ -817,6 +856,17 @@ impl<S: StorageProvider> Engine<S> {
                         .any(|member| member == self.identity.self_id())
                     {
                         self.clear_leave_request_state(&group_id)?;
+                        // Applied removal: the only authoritative participation
+                        // transition (spec group-state.md, "Reaching a
+                        // non-member state"). The reason comes from the commit
+                        // itself: our own consumed SelfRemove resolves to
+                        // `Left`, a peer's removal to `Evicted`.
+                        let participation = if self_removed.contains(self.identity.self_id()) {
+                            cgka_traits::GroupParticipation::Left
+                        } else {
+                            cgka_traits::GroupParticipation::Evicted
+                        };
+                        self.set_group_participation(&group_id, participation)?;
                     } else if after_ids.contains(self.identity.self_id()) {
                         if self.load_leave_request_state(&group_id)?.is_some() {
                             // A SelfRemove proposal is valid only in its

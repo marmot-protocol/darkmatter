@@ -919,6 +919,41 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Transition the local identity's durable participation record for a
+    /// group and surface the change as `GroupEvent::ParticipationChanged`.
+    /// Participation lives on the durable Marmot group record
+    /// (`spec/protocol-core/group-state.md`, "Participation"), so it survives
+    /// live-OpenMLS-state teardown and rolls back together with the record
+    /// when fork recovery restores a pre-commit snapshot. Idempotent: writing
+    /// the already-current state emits nothing.
+    pub(crate) fn set_group_participation(
+        &mut self,
+        group_id: &GroupId,
+        participation: cgka_traits::GroupParticipation,
+    ) -> Result<(), EngineError> {
+        let mut group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            // No durable record: nothing to transition. Participation exists
+            // only for groups the engine holds a record of; "no such group"
+            // stays distinguishable at the accessor.
+            Err(cgka_traits::StorageError::NotFound) => return Ok(()),
+            Err(e) => return Err(EngineError::Backend(format!("get_group: {e:?}"))),
+        };
+        if group.participation == participation {
+            return Ok(());
+        }
+        group.participation = participation;
+        self.storage
+            .put_group(&group)
+            .map_err(|e| EngineError::Backend(format!("put_group: {e:?}")))?;
+        self.events_buf
+            .push_back(cgka_traits::engine::GroupEvent::ParticipationChanged {
+                group_id: group_id.clone(),
+                participation,
+            });
+        Ok(())
+    }
+
     fn sent_self_remove_leaving_gate_should_restore(
         &self,
         group_id: &GroupId,
@@ -1647,6 +1682,17 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
         self.do_members(group_id)
+    }
+
+    fn participation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<cgka_traits::GroupParticipation>, EngineError> {
+        match self.storage.get_group(group_id) {
+            Ok(group) => Ok(Some(group.participation)),
+            Err(cgka_traits::StorageError::NotFound) => Ok(None),
+            Err(e) => Err(EngineError::Backend(format!("get_group: {e:?}"))),
+        }
     }
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {

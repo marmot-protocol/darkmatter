@@ -23,7 +23,7 @@ use cgka_traits::app_components::{AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, GroupParticipation, Member};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
@@ -221,6 +221,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch: EpochId(mls_group.epoch().as_u64()),
             members: projected_members,
             required_capabilities: required_caps,
+            participation: GroupParticipation::Member,
         };
         self.storage.put_group(&group_record)?;
 
@@ -519,6 +520,17 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
 
         // 6. Persist Marmot group record from signed group-context data.
+        //
+        // A verified rejoin is the reinstatement path in
+        // spec/protocol-core/group-state.md ("Participation"): a fresh
+        // membership grant returns the identity to `Member`. Capture the prior
+        // participation of any retained record first so the transition is
+        // surfaced, not silently overwritten.
+        let prior_participation = self
+            .storage
+            .get_group(&group_id)
+            .ok()
+            .map(|group| group.participation);
         let mut group_record = Group {
             id: group_id.clone(),
             name: String::new(),
@@ -528,9 +540,19 @@ impl<S: StorageProvider> Engine<S> {
             required_capabilities: crate::capability_manager::required_capabilities_from_group(
                 &mls_group,
             ),
+            participation: GroupParticipation::Member,
         };
         mirror_app_components_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;
+        if let Some(prior) = prior_participation
+            && prior != GroupParticipation::Member
+        {
+            self.events_buf
+                .push_back(cgka_traits::engine::GroupEvent::ParticipationChanged {
+                    group_id: group_id.clone(),
+                    participation: GroupParticipation::Member,
+                });
+        }
 
         // Cache self's capabilities. Other members' capabilities arrive as
         // we ingest commits that touched their leaves; join-via-welcome

@@ -403,6 +403,7 @@ impl<S: StorageProvider> Engine<S> {
                 selected_tip,
                 origin_commit_id,
                 origin_commit_actor,
+                &observations,
             )?;
         }
         self.emit_application_replay_events(group_id, &observations);
@@ -475,6 +476,7 @@ impl<S: StorageProvider> Engine<S> {
         selected_tip: EpochId,
         origin_commit_id: Option<MessageId>,
         origin_commit_actor: Option<MemberId>,
+        observations: &[OpenMlsReplayObservation],
     ) -> Result<(), OpenMlsProjectionError> {
         if previous_tip != selected_tip {
             self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -568,18 +570,57 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
         }
+        // SelfRemove senders consumed by the replayed commits, so departures
+        // attribute to the leaver here exactly like the direct-ingest seam
+        // (`MemberLeft` vs `MemberRemoved` is no longer path-dependent).
+        let self_removed: HashSet<MemberId> = observations
+            .iter()
+            .flat_map(|observation| match observation {
+                OpenMlsReplayObservation::CommitStaged {
+                    self_remove_senders,
+                    ..
+                } => self_remove_senders.as_slice(),
+                _ => &[],
+            })
+            .map(|identity| MemberId::new(identity.clone()))
+            .collect();
         for member_id in previous_ids.difference(&current_ids) {
             if member_id == self.identity.self_id() {
                 self.clear_leave_request_state(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                // Applied removal via the convergence path: the same
+                // authoritative participation transition as the direct seam
+                // (spec group-state.md, "Reaching a non-member state").
+                let participation = if self_removed.contains(self.identity.self_id()) {
+                    cgka_traits::GroupParticipation::Left
+                } else {
+                    cgka_traits::GroupParticipation::Evicted
+                };
+                self.set_group_participation(group_id, participation)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
             }
+            let (change, actor) = if self_removed.contains(member_id) {
+                // A leave is attributed to the leaver, not the member that
+                // sequenced the auto-commit.
+                (
+                    GroupStateChange::MemberLeft {
+                        member: member_id.clone(),
+                    },
+                    Some(member_id.clone()),
+                )
+            } else {
+                (
+                    GroupStateChange::MemberRemoved {
+                        member: member_id.clone(),
+                    },
+                    None,
+                )
+            };
             self.push_group_state_change(
                 group_id,
                 selected_tip,
-                None,
-                GroupStateChange::MemberRemoved {
-                    member: member_id.clone(),
-                },
+                actor,
+                change,
                 origin_commit_id.clone(),
             );
         }

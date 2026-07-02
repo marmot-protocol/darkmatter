@@ -21,7 +21,7 @@ use crate::app_components::{AppComponentData, AppComponentId};
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
-use crate::group::Member;
+use crate::group::{GroupParticipation, Member};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
 use crate::transport::TransportMessage;
@@ -372,6 +372,17 @@ pub enum GroupEvent {
         group_id: GroupId,
         reason: GroupHydrationQuarantineReason,
     },
+    /// The local identity's participation in the group changed (see
+    /// `spec/protocol-core/group-state.md`, "Participation"): an applied
+    /// removal commit resolved to `Left`/`Evicted`, a quarantine hold was
+    /// placed, or a verified rejoin restored `Member`. Distinct from
+    /// [`GroupEvent::GroupStateChanged`]: this is local-identity lifecycle
+    /// state the application gates surfaces on (composer, group list), not a
+    /// group system row.
+    ParticipationChanged {
+        group_id: GroupId,
+        participation: GroupParticipation,
+    },
     EpochChanged {
         group_id: GroupId,
         from: EpochId,
@@ -673,6 +684,13 @@ pub trait CgkaEngine: Send + Sync {
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError>;
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
+
+    /// The local identity's participation in the group. `Ok(None)` means the
+    /// engine has no durable record of the group at all ("no such group") —
+    /// distinct from every participation state, per
+    /// `spec/protocol-core/group-state.md`, "Participation and public
+    /// surfaces".
+    fn participation(&self, group_id: &GroupId) -> Result<Option<GroupParticipation>, EngineError>;
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;
 

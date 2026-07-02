@@ -42,10 +42,12 @@ async fn advance_selfremove_auto_commit<E: CgkaEngine>(engine: &mut E, group_id:
 }
 
 /// True if `events` contains a `GroupStateChanged` departure (removed or left)
-/// for `member`. Accepts either variant because the leave/removed distinction
-/// is path-dependent: the direct inbound seam classifies a SelfRemove as
-/// `MemberLeft`, while a convergence reorg surfaces it as an unattributed
-/// `MemberRemoved`.
+/// for `member`. Loose matcher for tests that only care that a departure was
+/// observed. The leave/removed distinction itself is no longer path-dependent:
+/// both the direct inbound seam and the convergence replay path resolve a
+/// consumed SelfRemove to `MemberLeft` (attributed to the leaver) and
+/// everything else to `MemberRemoved`; participation assertions pin the strict
+/// classification where it matters.
 fn emits_departure_of(events: &[cgka_traits::engine::GroupEvent], member: &MemberId) -> bool {
     events.iter().any(|event| {
         matches!(
@@ -759,6 +761,24 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
         emits_departure_of(&bob_remove_events, &bob.self_id()),
         "bob should observe his own removal; got {bob_remove_events:?}"
     );
+    // Applied removal is the authoritative participation transition (spec
+    // group-state.md, "Reaching a non-member state"): a peer's removal
+    // resolves to `Evicted`, surfaced as `ParticipationChanged`.
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Evicted),
+        "bob's participation should be Evicted after applying the removal"
+    );
+    assert!(
+        bob_remove_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::ParticipationChanged {
+                group_id: g,
+                participation: cgka_traits::GroupParticipation::Evicted,
+            } if g == &group_id
+        )),
+        "bob should emit ParticipationChanged(Evicted); got {bob_remove_events:?}"
+    );
     // After being removed, bob retains a tombstoned local record of the group
     // (the engine does NOT eagerly destroy local state on removal — retaining
     // it preserves the convergence artifacts a late winning branch needs to
@@ -804,6 +824,24 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
             cgka_traits::engine::GroupEvent::GroupJoined { group_id: g, .. } if g == &group_id
         )),
         "bob should emit GroupJoined on the re-add Welcome; got {rejoin_events:?}"
+    );
+    // A verified rejoin is the reinstatement path: participation returns to
+    // `Member` through the fresh membership grant, and the transition is
+    // surfaced rather than silently overwritten.
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Member),
+        "bob's participation should be Member again after the re-add welcome"
+    );
+    assert!(
+        rejoin_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::ParticipationChanged {
+                group_id: g,
+                participation: cgka_traits::GroupParticipation::Member,
+            } if g == &group_id
+        )),
+        "bob should emit ParticipationChanged(Member) on rejoin; got {rejoin_events:?}"
     );
     let bob_members = bob.members(&group_id).unwrap();
     assert!(
@@ -1283,6 +1321,31 @@ async fn selfremove_full_flow_with_auto_commit() {
     assert!(
         emits_departure_of(&bob_events, &bob.self_id()),
         "bob should emit a departure for himself; got {bob_events:?}"
+    );
+    // The commit consumed bob's own SelfRemove, so the participation reason
+    // resolves to `Left` (not `Evicted`) — read from the applied commit, on
+    // the convergence apply path as well as the direct seam (spec
+    // group-state.md, "Reaching a non-member state").
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Left),
+        "leaver's participation should resolve to Left from his consumed SelfRemove"
+    );
+    assert!(
+        bob_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::ParticipationChanged {
+                group_id: g,
+                participation: cgka_traits::GroupParticipation::Left,
+            } if g == &group_id
+        )),
+        "bob should emit ParticipationChanged(Left); got {bob_events:?}"
+    );
+    // The remaining member's own participation is untouched by bob's leave.
+    assert_eq!(
+        alice.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Member),
+        "alice remains a Member after bob's departure"
     );
 }
 

@@ -978,7 +978,8 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
         | GroupEvent::GroupUnrecoverable { group_id, .. }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
         | GroupEvent::GroupHydrationQuarantined { group_id, .. }
-        | GroupEvent::GroupHydrationRecovered { group_id, .. } => Some(group_id),
+        | GroupEvent::GroupHydrationRecovered { group_id, .. }
+        | GroupEvent::ParticipationChanged { group_id, .. } => Some(group_id),
     }
 }
 
