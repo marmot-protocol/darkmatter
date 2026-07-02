@@ -353,6 +353,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::Evicted
         }
     );
+    insta::assert_json_snapshot!(
+        "stale_quarantined",
+        IngestOutcome::Stale {
+            reason: StaleReason::Quarantined
+        }
+    );
 }
 
 #[test]

@@ -581,6 +581,24 @@ impl AccountDeviceSession {
         self.engine.wrap_removal_notice(commit, recipient).await
     }
 
+    /// Withhold a group pending an explicit recovery transition
+    /// (spec/protocol-core/group-state.md, "Quarantine").
+    pub async fn quarantine_group(
+        &mut self,
+        group_id: &GroupId,
+        reason: cgka_traits::QuarantineReason,
+    ) -> Result<(), EngineError> {
+        self.engine.quarantine_group(group_id, reason).await
+    }
+
+    /// The explicit recovery transition out of `Quarantined`.
+    pub async fn resolve_group_quarantine(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupParticipation, EngineError> {
+        self.engine.resolve_group_quarantine(group_id).await
+    }
+
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
         tracing::debug!(
             target: TRACE_TARGET,

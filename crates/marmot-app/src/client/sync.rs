@@ -632,6 +632,20 @@ impl AppClient {
             .or_default();
         entry.attempts = entry.attempts.saturating_add(1);
         entry.last_attempt_at = now;
+        // Probes stayed dry past the policy bound: hold the group as
+        // Quarantined(PendingMembership) instead of probing forever (spec
+        // group-state.md, "Reaching a non-member state", bounded hold). The
+        // kind-451 inbox notice remains a live discovery path (it does not
+        // need the group route), and explicit resolution re-runs convergence
+        // over everything retained meanwhile.
+        if entry.attempts > MEMBERSHIP_PROBE_QUARANTINE_ATTEMPTS {
+            self.runtime
+                .quarantine_group(group_id, cgka_traits::QuarantineReason::PendingMembership)
+                .await?;
+            let drained = self.drain_pending_session_events().await?;
+            let _ = drained;
+            return Ok(());
+        }
         // Anchor: the newest app event this client consumed for the group —
         // derived from decrypted input, so it is "the last input successfully
         // consumed" — widened by a slack. No consumed input yet means a full
@@ -704,6 +718,10 @@ impl MembershipProbeState {
 const MEMBERSHIP_BACKFILL_SLACK_SECS: u64 = 300;
 const MEMBERSHIP_BACKFILL_BASE_COOLDOWN_SECS: u64 = 60;
 const MEMBERSHIP_BACKFILL_MAX_COOLDOWN_SECS: u64 = 3600;
+/// Dry probes tolerated before the group is held as
+/// `Quarantined(PendingMembership)` — with the backoff schedule above this is
+/// several hours of failed recovery attempts.
+const MEMBERSHIP_PROBE_QUARANTINE_ATTEMPTS: u32 = 8;
 
 pub(crate) fn is_own_relay_echo(
     delivery: &cgka_traits::TransportDelivery,

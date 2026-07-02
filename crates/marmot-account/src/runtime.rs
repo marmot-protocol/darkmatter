@@ -182,6 +182,26 @@ where
         Ok(())
     }
 
+    /// Withhold a group pending an explicit recovery transition
+    /// (spec/protocol-core/group-state.md, "Quarantine"). The resulting
+    /// `ParticipationChanged` event surfaces on the next drain.
+    pub async fn quarantine_group(
+        &mut self,
+        group_id: &GroupId,
+        reason: cgka_traits::QuarantineReason,
+    ) -> AccountResult<()> {
+        self.session.quarantine_group(group_id, reason).await?;
+        Ok(())
+    }
+
+    /// The explicit recovery transition out of `Quarantined`.
+    pub async fn resolve_group_quarantine(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<cgka_traits::GroupParticipation> {
+        Ok(self.session.resolve_group_quarantine(group_id).await?)
+    }
+
     /// Membership recovery probe: re-issue one group's subscription with a
     /// widened `since` so a missed group-evolution commit (most importantly a
     /// missed removal commit) is recovered from relay history

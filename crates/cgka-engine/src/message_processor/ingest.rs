@@ -147,6 +147,31 @@ impl<S: StorageProvider> Engine<S> {
             let provider =
                 EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
             let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            // Withheld group (spec group-state.md, "Quarantine"): excluded
+            // from live inbound processing. The input is retained (Retryable)
+            // at the group's held epoch so the explicit resolution pass finds
+            // it inside the convergence window — ordinary inbound MUST NOT
+            // silently re-activate a quarantined group.
+            if !self.quarantine_resolutions.contains(&group_id)
+                && let Ok(group) = self.storage.get_group(&group_id)
+                && matches!(
+                    group.participation,
+                    cgka_traits::GroupParticipation::Quarantined { .. }
+                )
+            {
+                // PeelDeferred: the resolution pass replays exactly this state
+                // through `retry_deferred_peels`, re-entering ordinary ingest
+                // with the guard stood down.
+                self.persist_transport_message_for_existing_group(
+                    msg,
+                    &group_id,
+                    group.epoch,
+                    MessageState::PeelDeferred,
+                )?;
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::Quarantined,
+                });
+            }
             let mut mls_group = match MlsGroup::load(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
                     &provider,

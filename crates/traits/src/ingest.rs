@@ -53,6 +53,12 @@ pub enum StaleReason {
     /// non-member state itself is a participation transition, never derived
     /// from this classification.
     Evicted,
+    /// The group is withheld (`GroupParticipation::Quarantined`): excluded
+    /// from live inbound processing pending an explicit recovery transition
+    /// (spec/protocol-core/group-state.md, "Quarantine"). The input is
+    /// retained (`Retryable`) so the resolution pass can still consume it —
+    /// withheld, not discarded.
+    Quarantined,
 }
 
 /// Decrypted inbound message ready for engine processing.

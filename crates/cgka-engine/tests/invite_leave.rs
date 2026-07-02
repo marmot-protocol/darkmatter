@@ -1871,3 +1871,183 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[tokio::test]
+async fn quarantine_withholds_inbound_and_resolve_restores_member() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "quarantine".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    bob.drain_events();
+
+    // Hold bob's copy of the group.
+    bob.quarantine_group(&group_id, cgka_traits::QuarantineReason::PendingMembership)
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Quarantined {
+            reason: cgka_traits::QuarantineReason::PendingMembership
+        })
+    );
+    let bob_events = bob.drain_events();
+    assert!(
+        bob_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::ParticipationChanged {
+                participation: cgka_traits::GroupParticipation::Quarantined { .. },
+                ..
+            }
+        )),
+        "quarantine should surface as ParticipationChanged; got {bob_events:?}"
+    );
+
+    // Live inbound is withheld (retained, not processed): alice invites carol
+    // and bob's copy of that commit classifies Quarantined without advancing
+    // his epoch. Convergence is also excluded for the held group.
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, invite_pending) = match invite {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(invite_pending).await.unwrap();
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = bob.ingest(routed).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::Quarantined
+            }
+        ),
+        "inbound for a withheld group is retained, not processed; got {outcome:?}"
+    );
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 1, "epoch must not advance");
+    assert!(
+        bob.advance_convergence(&group_id).await.unwrap().is_empty(),
+        "live convergence skips a withheld group"
+    );
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 1);
+
+    // Explicit recovery: the resolution pass consumes the retained commit
+    // through the ordinary apply seams and restores Member.
+    let resolved = bob.resolve_group_quarantine(&group_id).await.unwrap();
+    assert_eq!(resolved, cgka_traits::GroupParticipation::Member);
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Member)
+    );
+    assert_eq!(
+        bob.epoch(&group_id).unwrap().0,
+        2,
+        "the withheld commit applies during resolution"
+    );
+    assert_eq!(bob.members(&group_id).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn quarantine_never_downgrades_an_authoritative_non_member_state() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "no-downgrade".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (remove_commit, remove_pending) = match remove {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(remove_pending).await.unwrap();
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..remove_commit
+    };
+    let outcome = bob.ingest(routed).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Evicted)
+    );
+
+    // Quarantine is a hold, not a verdict: it must not mask Evicted.
+    bob.quarantine_group(&group_id, cgka_traits::QuarantineReason::IntegrityHold)
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.participation(&group_id).unwrap(),
+        Some(cgka_traits::GroupParticipation::Evicted),
+        "an authoritative non-member state is never downgraded to a hold"
+    );
+    // Resolving a non-quarantined group is a no-op that reports the current
+    // authoritative state.
+    assert_eq!(
+        bob.resolve_group_quarantine(&group_id).await.unwrap(),
+        cgka_traits::GroupParticipation::Evicted
+    );
+}

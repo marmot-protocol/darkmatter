@@ -21,7 +21,7 @@ use crate::app_components::{AppComponentData, AppComponentId};
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
-use crate::group::{GroupParticipation, Member};
+use crate::group::{GroupParticipation, Member, QuarantineReason};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
 use crate::transport::TransportMessage;
@@ -704,6 +704,31 @@ pub trait CgkaEngine: Send + Sync {
     /// `spec/protocol-core/group-state.md`, "Participation and public
     /// surfaces".
     fn participation(&self, group_id: &GroupId) -> Result<Option<GroupParticipation>, EngineError>;
+
+    /// Withhold the group (`spec/protocol-core/group-state.md`, "Quarantine"):
+    /// participation moves to `Quarantined { reason }`, live inbound is
+    /// retained-but-unprocessed, and live convergence skips the group until
+    /// [`CgkaEngine::resolve_group_quarantine`] runs. A group already
+    /// authoritatively non-member (`Left`/`Evicted`) is never downgraded to a
+    /// hold; quarantining it is a no-op.
+    async fn quarantine_group(
+        &mut self,
+        group_id: &GroupId,
+        reason: QuarantineReason,
+    ) -> Result<(), EngineError>;
+
+    /// The explicit recovery transition out of `Quarantined`: run one
+    /// deliberate convergence pass over the withheld/stored input, let the
+    /// ordinary apply seams decide the outcome (an applied removal commit
+    /// resolves to `Left`/`Evicted`), and restore `Member` only when the live
+    /// MLS state is active and the canonical roster still contains the local
+    /// identity. Returns the resulting participation; a group that cannot be
+    /// safely resolved stays `Quarantined`. Ordinary inbound never triggers
+    /// this — quarantine cannot be silently re-activated.
+    async fn resolve_group_quarantine(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<GroupParticipation, EngineError>;
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;
 

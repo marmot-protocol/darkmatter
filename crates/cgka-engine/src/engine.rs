@@ -136,6 +136,12 @@ pub struct Engine<S: StorageProvider> {
     /// Fast runtime gate for groups where the local member must not produce
     /// further outbound group traffic while a leave request is outstanding.
     pub(crate) leaving_groups: HashSet<GroupId>,
+    /// Groups mid-`resolve_group_quarantine`: the explicit recovery pass
+    /// re-runs withheld input through ordinary ingest, so the quarantine
+    /// withhold guard stands down for exactly these groups for exactly that
+    /// pass — the mechanism behind "no silent re-activation" (spec
+    /// group-state.md, "Quarantine").
+    pub(crate) quarantine_resolutions: HashSet<GroupId>,
 
     /// Delayed SelfRemove auto-commit attempts keyed by the standalone
     /// proposal's content-derived message id. These are re-checked against live
@@ -308,6 +314,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
+            quarantine_resolutions: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),
             pending_convergence_groups: HashSet::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
@@ -1475,9 +1482,114 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<SendResult>, EngineError> {
+        // A withheld group is excluded from live convergence (spec
+        // group-state.md, "Quarantine"); only the explicit
+        // `resolve_group_quarantine` transition may process its stored input.
+        if matches!(
+            self.storage.get_group(group_id).map(|g| g.participation),
+            Ok(cgka_traits::GroupParticipation::Quarantined { .. })
+        ) {
+            return Ok(Vec::new());
+        }
         let now_ms = self.convergence_now_ms();
         self.converge_and_drain_queued_outbound_intents(group_id, now_ms)
             .await
+    }
+
+    async fn quarantine_group(
+        &mut self,
+        group_id: &GroupId,
+        reason: cgka_traits::QuarantineReason,
+    ) -> Result<(), EngineError> {
+        let group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(cgka_traits::StorageError::NotFound) => {
+                return Err(EngineError::UnknownGroup(group_id.clone()));
+            }
+            Err(e) => return Err(EngineError::Backend(format!("get_group: {e:?}"))),
+        };
+        // Quarantine is a hold, not a verdict: never downgrade an
+        // authoritative non-member state to "withheld".
+        if matches!(
+            group.participation,
+            cgka_traits::GroupParticipation::Left | cgka_traits::GroupParticipation::Evicted
+        ) {
+            return Ok(());
+        }
+        self.set_group_participation(
+            group_id,
+            cgka_traits::GroupParticipation::Quarantined { reason },
+        )
+    }
+
+    async fn resolve_group_quarantine(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupParticipation, EngineError> {
+        let current = self
+            .participation(group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        if !matches!(current, cgka_traits::GroupParticipation::Quarantined { .. }) {
+            return Ok(current);
+        }
+        // One deliberate convergence pass over the withheld/stored input. The
+        // ordinary apply seams decide the outcome: a stored removal commit
+        // resolves participation to Left/Evicted through the same code path
+        // as live traffic. The withhold guard stands down for this group for
+        // exactly this pass, and the pass runs past the settlement quiescence
+        // window: resolution is an explicit decision over a closed input set,
+        // not live traffic waiting for stragglers.
+        self.quarantine_resolutions.insert(group_id.clone());
+        let quiescence_ms = self
+            .convergence_policy_for_group(group_id)
+            .map(|policy| policy.settlement_quiescence_ms)
+            .unwrap_or_default();
+        // The pass re-ingests withheld rows, stamping fresh receive times
+        // *after* this snapshot; a bare `window + 1` margin would leave them
+        // inside quiescence forever. One minute of slack makes the closed
+        // input set decisively quiescent without touching wall-clock state.
+        let now_ms = self
+            .convergence_now_ms()
+            .saturating_add(quiescence_ms.saturating_add(60_000));
+        let pass = self
+            .advance_convergence_inputs_until_settled(group_id, now_ms)
+            .await;
+        self.quarantine_resolutions.remove(group_id);
+        let _ = pass?;
+        let after = self.participation(group_id)?.unwrap_or(current);
+        if !matches!(after, cgka_traits::GroupParticipation::Quarantined { .. }) {
+            return Ok(after);
+        }
+        // No authoritative outcome from the pass. Restore Member only when the
+        // live MLS state is active and the canonical roster still contains the
+        // local identity — otherwise the hold stands.
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+            &provider,
+        );
+        let live_and_member = openmls::group::MlsGroup::load(storage, &mls_gid)
+            .ok()
+            .flatten()
+            .is_some_and(|mls_group| mls_group.is_active())
+            && self
+                .storage
+                .get_group(group_id)
+                .map(|group| {
+                    group
+                        .members
+                        .iter()
+                        .any(|member| &member.id == self.identity.self_id())
+                })
+                .unwrap_or(false);
+        if live_and_member {
+            self.set_group_participation(group_id, cgka_traits::GroupParticipation::Member)?;
+            return Ok(cgka_traits::GroupParticipation::Member);
+        }
+        Ok(after)
     }
 
     async fn confirm_published(
