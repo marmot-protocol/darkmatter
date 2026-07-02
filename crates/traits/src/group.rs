@@ -43,11 +43,18 @@ pub enum GroupParticipation {
     /// The local identity is present in the group's canonical roster; the only
     /// state in which local commits or delivered app payloads are allowed.
     Member,
-    /// The local identity is authoritatively no longer a member — an applied
-    /// removal, or an observed `SelfEvicted` outcome when the removal commit
-    /// itself was never applied. The group is inactive for this identity.
+    /// The local identity voluntarily departed (its SelfRemove was committed).
+    /// Non-member; the group is inactive for this identity. Kept distinct from
+    /// [`GroupParticipation::Evicted`] so a surface can tell "you left" from
+    /// "you were removed".
+    Left,
+    /// The local identity was removed by another member. Non-member; the group
+    /// is inactive for this identity. Reached by applying the removal commit or
+    /// by deriving non-membership above MLS when that commit was never applied
+    /// (see `spec/protocol-core/group-state.md`) — not from an MLS error.
     Evicted,
     /// The group is excluded from the live group set pending an explicit
-    /// recovery transition; neither trusted as `Member` nor asserted `Evicted`.
+    /// recovery transition; neither trusted as a live member group nor asserted
+    /// non-member.
     Quarantined,
 }

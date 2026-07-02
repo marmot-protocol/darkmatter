@@ -618,6 +618,7 @@ fn snapshot_group_participation() {
     // Locks the serialized variant casing: this enum crosses the FFI boundary,
     // so its wire shape must not drift silently.
     insta::assert_json_snapshot!("participation_member", GroupParticipation::Member);
+    insta::assert_json_snapshot!("participation_left", GroupParticipation::Left);
     insta::assert_json_snapshot!("participation_evicted", GroupParticipation::Evicted);
     insta::assert_json_snapshot!("participation_quarantined", GroupParticipation::Quarantined);
 }
