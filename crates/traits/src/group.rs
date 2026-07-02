@@ -49,12 +49,31 @@ pub enum GroupParticipation {
     /// "you were removed".
     Left,
     /// The local identity was removed by another member. Non-member; the group
-    /// is inactive for this identity. Reached by applying the removal commit or
-    /// by deriving non-membership above MLS when that commit was never applied
-    /// (see `spec/protocol-core/group-state.md`) — not from an MLS error.
+    /// is inactive for this identity. Reached only by applying the removal
+    /// commit — delivered in order, recovered through the transport's
+    /// missed-input recovery, or carried by a removal notice (see
+    /// `spec/protocol-core/group-state.md`, "Reaching a non-member state") —
+    /// never asserted from an undecryptable message or an MLS error.
     Evicted,
     /// The group is excluded from the live group set pending an explicit
     /// recovery transition; neither trusted as a live member group nor asserted
-    /// non-member.
-    Quarantined,
+    /// non-member. Carries why it is withheld, because the two holds have
+    /// opposite expected exits (see [`QuarantineReason`]).
+    Quarantined { reason: QuarantineReason },
+}
+
+/// Why a group is held in [`GroupParticipation::Quarantined`]. The reason
+/// determines the expected exit: `PendingMembership` resolves through the
+/// removal commit (or recovered group-evolution input), `IntegrityHold`
+/// through a verified repair path. Mirrors the quarantine reasons in
+/// `spec/protocol-core/group-state.md`, "Quarantine".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuarantineReason {
+    /// Undecryptable group traffic suggests the local identity may have been
+    /// removed, and the discovery probes (transport missed-input recovery,
+    /// removal notice) have not yet recovered the removal commit.
+    PendingMembership,
+    /// Stored group material failed to load or validate, or a durable
+    /// invariant check failed.
+    IntegrityHold,
 }

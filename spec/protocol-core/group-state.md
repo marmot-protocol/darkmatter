@@ -160,40 +160,63 @@ through a fresh membership grant, not through the group's own inbound stream.
 
 ### Reaching a non-member state
 
-Removal authority in MLS is carried only by the commit that removes the identity. A client reaches `Left`/`Evicted`
-through one of two paths, and a correct client handles both:
+Removal authority lives in exactly one artifact: the commit that removes the identity. A client transitions to
+`Left`/`Evicted` only by applying that commit — its own SelfRemove committed resolves to `Left`, a peer's removal to
+`Evicted`; the roster diff after merging shows self in the removed set. No other input is authoritative: not an
+undecryptable message, not a transport claim, not an out-of-band notice. Everything else in this section is a
+discovery mechanism whose only job is to get that one commit delivered and applied. The removed identity can always
+still process it: the removal commit is protected under the last epoch it was a member of, so it remains readable to
+the removed member no matter how late it arrives.
 
-1. **Applied removal.** The client applies the commit that removes the local identity (its own SelfRemove for `Left`, a
-   peer's removal for `Evicted`); the roster diff after merging that commit shows self in the removed set. This is the
-   clean path, and it is the only path on which MLS itself changes membership.
-2. **Removal commit not applied.** Relay timing or ordering meant the client never applied that specific removal commit
-   and instead sees a later, post-removal message. MLS gives **no** eviction signal here: with the removal commit
-   unmerged the group is still active, and the later message merely fails to decrypt as a wrong-epoch / no-matching-secret
-   message — indistinguishable at the MLS layer from a future-epoch or corrupt message. The MLS `UseAfterEviction` guard
-   is **not** this signal: it fires only once the group is already inactive from a merged self-removal, i.e. it is
-   path-1 aftermath, not a fresh discovery. A client MUST therefore derive non-membership **above MLS** in this case,
-   by either obtaining and applying the missing removal commit (convergence backfill, after which path 1 applies) or
-   inferring non-membership from authenticated roster / relay state. A client MUST NOT leave the group readable as
-   `Member` indefinitely merely because the removal commit was reordered.
+The removal commit is not guaranteed to arrive in order. Transport timing or ordering can deliver later, post-removal
+traffic first, and MLS gives **no** signal in that case: with the removal commit unmerged the group is still active,
+and later traffic merely fails to decrypt — indistinguishable at the MLS layer from future-epoch or corrupt input.
+(The MLS `UseAfterEviction` guard is not this signal: it fires only after a merged removal has already made the group
+inactive — aftermath of the applied-removal path, not a fresh discovery.) A client MUST therefore treat undecryptable
+group traffic as a possible missed-removal symptom and actively pursue delivery of the missing commit:
 
-The `Left` vs `Evicted` reason is authoritative only from the removal commit — a self-removal resolves to `Left`, a
-peer's removal to `Evicted` — so path 1, and path 2 via commit backfill, both preserve it. Inference from roster / relay
-state alone can establish that the identity is no longer a member without revealing why. A client MUST NOT fabricate a
-reason in that case: it SHOULD obtain the removal commit to resolve `Left`/`Evicted`, and until it can, it holds the
-group `Quarantined` (withheld — neither asserted `Member` nor assigned a non-member reason) rather than guessing.
+1. **Recovery probe.** Undecryptable traffic for a group MUST trigger the active transport's missed-input recovery
+   mechanism, bounded around the last input the client successfully consumed, looking for group-evolution input its
+   retained candidate keys can open. Every transport binding states its recovery mechanism — or the delivery
+   guarantees under which group-evolution input cannot be missed, in which case this trigger never fires (see
+   [../transports/README.md](../transports/README.md), "Transport document checklist"). If the missing removal commit
+   is recovered, it is applied through the ordinary inbound flow and the applied-removal transition above fires —
+   late, but identically.
+2. **Removal notice.** On a transport binding with a recipient inbox address, the committer of a removal SHOULD also
+   send each removed member a removal notice through the member's account inbox, carrying or referencing the removal
+   commit (see [member-departure.md](./member-departure.md), "Removal notices"; the binding defines the shape). A
+   notice has no authority of its own: the receiver resolves it by validating and applying the carried or fetched
+   commit through the ordinary inbound flow, and a client MUST NOT change participation on an unverified notice. A
+   notice that does not resolve to a valid commit removing the local identity is ignored. Because a forged notice can
+   at most cause a validation attempt, an adversary gains nothing a real removal would not already grant.
+3. **Bounded hold.** When undecryptable traffic persists and the probes above have stayed dry past a local policy
+   bound, the client MUST move the group to `Quarantined` with the `pending_membership` reason (see "Quarantine"
+   below): withheld, still probing, asserting neither `Member` nor a non-member state. It leaves that hold only when
+   the removal commit (or other group-evolution input that restores decryption) arrives — never by guessing.
 
-Because the removal commit is not guaranteed to arrive before a post-removal message, path 2 is a required fallback, not
-an edge case. A client that surfaces removal only on path 1 will silently keep a dead group active. The mechanism for
-path 2 lives above the MLS layer; the disposition of the undecryptable post-removal message itself follows the ordinary
-inbound rules (deferred while the missing commit may still be fetched, terminal only when it cannot).
+The `Left` vs `Evicted` reason comes only from the applied removal commit, so every route preserves it. A client MUST
+NOT fabricate a reason it has not read from an applied commit.
+
+This design accepts an irreducible limit: a removed client that receives nothing at all — no later traffic, no notice —
+is indistinguishable from a member of a quiet group, and no mechanism at any layer can distinguish them. The guarantee
+is therefore eventual, not immediate: participation resolves to `Left`/`Evicted` once the removal commit is delivered
+by any route, and a client keeps the discovery mechanisms above active rather than leaving a dead group readable as
+`Member` indefinitely.
 
 ### Quarantine
 
-A client places a group in `Quarantined` when it cannot safely treat the group as live but has no authoritative eviction
-signal — for example, stored group material fails to load or validate, or a durable invariant check fails. Quarantine is
-a hold, not a verdict about membership.
+A client places a group in `Quarantined` when it cannot safely treat the group as live but holds no applied removal
+commit. Quarantine is a hold, not a verdict about membership, and it carries a reason so surfaces and recovery flows
+can tell the holds apart — the two reasons have opposite expected exits:
 
-While a group is `Quarantined`:
+- `pending_membership`: undecryptable traffic suggests the local identity may have been removed, and the discovery
+  probes in "Reaching a non-member state" have not yet recovered the removal commit. The expected exit is resolution:
+  the removal commit arrives and the group transitions to `Left`/`Evicted`, or recovered group-evolution input
+  restores decryption and the group returns to `Member`.
+- `integrity_hold`: stored group material fails to load or validate, or a durable invariant check fails. The expected
+  exit is repair: a verified repair path returns the group to live processing, or resolves it to a non-member state.
+
+While a group is `Quarantined`, under either reason:
 
 - it MUST be excluded from the live group set and from live inbound and convergence processing;
 - every group accessor MUST agree that the group is withheld: a client MUST NOT expose a durable roster through one
@@ -205,8 +228,8 @@ While a group is `Quarantined`:
 ### Participation and public surfaces
 
 Public group APIs MUST let a caller distinguish a live member group, a non-member group, `Quarantined`, and "no such
-group" from one another, and MUST preserve the non-member reason (`Left` vs `Evicted`) whenever it is known — that is,
-whenever the removal commit has been obtained. A group whose non-membership was only inferred, with the reason not yet
-resolved, is represented as `Quarantined` (withheld) rather than being assigned an arbitrary reason. Collapsing a
-non-member or `Quarantined` group into either "active member" or "unknown group" is a defect: the first keeps a dead
-group usable; the second loses the fact that the group existed and why it is no longer live.
+group" from one another. Because `Left`/`Evicted` are reached only by applying the removal commit, a non-member state
+always carries its reason; a group whose membership is merely in doubt is reported as `Quarantined` with its quarantine
+reason (`pending_membership` vs `integrity_hold`) rather than being assigned a participation it cannot prove.
+Collapsing a non-member or `Quarantined` group into either "active member" or "unknown group" is a defect: the first
+keeps a dead group usable; the second loses the fact that the group existed and why it is no longer live.

@@ -13,6 +13,10 @@ chooses group state, and a preview record never substitutes for the authoritativ
 binding is not required to display agent output: a `receive` member can ignore QUIC candidates and render the final
 kind `9` MLS message.
 
+Because this binding carries no group-evolution input and has no recipient inbox address, the missed-input recovery and
+removal notice checklist items ([README.md](./README.md)) do not apply here: both are owned by the active group
+transport.
+
 ## Scope
 
 This binding owns:

@@ -1,0 +1,9 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupParticipation::Quarantined\n{ reason: QuarantineReason::PendingMembership }"
+---
+{
+  "Quarantined": {
+    "reason": "PendingMembership"
+  }
+}

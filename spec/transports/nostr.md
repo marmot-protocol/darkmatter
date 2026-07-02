@@ -181,6 +181,36 @@ A receiver MUST reject a welcome that is not addressed to its own account identi
 A receiver MUST reject a kind `444` rumor whose content is not valid base64, whose `e` tag is missing or not a
 32-byte hex Nostr event id, or whose `relays` tag is missing or empty.
 
+## Removal notice delivery
+
+Nostr removal notices reinforce delivery of a removal commit to the member it removes
+([../protocol-core/member-departure.md](../protocol-core/member-departure.md), "Removal notices"). They use NIP-59
+gift wraps with the same layering as welcomes: the outer relay event is kind `1059`, containing a kind `13` seal,
+containing an unsigned kind `451` Marmot removal notice rumor.
+
+The gift-wrap recipient is the removed member's Nostr public key, and the notice is published to that account's kind
+`10050` inbox relay set ("Account inbox relays" above).
+
+The inner kind `451` rumor MUST include:
+
+- `content`: the JSON-serialized kind `445` event that carries the removal commit, exactly as published to the group's
+  relays (the stringified-event convention NIP-18 reposts use);
+- `h` tag: the lowercase hex `nostr_group_id` of the group, mirroring the kind `445` `h` tag;
+- `e` tag: the Nostr event id of that kind `445` event.
+
+It MAY include a `relays` tag with relay URLs, using the relay URL profile above, where that kind `445` event is
+fetchable. The inner rumor MUST NOT have a `sig` field.
+
+A receiver MUST reject a notice that is not addressed to its own account identity, and MUST ignore a notice for a
+group it has no state for (`unknown_group`). The embedded kind `445` event MUST pass the same validation as a fetched
+one — valid event id and Nostr signature, exactly one `h` tag whose value matches the rumor's `h` tag, base64 content
+of at least 28 decoded bytes — and is then handed to the ordinary inbound pipeline: outer decryption with retained
+candidate keys, deduplication on the recovered MLS bytes, and protocol-core convergence. A notice carries no authority
+of its own: participation changes only if the recovered commit validates and applies as a removal of the local
+identity ([../protocol-core/group-state.md](../protocol-core/group-state.md), "Reaching a non-member state"). A notice
+whose embedded event is missing, invalid, or does not resolve to such a commit is ignored; before discarding, the
+receiver MAY fall back to fetching the `e`-referenced event from the `relays` hints or the group's relay list.
+
 ## KeyPackage publication
 
 Nostr KeyPackages use kind `30443`.
@@ -250,6 +280,21 @@ A Nostr transport client subscribes to:
 Clients SHOULD use a `since` value when resubscribing if they have a retained transport timestamp. The timestamp is a
 fetch hint only.
 
+### Membership backfill probe
+
+The membership backfill probe is this binding's missed-input recovery mechanism (the checklist item in
+[README.md](./README.md); the recovery obligation is
+[../protocol-core/group-state.md](../protocol-core/group-state.md), "Reaching a non-member state"). When a group holds
+undecryptable kind `445` events — content no retained candidate key authenticates ("Outer decryption and epoch
+selection" above) — the client MUST re-fetch kind
+`445` events for the group's `nostr_group_id`, and any prior routing id the rotation rules still require, from the
+full relay list in `marmot.transport.nostr.routing.v1`, with `since` set a local slack before the transport timestamp
+of the last kind `445` event the client successfully consumed for that group. The window bounds the query; the
+recovered events flow through ordinary validation, deduplication, and convergence, so the probe never chooses group
+state — it only recovers candidate bytes that may include the missed removal commit. The probe MAY be repeated with
+backoff; when it stays dry past the local policy bound, the group is held under the quarantine rules in
+[../protocol-core/group-state.md](../protocol-core/group-state.md) rather than probed forever.
+
 ## Publish targets and acknowledgements
 
 Group messages are published to the relay list in `marmot.transport.nostr.routing.v1`, after applying any local safety
@@ -273,6 +318,8 @@ A Nostr transport client MUST validate the outer event enough to classify it bef
   MUST have base64 content whose decoded length is at least 28 bytes;
 - kind `1059` welcomes MUST be signed Nostr events and MUST have a `p` tag;
 - kind `444` welcome rumors MUST have `e` and `relays` tags after NIP-59 unwrapping;
+- kind `451` removal notice rumors MUST have `h` and `e` tags after NIP-59 unwrapping, and their embedded kind `445`
+  event MUST pass kind `445` validation before it is handed to the peeler ("Removal notice delivery" above);
 - kind `30443` KeyPackage event content MUST be base64-encoded `MLSMessage` bytes whose wire format is
   `mls_key_package`;
 - fields that claim to be hex or base64 MUST decode successfully;
@@ -304,6 +351,9 @@ Relays see only transport-envelope metadata, never plaintext or MLS secrets:
 - welcomes are NIP-59 gift wraps addressed to the invitee's account public key; the inbox address is the deliberate
   account-addressing exception ([../foundation/identity.md](../foundation/identity.md)). The gift wrap and seal hide the
   sender and the inner `kind 444` rumor.
+- removal notices are NIP-59 gift wraps addressed to the removed member's account public key, the same
+  account-addressing exception as welcomes. The group id, embedded commit event, and sender stay inside the seal;
+  relays see only the kind `1059` envelope.
 - kind `30443` KeyPackage events are authored by the account identity, because their purpose is to let others find that
   account's packages.
 

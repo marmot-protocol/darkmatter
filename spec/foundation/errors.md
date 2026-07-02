@@ -72,9 +72,10 @@ never be processed. `MissingRetainedAnchor` is storage loss: required retained s
 gone, canonical group state does not change, and the group moves to `Unrecoverable` (a group lifecycle state, not a
 disposition) until a verified repair path exists; the input stays deferred rather than terminal.
 
-Non-membership (`Left` / `Evicted`) is a participation state, not a convergence disposition — it is reached by applying
-the removal commit or by deriving it above MLS, per [group-state.md](../protocol-core/group-state.md), not read off an
-inbound message. The `evicted` category is only for classifying an inbound message that arrives for a group this
+Non-membership (`Left` / `Evicted`) is a participation state, not a convergence disposition — it is reached only by
+applying the removal commit, whether delivered in order, recovered through the transport's missed-input recovery, or
+carried by a removal notice (per [group-state.md](../protocol-core/group-state.md)); it is never asserted from an
+undecryptable message or an unverified notice. The `evicted` category is only for classifying an inbound message that arrives for a group this
 identity is no longer a member of; such input is `stale`.
 
 `PreMembership` is terminal by design: the input falls outside every interval during which this identity was a member of

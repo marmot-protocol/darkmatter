@@ -18,7 +18,7 @@ use cgka_traits::engine::{
     SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::group::{Group, GroupParticipation, Member};
+use cgka_traits::group::{Group, GroupParticipation, Member, QuarantineReason};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
@@ -620,7 +620,18 @@ fn snapshot_group_participation() {
     insta::assert_json_snapshot!("participation_member", GroupParticipation::Member);
     insta::assert_json_snapshot!("participation_left", GroupParticipation::Left);
     insta::assert_json_snapshot!("participation_evicted", GroupParticipation::Evicted);
-    insta::assert_json_snapshot!("participation_quarantined", GroupParticipation::Quarantined);
+    insta::assert_json_snapshot!(
+        "participation_quarantined_pending_membership",
+        GroupParticipation::Quarantined {
+            reason: QuarantineReason::PendingMembership
+        }
+    );
+    insta::assert_json_snapshot!(
+        "participation_quarantined_integrity_hold",
+        GroupParticipation::Quarantined {
+            reason: QuarantineReason::IntegrityHold
+        }
+    );
 }
 
 #[test]

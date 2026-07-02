@@ -25,6 +25,13 @@ Each transport document MUST define:
 - envelope bytes for MLS Welcome delivery;
 - publish targets and acknowledgement rules;
 - receive filters or fetch rules;
+- missed-input recovery: how a client re-obtains group-evolution input it did not receive — replayable history with a
+  recovery fetch rule, or delivery guarantees under which group-evolution input cannot be missed. Protocol-core
+  participation transitions depend on this ([../protocol-core/group-state.md](../protocol-core/group-state.md),
+  "Reaching a non-member state");
+- envelope bytes for removal notice delivery when the transport has a recipient inbox address
+  ([../protocol-core/member-departure.md](../protocol-core/member-departure.md), "Removal notices"), or an explicit
+  statement that the binding does not carry removal notices;
 - duplicate ids and replay handling inputs;
 - stale-input hints, if the envelope carries any;
 - validation that runs before MLS peeling;

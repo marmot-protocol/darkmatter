@@ -1,5 +1,0 @@
----
-source: crates/traits/tests/snapshots.rs
-expression: "GroupParticipation::Quarantined"
----
-"Quarantined"

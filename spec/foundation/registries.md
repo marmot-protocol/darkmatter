@@ -92,6 +92,7 @@ list) — are not Marmot-owned and are defined in [../transports/nostr.md](../tr
 | `448`   | Push token list response            | Marmot app payload                  | [push-notifications.md](../features/push-notifications.md) |
 | `449`   | Push token removal                  | Marmot app payload                  | [push-notifications.md](../features/push-notifications.md) |
 | `450`   | Multi-device identity proof event   | Local signing template, not relayed | [multi-device.md](../features/multi-device.md)          |
+| `451`   | Marmot removal notice rumor         | Nostr account transport             | [nostr.md](../transports/nostr.md)                      |
 | `1009`  | Message edit                        | Marmot app payload                  | [application-messages.md](application-messages.md)      |
 | `1200`  | Agent text stream start             | Marmot app payload                  | [agent-text-streams-quic.md](../features/agent-text-streams-quic.md) |
 | `1201`  | Agent activity                      | Marmot app payload                  | [agent-text-streams-quic.md](../features/agent-text-streams-quic.md) |
