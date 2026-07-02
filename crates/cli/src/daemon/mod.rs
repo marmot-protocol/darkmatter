@@ -402,9 +402,19 @@ async fn handle_execute_connection(
         return Ok(());
     }
     // Stream-compose commands mutate the compose session map and the runtime host together, so
-    // that low-traffic QUIC-preview path keeps the lock for its (short) duration. Only Stream
-    // commands can be compose commands, so non-Stream commands never take the lock here.
-    if matches!(cli.command, crate::Command::Stream { .. }) {
+    // that low-traffic QUIC-preview path keeps the lock for its (short) duration. Gate on the
+    // compose subcommands specifically: non-compose stream commands (start/finish/watch/send) are
+    // hosted-runtime commands and must not take the workers lock here, or they would block behind
+    // an unrelated busy workers mutex before falling through to the off-lock hosted path.
+    if matches!(
+        cli.command,
+        crate::Command::Stream {
+            command: crate::StreamCommand::ComposeOpen { .. }
+                | crate::StreamCommand::ComposeAppend { .. }
+                | crate::StreamCommand::ComposeFinish { .. }
+                | crate::StreamCommand::ComposeCancel { .. },
+        }
+    ) {
         let compose_output = {
             let mut guard = workers.lock().await;
             let guard = &mut *guard;
