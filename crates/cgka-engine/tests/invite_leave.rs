@@ -803,15 +803,36 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
         })
         .await
         .unwrap();
-    let (readd_pending, re_welcome) = match readd {
+    let (readd_pending, re_welcome, readd_commit) = match readd {
         SendResult::GroupEvolution {
+            msg,
             mut welcomes,
             pending,
-            ..
-        } => (pending, welcomes.remove(0)),
+        } => (pending, welcomes.remove(0), msg),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
     alice.confirm_published(readd_pending).await.unwrap();
+
+    // Post-eviction group traffic classifies as `evicted` (stale, terminal):
+    // an evicted client was removed from the ratchet, cannot apply a later
+    // commit for the group, and MUST NOT try (spec group-state.md).
+    // Reinstatement arrives only through the fresh Welcome below.
+    let routed_readd_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..readd_commit
+    };
+    let evicted_outcome = bob.ingest(routed_readd_commit).await.unwrap();
+    assert!(
+        matches!(
+            evicted_outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::Evicted
+            }
+        ),
+        "post-eviction commit should classify as Stale(Evicted); got {evicted_outcome:?}"
+    );
 
     // 4. Bob ingests the NEW Welcome and must successfully re-join: emit
     //    GroupJoined, the group is visible again, and bob is a member. Before

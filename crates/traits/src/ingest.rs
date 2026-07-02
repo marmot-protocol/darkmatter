@@ -46,6 +46,13 @@ pub enum StaleReason {
     /// retryable depending on whether the engine has evidence that another
     /// epoch context could later peel it.
     PeelFailed,
+    /// The local identity is no longer a member of this group (participation
+    /// `Left` or `Evicted`, or the live MLS state is inactive from a merged
+    /// removal): further inbound can no longer affect the group and is stale
+    /// with the `evicted` category (spec/foundation/errors.md). Reaching the
+    /// non-member state itself is a participation transition, never derived
+    /// from this classification.
+    Evicted,
 }
 
 /// Decrypted inbound message ready for engine processing.

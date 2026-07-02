@@ -347,6 +347,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::PeelFailed
         }
     );
+    insta::assert_json_snapshot!(
+        "stale_evicted",
+        IngestOutcome::Stale {
+            reason: StaleReason::Evicted
+        }
+    );
 }
 
 #[test]

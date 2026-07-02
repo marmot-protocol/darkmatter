@@ -132,6 +132,26 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 Ok(Some(g)) => g,
                 Ok(None) => {
+                    // No live MLS state. If the durable record says we are no
+                    // longer a member, this is post-departure traffic for a
+                    // tombstoned group — `evicted` classification, terminal —
+                    // not an unknown group (spec/foundation/errors.md scopes
+                    // `unknown_group` to "no state at all").
+                    if matches!(
+                        self.storage.get_group(&group_id).map(|g| g.participation),
+                        Ok(cgka_traits::GroupParticipation::Left
+                            | cgka_traits::GroupParticipation::Evicted)
+                    ) {
+                        self.persist_transport_message_for_existing_group(
+                            msg,
+                            &group_id,
+                            EpochId(0),
+                            MessageState::Failed,
+                        )?;
+                        return Ok(IngestOutcome::Stale {
+                            reason: StaleReason::Evicted,
+                        });
+                    }
                     self.persist_transport_message_for_existing_group(
                         msg,
                         &group_id,
@@ -167,7 +187,7 @@ impl<S: StorageProvider> Engine<S> {
                     MessageState::Failed,
                 )?;
                 return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
+                    reason: StaleReason::Evicted,
                 });
             }
             if !self.epoch_manager.can_ingest(&group_id) {
@@ -599,7 +619,7 @@ impl<S: StorageProvider> Engine<S> {
                     self.repair_participation_if_member_claims_inactive_group(&group_id)?;
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
+                        reason: StaleReason::Evicted,
                     });
                 }
                 Err(e) => {
