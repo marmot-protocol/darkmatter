@@ -1435,6 +1435,7 @@ fn build(intent: AppMessageIntent) -> MarmotInnerEvent {
 fn chat_intent_builds_kind_nine_with_no_tags() {
     let event = build(AppMessageIntent::Chat {
         content: "hello".to_owned(),
+        extra_tags: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert_eq!(event.content, "hello");
@@ -1481,6 +1482,7 @@ fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
     let event = build(AppMessageIntent::Reply {
         target_message_id: "parent".to_owned(),
         text: "sure".to_owned(),
+        extra_tags: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert_eq!(event.content, "sure");
@@ -1709,6 +1711,7 @@ fn group_system_intent_builds_kind_1210_json_payload() {
 fn received_event_decodes_when_id_and_sender_match() {
     let event = build(AppMessageIntent::Chat {
         content: "hi".to_owned(),
+        extra_tags: Vec::new(),
     });
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);
@@ -1824,6 +1827,7 @@ fn received_media_message_with_malformed_reference_is_rejected() {
 fn received_event_with_tampered_id_is_rejected() {
     let mut event = build(AppMessageIntent::Chat {
         content: "hi".to_owned(),
+        extra_tags: Vec::new(),
     });
     // Mutate the content without recomputing the id: the canonical id no
     // longer matches, so the strict decoder must reject it.
@@ -1840,6 +1844,7 @@ fn received_event_with_tampered_id_is_rejected() {
 fn received_event_with_wrong_sender_is_rejected() {
     let event = build(AppMessageIntent::Chat {
         content: "hi".to_owned(),
+        extra_tags: Vec::new(),
     });
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);

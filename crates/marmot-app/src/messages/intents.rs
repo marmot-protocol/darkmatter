@@ -146,6 +146,31 @@ fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     tags
 }
 
+/// The one host-defined `extra_tags` tag name Marmot will carry today: a
+/// message effect, e.g. `["effect", "fire"]`.
+const EFFECT_TAG: &str = "effect";
+
+/// Filter host-supplied `extra_tags` down to the tags Marmot is willing to
+/// carry on an outgoing chat/reply event.
+///
+/// `extra_tags` is a public authoring escape hatch, but a kind-9 event's tags
+/// are load-bearing on the receive side: `e`/`q` mark a row as a reply, `imeta`
+/// marks it as media, `stream*` marks it as an agent-stream final. Carrying
+/// arbitrary tags verbatim would let a plain text send be projected as a
+/// reply/media/stream message, so we whitelist rather than blacklist: only a
+/// well-formed `["effect", <value>]` tag survives. Everything else — reserved
+/// protocol tags, unknown names, and malformed effect tags — is dropped. When
+/// the set of app-defined tags grows, widen this whitelist deliberately.
+fn sanitized_extra_tags(extra_tags: &[Vec<String>]) -> Vec<Vec<String>> {
+    extra_tags
+        .iter()
+        .filter(|tag| {
+            matches!(tag.as_slice(), [name, value] if name == EFFECT_TAG && !value.is_empty())
+        })
+        .cloned()
+        .collect()
+}
+
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.
@@ -159,6 +184,13 @@ const STREAM_FINAL_KIND_CHAT: &str = "9";
 pub(crate) enum AppMessageIntent {
     Chat {
         content: String,
+        /// Extra application-defined tags appended to the kind-9 event (after the
+        /// protocol-derived ones). Lets host apps carry out-of-band metadata as a
+        /// real nostr tag instead of smuggling it into the visible body. Only a
+        /// well-formed `["effect", <value>]` tag is carried today; every other
+        /// tag (reserved protocol tags included) is dropped by
+        /// [`sanitized_extra_tags`]. Empty for a plain chat.
+        extra_tags: Vec<Vec<String>>,
     },
     Reaction {
         target_message_id: String,
@@ -170,6 +202,8 @@ pub(crate) enum AppMessageIntent {
     Reply {
         target_message_id: String,
         text: String,
+        /// See [`AppMessageIntent::Chat::extra_tags`].
+        extra_tags: Vec<Vec<String>>,
     },
     Edit {
         target_message_id: String,
@@ -241,11 +275,14 @@ pub(crate) fn build_inner_event(
         )
     };
     match intent {
-        AppMessageIntent::Chat { content } => Ok(event(
-            MARMOT_APP_EVENT_KIND_CHAT,
-            mention_p_tags(content),
-            content.clone(),
-        )),
+        AppMessageIntent::Chat {
+            content,
+            extra_tags,
+        } => {
+            let mut tags = mention_p_tags(content);
+            tags.extend(sanitized_extra_tags(extra_tags));
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, content.clone()))
+        }
         AppMessageIntent::Reaction {
             target_message_id,
             emoji,
@@ -265,6 +302,7 @@ pub(crate) fn build_inner_event(
         AppMessageIntent::Reply {
             target_message_id,
             text,
+            extra_tags,
         } => {
             validate_message_ref(target_message_id)?;
             if text.trim().is_empty() {
@@ -277,6 +315,7 @@ pub(crate) fn build_inner_event(
                 vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
             ];
             tags.extend(mention_p_tags(text));
+            tags.extend(sanitized_extra_tags(extra_tags));
             Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, text.clone()))
         }
         AppMessageIntent::Edit {
@@ -675,9 +714,81 @@ mod mention_tests {
         let npub = npub_for_account_id(&hex).unwrap();
         let intent = AppMessageIntent::Chat {
             content: format!("yo nostr:{npub}"),
+            extra_tags: Vec::new(),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn chat_intent_carries_effect_tag_and_drops_everything_else() {
+        let intent = AppMessageIntent::Chat {
+            content: "hello".to_owned(),
+            extra_tags: vec![
+                vec!["effect".to_owned(), "fire".to_owned()],
+                Vec::new(),                               // malformed — dropped
+                vec!["effect".to_owned()],                // no value — dropped
+                vec!["effect".to_owned(), String::new()], // empty value — dropped
+                vec!["effect".to_owned(), "fire".to_owned(), "x".to_owned()], // trailing field — dropped
+                vec!["e".to_owned(), "ff".repeat(32)], // reserved reply ref — dropped
+                vec!["imeta".to_owned(), "url ...".to_owned()], // reserved media — dropped
+                vec!["stream".to_owned(), "x".to_owned()], // reserved stream — dropped
+            ],
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert_eq!(event.content, "hello", "body must stay clean");
+        assert!(
+            event
+                .tags
+                .contains(&vec!["effect".to_owned(), "fire".to_owned()])
+        );
+        assert!(
+            event
+                .tags
+                .iter()
+                .all(|t| t.first().map(String::as_str) != Some("e")),
+            "reserved 'e' tag must not be injectable via extra_tags"
+        );
+        assert!(
+            event
+                .tags
+                .iter()
+                .all(|t| t.first().map(String::as_str) != Some("imeta")),
+            "reserved 'imeta' tag must not be injectable via extra_tags"
+        );
+        assert!(
+            event
+                .tags
+                .iter()
+                .all(|t| t.first().map(String::as_str) != Some("stream")),
+            "reserved 'stream' tag must not be injectable via extra_tags"
+        );
+        // Only the one well-formed effect tag rode along beside the derived p-tags.
+        assert_eq!(
+            event
+                .tags
+                .iter()
+                .filter(|t| t.first().map(String::as_str) == Some("effect"))
+                .count(),
+            1,
+            "only the well-formed effect tag survives"
+        );
+    }
+
+    #[test]
+    fn reply_intent_appends_extra_tags() {
+        let target = "ff".repeat(32);
+        let intent = AppMessageIntent::Reply {
+            target_message_id: target.clone(),
+            text: "re".to_owned(),
+            extra_tags: vec![vec!["effect".to_owned(), "love".to_owned()]],
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert!(
+            event
+                .tags
+                .contains(&vec!["effect".to_owned(), "love".to_owned()])
+        );
     }
 
     #[test]
@@ -688,6 +799,7 @@ mod mention_tests {
         let intent = AppMessageIntent::Reply {
             target_message_id: target.clone(),
             text: format!("re nostr:{npub}"),
+            extra_tags: Vec::new(),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(

@@ -1039,7 +1039,10 @@ impl AppClient {
         let (_event, summary) = self
             .send_app_event_with_local_projection(
                 group_id,
-                AppMessageIntent::Chat { content },
+                AppMessageIntent::Chat {
+                    content,
+                    extra_tags: Vec::new(),
+                },
                 on_local_projection,
             )
             .await?;
@@ -1287,6 +1290,7 @@ impl AppClient {
                 AppMessageIntent::Reply {
                     target_message_id: target_message_id.to_owned(),
                     text: text.to_owned(),
+                    extra_tags: Vec::new(),
                 },
             )
             .await?;

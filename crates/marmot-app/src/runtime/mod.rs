@@ -1310,6 +1310,40 @@ impl MarmotAppRuntime {
         Ok(summary)
     }
 
+    /// Like [`send_message`](Self::send_message), but appends host-supplied
+    /// `extra_tags` to the kind-9 event. The body stays exactly `payload`; the
+    /// tags travel out of band so clients that don't understand them simply
+    /// ignore them and render clean text. Used to carry metadata (e.g. a
+    /// message-effect key) without polluting the visible message content.
+    pub async fn send_message_with_tags(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        payload: Vec<u8>,
+        extra_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let content = String::from_utf8(payload).map_err(|_| {
+            AppError::InvalidAppMessagePayload("chat message must be valid UTF-8".into())
+        })?;
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Chat {
+                    content,
+                    extra_tags,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
     pub async fn send_agent_activity(
         &self,
         account_ref: &str,
@@ -1602,6 +1636,21 @@ impl MarmotAppRuntime {
         target_message_id: &str,
         text: &str,
     ) -> Result<SendSummary, AppError> {
+        self.reply_to_message_with_tags(account_ref, group_id, target_message_id, text, Vec::new())
+            .await
+    }
+
+    /// Like [`reply_to_message`](Self::reply_to_message), but appends
+    /// host-supplied `extra_tags` to the kind-9 reply event (alongside the
+    /// protocol `e`/`q` tags). See [`send_message_with_tags`](Self::send_message_with_tags).
+    pub async fn reply_to_message_with_tags(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        text: &str,
+        extra_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         let summary = self
             .accounts
             .send_app_event(
@@ -1610,6 +1659,7 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Reply {
                     target_message_id: target_message_id.to_owned(),
                     text: text.to_owned(),
+                    extra_tags,
                 },
             )
             .await?;
