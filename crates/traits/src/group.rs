@@ -28,6 +28,12 @@ pub struct Group {
     /// Defaults to `Member` for records written before this field existed.
     #[serde(default)]
     pub participation: GroupParticipation,
+    /// Epoch intervals during which the local identity was a member (see
+    /// [`MembershipInterval`]). Maintained by the participation transitions;
+    /// empty means "no retained history" for legacy records, which fails open
+    /// in [`membership_intervals_contain`].
+    #[serde(default)]
+    pub membership_intervals: Vec<MembershipInterval>,
 }
 
 /// One member of a group, as storage sees it.
@@ -38,6 +44,33 @@ pub struct Group {
 pub struct Member {
     pub id: MemberId,
     pub credential: Vec<u8>,
+}
+
+/// One epoch interval during which the local identity was a member of a
+/// group. Because a group may be left/removed and later rejoined, membership
+/// is a set of intervals, not a single boundary
+/// (spec/foundation/errors.md, `PreMembership`). `ended_at` is `None` for the
+/// currently-open interval and holds the epoch the removing commit reached
+/// once membership ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipInterval {
+    pub joined_at: EpochId,
+    pub ended_at: Option<EpochId>,
+}
+
+/// Whether `epoch` falls inside any retained membership interval.
+///
+/// An EMPTY interval set means "no retained membership history" (legacy
+/// records) and fails open: without history a client MUST NOT classify input
+/// as `PreMembership` (spec/foundation/errors.md scopes the outcome to groups
+/// the client has membership history for).
+pub fn membership_intervals_contain(intervals: &[MembershipInterval], epoch: EpochId) -> bool {
+    if intervals.is_empty() {
+        return true;
+    }
+    intervals.iter().any(|interval| {
+        epoch >= interval.joined_at && interval.ended_at.is_none_or(|ended| epoch <= ended)
+    })
 }
 
 /// The local identity's participation in a group — a dimension orthogonal to
@@ -86,4 +119,47 @@ pub enum QuarantineReason {
     /// Stored group material failed to load or validate, or a durable
     /// invariant check failed.
     IntegrityHold,
+}
+
+#[cfg(test)]
+mod membership_interval_tests {
+    use super::{MembershipInterval, membership_intervals_contain};
+    use crate::types::EpochId;
+
+    #[test]
+    fn empty_history_fails_open() {
+        // No retained history: PreMembership MUST NOT be classified
+        // (errors.md scopes it to groups with membership history).
+        assert!(membership_intervals_contain(&[], EpochId(0)));
+        assert!(membership_intervals_contain(&[], EpochId(999)));
+    }
+
+    #[test]
+    fn intervals_cover_joins_gaps_and_rejoins() {
+        // Member epochs 1..=1, removed, rejoined at 3 (still open).
+        let intervals = [
+            MembershipInterval {
+                joined_at: EpochId(1),
+                ended_at: Some(EpochId(1)),
+            },
+            MembershipInterval {
+                joined_at: EpochId(3),
+                ended_at: None,
+            },
+        ];
+        assert!(
+            !membership_intervals_contain(&intervals, EpochId(0)),
+            "pre-join epochs are outside"
+        );
+        assert!(membership_intervals_contain(&intervals, EpochId(1)));
+        assert!(
+            !membership_intervals_contain(&intervals, EpochId(2)),
+            "the removed gap is outside"
+        );
+        assert!(membership_intervals_contain(&intervals, EpochId(3)));
+        assert!(
+            membership_intervals_contain(&intervals, EpochId(50)),
+            "an open interval extends forward"
+        );
+    }
 }

@@ -79,6 +79,7 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::PeelFailed => "peel_failed",
         StaleReason::Evicted => "evicted",
         StaleReason::Quarantined => "quarantined",
+        StaleReason::PreMembership => "pre_membership",
     }
 }
 

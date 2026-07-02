@@ -533,6 +533,22 @@ impl<S: StorageProvider> Engine<S> {
                         &raw_msg_id,
                         "too_distant_in_the_past",
                     )?;
+                    // The source epoch is readable even though the content is
+                    // not. Outside every retained membership interval it is
+                    // PreMembership — terminal by design: this client was not
+                    // a member when it was sent and can never hold the keys
+                    // (errors.md). Empty history fails open to PeelFailed.
+                    if let Ok(group) = self.storage.get_group(&group_id)
+                        && !group.membership_intervals.is_empty()
+                        && !cgka_traits::membership_intervals_contain(
+                            &group.membership_intervals,
+                            msg_epoch,
+                        )
+                    {
+                        return Ok(IngestOutcome::Stale {
+                            reason: StaleReason::PreMembership,
+                        });
+                    }
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -656,6 +672,13 @@ impl<S: StorageProvider> Engine<S> {
                     }
 
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                    // Deliberately NOT PreMembership even when msg_epoch
+                    // predates every membership interval: a commit older than
+                    // our join is already represented by the state we joined
+                    // with (welcome-before-commit), and AlreadyAtEpoch is its
+                    // established classification. PreMembership is reserved
+                    // for CONTENT this client could never read — the
+                    // too-distant-in-the-past arm above.
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
                     });

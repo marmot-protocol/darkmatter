@@ -39,6 +39,7 @@ pub(crate) fn sample_group(id: GroupId, epoch: u64, members: usize) -> Group {
             .collect(),
         required_capabilities: GroupCapabilities::default(),
         participation: Default::default(),
+        membership_intervals: Vec::new(),
     }
 }
 

@@ -222,6 +222,10 @@ impl<S: StorageProvider> Engine<S> {
             members: projected_members,
             required_capabilities: required_caps,
             participation: GroupParticipation::Member,
+            membership_intervals: vec![cgka_traits::MembershipInterval {
+                joined_at: EpochId(mls_group.epoch().as_u64()),
+                ended_at: None,
+            }],
         };
         self.storage.put_group(&group_record)?;
 
@@ -526,11 +530,23 @@ impl<S: StorageProvider> Engine<S> {
         // membership grant returns the identity to `Member`. Capture the prior
         // participation of any retained record first so the transition is
         // surfaced, not silently overwritten.
-        let prior_participation = self
-            .storage
-            .get_group(&group_id)
-            .ok()
-            .map(|group| group.participation);
+        let prior_record = self.storage.get_group(&group_id).ok();
+        let prior_participation = prior_record.as_ref().map(|group| group.participation);
+        // Retained membership history survives a rejoin: prior intervals stay
+        // closed and the fresh grant opens a new one at the welcome's epoch
+        // (errors.md: membership is a set of intervals, not a boundary).
+        let mut membership_intervals = prior_record
+            .map(|group| group.membership_intervals)
+            .unwrap_or_default();
+        if !membership_intervals
+            .iter()
+            .any(|interval| interval.ended_at.is_none())
+        {
+            membership_intervals.push(cgka_traits::MembershipInterval {
+                joined_at: EpochId(mls_group.epoch().as_u64()),
+                ended_at: None,
+            });
+        }
         let mut group_record = Group {
             id: group_id.clone(),
             name: String::new(),
@@ -541,6 +557,7 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
             ),
             participation: GroupParticipation::Member,
+            membership_intervals,
         };
         mirror_app_components_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;

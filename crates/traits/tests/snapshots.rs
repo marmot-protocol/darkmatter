@@ -359,6 +359,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::Quarantined
         }
     );
+    insta::assert_json_snapshot!(
+        "stale_pre_membership",
+        IngestOutcome::Stale {
+            reason: StaleReason::PreMembership
+        }
+    );
 }
 
 #[test]
@@ -622,6 +628,7 @@ fn snapshot_group_and_member() {
             }],
             required_capabilities: GroupCapabilities::default(),
             participation: GroupParticipation::Member,
+            membership_intervals: vec![],
         }
     );
     // Records persisted before the participation field existed must load as

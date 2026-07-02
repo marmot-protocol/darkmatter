@@ -1427,6 +1427,7 @@ fn dummy_group(group_id: GroupId) -> Group {
         description: String::new(),
         epoch: EpochId(1),
         participation: Default::default(),
+        membership_intervals: Vec::new(),
         members: vec![Member {
             id: MemberId::new(vec![1]),
             credential: vec![1],

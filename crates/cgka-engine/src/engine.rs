@@ -950,6 +950,41 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(());
         }
         group.participation = participation;
+        // Membership intervals ride the same transition (errors.md,
+        // `PreMembership`): ending membership closes the open interval at the
+        // epoch the removing commit reached; a restored `Member` (rejoin or
+        // quarantine resolution) opens a new one. Quarantine holds change no
+        // interval — they assert nothing about membership.
+        match participation {
+            cgka_traits::GroupParticipation::Left | cgka_traits::GroupParticipation::Evicted => {
+                if let Some(open) = group
+                    .membership_intervals
+                    .iter_mut()
+                    .find(|interval| interval.ended_at.is_none())
+                {
+                    // The removing commit advanced the record to `epoch`; the
+                    // last epoch this identity held keys for is the commit's
+                    // SOURCE epoch (`epoch - 1`) — post-removal epochs were
+                    // never readable, so they stay outside the interval.
+                    open.ended_at = Some(EpochId(group.epoch.0.saturating_sub(1)));
+                }
+            }
+            cgka_traits::GroupParticipation::Member => {
+                if !group
+                    .membership_intervals
+                    .iter()
+                    .any(|interval| interval.ended_at.is_none())
+                {
+                    group
+                        .membership_intervals
+                        .push(cgka_traits::MembershipInterval {
+                            joined_at: group.epoch,
+                            ended_at: None,
+                        });
+                }
+            }
+            cgka_traits::GroupParticipation::Quarantined { .. } => {}
+        }
         self.storage
             .put_group(&group)
             .map_err(|e| EngineError::Backend(format!("put_group: {e:?}")))?;

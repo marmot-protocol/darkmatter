@@ -53,6 +53,12 @@ pub enum StaleReason {
     /// non-member state itself is a participation transition, never derived
     /// from this classification.
     Evicted,
+    /// The input's source epoch falls outside every retained interval during
+    /// which the local identity was a member — terminal by design: this
+    /// client can never hold the keys (spec/foundation/errors.md,
+    /// `PreMembership` -> `pre_membership`). Never used for groups without
+    /// retained membership history, and never retried.
+    PreMembership,
     /// The group is withheld (`GroupParticipation::Quarantined`): excluded
     /// from live inbound processing pending an explicit recovery transition
     /// (spec/protocol-core/group-state.md, "Quarantine"). The input is

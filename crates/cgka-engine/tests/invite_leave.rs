@@ -794,6 +794,27 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
         "bob should no longer be a member of his retained record; got {bob_after_remove:?}"
     );
 
+    // While bob is out, alice sends an app message at the post-removal epoch —
+    // an epoch bob never held keys for. Kept for the PreMembership assertion
+    // after the rejoin below.
+    let gap_message = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"sent while bob was out"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => msg,
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+    let routed_gap_message = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..gap_message
+    };
+
     // 3. Alice re-adds bob with a brand-new KeyPackage (never reuse the first).
     let bob_kp_2 = bob.fresh_key_package().await.unwrap();
     let readd = alice
@@ -879,6 +900,31 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
         alice.members(&group_id).unwrap().len(),
         bob_members.len(),
         "alice and bob should agree on the re-added group's membership"
+    );
+
+    // Membership intervals (errors.md, `PreMembership`): the first interval
+    // closed at the last epoch bob held keys for (the removal commit's source
+    // epoch), and the rejoin opened a fresh one at the welcome's epoch.
+    let bob_record = bob.participation(&group_id).unwrap();
+    assert_eq!(bob_record, Some(cgka_traits::GroupParticipation::Member));
+    let bob_group = {
+        // Read via the engine surface: members()+epoch() prove liveness; the
+        // interval shape is asserted through a gap-epoch classification below.
+        bob.epoch(&group_id).unwrap()
+    };
+    let _ = bob_group;
+
+    // A message from inside bob's removed gap: alice sends an app message
+    // while bob is out (epoch 2 for alice, bob's readable epochs are 1 and 3+).
+    let gap_outcome = bob.ingest(routed_gap_message).await.unwrap();
+    assert!(
+        matches!(
+            gap_outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::PreMembership
+            }
+        ),
+        "a gap-epoch message is PreMembership — terminal, never retried; got {gap_outcome:?}"
     );
 }
 
