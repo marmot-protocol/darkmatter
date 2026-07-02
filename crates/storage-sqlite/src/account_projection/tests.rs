@@ -1395,3 +1395,39 @@ fn all_row_count(store: &SqliteAccountStorage, table: &str) -> i64 {
         })
         .unwrap()
 }
+
+#[test]
+fn removed_membership_group_ids_reflect_self_membership_flag() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![group("aa", "alpha"), group("bb", "beta")],
+    };
+    store.save_account_projection_state(&state, 16).unwrap();
+
+    assert!(
+        store
+            .account_group_ids_with_removed_membership()
+            .unwrap()
+            .is_empty(),
+        "fresh rows default to member"
+    );
+
+    store.set_group_self_membership("aa", true).unwrap();
+    assert_eq!(
+        store.account_group_ids_with_removed_membership().unwrap(),
+        vec!["aa".to_owned()],
+        "only the flipped row reports removed membership"
+    );
+
+    // A rejoin flips it back and the group leaves the removed set.
+    store.set_group_self_membership("aa", false).unwrap();
+    assert!(
+        store
+            .account_group_ids_with_removed_membership()
+            .unwrap()
+            .is_empty()
+    );
+}

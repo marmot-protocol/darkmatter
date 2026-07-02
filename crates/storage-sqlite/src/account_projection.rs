@@ -436,6 +436,29 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
+    /// `group_id_hex` of every `account_groups` row whose `self_membership`
+    /// is `'removed'` — groups the local account left or was removed from.
+    /// The routing refresh uses this to keep dead groups out of the live
+    /// subscription set (spec/protocol-core/group-state.md: a non-member group
+    /// is excluded from live processing).
+    pub fn account_group_ids_with_removed_membership(&self) -> StorageResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT group_id_hex
+                 FROM account_groups
+                 WHERE self_membership = 'removed'
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        Ok(ids)
+    }
+
     /// `group_id_hex` of every `account_groups` row whose `self_membership` is
     /// still the migration default `'member'`. Used by the one-time
     /// open/upgrade backfill to decide which legacy rows need their membership

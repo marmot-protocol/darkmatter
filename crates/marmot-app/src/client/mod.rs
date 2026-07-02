@@ -1931,7 +1931,20 @@ impl AppClient {
     }
 
     pub(crate) fn refresh_group_routes(&mut self) -> Result<(), AppError> {
+        // Groups the local account left or was removed from keep their
+        // projection rows (the chat list still renders them) but MUST NOT
+        // rejoin the live routing/subscription set: re-adding a dead group's
+        // route here would silently resubscribe it on the next transport sync
+        // (spec/protocol-core/group-state.md, "Participation").
+        let removed_membership: std::collections::HashSet<String> = self
+            .app
+            .account_group_ids_with_removed_membership(&self.state.label)?
+            .into_iter()
+            .collect();
         for group in &self.state.groups {
+            if removed_membership.contains(&group.group_id_hex) {
+                continue;
+            }
             let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
             self.routing
                 .add_group(group.nostr_routing.subscription(&group_id)?);

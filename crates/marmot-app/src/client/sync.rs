@@ -517,6 +517,50 @@ impl AppClient {
                 self.app
                     .set_group_self_membership(&self.state.label, &group_id_hex, false)?;
             }
+            // Participation is the authoritative live-group gate
+            // (spec/protocol-core/group-state.md): a group the local identity
+            // left, was evicted from, or that is quarantined leaves the
+            // routing table and the transport subscription set NOW —
+            // deterministically, not only when the in-memory group count
+            // happens to change (the `len() != before` gate above misses a
+            // convergence-applied removal, leaving the dead group subscribed
+            // forever). A restored `Member` re-enters the live set the same
+            // way.
+            if let cgka_traits::engine::GroupEvent::ParticipationChanged {
+                group_id,
+                participation,
+            } = event
+            {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                match participation {
+                    cgka_traits::GroupParticipation::Left
+                    | cgka_traits::GroupParticipation::Evicted => {
+                        self.app.set_group_self_membership(
+                            &self.state.label,
+                            &group_id_hex,
+                            true,
+                        )?;
+                        self.routing.remove_group(group_id);
+                        self.sync_runtime_groups().await?;
+                    }
+                    cgka_traits::GroupParticipation::Quarantined { .. } => {
+                        // Withheld, not asserted non-member: no membership
+                        // flag write, but the group leaves live routing until
+                        // an explicit recovery transition.
+                        self.routing.remove_group(group_id);
+                        self.sync_runtime_groups().await?;
+                    }
+                    cgka_traits::GroupParticipation::Member => {
+                        self.app.set_group_self_membership(
+                            &self.state.label,
+                            &group_id_hex,
+                            false,
+                        )?;
+                        self.refresh_group_routes()?;
+                        self.sync_runtime_groups().await?;
+                    }
+                }
+            }
         }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).

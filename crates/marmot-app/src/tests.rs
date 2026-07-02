@@ -1282,6 +1282,37 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
 }
 
 #[test]
+fn app_transport_routing_remove_group_drops_only_that_route() {
+    let routing = AppTransportRouting::new(AppRoutingState {
+        local_inbox_endpoints: Vec::new(),
+        key_package_endpoints: Vec::new(),
+        inbox_routes: HashMap::new(),
+        group_routes: Vec::new(),
+        required_acks: 1,
+    });
+    let keep = cgka_traits::GroupId::new(vec![0xAA; 4]);
+    let drop = cgka_traits::GroupId::new(vec![0xBB; 4]);
+    for (group_id, transport_id) in [(&keep, vec![0x01; 4]), (&drop, vec![0x02; 4])] {
+        routing.add_group(cgka_traits::transport_adapter::TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id: transport_id,
+            endpoints: vec![cgka_traits::transport_adapter::TransportEndpoint(
+                "wss://relay.example".into(),
+            )],
+        });
+    }
+
+    routing.remove_group(&drop);
+
+    let routes = routing.snapshot().group_routes;
+    assert_eq!(routes.len(), 1, "only the removed group's route is dropped");
+    assert_eq!(routes[0].group_id, keep);
+    // Idempotent: removing an absent group is a no-op.
+    routing.remove_group(&drop);
+    assert_eq!(routing.snapshot().group_routes.len(), 1);
+}
+
+#[test]
 fn relay_plane_rebuild_uses_persisted_cursor_with_bounded_overlap() {
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
 

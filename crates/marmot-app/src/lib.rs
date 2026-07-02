@@ -1563,6 +1563,20 @@ impl MarmotApp {
         Ok(())
     }
 
+    /// `group_id_hex` of every `account_groups` row whose local account
+    /// membership ended (`self_membership = 'removed'`). The routing refresh
+    /// filters these out of the live subscription set.
+    pub(crate) fn account_group_ids_with_removed_membership(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .account_group_ids_with_removed_membership()?)
+    }
+
     /// `group_id_hex` of every `account_groups` row still carrying the migration
     /// default `self_membership = 'member'`. The one-time open/upgrade backfill
     /// uses this to derive membership for legacy rows from current engine state.
@@ -2777,6 +2791,18 @@ impl AppTransportRouting {
             return;
         }
         state.group_routes.push(group);
+    }
+
+    /// Drop a group's route so publishes fail fast and the next transport
+    /// sync unsubscribes it. Participation-driven: a group the local identity
+    /// left, was evicted from, or that is quarantined must leave the live
+    /// routing set deterministically, not only when the in-memory group count
+    /// happens to change (spec/protocol-core/group-state.md).
+    fn remove_group(&self, group_id: &GroupId) {
+        let mut state = self.write();
+        state
+            .group_routes
+            .retain(|route| &route.group_id != group_id);
     }
 
     fn snapshot(&self) -> AppRoutingState {
