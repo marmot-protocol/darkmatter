@@ -135,39 +135,51 @@ The lifecycle states and convergence status above describe how a client converge
 They do not describe whether the local identity is still a live member of that group. That is a separate, orthogonal
 dimension: a group can be `Stable` and `Settled` and yet no longer include the local identity.
 
-Participation has three states:
+Participation has four states:
 
 - `Member`: the local identity is present in the group's canonical roster. This is the only participation state in
   which a client MAY prepare local group-state commits or emit delivered app payloads for the group.
-- `Evicted`: the local identity is authoritatively no longer a member of the group. The group is inactive for this
-  identity: the client MUST NOT prepare commits, MUST NOT send app payloads, and SHOULD present the group as removed.
+- `Left`: the local identity voluntarily departed — its SelfRemove was committed (see
+  [member-departure.md](./member-departure.md)). Non-member; the group is inactive for this identity.
+- `Evicted`: the local identity was removed by another member. Non-member; the group is inactive for this identity.
 - `Quarantined`: the group is excluded from live processing and from the live group set pending an explicit recovery
-  transition. A quarantined group is neither trusted as `Member` nor asserted as `Evicted`; it is withheld.
+  transition. A quarantined group is neither trusted as a live member group nor asserted non-member; it is withheld.
 
-Participation is orthogonal to the lifecycle state, but two couplings hold. `Evicted` and `Quarantined` are terminal for
-normal processing the same way `Unrecoverable` is: a client MUST NOT apply group-state changes or release outbound work
-while in them. Unlike `Unrecoverable` — a convergence failure the client MAY repair from retained material — `Evicted`
-reflects the canonical group's authoritative decision about membership. It clears only through a verified rejoin or
-reinstatement path — normally a new Welcome to a later epoch, or another explicit protocol-defined reinstatement. An
-evicted client does not clear `Evicted` by resuming normal in-group processing: it was removed from the ratchet, so it
-cannot apply a later add commit for that group, and it MUST NOT try. Reinstatement returns the identity to `Member`
-through a fresh membership grant, not through the evicted group's own inbound stream.
+`Left` and `Evicted` are kept distinct — mirroring the `MemberLeft` vs `MemberRemoved` distinction elsewhere — so a
+surface can tell "you left" from "you were removed" without labeling one as the other. A client that does not need the
+distinction MAY treat both as a single non-member state, but the protocol MUST preserve the reason.
 
-### Authoritative eviction
+Participation is orthogonal to the lifecycle state, but two couplings hold. `Left`, `Evicted`, and `Quarantined` are
+terminal for normal processing the same way `Unrecoverable` is: a client MUST NOT apply group-state changes or release
+outbound work while in them. Unlike `Unrecoverable` — a convergence failure the client MAY repair from retained
+material — `Left` and `Evicted` reflect the canonical group's membership. They clear only through a verified rejoin or
+reinstatement path — normally a new Welcome to a later epoch, or another explicit protocol-defined reinstatement. A
+non-member client does not return to `Member` by resuming normal in-group processing: it was removed from the ratchet,
+so it cannot apply a later commit for that group, and it MUST NOT try. Reinstatement returns the identity to `Member`
+through a fresh membership grant, not through the group's own inbound stream.
 
-A client becomes `Evicted` when it observes an authoritative statement that the local identity is no longer a member.
-There are two such statements, and a client MUST honor both:
+### Reaching a non-member state
 
-1. **Applied removal.** The client applies the commit that removes the local identity; the roster diff shows self in the
-   removed set. This is the clean path.
-2. **Observed eviction without the removal commit.** The client never applied the specific removal commit — relay
-   timing or ordering meant a later, post-eviction message arrived first — and MLS reports that the local identity has
-   been evicted (the `SelfEvicted` outcome in [../foundation/errors.md](../foundation/errors.md)). The MLS layer stating
-   "you have been evicted" is authoritative. A client MUST NOT discard it: it MUST transition participation to `Evicted`
-   even though the exact removal commit was never applied, rather than leaving the group readable as `Member`.
+Removal authority in MLS is carried only by the commit that removes the identity. A client reaches `Left`/`Evicted`
+through one of two paths, and a correct client handles both:
 
-Because the removal commit is not guaranteed to arrive before a post-eviction message, path 2 is a required fallback, not
-an edge case. A client that surfaces eviction only on path 1 will silently keep an evicted group active.
+1. **Applied removal.** The client applies the commit that removes the local identity (its own SelfRemove for `Left`, a
+   peer's removal for `Evicted`); the roster diff after merging that commit shows self in the removed set. This is the
+   clean path, and it is the only path on which MLS itself changes membership.
+2. **Removal commit not applied.** Relay timing or ordering meant the client never applied that specific removal commit
+   and instead sees a later, post-removal message. MLS gives **no** eviction signal here: with the removal commit
+   unmerged the group is still active, and the later message merely fails to decrypt as a wrong-epoch / no-matching-secret
+   message — indistinguishable at the MLS layer from a future-epoch or corrupt message. The MLS `UseAfterEviction` guard
+   is **not** this signal: it fires only once the group is already inactive from a merged self-removal, i.e. it is
+   path-1 aftermath, not a fresh discovery. A client MUST therefore derive non-membership **above MLS** in this case,
+   by either obtaining and applying the missing removal commit (convergence backfill, after which path 1 applies) or
+   inferring non-membership from authenticated roster / relay state. A client MUST NOT leave the group readable as
+   `Member` indefinitely merely because the removal commit was reordered.
+
+Because the removal commit is not guaranteed to arrive before a post-removal message, path 2 is a required fallback, not
+an edge case. A client that surfaces removal only on path 1 will silently keep a dead group active. The mechanism for
+path 2 lives above the MLS layer; the disposition of the undecryptable post-removal message itself follows the ordinary
+inbound rules (deferred while the missing commit may still be fetched, terminal only when it cannot).
 
 ### Quarantine
 
@@ -186,6 +198,7 @@ While a group is `Quarantined`:
 
 ### Participation and public surfaces
 
-Public group APIs MUST let a caller distinguish `Member`, `Evicted`, `Quarantined`, and "no such group" from one
-another. Collapsing `Evicted` or `Quarantined` into either "active member" or "unknown group" is a defect: the first
-keeps a dead group usable; the second loses the fact that the group existed and why it is no longer live.
+Public group APIs MUST let a caller distinguish a live member group, a non-member group (`Left` / `Evicted`, with the
+reason preserved), `Quarantined`, and "no such group" from one another. Collapsing a non-member or `Quarantined` group
+into either "active member" or "unknown group" is a defect: the first keeps a dead group usable; the second loses the
+fact that the group existed and why it is no longer live.

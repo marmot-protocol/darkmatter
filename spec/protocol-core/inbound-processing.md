@@ -78,14 +78,20 @@ Input that cannot affect the group MUST receive a stale disposition. This includ
 - commits that fork from outside the rollback horizon: these are ineligible for branch selection (see
   [convergence.md](./convergence.md), "Eligibility") and, when their source epoch is also older than the retained
   anchor, are reported as `BeyondAnchor`.
-- messages that predate the local identity's membership and can never be decrypted by this client
-  (`PreMembership` -> `pre_membership`). Unlike a deferred `MissingRetainedAnchor`, a pre-membership message is
-  terminal: the client was not a member when it was sent, so no future state makes it processable and it MUST NOT be
-  retried.
+- messages that fall outside every interval during which the local identity was a member of the group
+  (`PreMembership` -> `pre_membership`). Because a group may be left or removed and later rejoined, membership is a set
+  of epoch intervals, not a single boundary: a message inside a prior valid interval may still be recoverable from
+  retained state, while one outside all intervals is terminal. Unlike a deferred `MissingRetainedAnchor`, a
+  `PreMembership` message MUST NOT be retried;
+- messages for a group the local identity is no longer a member of (`evicted`): once participation is `Left` or
+  `Evicted` (see [group-state.md](./group-state.md)), further inbound for that group can no longer affect it and is
+  stale.
 
-An authoritative eviction observed while processing a later message (`SelfEvicted` -> `evicted`) is likewise stale for
-this identity: the triggering input can no longer affect the group. It additionally drives the participation transition
-to `Evicted` in [group-state.md](./group-state.md); the input MUST NOT be silently discarded as a generic peel failure.
+Reaching `Left`/`Evicted` is a participation transition, not a disposition: it is driven by applying the removal commit
+or by deriving non-membership above MLS (see [group-state.md](./group-state.md)), not read off an inbound message's
+processing error. In particular, an undecryptable post-removal message when the removal commit was never applied is an
+ordinary wrong-epoch failure at this layer — `deferred` while the missing commit may still be fetched, terminal only
+when it cannot — and does not by itself establish eviction.
 
 The `snake_case` names in parentheses are the shared categories in [../foundation/errors.md](../foundation/errors.md);
 `BeyondAnchor` is a named convergence outcome that maps to the `stale` disposition and the `stale_epoch` category.
