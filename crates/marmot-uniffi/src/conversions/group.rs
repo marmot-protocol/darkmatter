@@ -321,6 +321,11 @@ pub struct AppGroupMlsStateFfi {
     pub epoch: u64,
     pub member_count: u32,
     pub required_app_components: Vec<u16>,
+    /// Stable participation tag ("member" / "left" / "evicted" /
+    /// "quarantined_pending_membership" / "quarantined_integrity_hold").
+    /// Clients gate the composer and group list on it: only "member" allows
+    /// sending.
+    pub participation: String,
 }
 
 impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
@@ -330,6 +335,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
             epoch: value.epoch,
             member_count: value.member_count as u32,
             required_app_components: value.required_app_components,
+            participation: value.participation,
         }
     }
 }

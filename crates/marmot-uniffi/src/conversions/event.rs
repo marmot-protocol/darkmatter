@@ -133,24 +133,7 @@ pub enum GroupEventKindFfi {
     },
 }
 
-/// Stable, low-cardinality tag for a [`cgka_traits::GroupParticipation`].
-/// String-tagged like [`group_state_change_tag`] so the FFI surface stays
-/// additive when new participation states or quarantine reasons appear.
-pub(crate) fn group_participation_tag(
-    participation: &cgka_traits::GroupParticipation,
-) -> &'static str {
-    match participation {
-        cgka_traits::GroupParticipation::Member => "member",
-        cgka_traits::GroupParticipation::Left => "left",
-        cgka_traits::GroupParticipation::Evicted => "evicted",
-        cgka_traits::GroupParticipation::Quarantined {
-            reason: cgka_traits::QuarantineReason::PendingMembership,
-        } => "quarantined_pending_membership",
-        cgka_traits::GroupParticipation::Quarantined {
-            reason: cgka_traits::QuarantineReason::IntegrityHold,
-        } => "quarantined_integrity_hold",
-    }
-}
+pub(crate) use marmot_app::group_participation_tag;
 
 /// Stable, low-cardinality tag for a [`GroupStateChange`] — surfaced to FFI in
 /// place of re-modeling the member-id-bearing variants. The subject/actor ids

@@ -334,6 +334,7 @@ impl AppClient {
                 .iter()
                 .copied()
                 .collect(),
+            participation: crate::groups::group_participation_tag(&group.participation).to_owned(),
         })
     }
 

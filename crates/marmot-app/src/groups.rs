@@ -71,6 +71,35 @@ pub struct AppGroupMlsState {
     pub epoch: u64,
     pub member_count: usize,
     pub required_app_components: Vec<u16>,
+    /// The local identity's participation in the group, as a stable
+    /// low-cardinality tag (see [`group_participation_tag`]). Clients gate
+    /// the composer and group list on it: only `"member"` allows sending
+    /// (spec/protocol-core/group-state.md, "Participation and public
+    /// surfaces"). Defaults to `"member"` for snapshots serialized before the
+    /// field existed.
+    #[serde(default = "default_participation_member")]
+    pub participation: String,
+}
+
+fn default_participation_member() -> String {
+    group_participation_tag(&cgka_traits::GroupParticipation::Member).to_owned()
+}
+
+/// Stable, low-cardinality tag for a [`cgka_traits::GroupParticipation`].
+/// String-tagged so app and FFI surfaces stay additive when new participation
+/// states or quarantine reasons appear.
+pub fn group_participation_tag(participation: &cgka_traits::GroupParticipation) -> &'static str {
+    match participation {
+        cgka_traits::GroupParticipation::Member => "member",
+        cgka_traits::GroupParticipation::Left => "left",
+        cgka_traits::GroupParticipation::Evicted => "evicted",
+        cgka_traits::GroupParticipation::Quarantined {
+            reason: cgka_traits::QuarantineReason::PendingMembership,
+        } => "quarantined_pending_membership",
+        cgka_traits::GroupParticipation::Quarantined {
+            reason: cgka_traits::QuarantineReason::IntegrityHold,
+        } => "quarantined_integrity_hold",
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1430,5 +1459,49 @@ mod fail_if_publish_failed_tests {
             AppError::Publish(msg) => assert_eq!(msg, "reason-a; reason-b"),
             other => panic!("expected AppError::Publish, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod participation_tag_tests {
+    use super::{AppGroupMlsState, group_participation_tag};
+
+    #[test]
+    fn participation_tags_are_stable_and_snapshots_default_to_member() {
+        // The tag vocabulary crosses the FFI boundary; renames are breaking.
+        assert_eq!(
+            group_participation_tag(&cgka_traits::GroupParticipation::Member),
+            "member"
+        );
+        assert_eq!(
+            group_participation_tag(&cgka_traits::GroupParticipation::Left),
+            "left"
+        );
+        assert_eq!(
+            group_participation_tag(&cgka_traits::GroupParticipation::Evicted),
+            "evicted"
+        );
+        assert_eq!(
+            group_participation_tag(&cgka_traits::GroupParticipation::Quarantined {
+                reason: cgka_traits::QuarantineReason::PendingMembership
+            }),
+            "quarantined_pending_membership"
+        );
+        assert_eq!(
+            group_participation_tag(&cgka_traits::GroupParticipation::Quarantined {
+                reason: cgka_traits::QuarantineReason::IntegrityHold
+            }),
+            "quarantined_integrity_hold"
+        );
+
+        // Pre-field serialized snapshots decode as live members.
+        let legacy = serde_json::json!({
+            "group_id_hex": "aa",
+            "epoch": 3,
+            "member_count": 2,
+            "required_app_components": [],
+        });
+        let decoded: AppGroupMlsState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.participation, "member");
     }
 }
