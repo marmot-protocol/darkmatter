@@ -78,6 +78,24 @@ Input that cannot affect the group MUST receive a stale disposition. This includ
 - commits that fork from outside the rollback horizon: these are ineligible for branch selection (see
   [convergence.md](./convergence.md), "Eligibility") and, when their source epoch is also older than the retained
   anchor, are reported as `BeyondAnchor`.
+- messages that fall outside every interval during which the local identity was a member of the group
+  (`PreMembership` -> `pre_membership`). Because a group may be left or removed and later rejoined, membership is a set
+  of epoch intervals, not a single boundary: a message inside a prior valid interval may still be recoverable from
+  retained state, while one outside all intervals is terminal. This is scoped to groups the client has membership
+  history for; input for a group the client has no state for at all is `unknown_group`, not `PreMembership`. Unlike a
+  deferred `MissingRetainedAnchor`, a `PreMembership` message MUST NOT be retried;
+- messages for a group the local identity is no longer a member of (`evicted`): once participation is `Left` or
+  `Evicted` (see [group-state.md](./group-state.md)), further inbound for that group can no longer affect it and is
+  stale.
+
+Reaching `Left`/`Evicted` is a participation transition, not a disposition: it happens only when the removal commit is
+applied (see [group-state.md](./group-state.md), "Reaching a non-member state"), never read off an inbound message's
+processing error. An undecryptable post-removal message when the removal commit was never applied is an ordinary
+wrong-epoch failure at this layer — `deferred` while the missing commit may still be recovered — but it MUST trigger
+the discovery mechanisms in [group-state.md](./group-state.md): the active transport's missed-input recovery, bounded
+around the last input the client successfully consumed, and resolution of any removal notice. When those probes stay
+dry past the local policy bound, the group moves to `Quarantined` (`pending_membership`) and the input is withheld
+with it, rather than given a terminal disposition it has not earned.
 
 The `snake_case` names in parentheses are the shared categories in [../foundation/errors.md](../foundation/errors.md);
 `BeyondAnchor` is a named convergence outcome that maps to the `stale` disposition and the `stale_epoch` category.

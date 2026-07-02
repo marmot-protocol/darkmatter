@@ -73,6 +73,25 @@ is consumed MUST bound storage and commit eligibility to one retained proposal. 
 under [inbound-processing.md](./inbound-processing.md), and non-identical redundant proposals are stale unless a future
 protocol version defines a distinct retry identity.
 
+## Removal notices
+
+A commit that removes a member severs that member from the group's key schedule: everything after it is undecryptable
+to them, so the removal commit itself is the last group input the removed member can process — and the only artifact
+that can tell them they are out (see [group-state.md](./group-state.md), "Reaching a non-member state"). Delivery of
+that one commit is therefore worth reinforcing beyond the ordinary group stream, which the removed member may fetch
+late, partially, or not at all.
+
+After a commit that removes one or more members is published and applied, and when the active transport binding has a
+recipient inbox address, the committer SHOULD send each removed member a removal notice through that member's account
+inbox. Any other remaining member MAY also send one; duplicate notices collapse through ordinary deduplication of the
+carried commit. The transport binding defines the notice shape; it MUST carry or reference the removal commit so the
+receiver can validate and apply it.
+
+A removal notice is a delivery aid, not an authority: the receiver's participation changes only when the carried or
+fetched commit validates and applies through the ordinary inbound flow (see [group-state.md](./group-state.md)). The
+notice covers both departure paths — the committer of a SelfRemove-only commit notifies the leaver, confirming the
+departure as `Left`, and the committer of an admin removal notifies the removed member, resolving to `Evicted`.
+
 ## Validation
 
 A SelfRemove flow is invalid if:

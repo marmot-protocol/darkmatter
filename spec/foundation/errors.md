@@ -21,6 +21,10 @@ An input that does not produce application content SHOULD map to one of these ca
 - `unsupported_required_feature`: the group requires a feature the client does not understand.
 - `authorization_failed`: the sender or committer is not allowed to make the change.
 - `missing_history`: the client would need retained state it no longer has.
+- `evicted`: the input is for a group this identity is no longer a member of.
+- `pre_membership`: the client has retained membership history for the group, and the input falls outside every interval
+  during which this identity was a member, so it can never be decrypted. A group the client has no state for at all is
+  `unknown_group`, not `pre_membership`.
 - `transport_rejected`: publication or delivery failed at the transport layer.
 
 Protocol-core docs can split these into more detailed outcomes when needed.
@@ -61,11 +65,26 @@ Protocol-core documents name some outcomes in `PascalCase`. Each maps to one dis
 | ----------------------- | ----------- | ----------------- | ----------------------------------------------------------- |
 | `BeyondAnchor`          | `stale`     | `stale_epoch`     | [retained-history.md](../protocol-core/retained-history.md) |
 | `MissingRetainedAnchor` | `deferred`  | `missing_history` | [retained-history.md](../protocol-core/retained-history.md) |
+| `PreMembership`         | `stale`     | `pre_membership`  | [inbound-processing.md](../protocol-core/inbound-processing.md) |
 
 `BeyondAnchor` is window exclusion by design: the source epoch is older than the retained anchor, and the input will
 never be processed. `MissingRetainedAnchor` is storage loss: required retained state inside the rollback horizon is
 gone, canonical group state does not change, and the group moves to `Unrecoverable` (a group lifecycle state, not a
 disposition) until a verified repair path exists; the input stays deferred rather than terminal.
+
+Non-membership (`Left` / `Evicted`) is a participation state, not a convergence disposition — it is reached only by
+applying the removal commit, whether delivered in order, recovered through the transport's missed-input recovery, or
+carried by a removal notice (per [group-state.md](../protocol-core/group-state.md)); it is never asserted from an
+undecryptable message or an unverified notice. The `evicted` category is only for classifying an inbound message that arrives for a group this
+identity is no longer a member of; such input is `stale`.
+
+`PreMembership` is terminal by design: the input falls outside every interval during which this identity was a member of
+the group, so this client can never hold the keys to decrypt it. Because a group may be left/removed and later rejoined,
+membership is a set of epoch intervals, not a single boundary; a client classifies an undecryptable historical message
+against those retained intervals. Input inside a prior valid interval may still be recoverable from retained state and is
+not `PreMembership`. It is scoped to groups the client has membership history for: with no retained state for the group
+at all the input is `unknown_group`, not `PreMembership`. Unlike a deferred `MissingRetainedAnchor`, `PreMembership` MUST
+NOT be deferred or retried.
 
 ## Protocol and local errors
 

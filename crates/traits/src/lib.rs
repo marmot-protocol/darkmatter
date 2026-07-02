@@ -74,7 +74,7 @@ pub use engine_state::{
     Recovering, StagedCommitHandle, WelcomeState,
 };
 pub use error::{EngineError, PeelerError};
-pub use group::{Group, Member};
+pub use group::{Group, GroupParticipation, Member, QuarantineReason};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
 pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 pub use message::{MessageRecord, MessageState, StoredMessagePayload};
