@@ -176,6 +176,12 @@ through one of two paths, and a correct client handles both:
    inferring non-membership from authenticated roster / relay state. A client MUST NOT leave the group readable as
    `Member` indefinitely merely because the removal commit was reordered.
 
+The `Left` vs `Evicted` reason is authoritative only from the removal commit — a self-removal resolves to `Left`, a
+peer's removal to `Evicted` — so path 1, and path 2 via commit backfill, both preserve it. Inference from roster / relay
+state alone can establish that the identity is no longer a member without revealing why. A client MUST NOT fabricate a
+reason in that case: it SHOULD obtain the removal commit to resolve `Left`/`Evicted`, and until it can, it holds the
+group `Quarantined` (withheld — neither asserted `Member` nor assigned a non-member reason) rather than guessing.
+
 Because the removal commit is not guaranteed to arrive before a post-removal message, path 2 is a required fallback, not
 an edge case. A client that surfaces removal only on path 1 will silently keep a dead group active. The mechanism for
 path 2 lives above the MLS layer; the disposition of the undecryptable post-removal message itself follows the ordinary
@@ -198,7 +204,9 @@ While a group is `Quarantined`:
 
 ### Participation and public surfaces
 
-Public group APIs MUST let a caller distinguish a live member group, a non-member group (`Left` / `Evicted`, with the
-reason preserved), `Quarantined`, and "no such group" from one another. Collapsing a non-member or `Quarantined` group
-into either "active member" or "unknown group" is a defect: the first keeps a dead group usable; the second loses the
-fact that the group existed and why it is no longer live.
+Public group APIs MUST let a caller distinguish a live member group, a non-member group, `Quarantined`, and "no such
+group" from one another, and MUST preserve the non-member reason (`Left` vs `Evicted`) whenever it is known — that is,
+whenever the removal commit has been obtained. A group whose non-membership was only inferred, with the reason not yet
+resolved, is represented as `Quarantined` (withheld) rather than being assigned an arbitrary reason. Collapsing a
+non-member or `Quarantined` group into either "active member" or "unknown group" is a defect: the first keeps a dead
+group usable; the second loses the fact that the group existed and why it is no longer live.

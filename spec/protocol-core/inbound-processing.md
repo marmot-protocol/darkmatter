@@ -81,8 +81,9 @@ Input that cannot affect the group MUST receive a stale disposition. This includ
 - messages that fall outside every interval during which the local identity was a member of the group
   (`PreMembership` -> `pre_membership`). Because a group may be left or removed and later rejoined, membership is a set
   of epoch intervals, not a single boundary: a message inside a prior valid interval may still be recoverable from
-  retained state, while one outside all intervals is terminal. Unlike a deferred `MissingRetainedAnchor`, a
-  `PreMembership` message MUST NOT be retried;
+  retained state, while one outside all intervals is terminal. This is scoped to groups the client has membership
+  history for; input for a group the client has no state for at all is `unknown_group`, not `PreMembership`. Unlike a
+  deferred `MissingRetainedAnchor`, a `PreMembership` message MUST NOT be retried;
 - messages for a group the local identity is no longer a member of (`evicted`): once participation is `Left` or
   `Evicted` (see [group-state.md](./group-state.md)), further inbound for that group can no longer affect it and is
   stale.

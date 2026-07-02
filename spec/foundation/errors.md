@@ -22,8 +22,9 @@ An input that does not produce application content SHOULD map to one of these ca
 - `authorization_failed`: the sender or committer is not allowed to make the change.
 - `missing_history`: the client would need retained state it no longer has.
 - `evicted`: the input is for a group this identity is no longer a member of.
-- `pre_membership`: the input falls outside every interval during which this identity was a member of the group, so it
-  can never be decrypted by this client.
+- `pre_membership`: the client has retained membership history for the group, and the input falls outside every interval
+  during which this identity was a member, so it can never be decrypted. A group the client has no state for at all is
+  `unknown_group`, not `pre_membership`.
 - `transport_rejected`: publication or delivery failed at the transport layer.
 
 Protocol-core docs can split these into more detailed outcomes when needed.
@@ -80,7 +81,9 @@ identity is no longer a member of; such input is `stale`.
 the group, so this client can never hold the keys to decrypt it. Because a group may be left/removed and later rejoined,
 membership is a set of epoch intervals, not a single boundary; a client classifies an undecryptable historical message
 against those retained intervals. Input inside a prior valid interval may still be recoverable from retained state and is
-not `PreMembership`. Unlike a deferred `MissingRetainedAnchor`, `PreMembership` MUST NOT be deferred or retried.
+not `PreMembership`. It is scoped to groups the client has membership history for: with no retained state for the group
+at all the input is `unknown_group`, not `PreMembership`. Unlike a deferred `MissingRetainedAnchor`, `PreMembership` MUST
+NOT be deferred or retried.
 
 ## Protocol and local errors
 
