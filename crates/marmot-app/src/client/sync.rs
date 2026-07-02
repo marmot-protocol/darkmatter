@@ -255,11 +255,27 @@ impl AppClient {
     ) -> Result<(), AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let source_recorded_at = delivery.message.timestamp.0;
+        let group_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
         fail_if_publish_failed(&effects.effects)?;
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_effects(&effects.effects);
-        self.remember_transport_cursor(source_recorded_at);
+        if outcome_advances_transport_cursor(&effects.outcome) {
+            self.remember_transport_cursor(source_recorded_at);
+            if let Some(group_id) = &group_hint {
+                // Decryption resumed (or the input was consumed): the group is
+                // not starving on a missed commit, so re-arm its probe budget.
+                self.membership_probe_state
+                    .remove(&hex::encode(group_id.as_slice()));
+            }
+        } else if let Some(group_id) = &group_hint {
+            // An undecryptable delivery is evidence that something EARLIER is
+            // missing — possibly the commit that removed us (#722). The cursor
+            // stays anchored at the last consumed input (spec group-state.md:
+            // the recovery window is anchored there, not at last received),
+            // and the group's membership recovery probe fires with backoff.
+            self.maybe_backfill_group_membership(group_id).await?;
+        }
         self.observe_account_device_effects(
             &effects.effects,
             display_names,
@@ -587,7 +603,107 @@ impl AppClient {
             TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
         ));
     }
+
+    /// Membership recovery probe driver (spec/protocol-core/group-state.md,
+    /// "Reaching a non-member state"): on undecryptable traffic for a group,
+    /// re-fetch its message stream from a bounded window anchored at the last
+    /// input this client successfully consumed, with exponential backoff so a
+    /// relay withholding the commit costs bounded bandwidth, not a hot loop.
+    async fn maybe_backfill_group_membership(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<(), AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        // Only probe groups this account actually holds a record of.
+        if self.state_group_record(group_id).is_none() {
+            return Ok(());
+        }
+        let now = unix_now_seconds();
+        let due = self
+            .membership_probe_state
+            .get(&group_id_hex)
+            .is_none_or(|probe| probe.next_due(now));
+        if !due {
+            return Ok(());
+        }
+        let entry = self
+            .membership_probe_state
+            .entry(group_id_hex.clone())
+            .or_default();
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.last_attempt_at = now;
+        // Anchor: the newest app event this client consumed for the group —
+        // derived from decrypted input, so it is "the last input successfully
+        // consumed" — widened by a slack. No consumed input yet means a full
+        // re-fetch of the group's stream (bounded by relay retention; dedup
+        // collapses the overlap).
+        let anchor = self
+            .app
+            .messages_with_query(
+                &self.state.label,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex),
+                    limit: Some(1),
+                },
+            )?
+            .into_iter()
+            .next_back()
+            .map(|message| message.recorded_at);
+        let since = anchor
+            .map(|at| cgka_traits::Timestamp(at.saturating_sub(MEMBERSHIP_BACKFILL_SLACK_SECS)));
+        self.runtime
+            .backfill_transport_group(group_id, since)
+            .await?;
+        Ok(())
+    }
 }
+
+/// Whether an ingest outcome may advance the persisted transport cursor.
+///
+/// The cursor becomes the relay `since` filter, so advancing it past input we
+/// could not decrypt permanently skips the window that likely contains the
+/// missing group-evolution commit — the #722 silent-eviction mechanism: a
+/// post-removal message advances the cursor beyond the removal commit's
+/// timestamp and no future subscription ever fetches it. Undecryptable input
+/// therefore freezes the cursor at the last consumed input; every other
+/// outcome (consumed, buffered-for-convergence, terminal-stale) is durably
+/// accounted for and safe to advance past.
+pub(crate) fn outcome_advances_transport_cursor(
+    outcome: &cgka_traits::ingest::IngestOutcome,
+) -> bool {
+    !matches!(
+        outcome,
+        cgka_traits::ingest::IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::PeelFailed
+        }
+    )
+}
+
+/// Backoff bookkeeping for one group's membership recovery probe.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MembershipProbeState {
+    pub(crate) attempts: u32,
+    pub(crate) last_attempt_at: u64,
+}
+
+impl MembershipProbeState {
+    /// Exponential cooldown: 60s doubling per attempt, capped at one hour.
+    pub(crate) fn next_due(&self, now: u64) -> bool {
+        if self.attempts == 0 {
+            return true;
+        }
+        let shift = (self.attempts - 1).min(6);
+        let cooldown = (MEMBERSHIP_BACKFILL_BASE_COOLDOWN_SECS << shift)
+            .min(MEMBERSHIP_BACKFILL_MAX_COOLDOWN_SECS);
+        now.saturating_sub(self.last_attempt_at) >= cooldown
+    }
+}
+
+/// Widen the probe window this far before the last consumed input, absorbing
+/// relay timestamp skew between the missed commit and the anchor message.
+const MEMBERSHIP_BACKFILL_SLACK_SECS: u64 = 300;
+const MEMBERSHIP_BACKFILL_BASE_COOLDOWN_SECS: u64 = 60;
+const MEMBERSHIP_BACKFILL_MAX_COOLDOWN_SECS: u64 = 3600;
 
 pub(crate) fn is_own_relay_echo(
     delivery: &cgka_traits::TransportDelivery,
@@ -704,5 +820,75 @@ mod transport_cursor_tests {
             later,
             "after healing, the cursor tracks present-dated messages again"
         );
+    }
+}
+
+#[cfg(test)]
+mod membership_probe_tests {
+    use super::{MembershipProbeState, outcome_advances_transport_cursor};
+    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+
+    #[test]
+    fn undecryptable_input_freezes_the_cursor_and_everything_else_advances_it() {
+        // The #722 mechanism: advancing the persisted cursor past input we
+        // could not decrypt permanently skips the relay window that likely
+        // contains the missed removal commit.
+        assert!(!outcome_advances_transport_cursor(&IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }));
+
+        assert!(outcome_advances_transport_cursor(&IngestOutcome::Processed));
+        assert!(outcome_advances_transport_cursor(
+            &IngestOutcome::Buffered {
+                group_id: cgka_traits::GroupId::new(vec![1; 4]),
+                epoch: cgka_traits::EpochId(1),
+            }
+        ));
+        for reason in [
+            StaleReason::AlreadySeen,
+            StaleReason::NotForThisClient,
+            StaleReason::UnknownGroup,
+            StaleReason::OwnEcho,
+            StaleReason::Evicted,
+        ] {
+            let outcome = IngestOutcome::Stale {
+                reason: reason.clone(),
+            };
+            assert!(
+                outcome_advances_transport_cursor(&outcome),
+                "durably-accounted-for outcome should advance the cursor: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_backoff_doubles_per_attempt_and_caps_at_an_hour() {
+        let now = 1_800_000_000;
+        // Fresh group: due immediately.
+        assert!(MembershipProbeState::default().next_due(now));
+
+        // First retry waits the 60s base cooldown.
+        let one = MembershipProbeState {
+            attempts: 1,
+            last_attempt_at: now,
+        };
+        assert!(!one.next_due(now + 59));
+        assert!(one.next_due(now + 60));
+
+        // Fourth retry waits 60 << 3 = 480s.
+        let four = MembershipProbeState {
+            attempts: 4,
+            last_attempt_at: now,
+        };
+        assert!(!four.next_due(now + 479));
+        assert!(four.next_due(now + 480));
+
+        // Deep attempt counts cap at one hour, not overflow.
+        let deep = MembershipProbeState {
+            attempts: 40,
+            last_attempt_at: now,
+        };
+        assert!(!deep.next_due(now + 3_599));
+        assert!(deep.next_due(now + 3_600));
     }
 }

@@ -763,6 +763,27 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .await
     }
 
+    async fn backfill_account_group(
+        &self,
+        backfill: cgka_traits::TransportGroupBackfill,
+    ) -> Result<(), TransportAdapterError> {
+        if backfill.account_id != self.account_id {
+            return Err(TransportAdapterError::AccountNotActive(backfill.account_id));
+        }
+        let backfill = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_group_backfill(backfill)
+            .map_err(TransportAdapterError::Subscription)?;
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .backfill_account_group(backfill)
+            .await
+    }
+
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
         if account_id != &self.account_id {
             return Err(TransportAdapterError::AccountNotActive(account_id.clone()));

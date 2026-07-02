@@ -84,6 +84,21 @@ pub struct TransportGroupSync {
     pub since: Option<Timestamp>,
 }
 
+/// A bounded re-fetch of one group's message stream — the transport
+/// realization of the missed-input recovery probe required by
+/// `spec/protocol-core/group-state.md` ("Reaching a non-member state").
+/// Re-issues the group's subscription with `since` widened to the caller's
+/// anchor (last input successfully consumed, minus a local slack) so a missed
+/// group-evolution commit — most importantly a missed removal commit — is
+/// recovered from replayable history. Recovered events flow through ordinary
+/// validation and deduplication; the probe never chooses group state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportGroupBackfill {
+    pub account_id: MemberId,
+    pub group_subscription: TransportGroupSubscription,
+    pub since: Option<Timestamp>,
+}
+
 /// Publish target for an already-wrapped transport message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportPublishTarget {
@@ -284,6 +299,16 @@ pub trait TransportAdapter: Send + Sync {
     async fn sync_account_groups(
         &self,
         sync: TransportGroupSync,
+    ) -> Result<(), TransportAdapterError>;
+
+    /// Re-issue one group's subscription with a widened `since` window — the
+    /// membership recovery probe (`TransportGroupBackfill`). Implementations
+    /// reuse the group's existing subscription identity so the probe replaces
+    /// (never duplicates) the live subscription and the relay replays stored
+    /// events from the widened window.
+    async fn backfill_account_group(
+        &self,
+        backfill: TransportGroupBackfill,
     ) -> Result<(), TransportAdapterError>;
 
     /// Deactivate every subscription owned by an account.

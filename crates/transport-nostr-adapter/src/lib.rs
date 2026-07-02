@@ -19,8 +19,9 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
-    TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportWireMetadata,
+    TransportEndpointFailure, TransportEndpointReceipt, TransportGroupBackfill,
+    TransportGroupSubscription, TransportGroupSync, TransportPublishReport,
+    TransportPublishRequest, TransportWireMetadata,
 };
 use nostr::RelayUrl;
 use sha2::{Digest, Sha256};
@@ -566,6 +567,41 @@ impl TransportAdapter for NostrTransportAdapter {
         state.record_subscription_starts(&to_add, now_ms);
         state.sync_groups(sync, to_add.len(), to_remove.len());
         Ok(())
+    }
+
+    async fn backfill_account_group(
+        &self,
+        backfill: TransportGroupBackfill,
+    ) -> Result<(), TransportAdapterError> {
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "backfill_account_group",
+            has_since = backfill.since.is_some(),
+            "re-issuing group subscription for membership backfill probe"
+        );
+        // Resolve the account's CURRENT route for this group and re-issue that
+        // subscription with the widened `since`. Using the stored route (not
+        // the caller-supplied endpoints) keeps the probe pinned to the signed
+        // routing state, and reusing the subscription identity means the relay
+        // replaces the live subscription and replays stored events from the
+        // widened window — no duplicate subscription to leak or diff away.
+        let subscription = {
+            let state = self.state.read().await;
+            let routes = state.accounts.get(&backfill.account_id).ok_or_else(|| {
+                TransportAdapterError::AccountNotActive(backfill.account_id.clone())
+            })?;
+            let group = routes
+                .groups
+                .iter()
+                .find(|group| group.group_id == backfill.group_subscription.group_id)
+                .ok_or_else(|| {
+                    TransportAdapterError::Subscription(
+                        "backfill target group is not subscribed for this account".to_string(),
+                    )
+                })?;
+            group_subscription(&backfill.account_id, group, backfill.since)
+        };
+        self.relay_client.subscribe(subscription).await
     }
 
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {

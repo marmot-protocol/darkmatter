@@ -198,6 +198,7 @@ struct RecordingAdapter {
 struct RecordingAdapterInner {
     activations: Mutex<Vec<TransportAccountActivation>>,
     syncs: Mutex<Vec<TransportGroupSync>>,
+    backfills: Mutex<Vec<cgka_traits::TransportGroupBackfill>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
 }
@@ -213,6 +214,10 @@ impl RecordingAdapter {
             .lock()
             .unwrap()
             .push_back(accepted_count);
+    }
+
+    fn backfills(&self) -> Vec<cgka_traits::TransportGroupBackfill> {
+        self.inner.backfills.lock().unwrap().clone()
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -239,6 +244,14 @@ impl TransportAdapter for RecordingAdapter {
         sync: TransportGroupSync,
     ) -> Result<(), TransportAdapterError> {
         self.inner.syncs.lock().unwrap().push(sync);
+        Ok(())
+    }
+
+    async fn backfill_account_group(
+        &self,
+        backfill: cgka_traits::TransportGroupBackfill,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.backfills.lock().unwrap().push(backfill);
         Ok(())
     }
 
@@ -403,6 +416,50 @@ async fn activate_transport_uses_session_identity_and_policy() {
         vec![TransportEndpoint("wss://inbox.example".into())]
     );
     assert_eq!(activations[0].since, Some(Timestamp(10)));
+}
+
+#[tokio::test]
+async fn backfill_transport_group_reissues_only_that_groups_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot account backfill key").unwrap();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let adapter = RecordingAdapter::default();
+    let group_id = cgka_traits::GroupId::new(vec![0xAB; 8]);
+    let other_group = cgka_traits::GroupId::new(vec![0xCD; 8]);
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://group.example".into())],
+        );
+    let runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    // The membership recovery probe forwards the group's routed subscription
+    // and the widened anchor to the adapter...
+    runtime
+        .backfill_transport_group(&group_id, Some(Timestamp(1_700_000_000)))
+        .await
+        .unwrap();
+    // ...and a group with no live route is a no-op, not an error.
+    runtime
+        .backfill_transport_group(&other_group, Some(Timestamp(1_700_000_000)))
+        .await
+        .unwrap();
+
+    let backfills = adapter.backfills();
+    assert_eq!(backfills.len(), 1);
+    assert_eq!(backfills[0].account_id, runtime.session().self_id());
+    assert_eq!(backfills[0].group_subscription.group_id, group_id);
+    assert_eq!(
+        backfills[0].group_subscription.endpoints,
+        vec![TransportEndpoint("wss://group.example".into())]
+    );
+    assert_eq!(backfills[0].since, Some(Timestamp(1_700_000_000)));
 }
 
 #[tokio::test]

@@ -66,6 +66,11 @@ pub struct AppClient {
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Per-group membership recovery probe bookkeeping (attempt count +
+    /// last-attempt time), in-memory: probes are cheap re-subscriptions, so a
+    /// restart simply re-arms them on the next undecryptable delivery.
+    pub(crate) membership_probe_state:
+        std::collections::HashMap<String, crate::client::sync::MembershipProbeState>,
 }
 
 /// A point-in-time copy of the live session's read-only group projections

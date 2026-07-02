@@ -42,6 +42,17 @@ impl RelaySafetyPolicy {
         Ok(sync)
     }
 
+    pub(crate) fn sanitize_group_backfill(
+        &self,
+        mut backfill: cgka_traits::TransportGroupBackfill,
+    ) -> Result<cgka_traits::TransportGroupBackfill, String> {
+        backfill.group_subscription.endpoints = self.sanitize_endpoints(
+            backfill.group_subscription.endpoints.clone(),
+            "group backfill",
+        )?;
+        Ok(backfill)
+    }
+
     pub(crate) fn sanitize_publish_request(
         &self,
         mut request: TransportPublishRequest,

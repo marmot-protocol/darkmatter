@@ -1082,3 +1082,86 @@ fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent 
         sig: None,
     }
 }
+
+#[tokio::test]
+async fn backfill_reissues_the_stored_route_with_the_probe_window() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xC3; 32]);
+    let subscription = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0xD4; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: alice.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://alice-inbox.example".into())],
+            group_subscriptions: vec![subscription.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let live_count = relay.subscriptions.lock().unwrap().len();
+
+    // The probe re-issues the group's subscription with the widened window.
+    // Caller-supplied endpoints are ignored in favor of the STORED route, so
+    // a stale caller cannot point the probe at rogue relays.
+    adapter
+        .backfill_account_group(cgka_traits::TransportGroupBackfill {
+            account_id: alice.clone(),
+            group_subscription: TransportGroupSubscription {
+                endpoints: vec![TransportEndpoint("wss://rogue.example".into())],
+                ..subscription.clone()
+            },
+            since: Some(cgka_traits::Timestamp(1_600_000_000)),
+        })
+        .await
+        .expect("backfill succeeds");
+
+    {
+        let subs = relay.subscriptions.lock().unwrap();
+        let probe = subs.last().expect("probe subscription issued");
+        assert_eq!(subs.len(), live_count + 1);
+        match probe {
+            transport_nostr_adapter::NostrSubscription::Group {
+                endpoints, since, ..
+            } => {
+                assert_eq!(
+                    endpoints,
+                    &vec![TransportEndpoint("wss://group.example".into())],
+                    "probe must use the stored route, not caller endpoints"
+                );
+                assert_eq!(*since, Some(cgka_traits::Timestamp(1_600_000_000)));
+            }
+            other => panic!("expected a group subscription, got {other:?}"),
+        }
+        // Same subscription identity as the live subscription: the relay
+        // replaces the live filter and replays, rather than stacking a
+        // duplicate.
+        assert_eq!(
+            probe.subscription_id(),
+            subs[live_count - 1].subscription_id(),
+            "probe reuses the live subscription id"
+        );
+    }
+
+    // Unknown group: typed rejection, no subscription issued.
+    let err = adapter
+        .backfill_account_group(cgka_traits::TransportGroupBackfill {
+            account_id: alice,
+            group_subscription: TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
+                transport_group_id: vec![0xEE; 32],
+                endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            },
+            since: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        cgka_traits::TransportAdapterError::Subscription(_)
+    ));
+}

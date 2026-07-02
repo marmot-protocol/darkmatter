@@ -17,7 +17,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EpochId, GroupId, Timestamp, TransportAccountActivation, TransportAdapter, TransportDelivery,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    TransportGroupBackfill, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
@@ -176,6 +176,40 @@ where
             .sync_account_groups(TransportGroupSync {
                 account_id: self.session.self_id(),
                 group_subscriptions: self.routing.group_subscriptions(),
+                since,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Membership recovery probe: re-issue one group's subscription with a
+    /// widened `since` so a missed group-evolution commit (most importantly a
+    /// missed removal commit) is recovered from relay history
+    /// (spec/protocol-core/group-state.md, "Reaching a non-member state").
+    /// A group with no live route (already withheld/quarantined) is a no-op.
+    pub async fn backfill_transport_group(
+        &self,
+        group_id: &GroupId,
+        since: Option<Timestamp>,
+    ) -> AccountResult<()> {
+        let Some(group_subscription) = self
+            .routing
+            .group_subscriptions()
+            .into_iter()
+            .find(|subscription| &subscription.group_id == group_id)
+        else {
+            return Ok(());
+        };
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "backfill_transport_group",
+            has_since = since.is_some(),
+            "issuing membership backfill probe"
+        );
+        self.adapter
+            .backfill_account_group(TransportGroupBackfill {
+                account_id: self.session.self_id(),
+                group_subscription,
                 since,
             })
             .await?;
