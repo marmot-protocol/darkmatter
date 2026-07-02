@@ -685,6 +685,19 @@ pub trait CgkaEngine: Send + Sync {
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 
+    /// Wrap a removal notice for `recipient` embedding the already-published
+    /// commit (spec/protocol-core/member-departure.md, "Removal notices").
+    /// Delegates to the active transport peeler; `Ok(None)` means the binding
+    /// does not carry removal notices (the default).
+    async fn wrap_removal_notice(
+        &self,
+        commit: &TransportMessage,
+        recipient: &MemberId,
+    ) -> Result<Option<TransportMessage>, EngineError> {
+        let _ = (commit, recipient);
+        Ok(None)
+    }
+
     /// The local identity's participation in the group. `Ok(None)` means the
     /// engine has no durable record of the group at all ("no such group") —
     /// distinct from every participation state, per

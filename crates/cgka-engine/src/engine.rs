@@ -1684,6 +1684,17 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.do_members(group_id)
     }
 
+    async fn wrap_removal_notice(
+        &self,
+        commit: &TransportMessage,
+        recipient: &MemberId,
+    ) -> Result<Option<TransportMessage>, EngineError> {
+        self.peeler
+            .wrap_removal_notice(commit, recipient)
+            .await
+            .map_err(EngineError::Peeler)
+    }
+
     fn participation(
         &self,
         group_id: &GroupId,

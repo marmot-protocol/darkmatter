@@ -862,6 +862,9 @@ impl HarnessClient {
                 ..msg.clone()
             }),
             PeeledContent::Welcome { .. } => Err("group peeler returned a welcome".into()),
+            PeeledContent::RemovalNotice { .. } => {
+                Err("group peeler returned a removal notice".into())
+            }
         }
     }
 }

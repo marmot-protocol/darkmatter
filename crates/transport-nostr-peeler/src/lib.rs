@@ -29,6 +29,10 @@ pub const KIND_NIP59_GIFT_WRAP: u64 = 1059;
 /// Marmot welcome rumor kind inside the NIP-59 seal.
 pub const KIND_MARMOT_WELCOME_RUMOR: u16 = 444;
 
+/// Marmot removal notice rumor kind inside a NIP-59 gift wrap
+/// (spec/transports/nostr.md, "Removal notice delivery").
+pub const KIND_MARMOT_REMOVAL_NOTICE_RUMOR: u16 = 451;
+
 /// Source label carried by [`cgka_traits::transport::TransportMessage`] values
 /// produced here.
 pub const NOSTR_SOURCE: &str = "nostr";

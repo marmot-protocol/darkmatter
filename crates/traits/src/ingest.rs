@@ -77,4 +77,11 @@ pub enum PeeledContent {
     MlsMessage { bytes: Vec<u8> },
     /// Welcome payload (MLS welcome bytes).
     Welcome { bytes: Vec<u8> },
+    /// A removal notice: an inbox-delivered carrier for a group message the
+    /// removed member may have missed — most importantly its own removal
+    /// commit (spec/protocol-core/member-departure.md, "Removal notices").
+    /// The notice has no authority of its own: the engine re-injects the
+    /// embedded, transport-validated group message into the ordinary inbound
+    /// pipeline, and only an applied removal commit changes participation.
+    RemovalNotice { embedded: TransportMessage },
 }

@@ -126,6 +126,29 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
+    async fn wrap_removal_notice(
+        &self,
+        commit: &TransportMessage,
+        recipient: &MemberId,
+    ) -> Result<Option<TransportMessage>, PeelerError> {
+        // Synthetic notice: inbox-addressed carrier for the published commit,
+        // recognizable by carrying the commit's payload. The Nostr wire shape
+        // is covered by transport-nostr-peeler's removal_notice tests; this
+        // exercises the runtime's committer-side correlation + publish seam.
+        let mut id_material = commit.id.as_slice().to_vec();
+        id_material.extend_from_slice(recipient.as_slice());
+        Ok(Some(TransportMessage {
+            id: hash_id(&id_material),
+            payload: commit.payload.clone(),
+            timestamp: commit.timestamp,
+            causal_deps: vec![],
+            source: TransportSource("marmot-account-test".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+        }))
+    }
+
     async fn wrap_welcome(
         &self,
         payload: &EncryptedPayload,
@@ -1242,4 +1265,88 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     // The removal was applied locally: epoch advanced and bob is gone.
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn committer_publishes_removal_notice_to_removed_members_inbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot removal notice key").unwrap();
+    let mut alice_session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+
+    let created = alice_session
+        .create_group(CreateGroupRequest {
+            name: "removal notice".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice_session
+        .confirm_published(create_pending)
+        .await
+        .unwrap();
+
+    let adapter = RecordingAdapter::default();
+    adapter.accept_next(1); // the removal commit
+    adapter.accept_next(1); // the removal notice
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                created.group_id.clone(),
+                created.group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                bob_id.clone(),
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice_session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    runtime
+        .send(SendIntent::RemoveMembers {
+            group_id: created.group_id.clone(),
+            members: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+
+    // Publish 1: the removal commit to the group's relays. Publish 2: the
+    // committer-side removal notice, inbox-addressed to the removed member and
+    // carrying the exact published commit (spec member-departure.md, "Removal
+    // notices").
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2, "commit + removal notice");
+    assert!(matches!(
+        publishes[0].message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ));
+    assert!(matches!(
+        &publishes[1].message.envelope,
+        TransportEnvelope::Welcome { recipient } if recipient == &bob_id
+    ));
+    assert!(matches!(
+        &publishes[1].target,
+        cgka_traits::TransportPublishTarget::Inbox { recipient, endpoints }
+            if recipient == &bob_id
+                && endpoints == &vec![TransportEndpoint("wss://bob-inbox.example".into())]
+    ));
+    assert_eq!(
+        publishes[1].message.payload, publishes[0].message.payload,
+        "the notice embeds the published commit"
+    );
 }

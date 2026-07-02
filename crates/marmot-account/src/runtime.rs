@@ -376,6 +376,10 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(effects, &mut queue);
 
+        // Commits published in this drain, kept so the removal-notice pass
+        // below can embed the exact published wire event
+        // (spec/protocol-core/member-departure.md, "Removal notices").
+        let mut published_commits: Vec<TransportMessage> = Vec::new();
         while let Some(work) = queue.pop_front() {
             match work {
                 PublishWork::ApplicationMessage { msg } | PublishWork::Proposal { msg } => {
@@ -396,6 +400,7 @@ where
                     welcomes,
                     pending,
                 } => {
+                    published_commits.push(msg.clone());
                     self.publish_group_evolution(
                         msg,
                         welcomes,
@@ -407,6 +412,7 @@ where
                     .await?;
                 }
                 PublishWork::AutoPublish { msg, pending } => {
+                    published_commits.push(msg.clone());
                     self.publish_pending(
                         vec![msg],
                         pending,
@@ -418,8 +424,97 @@ where
                 }
             }
         }
+        self.send_removal_notices(&published_commits, &output.events)
+            .await;
 
         Ok(output)
+    }
+
+    /// Committer-side removal notices (spec/protocol-core/member-departure.md,
+    /// "Removal notices"): after a commit this device published and confirmed
+    /// removes members, gift-deliver each removed member the published commit
+    /// through its account inbox. The correlation is the confirmed events'
+    /// `origin_commit_id` against the commits published in this drain — only
+    /// the committer holds the published wire event, so only the committer
+    /// sends (the SHOULD in the spec). Notices are a delivery aid: every
+    /// failure here is logged and swallowed — a missing inbox route or a
+    /// binding without notice support MUST NOT fail the commit flow.
+    async fn send_removal_notices(
+        &self,
+        published_commits: &[TransportMessage],
+        events: &[GroupEvent],
+    ) {
+        if published_commits.is_empty() {
+            return;
+        }
+        let self_id = self.session.self_id();
+        for event in events {
+            let GroupEvent::GroupStateChanged {
+                change:
+                    cgka_traits::engine::GroupStateChange::MemberRemoved { member }
+                    | cgka_traits::engine::GroupStateChange::MemberLeft { member },
+                origin_commit_id: Some(origin_commit_id),
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if member == &self_id {
+                continue;
+            }
+            let Some(commit) = published_commits
+                .iter()
+                .find(|commit| &commit.id == origin_commit_id)
+            else {
+                continue;
+            };
+            let notice = match self.session.wrap_removal_notice(commit, member).await {
+                // The active binding does not carry removal notices.
+                Ok(None) => continue,
+                Ok(Some(notice)) => notice,
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "send_removal_notices",
+                        error_code = "wrap_failed",
+                        error = %e,
+                        "failed to wrap removal notice"
+                    );
+                    continue;
+                }
+            };
+            let target = match self.routing.publish_target(&notice) {
+                Ok(target) => target,
+                Err(e) => {
+                    // No cached inbox route for the removed member. The notice
+                    // is best-effort; the recovery probe and ordinary delivery
+                    // remain the other discovery paths.
+                    tracing::debug!(
+                        target: TRACE_TARGET,
+                        method = "send_removal_notices",
+                        error_code = "no_inbox_route",
+                        error = %e,
+                        "skipping removal notice without an inbox route"
+                    );
+                    continue;
+                }
+            };
+            let request = TransportPublishRequest {
+                account_id: self_id.clone(),
+                message: notice,
+                target,
+                required_acks: 1,
+            };
+            if let Err(e) = self.adapter.publish(request).await {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "send_removal_notices",
+                    error_code = "publish_failed",
+                    error = %e,
+                    "failed to publish removal notice"
+                );
+            }
+        }
     }
 
     /// Confirm a published commit, retrying on transient backend contention.

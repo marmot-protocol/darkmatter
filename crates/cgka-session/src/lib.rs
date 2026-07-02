@@ -569,6 +569,18 @@ impl AccountDeviceSession {
         self.engine.self_id()
     }
 
+    /// Wrap a removal notice for `recipient` embedding the already-published
+    /// commit (spec/protocol-core/member-departure.md, "Removal notices").
+    /// `Ok(None)` means the active transport binding does not carry removal
+    /// notices.
+    pub async fn wrap_removal_notice(
+        &self,
+        commit: &TransportMessage,
+        recipient: &MemberId,
+    ) -> Result<Option<TransportMessage>, EngineError> {
+        self.engine.wrap_removal_notice(commit, recipient).await
+    }
+
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
         tracing::debug!(
             target: TRACE_TARGET,

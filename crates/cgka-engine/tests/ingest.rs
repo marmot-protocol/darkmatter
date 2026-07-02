@@ -1000,3 +1000,127 @@ async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
         "both distinct messages must be delivered; got {delivered:?}"
     );
 }
+
+/// Peeler stub whose `peel_welcome` returns a removal notice embedding a
+/// group message, exercising the engine's carrier re-injection seam without
+/// NIP-59 machinery (the Nostr wire shape is covered in
+/// transport-nostr-peeler).
+struct RemovalNoticePeeler {
+    embedded: TransportMessage,
+}
+
+#[async_trait]
+impl TransportPeeler for RemovalNoticePeeler {
+    async fn peel_group_message(
+        &self,
+        _msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Err(PeelerError::DecryptFailed)
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::RemovalNotice {
+                embedded: self.embedded.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn wrap_group_message(
+        &self,
+        _payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::WrapFailed("not used".into()))
+    }
+
+    async fn wrap_welcome(
+        &self,
+        _payload: &EncryptedPayload,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::WrapFailed("not used".into()))
+    }
+}
+
+#[tokio::test]
+async fn removal_notice_reinjects_embedded_group_message_into_ordinary_ingest() {
+    // The embedded message targets a group this client has no state for, so a
+    // re-injected classification of UnknownGroup proves the embedded message
+    // went through the ordinary group-message pipeline (a rejected notice
+    // would surface PeelFailed instead) while the notice itself granted no
+    // authority.
+    let embedded = TransportMessage {
+        id: MessageId::new(vec![7; 4]),
+        payload: vec![9, 9, 9],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xEE; 32],
+        },
+    };
+    let mut engine = build_client_with_peeler(
+        b"me",
+        Box::new(RemovalNoticePeeler {
+            embedded: embedded.clone(),
+        }),
+    );
+    let notice = TransportMessage {
+        id: MessageId::new(vec![8; 4]),
+        payload: vec![],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+    };
+
+    let outcome = engine.ingest(notice).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::UnknownGroup
+            }
+        ),
+        "embedded message should re-enter ordinary ingest; got {outcome:?}"
+    );
+
+    // A notice whose embedded message is not a group message is rejected
+    // before re-injection.
+    let bogus = TransportMessage {
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+        id: MessageId::new(vec![9; 4]),
+        payload: vec![],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+    };
+    let mut engine = build_client_with_peeler(
+        b"me",
+        Box::new(RemovalNoticePeeler {
+            embedded: TransportMessage {
+                envelope: TransportEnvelope::Welcome {
+                    recipient: MemberId::new(vec![1; 32]),
+                },
+                ..embedded
+            },
+        }),
+    );
+    let outcome = engine.ingest(bogus).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+}

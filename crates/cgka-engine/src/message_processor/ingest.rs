@@ -64,6 +64,29 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // Inbox gift wraps carry either a welcome rumor or a removal notice.
+        // Peel once to discriminate: a removal notice is only a carrier — its
+        // embedded, transport-validated group message re-enters the ordinary
+        // inbound pipeline, where dedup, validation, and (if it really is our
+        // removal commit) the participation transition all apply as if the
+        // message had arrived on the group stream (spec member-departure.md,
+        // "Removal notices" — the notice itself has no authority). A peel
+        // failure falls through to the welcome path so its established error
+        // mapping stays intact.
+        if let Ok(peeled) = self.peeler.peel_welcome(msg).await
+            && let PeeledContent::RemovalNotice { embedded } = peeled.content
+        {
+            if !matches!(
+                embedded.envelope,
+                cgka_traits::transport::TransportEnvelope::GroupMessage { .. }
+            ) {
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                });
+            }
+            return Box::pin(self.do_ingest(embedded)).await;
+        }
+
         // Reuse the existing join_welcome machinery. Map its error shapes
         // to typed stale reasons where applicable.
         match self.do_join_welcome(msg.clone()).await {
@@ -340,7 +363,9 @@ impl<S: StorageProvider> Engine<S> {
             };
             let mls_bytes = match peeled.content {
                 PeeledContent::MlsMessage { bytes } => bytes,
-                PeeledContent::Welcome { .. } => {
+                // Neither shape belongs on the group-message peel path: a
+                // welcome or removal notice arriving here is malformed input.
+                PeeledContent::Welcome { .. } | PeeledContent::RemovalNotice { .. } => {
                     self.persist_transport_message(
                         msg,
                         &group_id,

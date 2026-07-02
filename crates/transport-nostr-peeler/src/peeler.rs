@@ -1,9 +1,9 @@
 use crate::error::to_peeler_error;
 use crate::event::{decode_hex, decode_hex_exact};
 use crate::{
-    DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_MARMOT_WELCOME_RUMOR,
-    KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN, NOSTR_GROUP_KEY_LEN, NostrTransportEvent,
-    RECIPIENT_TAG,
+    DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_MARMOT_REMOVAL_NOTICE_RUMOR,
+    KIND_MARMOT_WELCOME_RUMOR, KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN,
+    NOSTR_GROUP_KEY_LEN, NostrTransportEvent, RECIPIENT_TAG,
 };
 use async_trait::async_trait;
 use cgka_traits::engine::WelcomeMetadata;
@@ -26,6 +26,7 @@ const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
 const KEY_PACKAGE_EVENT_TAG: &str = "e";
 const EXPIRATION_TAG: &str = "expiration";
 const WELCOME_RELAYS_TAG: &str = "relays";
+const REMOVAL_NOTICE_EVENT_TAG: &str = "e";
 
 /// Empty AAD for the outer kind-445 ChaCha20-Poly1305 sealing
 /// (`spec/transports/nostr.md`: `aad = ""`).
@@ -242,6 +243,9 @@ impl TransportPeeler for NostrMlsPeeler {
             .await
             .map_err(map_nip59_error)?;
 
+        if unwrapped.rumor.kind == Kind::Custom(KIND_MARMOT_REMOVAL_NOTICE_RUMOR) {
+            return peel_removal_notice_rumor(msg, &unwrapped);
+        }
         if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
             return Err(PeelerError::Malformed(format!(
                 "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
@@ -361,6 +365,137 @@ impl TransportPeeler for NostrMlsPeeler {
         let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
         event.to_transport_message().map_err(to_peeler_error)
     }
+
+    async fn wrap_removal_notice(
+        &self,
+        commit: &TransportMessage,
+        recipient: &MemberId,
+    ) -> Result<Option<TransportMessage>, PeelerError> {
+        // spec/transports/nostr.md, "Removal notice delivery": an unsigned
+        // kind-451 rumor embedding the published kind-445 removal-commit event
+        // (stringified-event convention), gift-wrapped to the removed member.
+        // Embedding removes the fetch round-trip and the relay-retention
+        // dependency; the receiver validates the embedded event exactly like a
+        // fetched one, so the notice never carries authority of its own.
+        let event = NostrTransportEvent::from_transport_message(commit).map_err(to_peeler_error)?;
+        if event.kind != KIND_MARMOT_GROUP_MESSAGE {
+            return Err(PeelerError::WrapFailed(format!(
+                "removal notice must embed a kind {KIND_MARMOT_GROUP_MESSAGE} group message, got {}",
+                event.kind
+            )));
+        }
+        if event.sig.is_none() {
+            return Err(PeelerError::WrapFailed(
+                "removal notice must embed the signed, published group message event".into(),
+            ));
+        }
+        // Reuse the 445 envelope validation for the h value.
+        let transport_group_id = match event.to_transport_message().map_err(to_peeler_error)? {
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage { transport_group_id },
+                ..
+            } => transport_group_id,
+            _ => {
+                return Err(PeelerError::WrapFailed(
+                    "embedded event did not map to a group message envelope".into(),
+                ));
+            }
+        };
+        let signer = self.welcome_signer()?;
+        let sender_pubkey = signer
+            .get_public_key()
+            .await
+            .map_err(|e| PeelerError::WrapFailed(format!("signer public key: {e}")))?;
+        let recipient_pubkey = Self::recipient_pubkey(recipient)?;
+        let content = serde_json::to_string(&event)
+            .map_err(|e| PeelerError::WrapFailed(format!("embedded event JSON: {e}")))?;
+        let rumor: UnsignedEvent =
+            EventBuilder::new(Kind::Custom(KIND_MARMOT_REMOVAL_NOTICE_RUMOR), content)
+                .tags([
+                    Tag::custom(
+                        nostr::TagKind::custom(GROUP_TAG),
+                        [hex::encode(&transport_group_id)],
+                    ),
+                    Tag::custom(
+                        nostr::TagKind::custom(REMOVAL_NOTICE_EVENT_TAG),
+                        [event.id.clone()],
+                    ),
+                ])
+                .build(sender_pubkey);
+        let gift_wrap = EventBuilder::gift_wrap(signer, &recipient_pubkey, rumor, [])
+            .await
+            .map_err(|e| PeelerError::WrapFailed(format!("NIP-59 gift wrap: {e}")))?;
+        let wrapped = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
+        Ok(Some(
+            wrapped.to_transport_message().map_err(to_peeler_error)?,
+        ))
+    }
+}
+
+/// Peel an unwrapped kind-451 removal notice rumor
+/// (spec/transports/nostr.md, "Removal notice delivery"). The embedded
+/// kind-445 event MUST pass the same validation as a fetched one; the caller
+/// re-injects the returned transport message into the ordinary inbound
+/// pipeline, so the notice itself carries no authority.
+fn peel_removal_notice_rumor(
+    msg: &TransportMessage,
+    unwrapped: &nostr::nips::nip59::UnwrappedGift,
+) -> Result<PeeledMessage, PeelerError> {
+    let rumor_h = rumor_tag_value(&unwrapped.rumor, GROUP_TAG)
+        .ok_or_else(|| PeelerError::Malformed("removal notice rumor is missing h tag".into()))?
+        .to_owned();
+    let rumor_event_id = rumor_tag_value(&unwrapped.rumor, REMOVAL_NOTICE_EVENT_TAG)
+        .ok_or_else(|| PeelerError::Malformed("removal notice rumor is missing e tag".into()))?
+        .to_owned();
+    decode_hex_exact("removal notice e tag", &rumor_event_id, 32).map_err(to_peeler_error)?;
+
+    // Embedded event: parse, verify id + signature, and run the kind-445
+    // envelope validation (32-byte id, exactly one h tag) via the shared DTO.
+    let embedded_event =
+        <nostr::Event as nostr::JsonUtil>::from_json(unwrapped.rumor.content.as_bytes())
+            .map_err(|e| PeelerError::Malformed(format!("embedded event parse: {e}")))?;
+    embedded_event
+        .verify()
+        .map_err(|e| PeelerError::Malformed(format!("embedded event verification: {e}")))?;
+    let dto = NostrTransportEvent::from_nostr_event(&embedded_event).map_err(to_peeler_error)?;
+    if dto.kind != KIND_MARMOT_GROUP_MESSAGE {
+        return Err(PeelerError::Malformed(format!(
+            "removal notice must embed a kind {KIND_MARMOT_GROUP_MESSAGE} event, got {}",
+            dto.kind
+        )));
+    }
+    if dto.id != rumor_event_id {
+        return Err(PeelerError::Malformed(
+            "removal notice e tag does not match the embedded event id".into(),
+        ));
+    }
+    let decoded_len = BASE64_STANDARD
+        .decode(dto.content.as_bytes())
+        .map_err(|e| PeelerError::Malformed(format!("embedded event content base64: {e}")))?
+        .len();
+    if decoded_len < NOSTR_GROUP_CONTENT_MIN_LEN {
+        return Err(PeelerError::Malformed(
+            "embedded event content shorter than nonce + AEAD tag".into(),
+        ));
+    }
+    let embedded = dto.to_transport_message().map_err(to_peeler_error)?;
+    match &embedded.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id }
+            if hex::encode(transport_group_id) == rumor_h => {}
+        _ => {
+            return Err(PeelerError::Malformed(
+                "removal notice h tag does not match the embedded event's group".into(),
+            ));
+        }
+    }
+
+    Ok(PeeledMessage {
+        id: msg.id.clone(),
+        group_id: None,
+        sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
+        content: PeeledContent::RemovalNotice { embedded },
+        origin: msg.clone(),
+    })
 }
 
 /// First value of a tag on an unwrapped NIP-59 rumor (`tag[0] == name` →
@@ -1074,5 +1209,157 @@ mod tests {
     fn wrong_receiver_keys() -> nostr::Keys {
         nostr::Keys::parse("5b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod removal_notice_tests {
+    use super::*;
+    use crate::KIND_MARMOT_REMOVAL_NOTICE_RUMOR;
+    use cgka_traits::group_context::GroupContextSnapshot;
+    use cgka_traits::ingest::PeeledContent;
+    use cgka_traits::types::EpochId;
+    use std::collections::HashMap;
+
+    fn sender_keys() -> Keys {
+        Keys::generate()
+    }
+
+    fn receiver_keys() -> Keys {
+        Keys::generate()
+    }
+
+    async fn wrapped_commit(group_id: &[u8]) -> TransportMessage {
+        // A real signed kind-445 event, exactly what the committer published.
+        let ctx = GroupContextSnapshot::new(
+            EpochId(4),
+            HashMap::from([(
+                DEFAULT_EXPORTER_LABEL.to_string(),
+                vec![0x42; NOSTR_GROUP_KEY_LEN],
+            )]),
+            Some(group_id.to_vec()),
+        );
+        NostrMlsPeeler::default()
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: b"removal commit mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &ctx,
+            )
+            .await
+            .expect("wrap commit succeeds")
+    }
+
+    #[tokio::test]
+    async fn removal_notice_wrap_and_peel_round_trips_the_published_commit() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let sender_peeler = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
+        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let group_id = vec![0x5c; 32];
+        let commit = wrapped_commit(&group_id).await;
+
+        let notice = sender_peeler
+            .wrap_removal_notice(&commit, &recipient)
+            .await
+            .expect("wrap succeeds")
+            .expect("nostr binding carries removal notices");
+
+        // Outer shape: a NIP-59 gift wrap addressed to the removed member;
+        // relays never see the group id or the embedded commit.
+        assert!(matches!(
+            notice.envelope,
+            TransportEnvelope::Welcome { ref recipient }
+                if recipient.as_slice() == receiver.public_key().as_bytes()
+        ));
+        let outer = NostrTransportEvent::from_transport_message(&notice).unwrap();
+        assert_eq!(outer.kind, KIND_NIP59_GIFT_WRAP);
+        assert!(
+            !outer
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(String::as_str) == Some("h")),
+            "gift wrap must not leak the group id to relays"
+        );
+
+        let peeled = receiver_peeler
+            .peel_welcome(&notice)
+            .await
+            .expect("peel succeeds");
+        assert_eq!(
+            peeled.sender,
+            Some(MemberId::new(sender.public_key().to_bytes().to_vec()))
+        );
+        let PeeledContent::RemovalNotice { embedded } = peeled.content else {
+            panic!("expected a removal notice, got {:?}", peeled.content);
+        };
+        // The embedded message is byte-identical to the published commit, so
+        // it re-enters the inbound pipeline exactly as if fetched from the
+        // group stream (dedup collapses any overlap).
+        assert_eq!(embedded.id, commit.id);
+        assert_eq!(embedded.envelope, commit.envelope);
+        assert_eq!(embedded.payload, commit.payload);
+    }
+
+    #[tokio::test]
+    async fn removal_notice_rejects_non_group_message_embeds() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let sender_peeler = NostrMlsPeeler::new().with_welcome_signer(sender.clone());
+
+        // A gift wrap (kind 1059) is not an embeddable group message.
+        let commit = wrapped_commit(&[0x5c; 32]).await;
+        let notice = sender_peeler
+            .wrap_removal_notice(&commit, &recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = sender_peeler
+            .wrap_removal_notice(&notice, &recipient)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PeelerError::WrapFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn removal_notice_peel_rejects_a_tampered_embedded_event() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+        let group_id = vec![0x5c; 32];
+        let commit = wrapped_commit(&group_id).await;
+
+        // Hand-build a notice whose embedded event content was tampered after
+        // signing: verification of the embedded event must fail, so a forged
+        // notice can never inject bytes the committer did not publish.
+        let mut embedded = NostrTransportEvent::from_transport_message(&commit).unwrap();
+        embedded.content = BASE64_STANDARD.encode(vec![0xEE; NOSTR_GROUP_CONTENT_MIN_LEN + 4]);
+        let rumor: UnsignedEvent = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_REMOVAL_NOTICE_RUMOR),
+            serde_json::to_string(&embedded).unwrap(),
+        )
+        .tags([
+            Tag::custom(nostr::TagKind::custom(GROUP_TAG), [hex::encode(&group_id)]),
+            Tag::custom(
+                nostr::TagKind::custom(REMOVAL_NOTICE_EVENT_TAG),
+                [embedded.id.clone()],
+            ),
+        ])
+        .build(sender.public_key());
+        let gift_wrap = EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
+            .await
+            .unwrap();
+        let msg = NostrTransportEvent::from_nostr_event(&gift_wrap)
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+        let _ = recipient;
+
+        let err = receiver_peeler.peel_welcome(&msg).await.unwrap_err();
+        assert!(matches!(err, PeelerError::Malformed(_)));
     }
 }

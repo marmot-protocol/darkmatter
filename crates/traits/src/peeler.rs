@@ -134,4 +134,18 @@ pub trait TransportPeeler: Send + Sync {
     ) -> Result<TransportMessage, PeelerError> {
         self.wrap_welcome(payload, recipient).await
     }
+
+    /// Wrap a removal notice for `recipient` embedding the already-published
+    /// group message `commit` (spec/protocol-core/member-departure.md,
+    /// "Removal notices"; the transport binding defines the shape).
+    /// `Ok(None)` means this binding does not carry removal notices — the
+    /// default, so bindings (and test peelers) opt in explicitly.
+    async fn wrap_removal_notice(
+        &self,
+        commit: &TransportMessage,
+        recipient: &MemberId,
+    ) -> Result<Option<TransportMessage>, PeelerError> {
+        let _ = (commit, recipient);
+        Ok(None)
+    }
 }
